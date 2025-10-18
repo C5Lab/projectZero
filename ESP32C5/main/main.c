@@ -125,6 +125,9 @@ typedef struct {
     float longitude;
     float altitude;
     float accuracy;
+    int satellites;
+    int fix_quality;
+    char time_utc[16];
     bool valid;
 } gps_data_t;
 
@@ -132,6 +135,10 @@ typedef struct {
 static bool wardrive_active = false;
 static int wardrive_file_counter = 1;
 static gps_data_t current_gps = {0};
+static TaskHandle_t gps_read_task_handle = NULL;
+static volatile bool gps_read_active = false;
+static volatile bool gps_read_stop_requested = false;
+static bool gps_uart_initialized = false;
 
 // Global stop flag for all operations
 static volatile bool operation_stop_requested = false;
@@ -211,6 +218,8 @@ static const wifi_promiscuous_filter_t sniffer_filter = {
 
 // Wardrive buffers (static to avoid stack overflow)
 static char wardrive_gps_buffer[GPS_BUF_SIZE];
+static char gps_read_buffer[GPS_BUF_SIZE];
+static size_t gps_read_buffer_len = 0;
 static wifi_ap_record_t wardrive_scan_results[MAX_AP_CNT];
 
 
@@ -354,6 +363,9 @@ static void get_timestamp_string(char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
 static bool wait_for_gps_fix(int timeout_seconds);
 static int find_next_wardrive_file_number(void);
+static void gps_read_task(void *pvParameters);
+static int cmd_gps_read(int argc, char **argv);
+static int cmd_stop_gps(int argc, char **argv);
 // Portal data logging functions
 static void save_evil_twin_password(const char* ssid, const char* password);
 static void save_portal_data(const char* ssid, const char* form_data);
@@ -1828,6 +1840,22 @@ static int cmd_stop(int argc, char **argv) {
     // Set global stop flags
     operation_stop_requested = true;
     wardrive_active = false;
+
+    if (gps_read_active || gps_read_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping GPS reader task...");
+        gps_read_stop_requested = true;
+        for (int i = 0; i < 20 && gps_read_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (gps_read_task_handle != NULL) {
+            vTaskDelete(gps_read_task_handle);
+            gps_read_task_handle = NULL;
+        }
+        gps_read_active = false;
+        gps_read_stop_requested = false;
+        gps_read_buffer_len = 0;
+        gps_read_buffer[0] = '\0';
+    }
     
     // Stop deauth attack task if running
     if (deauth_attack_active || deauth_attack_task_handle != NULL) {
@@ -2721,6 +2749,11 @@ static int cmd_start_wardrive(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Wardrive already running. Use 'stop' to stop it first.");
         return 1;
     }
+
+    if (gps_read_active || gps_read_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "GPS read is currently active. Use 'stop_gps' before starting wardrive.");
+        return 1;
+    }
     
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
@@ -2762,6 +2795,179 @@ static int cmd_start_wardrive(int argc, char **argv) {
     }
     
     MY_LOG_INFO(TAG, "Wardrive task started. Use 'stop' to stop.");
+    return 0;
+}
+
+static void gps_read_task(void *pvParameters) {
+    (void)pvParameters;
+    MY_LOG_INFO(TAG, "GPS reader started. Use 'stop_gps' to stop.");
+
+    gps_read_buffer_len = 0;
+
+    while (!gps_read_stop_requested) {
+        size_t space = GPS_BUF_SIZE - 1 - gps_read_buffer_len;
+        if (space == 0) {
+            gps_read_buffer_len = 0;
+            space = GPS_BUF_SIZE - 1;
+        }
+
+        int len = uart_read_bytes(GPS_UART_NUM,
+                                  (uint8_t*)gps_read_buffer + gps_read_buffer_len,
+                                  (uint32_t)space,
+                                  pdMS_TO_TICKS(1000));
+        if (len > 0) {
+            gps_read_buffer_len += (size_t)len;
+            if (gps_read_buffer_len >= GPS_BUF_SIZE) {
+                gps_read_buffer_len = GPS_BUF_SIZE - 1;
+            }
+            gps_read_buffer[gps_read_buffer_len] = '\0';
+
+            size_t start = 0;
+            while (!gps_read_stop_requested && start < gps_read_buffer_len) {
+                size_t i = start;
+                while (i < gps_read_buffer_len &&
+                       gps_read_buffer[i] != '\n' &&
+                       gps_read_buffer[i] != '\r') {
+                    i++;
+                }
+
+                if (i == gps_read_buffer_len) {
+                    break; // Incomplete sentence, keep for next read
+                }
+
+                gps_read_buffer[i] = '\0';
+
+                if (i > start) {
+                    char *line = &gps_read_buffer[start];
+                    if (parse_gps_nmea(line)) {
+                        if (current_gps.valid) {
+                            printf("[GPS] time=%s UTC, lat=%.7f, lon=%.7f, alt=%.2f m, sats=%d, quality=%d, accuracy=%.2f m\n",
+                                   current_gps.time_utc[0] ? current_gps.time_utc : "unknown",
+                                   current_gps.latitude,
+                                   current_gps.longitude,
+                                   current_gps.altitude,
+                                   current_gps.satellites,
+                                   current_gps.fix_quality,
+                                   current_gps.accuracy);
+                        } else {
+                            printf("[GPS] Waiting for fix... quality=%d, sats=%d\n",
+                                   current_gps.fix_quality,
+                                   current_gps.satellites);
+                        }
+                    }
+                }
+
+                size_t j = i + 1;
+                while (j < gps_read_buffer_len &&
+                       (gps_read_buffer[j] == '\n' || gps_read_buffer[j] == '\r')) {
+                    j++;
+                }
+                start = j;
+            }
+
+            if (start > 0) {
+                gps_read_buffer_len -= start;
+                if (gps_read_buffer_len > 0) {
+                    memmove(gps_read_buffer, gps_read_buffer + start, gps_read_buffer_len);
+                } else {
+                    gps_read_buffer_len = 0;
+                }
+            }
+
+            gps_read_buffer[gps_read_buffer_len] = '\0';
+        }
+
+        if (!gps_read_stop_requested) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    gps_read_buffer_len = 0;
+    gps_read_buffer[0] = '\0';
+
+    MY_LOG_INFO(TAG, "GPS reader stopping...");
+    gps_read_active = false;
+    gps_read_task_handle = NULL;
+    gps_read_stop_requested = false;
+    vTaskDelete(NULL);
+}
+
+static int cmd_gps_read(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    if (gps_read_active || gps_read_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "GPS read already running. Use 'stop_gps' to stop it first.");
+        return 1;
+    }
+
+    if (wardrive_active || wardrive_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Wardrive is currently running. Use 'stop' before starting GPS read.");
+        return 1;
+    }
+
+    esp_err_t ret = init_gps_uart();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    current_gps.valid = false;
+    current_gps.satellites = 0;
+    current_gps.fix_quality = 0;
+    current_gps.time_utc[0] = '\0';
+
+    gps_read_buffer_len = 0;
+    gps_read_buffer[0] = '\0';
+
+    gps_read_stop_requested = false;
+    gps_read_active = true;
+
+    BaseType_t result = xTaskCreate(
+        gps_read_task,
+        "gps_read_task",
+        4096,
+        NULL,
+        4,
+        &gps_read_task_handle
+    );
+
+    if (result != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create GPS read task!");
+        gps_read_active = false;
+        gps_read_task_handle = NULL;
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "GPS read task started. Use 'stop_gps' to stop.");
+    return 0;
+}
+
+static int cmd_stop_gps(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    if (!gps_read_active && gps_read_task_handle == NULL) {
+        MY_LOG_INFO(TAG, "GPS read is not running.");
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Stopping GPS read...");
+    gps_read_stop_requested = true;
+
+    for (int i = 0; i < 20 && gps_read_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (gps_read_task_handle != NULL) {
+        vTaskDelete(gps_read_task_handle);
+        gps_read_task_handle = NULL;
+    }
+
+    gps_read_active = false;
+    gps_read_stop_requested = false;
+    gps_read_buffer_len = 0;
+    gps_read_buffer[0] = '\0';
+
+    MY_LOG_INFO(TAG, "GPS read stopped.");
     return 0;
 }
 
@@ -3808,6 +4014,24 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&karma_cmd));
 
+    const esp_console_cmd_t gps_read_cmd = {
+        .command = "gps_read",
+        .help = "Streams GPS data over UART until stop_gps is issued",
+        .hint = NULL,
+        .func = &cmd_gps_read,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&gps_read_cmd));
+
+    const esp_console_cmd_t stop_gps_cmd = {
+        .command = "stop_gps",
+        .help = "Stops the GPS data stream started with gps_read",
+        .hint = NULL,
+        .func = &cmd_stop_gps,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&stop_gps_cmd));
+
     const esp_console_cmd_t stop_cmd = {
         .command = "stop",
         .help = "Stop all running operations",
@@ -3934,6 +4158,8 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
     MY_LOG_INFO(TAG,"  start_sniffer_dog");
     MY_LOG_INFO(TAG,"  stop");
+    MY_LOG_INFO(TAG,"  gps_read");
+    MY_LOG_INFO(TAG,"  stop_gps");
     MY_LOG_INFO(TAG,"  reboot");
 
     repl_config.prompt = ">";
@@ -5051,6 +5277,10 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
 // === WARDRIVE HELPER FUNCTIONS ===
 
 static esp_err_t init_gps_uart(void) {
+    if (gps_uart_initialized) {
+        return ESP_OK;
+    }
+
     uart_config_t uart_config = {
         .baud_rate = 9600,
         .data_bits = UART_DATA_8_BITS,
@@ -5059,11 +5289,28 @@ static esp_err_t init_gps_uart(void) {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    
-    ESP_ERROR_CHECK(uart_driver_install(GPS_UART_NUM, GPS_BUF_SIZE * 2, 0, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(GPS_UART_NUM, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(GPS_UART_NUM, GPS_TX_PIN, GPS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    
+
+    esp_err_t err = uart_driver_install(GPS_UART_NUM, GPS_BUF_SIZE * 2, 0, 0, NULL, 0);
+    if (err == ESP_ERR_INVALID_STATE) {
+        // Driver already installed elsewhere - continue
+        err = ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = uart_param_config(GPS_UART_NUM, &uart_config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = uart_set_pin(GPS_UART_NUM, GPS_TX_PIN, GPS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    gps_uart_initialized = true;
+
     return ESP_OK;
 }
 
@@ -5153,7 +5400,7 @@ static bool parse_gps_nmea(const char* nmea_sentence) {
         char sentence[256];
         strncpy(sentence, nmea_sentence, sizeof(sentence) - 1);
         sentence[sizeof(sentence) - 1] = '\0';
-        
+
         char *token = strtok(sentence, ",");
         int field = 0;
         float lat_deg = 0, lat_min = 0;
@@ -5162,9 +5409,16 @@ static bool parse_gps_nmea(const char* nmea_sentence) {
         int quality = 0;
         float altitude = 0;
         float hdop = 1.0;
-        
+        int satellites = 0;
+        char time_raw[16] = {0};
+
         while (token != NULL) {
             switch (field) {
+                case 1: // Fix time HHMMSS.SSS
+                    if (strlen(token) >= 6) {
+                        strncpy(time_raw, token, sizeof(time_raw) - 1);
+                    }
+                    break;
                 case 2: // Latitude DDMM.MMMM
                     if (strlen(token) > 4) {
                         lat_deg = (token[0] - '0') * 10 + (token[1] - '0');
@@ -5172,7 +5426,9 @@ static bool parse_gps_nmea(const char* nmea_sentence) {
                     }
                     break;
                 case 3: // Latitude direction
-                    lat_dir = token[0];
+                    if (token[0] != '\0') {
+                        lat_dir = token[0];
+                    }
                     break;
                 case 4: // Longitude DDDMM.MMMM
                     if (strlen(token) > 5) {
@@ -5181,10 +5437,15 @@ static bool parse_gps_nmea(const char* nmea_sentence) {
                     }
                     break;
                 case 5: // Longitude direction
-                    lon_dir = token[0];
+                    if (token[0] != '\0') {
+                        lon_dir = token[0];
+                    }
                     break;
                 case 6: // GPS quality
                     quality = atoi(token);
+                    break;
+                case 7: // Satellites in use
+                    satellites = atoi(token);
                     break;
                 case 8: // HDOP
                     hdop = atof(token);
@@ -5196,21 +5457,36 @@ static bool parse_gps_nmea(const char* nmea_sentence) {
             token = strtok(NULL, ",");
             field++;
         }
-        
-        if (quality > 0) {
-            // Convert to decimal degrees
-            current_gps.latitude = lat_deg + lat_min / 60.0;
-            if (lat_dir == 'S') current_gps.latitude = -current_gps.latitude;
-            
-            current_gps.longitude = lon_deg + lon_min / 60.0;
-            if (lon_dir == 'W') current_gps.longitude = -current_gps.longitude;
-            
-            current_gps.altitude = altitude;
-            current_gps.accuracy = hdop * 4.0; // Rough accuracy estimate
-            current_gps.valid = true;
-            
-            return true;
+
+        // Convert to decimal degrees
+        current_gps.latitude = lat_deg + lat_min / 60.0;
+        if (lat_dir == 'S') {
+            current_gps.latitude = -current_gps.latitude;
         }
+
+        current_gps.longitude = lon_deg + lon_min / 60.0;
+        if (lon_dir == 'W') {
+            current_gps.longitude = -current_gps.longitude;
+        }
+
+        current_gps.altitude = altitude;
+        current_gps.accuracy = hdop * 4.0; // Rough accuracy estimate
+        current_gps.satellites = satellites;
+        current_gps.fix_quality = quality;
+
+        if (strlen(time_raw) >= 6) {
+            snprintf(current_gps.time_utc, sizeof(current_gps.time_utc),
+                     "%c%c:%c%c:%c%c",
+                     time_raw[0], time_raw[1],
+                     time_raw[2], time_raw[3],
+                     time_raw[4], time_raw[5]);
+        } else {
+            current_gps.time_utc[0] = '\0';
+        }
+
+        current_gps.valid = (quality > 0);
+
+        return true;
     }
     
     return false;

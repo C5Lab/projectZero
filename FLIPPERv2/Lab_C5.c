@@ -54,6 +54,10 @@ typedef enum {
 #define SERIAL_BUFFER_SIZE 4096
 #define UART_STREAM_SIZE 1024
 #define MENU_VISIBLE_COUNT 6
+#define MENU_MAX_SCREEN_LINES 4
+#define MENU_ENTRY_FIRST_Y 24
+#define MENU_ENTRY_STEP 12
+#define MENU_SCROLL_BOTTOM_LIMIT 60
 #define MENU_VISIBLE_COUNT_SNIFFERS 3
 #define MENU_VISIBLE_COUNT_ATTACKS 3
 #define SERIAL_VISIBLE_LINES 6
@@ -99,6 +103,7 @@ typedef enum {
     MenuActionToggleOtgPower,
     MenuActionOpenScannerSetup,
     MenuActionOpenConsole,
+    MenuActionOpenGpsDebug,
     MenuActionConfirmBlackout,
     MenuActionOpenEvilTwinMenu,
 } MenuAction;
@@ -149,7 +154,10 @@ typedef struct {
     size_t serial_scroll;
     bool serial_follow_tail;
     bool serial_targets_hint;
-    bool last_command_sent;
+    bool stop_command_pending;
+    char stop_command[32];
+    bool gps_debug_active;
+    uint32_t setup_return_index;
     bool confirm_blackout_yes;
     uint32_t last_attack_index;
     size_t evil_twin_menu_index;
@@ -243,6 +251,8 @@ static void simple_app_show_status_message(SimpleApp* app, const char* message, 
 static void simple_app_clear_status_message(SimpleApp* app);
 static bool simple_app_status_message_is_active(SimpleApp* app);
 static void simple_app_send_command_with_targets(SimpleApp* app, const char* base_command);
+static void simple_app_send_command_full(SimpleApp* app, const char* command, bool go_to_serial, const char* stop_command);
+static void simple_app_start_gps_debug(SimpleApp* app);
 static size_t simple_app_menu_visible_count(const SimpleApp* app, uint32_t section_index);
 static size_t simple_app_render_display_lines(
     SimpleApp* app,
@@ -312,6 +322,8 @@ static const char hint_setup_filters[] =
     "Choose visible fields\nSimplify result list\nHide unused data\nTailor display\nOK flips options.";
 static const char hint_setup_console[] =
     "Open live console\nStream UART output\nWatch commands\nDebug operations\nClose with Back.";
+static const char hint_setup_gps_debug[] =
+    "Start GPS reader\nStream live NMEA\nMonitor fixes\nBack stops GPS\nReturn to setup.";
 
 static const MenuEntry menu_entries_sniffers[] = {
     {"Start Sniffer", "start_sniffer", MenuActionCommand, hint_sniffer_start},
@@ -337,6 +349,7 @@ static const MenuEntry menu_entries_setup[] = {
     {menu_label_otg_power, NULL, MenuActionToggleOtgPower, hint_setup_otg},
     {"Scanner Filters", NULL, MenuActionOpenScannerSetup, hint_setup_filters},
     {"Console", NULL, MenuActionOpenConsole, hint_setup_console},
+    {"GPS debug", NULL, MenuActionOpenGpsDebug, hint_setup_gps_debug},
 };
 
 static const MenuSection menu_sections[] = {
@@ -351,13 +364,35 @@ static const size_t menu_section_count = sizeof(menu_sections) / sizeof(menu_sec
 
 static size_t simple_app_menu_visible_count(const SimpleApp* app, uint32_t section_index) {
     UNUSED(app);
+    size_t count;
     if(section_index == MENU_SECTION_SNIFFERS) {
-        return MENU_VISIBLE_COUNT_SNIFFERS;
+        count = MENU_VISIBLE_COUNT_SNIFFERS;
+    } else if(section_index == MENU_SECTION_ATTACKS) {
+        count = MENU_VISIBLE_COUNT_ATTACKS;
+    } else {
+        count = MENU_VISIBLE_COUNT;
     }
-    if(section_index == MENU_SECTION_ATTACKS) {
-        return MENU_VISIBLE_COUNT_ATTACKS;
+
+    if(section_index < menu_section_count) {
+        const MenuSection* section = &menu_sections[section_index];
+        if(section->display_height > 0) {
+            size_t section_limit = section->display_height / 12;
+            if(section_limit == 0) section_limit = 1;
+            if(count > section_limit) {
+                count = section_limit;
+            }
+        }
     }
-    return MENU_VISIBLE_COUNT;
+
+    if(count > MENU_MAX_SCREEN_LINES) {
+        count = MENU_MAX_SCREEN_LINES;
+    }
+
+    if(count == 0) {
+        count = 1;
+    }
+
+    return count;
 }
 
 static void simple_app_focus_attacks_menu(SimpleApp* app) {
@@ -1328,7 +1363,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
     simple_app_update_scroll(app);
 }
 
-static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial) {
+static void simple_app_send_command_full(SimpleApp* app, const char* command, bool go_to_serial, const char* stop_command) {
     if(!app || !command || command[0] == '\0') return;
 
     app->serial_targets_hint = false;
@@ -1348,12 +1383,24 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
         simple_app_append_serial_data(app, (const uint8_t*)log_line, (size_t)log_len);
     }
 
-    app->last_command_sent = true;
+    if(stop_command && stop_command[0] != '\0') {
+        strncpy(app->stop_command, stop_command, sizeof(app->stop_command) - 1);
+        app->stop_command[sizeof(app->stop_command) - 1] = '\0';
+        app->stop_command_pending = true;
+    } else {
+        app->stop_command_pending = false;
+        app->stop_command[0] = '\0';
+    }
+
     if(go_to_serial) {
         app->screen = ScreenSerial;
         app->serial_follow_tail = true;
         simple_app_update_scroll(app);
     }
+}
+
+static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial) {
+    simple_app_send_command_full(app, command, go_to_serial, "stop");
 }
 
 static void simple_app_send_command_with_targets(SimpleApp* app, const char* base_command) {
@@ -1432,10 +1479,35 @@ static void simple_app_send_command_with_targets(SimpleApp* app, const char* bas
     simple_app_send_command(app, command, true);
 }
 
-static void simple_app_send_stop_if_needed(SimpleApp* app) {
-    if(!app || !app->last_command_sent) return;
-    simple_app_send_command(app, "stop", false);
-    app->last_command_sent = false;
+static bool simple_app_send_stop_if_needed(SimpleApp* app) {
+    if(!app || !app->stop_command_pending) return false;
+
+    char stop_command_local[sizeof(app->stop_command)];
+    strncpy(stop_command_local, app->stop_command, sizeof(stop_command_local) - 1);
+    stop_command_local[sizeof(stop_command_local) - 1] = '\0';
+
+    bool was_gps_stop = (strcmp(stop_command_local, "stop_gps") == 0);
+    bool was_generic_stop = (strcmp(stop_command_local, "stop") == 0);
+
+    app->stop_command_pending = false;
+    app->stop_command[0] = '\0';
+
+    bool sent = false;
+
+    if(stop_command_local[0] != '\0') {
+        simple_app_send_command_full(app, stop_command_local, false, NULL);
+        sent = true;
+    }
+
+    if(sent && (was_gps_stop || was_generic_stop)) {
+        furi_delay_ms(120);
+    }
+
+    if(was_gps_stop) {
+        app->gps_debug_active = false;
+    }
+
+    return sent;
 }
 
 static void simple_app_request_scan_results(SimpleApp* app, const char* command) {
@@ -1458,22 +1530,63 @@ static void simple_app_console_enter(SimpleApp* app) {
     view_port_update(app->viewport);
 }
 
+static void simple_app_start_gps_debug(SimpleApp* app) {
+    if(!app) return;
+    if(!app->otg_power_enabled) {
+        simple_app_show_status_message(app, "Enable 5V power\nbefore GPS debug", 1800, true);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+    bool stop_sent = simple_app_send_stop_if_needed(app);
+    if(stop_sent) {
+        simple_app_reset_serial_log(app, "READY");
+    }
+    app->gps_debug_active = true;
+    simple_app_console_enter(app);
+    simple_app_send_command_full(app, "gps_read", false, "stop_gps");
+    app->serial_follow_tail = true;
+    simple_app_update_scroll(app);
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
 static void simple_app_console_leave(SimpleApp* app) {
     if(!app) return;
     app->screen = ScreenMenu;
     app->menu_state = MenuStateItems;
     app->section_index = MENU_SECTION_SETUP;
-    app->item_index = menu_sections[MENU_SECTION_SETUP].entry_count - 1;
-    size_t visible_count = simple_app_menu_visible_count(app, MENU_SECTION_SETUP);
-    if(visible_count == 0) visible_count = 1;
-    if(menu_sections[MENU_SECTION_SETUP].entry_count > visible_count) {
-        size_t max_offset = menu_sections[MENU_SECTION_SETUP].entry_count - visible_count;
-        app->item_offset = max_offset;
-    } else {
+    size_t entry_count = menu_sections[MENU_SECTION_SETUP].entry_count;
+    size_t target_index = (size_t)app->setup_return_index;
+    if(entry_count == 0) {
+        app->item_index = 0;
         app->item_offset = 0;
+    } else {
+        if(target_index >= entry_count) {
+            target_index = entry_count - 1;
+        }
+        app->item_index = target_index;
+        size_t visible_count = simple_app_menu_visible_count(app, MENU_SECTION_SETUP);
+        if(visible_count == 0) visible_count = 1;
+        if(entry_count <= visible_count) {
+            app->item_offset = 0;
+        } else {
+            size_t max_offset = entry_count - visible_count;
+            size_t desired_offset = 0;
+            if(target_index + 1 > visible_count) {
+                desired_offset = target_index - visible_count + 1;
+            }
+            if(desired_offset > max_offset) {
+                desired_offset = max_offset;
+            }
+            app->item_offset = desired_offset;
+        }
     }
     app->serial_follow_tail = true;
     simple_app_update_scroll(app);
+    app->gps_debug_active = false;
     view_port_update(app->viewport);
 }
 
@@ -2129,7 +2242,7 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     for(uint32_t i = 0; i < visible_count; i++) {
         uint32_t idx = app->item_offset + i;
         if(idx >= section->entry_count) break;
-        uint8_t y = 28 + i * 12;
+        uint8_t y = MENU_ENTRY_FIRST_Y + i * MENU_ENTRY_STEP;
 
         if(idx == app->item_index) {
             canvas_draw_str(canvas, 2, y, ">");
@@ -2141,9 +2254,20 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
 
     if(section->entry_count > visible_count) {
         const uint8_t track_width = 3;
-        uint8_t track_height = section->display_height ? section->display_height : (uint8_t)(visible_count * 12);
+        uint8_t base_height = (uint8_t)(visible_count * MENU_ENTRY_STEP - 4);
+        uint8_t track_height = (uint8_t)((base_height * 8) / 10);
+        if(track_height < 6) track_height = 6;
+        uint8_t top_limit = (MENU_ENTRY_FIRST_Y > 6) ? (uint8_t)(MENU_ENTRY_FIRST_Y - 6) : 0;
+        uint8_t bottom_limit = MENU_SCROLL_BOTTOM_LIMIT;
+        uint8_t available_height =
+            (bottom_limit > top_limit) ? (uint8_t)(bottom_limit - top_limit) : 0;
+        uint8_t track_y = top_limit;
+        if(available_height > track_height) {
+            track_y = (uint8_t)(top_limit + (available_height - track_height) / 2);
+        } else if(top_limit + track_height > bottom_limit) {
+            track_y = (bottom_limit > track_height) ? (uint8_t)(bottom_limit - track_height) : 0;
+        }
         const uint8_t track_x = DISPLAY_WIDTH - track_width;
-        const uint8_t track_y = 18;
         canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
         uint8_t thumb_height =
             (uint8_t)(((uint32_t)visible_count * track_height) / section->entry_count);
@@ -2709,7 +2833,12 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             app->scanner_adjusting_power = false;
             app->scanner_view_offset = 0;
         } else if(entry->action == MenuActionOpenConsole) {
+            app->setup_return_index = app->item_index;
+            app->gps_debug_active = false;
             simple_app_console_enter(app);
+        } else if(entry->action == MenuActionOpenGpsDebug) {
+            app->setup_return_index = app->item_index;
+            simple_app_start_gps_debug(app);
         } else if(entry->action == MenuActionConfirmBlackout) {
             app->confirm_blackout_yes = true;
             app->screen = ScreenConfirmBlackout;
@@ -2798,7 +2927,8 @@ static void simple_app_start_evil_portal(SimpleApp* app) {
         "select_html %u",
         (unsigned)app->evil_twin_selected_html_id);
     simple_app_send_command(app, select_command, false);
-    app->last_command_sent = false;
+    app->stop_command_pending = false;
+    app->stop_command[0] = '\0';
     simple_app_send_command_with_targets(app, "start_evil_twin");
     if(app->viewport) {
         view_port_update(app->viewport);
@@ -2826,7 +2956,8 @@ static void simple_app_finish_evil_twin_listing(SimpleApp* app) {
     app->evil_twin_list_length = 0;
     app->evil_twin_list_header_seen = false;
     app->evil_twin_popup_active = false;
-    app->last_command_sent = false;
+    app->stop_command_pending = false;
+    app->stop_command[0] = '\0';
     app->screen = ScreenEvilTwinMenu;
     simple_app_clear_status_message(app);
 
@@ -3040,7 +3171,8 @@ static void simple_app_handle_evil_twin_popup_event(SimpleApp* app, const InputE
             char command[48];
             snprintf(command, sizeof(command), "select_html %u", (unsigned)entry->id);
             simple_app_send_command(app, command, false);
-            app->last_command_sent = false;
+            app->stop_command_pending = false;
+            app->stop_command[0] = '\0';
 
             char message[64];
             snprintf(message, sizeof(message), "HTML set:\n%s", entry->name);
@@ -3344,6 +3476,9 @@ int32_t Lab_C5_app(void* p) {
         return 0;
     }
     memset(app, 0, sizeof(SimpleApp));
+    app->setup_return_index = (menu_sections[MENU_SECTION_SETUP].entry_count > 0) ?
+                                  (menu_sections[MENU_SECTION_SETUP].entry_count - 1) :
+                                  0;
     app->scanner_show_ssid = true;
     app->scanner_show_bssid = true;
     app->scanner_show_channel = true;
