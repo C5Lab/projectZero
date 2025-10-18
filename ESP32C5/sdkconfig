@@ -3153,62 +3153,41 @@ CONFIG_ESP_COREDUMP_ENABLE_TO_NONE=y
 #
 # default:
 CONFIG_FATFS_VOLUME_COUNT=2
-# default:
-CONFIG_FATFS_LFN_NONE=y
-# default:
-# CONFIG_FATFS_LFN_HEAP is not set
-# default:
+# CONFIG_FATFS_LFN_NONE is not set
+CONFIG_FATFS_LFN_HEAP=y
 # CONFIG_FATFS_LFN_STACK is not set
 # default:
 # CONFIG_FATFS_SECTOR_512 is not set
 # default:
 CONFIG_FATFS_SECTOR_4096=y
-# default:
 # CONFIG_FATFS_CODEPAGE_DYNAMIC is not set
-# default:
 CONFIG_FATFS_CODEPAGE_437=y
-# default:
 # CONFIG_FATFS_CODEPAGE_720 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_737 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_771 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_775 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_850 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_852 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_855 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_857 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_860 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_861 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_862 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_863 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_864 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_865 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_866 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_869 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_932 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_936 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_949 is not set
-# default:
 # CONFIG_FATFS_CODEPAGE_950 is not set
 # default:
 CONFIG_FATFS_CODEPAGE=437
+# default:
+CONFIG_FATFS_MAX_LFN=255
+# CONFIG_FATFS_API_ENCODING_ANSI_OEM is not set
+CONFIG_FATFS_API_ENCODING_UTF_8=y
 # default:
 CONFIG_FATFS_FS_LOCK=0
 # default:

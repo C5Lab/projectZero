@@ -54,6 +54,26 @@ Sniffer is able to passively listen for traffic between AP and Clients. After yo
 
 Additionally you can inspect probe requests captured during the scan.
 
+## Blackout and Sniffer Dog
+
+Blackout scans networks around every 5 minutes and then deauths them all (broadcast).
+
+Sniffer Dog listens to traffic between AP and STA and deauths every station it sniffs.
+
+## Whitelist
+Allows to skip some networks in Sniffer Dog and Blackout attacks. Add networks BSSIDs into white.txt file on your SD card, each in new line:
+
+AA:BB:CC:DD:EE:FF
+
+AA:BB:CC:DD:EE:FF
+
+AA:BB:CC:DD:EE:FF
+
+Please note start_deauth command does not respect whitelist - it attacks all selected networks. 
+
+## Karma attack
+This attack relies on sniffing of probe requests sent by phones around you. Next, it will start a captive portal network where SSID is based on the sniffed probe.
+Example: Sniffer shows a phone around you looks for 'Starbucks' network. Karma will start a new network named 'Starbucks' using your html file. When user connects, will be redirected to your captive portal asking for Instagram credentials to log in.
 
 # CLI Usage
 The board, when connected to USB, offers a CLI interface. 
@@ -145,6 +165,8 @@ Target BSSID[1]: , BSSID: 30:AA:E4:3C:3F:69, Channel: 1
 
 Deauth attack started. Use 'stop' to stop.
 
+All entered credentials will be stored in EVILTWIN.TXT file on SD card.
+
 ## SAE Overflow
 After scan, first run select_networks with only one index:
 
@@ -178,11 +200,68 @@ show_probes
 
 Just run: start_blackout
 
+## Sniffer dog
+Just run: start_sniffer_dog
+
 ## Wardrive
 
 Just run: start_wardrive
 
 First you need to patiently wait for gps fix to be obtained! Only then wardrive will start and networks would be started.
+
+
+## Portal
+
+verify what html files are present on SD card:
+
+> list_sd
+
+SD card mounted successfully
+
+[...]
+
+HTML files found on SD card:
+
+1 1EXA~145.HTM
+
+Here we have only one file, now we need to select it by providing its index:
+
+> select_html 1
+
+Loaded HTML file: 1EXA~145.HTM (1668 bytes)
+
+Portal will now use this custom HTML.
+
+Now, we're ready to start the attack:
+
+start_portal MySSID
+
+Network named MySSID will be created. All entered credentials will be stored in PORTAL.TXT file on SD card.
+
+## Karma
+First, run:
+
+> start_sniffer
+
+When collected enough packets, stop it: 
+
+> stop
+
+Next, show probe requests:
+
+> list_probes
+
+And you will see output with sequential numbers:
+
+1 Starbucks
+
+2 McDonalds
+
+Next, load your target HTML portal file using commands list_sd and select_html. When done, start karma atatck:
+
+start_karma 2
+
+This will start 'McDonalds' network which opens your captive portal.
 
 # Flipper application screens and user journey
 Run the app:
@@ -247,6 +326,14 @@ Select portal option presents portals found on the SD card:
 
 ![alt text](Gfx/portals.png)
 
+
+Blackout attack
+
+![alt text](Gfx/blackout.png)
+
+Sniffer dog attack
+
+![alt text](Gfx/sniffer.png)
 
 
 ## Flashing ESP32-C5 Board

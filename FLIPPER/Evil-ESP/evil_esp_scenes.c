@@ -116,6 +116,22 @@ static void evil_esp_text_input_callback_uart(void* context) {
     scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
 }
 
+// Text input callback for Portal SSID
+static void evil_esp_text_input_callback_portal(void* context) {
+    EvilEspApp* app = context;
+
+    // Send start_portal command with the SSID
+    if(strlen(app->text_input_store) > 0) {
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "start_portal %s", app->text_input_store);
+        evil_esp_send_command(app, cmd);
+    }
+
+    // Switch to terminal display mode
+    scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
+    scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
+}
+
 // Text input callback for configuration
 static void evil_esp_config_input_callback(void* context) {
     EvilEspApp* app = context;
@@ -260,7 +276,7 @@ void evil_esp_scene_on_enter_main_menu(void* context) {
     }
 
     submenu_reset(app->submenu);
-    submenu_set_header(app->submenu, "C5 Lab 1.3");
+    submenu_set_header(app->submenu, "C5 Lab 1.5");
 
     submenu_add_item(app->submenu, "Scanner", EvilEspMainMenuIndexScanner, evil_esp_submenu_callback_main_menu, app);
     submenu_add_item(app->submenu, "Sniffer", EvilEspMainMenuIndexSnifferMenu, evil_esp_submenu_callback_main_menu, app);
@@ -530,6 +546,8 @@ enum EvilEspAttacksMenuIndex {
     EvilEspAttacksMenuIndexRandom,
     EvilEspAttacksMenuIndexWardrive,
     EvilEspAttacksMenuIndexBlackout,
+    EvilEspAttacksMenuIndexSnifferDog,
+    EvilEspAttacksMenuIndexPortal,
     EvilEspAttacksMenuIndexStop,
 };
 
@@ -544,6 +562,8 @@ void evil_esp_scene_on_enter_attacks(void* context) {
     submenu_add_item(app->submenu, "WPA3 SAE Overflow", EvilEspAttacksMenuIndexRandom, evil_esp_submenu_callback_attacks, app);
     submenu_add_item(app->submenu, "Wardrive", EvilEspAttacksMenuIndexWardrive, evil_esp_submenu_callback_attacks, app);
     submenu_add_item(app->submenu, "Blackout", EvilEspAttacksMenuIndexBlackout, evil_esp_submenu_callback_attacks, app);
+    submenu_add_item(app->submenu, "SnifferDog", EvilEspAttacksMenuIndexSnifferDog, evil_esp_submenu_callback_attacks, app);
+    submenu_add_item(app->submenu, "Portal", EvilEspAttacksMenuIndexPortal, evil_esp_submenu_callback_attacks, app);
     //submenu_add_item(app->submenu, "Stop Attack", EvilEspAttacksMenuIndexStop, evil_esp_submenu_callback_attacks, app);
 
     view_dispatcher_switch_to_view(app->view_dispatcher, EvilEspViewMainMenu);
@@ -595,6 +615,30 @@ bool evil_esp_scene_on_event_attacks(void* context, SceneManagerEvent event) {
             app->attack_state.mode = EvilEspAttackModeRandom; // Use existing mode for blackout
             scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
             scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
+            return true;
+
+        case EvilEspAttacksMenuIndexSnifferDog:
+            evil_esp_send_command(app, "start_sniffer_dog");
+            app->attack_state.active = true;
+            app->attack_state.mode = EvilEspAttackModeRandom; // Use existing mode for sniffer dog
+            scene_manager_set_scene_state(app->scene_manager, EvilEspSceneUartTerminal, 1);
+            scene_manager_next_scene(app->scene_manager, EvilEspSceneUartTerminal);
+            return true;
+
+        case EvilEspAttacksMenuIndexPortal:
+            // Show text input for SSID
+            strncpy(app->text_input_store, "", EVIL_ESP_TEXT_INPUT_STORE_SIZE - 1);
+            text_input_reset(app->text_input);
+            text_input_set_header_text(app->text_input, "Enter SSID:");
+            text_input_set_result_callback(
+                app->text_input,
+                evil_esp_text_input_callback_portal,
+                app,
+                app->text_input_store,
+                EVIL_ESP_TEXT_INPUT_STORE_SIZE,
+                true
+            );
+            view_dispatcher_switch_to_view(app->view_dispatcher, EvilEspViewTextInput);
             return true;
 
         case EvilEspAttacksMenuIndexStop:
