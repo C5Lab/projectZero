@@ -56,7 +56,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.5.0"
+#define JANOS_VERSION "0.5.1"
 
 
 #define NEOPIXEL_GPIO      27
@@ -357,6 +357,7 @@ static void add_client_to_ap(int ap_index, const uint8_t *client_mac, int rssi);
 // Wardrive functions
 static esp_err_t init_gps_uart(void);
 static esp_err_t init_sd_card(void);
+static esp_err_t create_sd_directories(void);
 static bool parse_gps_nmea(const char* nmea_sentence);
 static void get_timestamp_string(char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
@@ -2465,9 +2466,9 @@ static int cmd_list_sd(int argc, char **argv)
         return 1;
     }
     
-    DIR *dir = opendir("/sdcard");
+    DIR *dir = opendir("/sdcard/lab/htmls");
     if (dir == NULL) {
-        MY_LOG_INFO(TAG, "Failed to open /sdcard directory. Error: %d (%s)", errno, strerror(errno));
+        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/htmls directory. Error: %d (%s)", errno, strerror(errno));
         return 1;
     }
     
@@ -2550,7 +2551,7 @@ static int cmd_select_html(int argc, char **argv)
     }
     
     char filepath[128];
-    snprintf(filepath, sizeof(filepath), "/sdcard/%s", sd_html_files[index]);
+    snprintf(filepath, sizeof(filepath), "/sdcard/lab/htmls/%s", sd_html_files[index]);
     
     // Open file and get size
     FILE *f = fopen(filepath, "r");
@@ -2689,13 +2690,13 @@ static void wardrive_task(void *pvParameters) {
         esp_wifi_scan_get_ap_records(&scan_count, wardrive_scan_results);
         
         // Create filename (keep it simple for FAT filesystem)
-        char filename[32];
-        snprintf(filename, sizeof(filename), "/sdcard/w%d.log", wardrive_file_counter);
+        char filename[64];
+        snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", wardrive_file_counter);
         
-        // Check if /sdcard directory is accessible
+        // Check if /sdcard/lab/wardrives directory is accessible
         struct stat st;
-        if (stat("/sdcard", &st) != 0) {
-            MY_LOG_INFO(TAG, "Error: /sdcard directory not accessible");
+        if (stat("/sdcard/lab/wardrives", &st) != 0) {
+            MY_LOG_INFO(TAG, "Error: /sdcard/lab/wardrives directory not accessible");
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
@@ -4044,6 +4045,12 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
     vTaskDelay(pdMS_TO_TICKS(500));
     
+    // Initialize SD card and create necessary directories
+    esp_err_t sd_init_ret = init_sd_card();
+    if (sd_init_ret == ESP_OK) {
+        create_sd_directories();
+    }
+    
     // Load BSSID whitelist from SD card
     load_whitelist_from_sd();
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -5386,6 +5393,52 @@ static esp_err_t init_sd_card(void) {
     return ESP_OK;
 }
 
+// Create necessary directories on SD card
+static esp_err_t create_sd_directories(void) {
+    struct stat st;
+    
+    MY_LOG_INFO(TAG, "Checking and creating SD card directories...");
+    
+    // Create /sdcard/lab directory
+    if (stat("/sdcard/lab", &st) != 0) {
+        MY_LOG_INFO(TAG, "Creating /sdcard/lab directory...");
+        if (mkdir("/sdcard/lab", 0755) != 0) {
+            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab directory: %s", strerror(errno));
+            return ESP_FAIL;
+        }
+        MY_LOG_INFO(TAG, "/sdcard/lab created successfully");
+    } else {
+        MY_LOG_INFO(TAG, "/sdcard/lab already exists");
+    }
+    
+    // Create /sdcard/lab/htmls directory
+    if (stat("/sdcard/lab/htmls", &st) != 0) {
+        MY_LOG_INFO(TAG, "Creating /sdcard/lab/htmls directory...");
+        if (mkdir("/sdcard/lab/htmls", 0755) != 0) {
+            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/htmls directory: %s", strerror(errno));
+            return ESP_FAIL;
+        }
+        MY_LOG_INFO(TAG, "/sdcard/lab/htmls created successfully");
+    } else {
+        MY_LOG_INFO(TAG, "/sdcard/lab/htmls already exists");
+    }
+    
+    // Create /sdcard/lab/wardrives directory
+    if (stat("/sdcard/lab/wardrives", &st) != 0) {
+        MY_LOG_INFO(TAG, "Creating /sdcard/lab/wardrives directory...");
+        if (mkdir("/sdcard/lab/wardrives", 0755) != 0) {
+            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/wardrives directory: %s", strerror(errno));
+            return ESP_FAIL;
+        }
+        MY_LOG_INFO(TAG, "/sdcard/lab/wardrives created successfully");
+    } else {
+        MY_LOG_INFO(TAG, "/sdcard/lab/wardrives already exists");
+    }
+    
+    MY_LOG_INFO(TAG, "All required directories are ready");
+    return ESP_OK;
+}
+
 static bool parse_gps_nmea(const char* nmea_sentence) {
     if (!nmea_sentence || strlen(nmea_sentence) < 10) {
         return false;
@@ -5536,11 +5589,11 @@ static bool wait_for_gps_fix(int timeout_seconds) {
 
 static int find_next_wardrive_file_number(void) {
     int max_number = 0;
-    char filename[32];
+    char filename[64];
     MY_LOG_INFO(TAG, "Scanning for existing wardrive log files...");
     // Scan through possible file numbers to find the highest existing one
     for (int i = 1; i <= 9999; i++) {
-        snprintf(filename, sizeof(filename), "/sdcard/w%d.log", i);
+        snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", i);
         
         struct stat file_stat;
         if (stat(filename, &file_stat) == 0) {
@@ -5576,19 +5629,19 @@ static void save_evil_twin_password(const char* ssid, const char* password) {
     }
     
     // Try to open file for appending (use short name without underscore for FAT compatibility)
-    FILE *file = fopen("/sdcard/eviltwin.txt", "a");
+    FILE *file = fopen("/sdcard/lab/eviltwin.txt", "a");
     if (file == NULL) {
         MY_LOG_INFO(TAG, "Failed to open eviltwin.txt for append, errno: %d (%s). Trying to create...", errno, strerror(errno));
         
         // Try to create the file first
-        file = fopen("/sdcard/eviltwin.txt", "w");
+        file = fopen("/sdcard/lab/eviltwin.txt", "w");
         if (file == NULL) {
             MY_LOG_INFO(TAG, "Failed to create eviltwin.txt, errno: %d (%s)", errno, strerror(errno));
             return;
         }
         // Close and reopen in append mode
         fclose(file);
-        file = fopen("/sdcard/eviltwin.txt", "a");
+        file = fopen("/sdcard/lab/eviltwin.txt", "a");
         if (file == NULL) {
             MY_LOG_INFO(TAG, "Failed to reopen eviltwin.txt, errno: %d (%s)", errno, strerror(errno));
             return;
@@ -5623,19 +5676,19 @@ static void save_portal_data(const char* ssid, const char* form_data) {
     }
     
     // Try to open file for appending
-    FILE *file = fopen("/sdcard/portals.txt", "a");
+    FILE *file = fopen("/sdcard/lab/portals.txt", "a");
     if (file == NULL) {
         MY_LOG_INFO(TAG, "Failed to open portals.txt for append, errno: %d (%s). Trying to create...", errno, strerror(errno));
         
         // Try to create the file first
-        file = fopen("/sdcard/portals.txt", "w");
+        file = fopen("/sdcard/lab/portals.txt", "w");
         if (file == NULL) {
             MY_LOG_INFO(TAG, "Failed to create portals.txt, errno: %d (%s)", errno, strerror(errno));
             return;
         }
         // Close and reopen in append mode
         fclose(file);
-        file = fopen("/sdcard/portals.txt", "a");
+        file = fopen("/sdcard/lab/portals.txt", "a");
         if (file == NULL) {
             MY_LOG_INFO(TAG, "Failed to reopen portals.txt, errno: %d (%s)", errno, strerror(errno));
             return;
@@ -5734,7 +5787,7 @@ static void load_whitelist_from_sd(void) {
     }
     
     // Try to open white.txt file
-    FILE *file = fopen("/sdcard/white.txt", "r");
+    FILE *file = fopen("/sdcard/lab/white.txt", "r");
     if (file == NULL) {
         MY_LOG_INFO(TAG, "white.txt not found on SD card - whitelist will be empty");
         return;

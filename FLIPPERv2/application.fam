@@ -8,6 +8,5 @@ App(
     fap_icon="gfx\icon.png",
     fap_category="GPIO",
     fap_author="Lab_Team",
-    fap_version="0.8",
     fap_description="WiFi Deauther controller for Lab_C5 module via UART",
 )

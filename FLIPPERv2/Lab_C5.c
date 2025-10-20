@@ -22,6 +22,7 @@ typedef enum {
     ScreenSetupScanner,
     ScreenConsole,
     ScreenConfirmBlackout,
+    ScreenConfirmSnifferDos,
     ScreenEvilTwinMenu,
 } AppScreen;
 
@@ -29,15 +30,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#ifndef FAP_VERSION_TEXT
-#ifdef FAP_VERSION
-#define FAP_VERSION_TEXT FAP_VERSION
-#else
-#define FAP_VERSION_TEXT "0.1"
-#endif
-#endif
-
-#define LAB_C5_VERSION_TEXT FAP_VERSION_TEXT
+#define LAB_C5_VERSION_TEXT "0.9"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -54,8 +47,12 @@ typedef enum {
 #define SERIAL_BUFFER_SIZE 4096
 #define UART_STREAM_SIZE 1024
 #define MENU_VISIBLE_COUNT 6
-#define MENU_VISIBLE_COUNT_SNIFFERS 3
-#define MENU_VISIBLE_COUNT_ATTACKS 3
+#define MENU_VISIBLE_COUNT_SNIFFERS 4
+#define MENU_VISIBLE_COUNT_ATTACKS 4
+#define MENU_TITLE_Y 12
+#define MENU_ITEM_BASE_Y 24
+#define MENU_ITEM_SPACING 12
+#define MENU_SCROLL_TRACK_Y 14
 #define SERIAL_VISIBLE_LINES 6
 #define SERIAL_LINE_CHAR_LIMIT 22
 #define SERIAL_TEXT_LINE_HEIGHT 10
@@ -66,9 +63,9 @@ typedef enum {
 #define RESULT_START_Y 12
 #define RESULT_ENTRY_SPACING 0
 #define RESULT_PREFIX_X 2
-#define RESULT_TEXT_X 9
+#define RESULT_TEXT_X 5
 #define RESULT_SCROLL_WIDTH 3
-#define RESULT_SCROLL_GAP 1
+#define RESULT_SCROLL_GAP 0
 #define CONSOLE_VISIBLE_LINES 4
 #define MENU_SECTION_SCANNER 0
 #define MENU_SECTION_SNIFFERS 1
@@ -90,6 +87,7 @@ typedef enum {
 #define EVIL_TWIN_HTML_NAME_MAX 32
 #define EVIL_TWIN_POPUP_VISIBLE_LINES 3
 #define EVIL_TWIN_MENU_OPTION_COUNT 2
+#define HELP_HINT_IDLE_MS 3000
 
 typedef enum {
     MenuActionCommand,
@@ -100,6 +98,7 @@ typedef enum {
     MenuActionOpenScannerSetup,
     MenuActionOpenConsole,
     MenuActionConfirmBlackout,
+    MenuActionConfirmSnifferDos,
     MenuActionOpenEvilTwinMenu,
 } MenuAction;
 
@@ -151,6 +150,7 @@ typedef struct {
     bool serial_targets_hint;
     bool last_command_sent;
     bool confirm_blackout_yes;
+    bool confirm_sniffer_dos_yes;
     uint32_t last_attack_index;
     size_t evil_twin_menu_index;
     EvilTwinHtmlEntry evil_twin_html_entries[EVIL_TWIN_MAX_HTML_FILES];
@@ -204,6 +204,8 @@ typedef struct {
     char status_message[64];
     uint32_t status_message_until;
     bool status_message_fullscreen;
+    uint32_t last_input_tick;
+    bool help_hint_visible;
 } SimpleApp;
 static void simple_app_adjust_result_offset(SimpleApp* app);
 static void simple_app_rebuild_visible_results(SimpleApp* app);
@@ -272,11 +274,11 @@ static const uint8_t image_icon_0_bits[] = {
 };
 
 static const char hint_section_scanner[] =
-    "Run a Wi-Fi scan\nCollect network list\nResults appear under\nTargets for selection\nUse them for actions.";
+    "Passively listens \nto network events collecting \ninfo about APs, STAs associated \nand Probe Requests.";
 static const char hint_section_sniffers[] =
     "Passive Wi-Fi tools\nMonitor live clients\nAuto channel hopping\nReview captured data\nFrom the results tab.";
 static const char hint_section_targets[] =
-    "Shows scan results\nOK toggles selection\nChoose multiple nets\nFeed attack modules\nBack returns to menu.";
+    "Selects targets \nfor Deauth, Evil Twin \nand SAE Overflow attacks.";
 static const char hint_section_attacks[] =
     "Test features here\nUse only on own lab\nTargets come from\nSelected networks\nFollow local laws.";
 static const char hint_section_setup[] =
@@ -292,17 +294,17 @@ static const char hint_sniffer_debug[] =
     "Enable verbose logs\nPrints frame details\nDecision reasoning\nHelpful diagnostics\nBut very noisy.";
 
 static const char hint_attack_blackout[] =
-    "Prepare blackout test\nRequires confirmation\nFor controlled labs\nUse responsibly\nAvoid live systems.";
+    "Sends broadcast deauth \npackets to all networks \naround you.";
 static const char hint_attack_deauth[] =
-    "Launch deauth waves\nTargets chosen Wi-Fi\nDisrupts client links\nUse only with rights\nMonitor via console.";
+    "Disconnects clients \nof all selected networks.";
 static const char hint_attack_evil_twin[] =
-    "Clone selected SSID\nRequire selected net\nNotify ESP module\nAwait credentials\nPair with deauth.";
+    "Creates fake network \nwith captive portal in the \nname of the first selected.";
 static const char hint_attack_sae_overflow[] =
-    "Craft SAE traffic\nRequire selected net\nExercise WPA3 APs\nWatch retry counts\nStop when done.";
+    "Sends SAE Commit frames \nto overflow WPA3 router.";
 static const char hint_attack_sniffer_dog[] =
-    "Sniff AP-client chat\nListen for traffic\nCatch handshake peaks\nSend deauth frames\nUse in lab only.";
+    "Listens to traffic \nbetween AP and STA \nand sends deauth packet \ndirectly to this STA";
 static const char hint_attack_wardrive[] =
-    "Wardrive logger mode\nWrites data to SD\nAdds GPS context\nMap wireless areas\nReview later.";
+    "Logs networks around you \nwith GPS coordinates.";
 
 static const char hint_setup_backlight[] =
     "Toggle screen light\nKeep brightness high\nOr allow auto dim\nGreat for console\nLong sessions.";
@@ -325,7 +327,7 @@ static const MenuEntry menu_entries_attacks[] = {
     {"Deauth", "start_deauth", MenuActionCommandWithTargets, hint_attack_deauth},
     {"Evil Twin", NULL, MenuActionOpenEvilTwinMenu, hint_attack_evil_twin},
     {"SAE Overflow", "sae_overflow", MenuActionCommandWithTargets, hint_attack_sae_overflow},
-    {"Sniffer Dog", "start_sniffer_dog", MenuActionCommand, hint_attack_sniffer_dog},
+    {"Sniffer Dog", NULL, MenuActionConfirmSnifferDos, hint_attack_sniffer_dog},
     {"Wardrive", "start_wardrive", MenuActionCommand, hint_attack_wardrive},
 };
 
@@ -340,11 +342,11 @@ static const MenuEntry menu_entries_setup[] = {
 };
 
 static const MenuSection menu_sections[] = {
-    {"Scanner", hint_section_scanner, NULL, 0, 12, MENU_VISIBLE_COUNT * 12},
-    {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 24, MENU_VISIBLE_COUNT_SNIFFERS * 12},
-    {"Targets", hint_section_targets, NULL, 0, 36, MENU_VISIBLE_COUNT * 12},
-    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 48, MENU_VISIBLE_COUNT_ATTACKS * 12},
-    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 60, MENU_VISIBLE_COUNT * 12},
+    {"Scanner", hint_section_scanner, NULL, 0, 12, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 24, MENU_VISIBLE_COUNT_SNIFFERS * MENU_ITEM_SPACING},
+    {"Targets", hint_section_targets, NULL, 0, 36, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 48, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
+    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 60, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
 };
 
 static const size_t menu_section_count = sizeof(menu_sections) / sizeof(menu_sections[0]);
@@ -607,40 +609,200 @@ static void simple_app_update_result_layout(SimpleApp* app) {
     }
 }
 
-static void simple_app_append_field(
-    char* buffer,
-    size_t buffer_size,
-    size_t* offset,
-    bool* first_field,
-    const char* prefix,
-    const char* value,
-    const char* suffix) {
-    if(!buffer || buffer_size == 0 || !offset || !first_field || !value || value[0] == '\0') {
-        return;
-    }
-
-    size_t remaining = (buffer_size > *offset) ? (buffer_size - *offset) : 0;
+static void simple_app_line_append_token(
+    char* line,
+    size_t line_size,
+    const char* label,
+    const char* value) {
+    if(!line || line_size == 0 || !value || value[0] == '\0') return;
+    size_t current_len = strlen(line);
+    if(current_len >= line_size - 1) return;
+    size_t remaining = (line_size > current_len) ? (line_size - current_len - 1) : 0;
     if(remaining == 0) return;
 
-    const char* separator = *first_field ? " " : " | ";
-    int written = snprintf(
-        buffer + *offset,
-        remaining,
-        "%s%s%s%s",
-        separator,
-        prefix ? prefix : "",
-        value,
-        suffix ? suffix : "");
-
-    if(written < 0) return;
-    size_t consumed = (size_t)written;
-    if(consumed >= remaining) {
-        *offset = buffer_size - 1;
-        buffer[buffer_size - 1] = '\0';
-    } else {
-        *offset += consumed;
+    const char* separator = (current_len > 0) ? "  " : "";
+    size_t sep_len = strlen(separator);
+    if(sep_len > remaining) sep_len = remaining;
+    if(sep_len > 0) {
+        memcpy(line + current_len, separator, sep_len);
+        current_len += sep_len;
+        remaining -= sep_len;
     }
-    *first_field = false;
+
+    if(label && label[0] != '\0' && remaining > 0) {
+        size_t label_len = strlen(label);
+        if(label_len > remaining) label_len = remaining;
+        memcpy(line + current_len, label, label_len);
+        current_len += label_len;
+        remaining -= label_len;
+    }
+
+    if(remaining > 0) {
+        size_t value_len = strlen(value);
+        if(value_len > remaining) value_len = remaining;
+        memcpy(line + current_len, value, value_len);
+        current_len += value_len;
+    }
+
+    if(current_len < line_size) {
+        line[current_len] = '\0';
+    } else {
+        line[line_size - 1] = '\0';
+    }
+}
+
+static size_t simple_app_build_result_lines(
+    const SimpleApp* app,
+    const ScanResult* result,
+    char lines[][64],
+    size_t max_lines) {
+    if(!app || !result || max_lines == 0) return 0;
+
+    size_t char_limit = (app->result_char_limit > 0) ? app->result_char_limit : RESULT_DEFAULT_CHAR_LIMIT;
+    if(char_limit == 0) char_limit = RESULT_DEFAULT_CHAR_LIMIT;
+    if(char_limit >= 63) char_limit = 63;
+
+    bool store_lines = (lines != NULL);
+    if(max_lines > RESULT_DEFAULT_MAX_LINES) {
+        max_lines = RESULT_DEFAULT_MAX_LINES;
+    }
+
+    size_t emitted = 0;
+    const size_t line_cap = 64;
+    size_t truncate_limit = (char_limit < (line_cap - 1)) ? char_limit : (line_cap - 1);
+    if(truncate_limit < 1) truncate_limit = 1;
+
+#define SIMPLE_APP_EMIT_LINE(buffer) \
+    do { \
+        if(emitted < max_lines) { \
+            if(store_lines) { \
+                strncpy(lines[emitted], buffer, line_cap - 1); \
+                lines[emitted][line_cap - 1] = '\0'; \
+                simple_app_truncate_text(lines[emitted], truncate_limit); \
+            } \
+            emitted++; \
+        } \
+    } while(0)
+
+    char first_line[line_cap];
+    memset(first_line, 0, sizeof(first_line));
+    snprintf(first_line, sizeof(first_line), "%u%s", (unsigned)result->number, result->selected ? "*" : "");
+
+    bool ssid_visible = app->scanner_show_ssid && result->ssid[0] != '\0';
+    if(ssid_visible) {
+        size_t len = strlen(first_line);
+        if(len < sizeof(first_line) - 1) {
+            size_t remaining = sizeof(first_line) - len - 1;
+            if(remaining > 0) {
+                first_line[len++] = ' ';
+                size_t ssid_len = strlen(result->ssid);
+                if(ssid_len > remaining) ssid_len = remaining;
+                memcpy(first_line + len, result->ssid, ssid_len);
+                len += ssid_len;
+                first_line[len] = '\0';
+            }
+        }
+    }
+
+    bool bssid_in_first_line = false;
+    if(!ssid_visible && app->scanner_show_bssid && result->bssid[0] != '\0') {
+        size_t len = strlen(first_line);
+        if(len < sizeof(first_line) - 1) {
+            size_t remaining = sizeof(first_line) - len - 1;
+            if(remaining > 0) {
+                first_line[len++] = ' ';
+                size_t bssid_len = strlen(result->bssid);
+                if(bssid_len > remaining) bssid_len = remaining;
+                memcpy(first_line + len, result->bssid, bssid_len);
+                len += bssid_len;
+                first_line[len] = '\0';
+                bssid_in_first_line = true;
+            }
+        }
+    }
+
+    SIMPLE_APP_EMIT_LINE(first_line);
+
+    if(emitted < max_lines && app->scanner_show_bssid && !bssid_in_first_line &&
+       result->bssid[0] != '\0') {
+        char bssid_line[line_cap];
+        memset(bssid_line, 0, sizeof(bssid_line));
+        size_t len = 0;
+        bssid_line[len++] = ' ';
+        if(len < sizeof(bssid_line) - 1) {
+            size_t remaining = sizeof(bssid_line) - len - 1;
+            size_t bssid_len = strlen(result->bssid);
+            if(bssid_len > remaining) bssid_len = remaining;
+            memcpy(bssid_line + len, result->bssid, bssid_len);
+            len += bssid_len;
+            bssid_line[len] = '\0';
+        } else {
+            bssid_line[sizeof(bssid_line) - 1] = '\0';
+        }
+        SIMPLE_APP_EMIT_LINE(bssid_line);
+    }
+
+    if(emitted < max_lines) {
+        char info_line[line_cap];
+        memset(info_line, 0, sizeof(info_line));
+        if(app->scanner_show_channel && result->channel[0] != '\0') {
+            simple_app_line_append_token(info_line, sizeof(info_line), NULL, result->channel);
+        }
+        if(app->scanner_show_band && result->band[0] != '\0') {
+            simple_app_line_append_token(info_line, sizeof(info_line), NULL, result->band);
+        }
+        if(info_line[0] != '\0') {
+            SIMPLE_APP_EMIT_LINE(info_line);
+        }
+    }
+
+    if(emitted < max_lines) {
+        char info_line[line_cap];
+        memset(info_line, 0, sizeof(info_line));
+        if(app->scanner_show_security && result->security[0] != '\0') {
+            char security_value[SCAN_FIELD_BUFFER_LEN];
+            memset(security_value, 0, sizeof(security_value));
+            strncpy(security_value, result->security, sizeof(security_value) - 1);
+            char* mixed_suffix = strstr(security_value, " Mixed");
+            if(mixed_suffix) {
+                *mixed_suffix = '\0';
+                size_t trimmed_len = strlen(security_value);
+                while(trimmed_len > 0 &&
+                      (security_value[trimmed_len - 1] == ' ' || security_value[trimmed_len - 1] == '/')) {
+                    security_value[trimmed_len - 1] = '\0';
+                    trimmed_len--;
+                }
+            }
+            simple_app_line_append_token(info_line, sizeof(info_line), NULL, security_value);
+        }
+        if(app->scanner_show_power && result->power_display[0] != '\0') {
+            char power_value[SCAN_FIELD_BUFFER_LEN];
+            memset(power_value, 0, sizeof(power_value));
+            strncpy(power_value, result->power_display, sizeof(power_value) - 1);
+            if(strstr(power_value, "dBm") == NULL) {
+                size_t len = strlen(power_value);
+                if(len < sizeof(power_value) - 4) {
+                    strncpy(power_value + len, " dBm", sizeof(power_value) - len - 1);
+                    power_value[sizeof(power_value) - 1] = '\0';
+                }
+            }
+            simple_app_line_append_token(info_line, sizeof(info_line), NULL, power_value);
+        }
+        if(info_line[0] != '\0') {
+            SIMPLE_APP_EMIT_LINE(info_line);
+        }
+    }
+
+    if(emitted == 0) {
+        char fallback_line[line_cap];
+        strncpy(fallback_line, "-", sizeof(fallback_line) - 1);
+        fallback_line[sizeof(fallback_line) - 1] = '\0';
+        SIMPLE_APP_EMIT_LINE(fallback_line);
+    }
+
+#undef SIMPLE_APP_EMIT_LINE
+
+    return emitted;
 }
 
 static void simple_app_show_status_message(
@@ -992,68 +1154,16 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
     }
 }
 
-static size_t simple_app_format_result_line(
-    const SimpleApp* app,
-    const ScanResult* result,
-    char* buffer,
-    size_t buffer_size) {
-    if(!app || !result || !buffer || buffer_size == 0) {
-        return 0;
-    }
-
-    const char* selection_marker = result->selected ? "*" : "";
-    int written = snprintf(buffer, buffer_size, "%u%s", (unsigned)result->number, selection_marker);
-    if(written < 0) {
-        buffer[0] = '\0';
-        return 0;
-    }
-
-    size_t offset = (written < (int)buffer_size) ? (size_t)written : buffer_size - 1;
-    bool first_field = true;
-
-    if(app->scanner_show_ssid) {
-        simple_app_append_field(buffer, buffer_size, &offset, &first_field, NULL, result->ssid, NULL);
-    }
-    if(app->scanner_show_bssid) {
-        simple_app_append_field(
-            buffer, buffer_size, &offset, &first_field, NULL, result->bssid, NULL);
-    }
-    if(app->scanner_show_channel) {
-        simple_app_append_field(buffer, buffer_size, &offset, &first_field, NULL, result->channel, NULL);
-    }
-    if(app->scanner_show_security) {
-        simple_app_append_field(
-            buffer, buffer_size, &offset, &first_field, NULL, result->security, NULL);
-    }
-    if(app->scanner_show_power) {
-        const char* suffix =
-            (strstr(result->power_display, "dBm") != NULL) ? NULL : " dBm";
-        simple_app_append_field(
-            buffer, buffer_size, &offset, &first_field, NULL, result->power_display, suffix);
-    }
-    if(app->scanner_show_band) {
-        simple_app_append_field(
-            buffer, buffer_size, &offset, &first_field, NULL, result->band, NULL);
-    }
-
-    size_t length = (offset < buffer_size) ? offset : buffer_size - 1;
-    if(buffer[length] != '\0') {
-        buffer[length] = '\0';
-    }
-    return length;
-}
-
 static uint8_t simple_app_result_line_count(const SimpleApp* app, const ScanResult* result) {
     if(!app || !result) return 1;
-    if(app->result_char_limit == 0) return 1;
-    char buffer[96];
-    size_t len = simple_app_format_result_line(app, result, buffer, sizeof(buffer));
-    size_t lines = (len + app->result_char_limit - 1) / app->result_char_limit;
-    if(lines == 0) lines = 1;
-    if(app->result_max_lines > 0 && lines > app->result_max_lines) {
-        lines = app->result_max_lines;
+    size_t max_lines = (app->result_max_lines > 0) ? app->result_max_lines : RESULT_DEFAULT_MAX_LINES;
+    if(max_lines == 0) max_lines = RESULT_DEFAULT_MAX_LINES;
+    if(max_lines > RESULT_DEFAULT_MAX_LINES) {
+        max_lines = RESULT_DEFAULT_MAX_LINES;
     }
-    return (uint8_t)lines;
+    size_t count = simple_app_build_result_lines(app, result, NULL, max_lines);
+    if(count == 0) count = 1;
+    return (uint8_t)count;
 }
 
 static size_t simple_app_total_result_lines(SimpleApp* app) {
@@ -1568,9 +1678,26 @@ static void simple_app_draw_confirm_blackout(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 38, AlignCenter, AlignCenter, "Confirm?");
 
     canvas_set_font(canvas, FontSecondary);
-    const char* option_line = app->confirm_blackout_yes ? "> Yes        No" : "Yes        > No";
+    const char* option_line = app->confirm_blackout_yes ? "No        > Yes" : "> No        Yes";
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 50, AlignCenter, AlignCenter, option_line);
-    canvas_draw_str(canvas, 2, 62, "Left/Right choose");
+}
+
+static void simple_app_draw_confirm_sniffer_dos(SimpleApp* app, Canvas* canvas) {
+    if(!app) return;
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(
+        canvas, DISPLAY_WIDTH / 2, 12, AlignCenter, AlignCenter, "Sniffer Dog will flood");
+    canvas_draw_str_aligned(
+        canvas, DISPLAY_WIDTH / 2, 24, AlignCenter, AlignCenter, "clients found by sniffer");
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 38, AlignCenter, AlignCenter, "Confirm?");
+
+    canvas_set_font(canvas, FontSecondary);
+    const char* option_line =
+        app->confirm_sniffer_dos_yes ? "No        > Yes" : "> No        Yes";
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 50, AlignCenter, AlignCenter, option_line);
 }
 
 static void simple_app_handle_console_input(SimpleApp* app, InputKey key) {
@@ -1654,6 +1781,33 @@ static void simple_app_handle_confirm_blackout_input(SimpleApp* app, InputKey ke
         if(app->confirm_blackout_yes) {
             app->confirm_blackout_yes = false;
             simple_app_send_command(app, "start_blackout", true);
+        } else {
+            simple_app_focus_attacks_menu(app);
+            view_port_update(app->viewport);
+        }
+    }
+}
+
+static void simple_app_handle_confirm_sniffer_dos_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+    if(key == InputKeyBack) {
+        simple_app_send_stop_if_needed(app);
+        app->confirm_sniffer_dos_yes = false;
+        simple_app_focus_attacks_menu(app);
+        view_port_update(app->viewport);
+        return;
+    }
+
+    if(key == InputKeyLeft || key == InputKeyRight) {
+        app->confirm_sniffer_dos_yes = !app->confirm_sniffer_dos_yes;
+        view_port_update(app->viewport);
+        return;
+    }
+
+    if(key == InputKeyOk) {
+        if(app->confirm_sniffer_dos_yes) {
+            app->confirm_sniffer_dos_yes = false;
+            simple_app_send_command(app, "start_sniffer_dog", true);
         } else {
             simple_app_focus_attacks_menu(app);
             view_port_update(app->viewport);
@@ -1823,7 +1977,7 @@ static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas) {
 
     canvas_set_font(canvas, FontSecondary);
     uint8_t text_x = bubble_x + 7;
-    uint8_t text_y = bubble_y + 30;
+    uint8_t text_y = bubble_y + 28;
 
     if(app->hint_line_count > 0) {
         size_t visible = app->hint_line_count - app->hint_scroll;
@@ -1842,7 +1996,14 @@ static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas) {
         const uint8_t track_width = 5;
         const uint8_t track_height = (uint8_t)(HINT_VISIBLE_LINES * HINT_LINE_HEIGHT);
         const uint8_t track_x = bubble_x + bubble_w - track_width - 4;
-        const uint8_t track_y = text_y - (HINT_LINE_HEIGHT - 2);
+        int16_t desired_track_y =
+            bubble_y + ((int16_t)bubble_h - (int16_t)track_height) / 2;
+        int16_t track_min = bubble_y + 2;
+        int16_t track_max = bubble_y + bubble_h - track_height - 2;
+        if(track_max < track_min) track_max = track_min;
+        if(desired_track_y < track_min) desired_track_y = track_min;
+        if(desired_track_y > track_max) desired_track_y = track_max;
+        uint8_t track_y = (uint8_t)desired_track_y;
 
         canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
 
@@ -1860,18 +2021,18 @@ static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas) {
                 (uint8_t)(((uint32_t)app->hint_scroll * max_thumb_offset) / max_scroll);
         }
         uint8_t thumb_x = track_x + 1;
-        uint8_t thumb_y = track_y + 1 + thumb_offset;
+        uint8_t thumb_y = (uint8_t)(track_y + 1 + thumb_offset);
         uint8_t thumb_inner_height = (thumb_height > 2) ? (uint8_t)(thumb_height - 2) : thumb_height;
         if(thumb_inner_height == 0) thumb_inner_height = thumb_height;
         uint8_t thumb_width = (track_width > 2) ? (uint8_t)(track_width - 2) : 1;
         canvas_draw_box(canvas, thumb_x, thumb_y, thumb_width, thumb_inner_height);
 
-        uint8_t arrow_top_center = track_y + 2;
+        uint8_t arrow_top_center = (uint8_t)(track_y + 2);
         canvas_draw_line(canvas, track_x + track_width / 2, arrow_top_center - 2, track_x + 1, arrow_top_center);
         canvas_draw_line(
             canvas, track_x + track_width / 2, arrow_top_center - 2, track_x + track_width - 2, arrow_top_center);
 
-        uint8_t arrow_bottom_center = track_y + track_height - 3;
+        uint8_t arrow_bottom_center = (uint8_t)(track_y + track_height - 3);
         canvas_draw_line(canvas, track_x + 1, arrow_bottom_center, track_x + track_width / 2, arrow_bottom_center + 2);
         canvas_draw_line(
             canvas,
@@ -1963,7 +2124,7 @@ static void simple_app_draw_evil_twin_popup(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str(canvas, bubble_x + 8, bubble_y + 16, "Select HTML");
 
     canvas_set_font(canvas, FontSecondary);
-    uint8_t list_y = bubble_y + 30;
+    uint8_t list_y = bubble_y + 28;
 
     if(app->evil_twin_html_count == 0) {
         canvas_draw_str(canvas, bubble_x + 10, list_y, "No HTML files");
@@ -1999,16 +2160,14 @@ static void simple_app_draw_evil_twin_popup(SimpleApp* app, Canvas* canvas) {
         const uint8_t track_width = 3;
         uint8_t track_height = (uint8_t)(EVIL_TWIN_POPUP_VISIBLE_LINES * HINT_LINE_HEIGHT);
         const uint8_t track_x = bubble_x + bubble_w - track_width - 6;
-        uint8_t track_y = list_y;
-
-        uint8_t track_bottom_limit = (uint8_t)(bubble_y + bubble_h - 6);
-        if((uint8_t)(track_y + track_height) > track_bottom_limit) {
-            if(track_bottom_limit > track_height) {
-                track_y = (uint8_t)(track_bottom_limit - track_height);
-            } else {
-                track_y = (uint8_t)(bubble_y + 2);
-            }
-        }
+        int16_t desired_track_y =
+            bubble_y + ((int16_t)bubble_h - (int16_t)track_height) / 2;
+        int16_t track_min = bubble_y + 2;
+        int16_t track_max = bubble_y + bubble_h - track_height - 2;
+        if(track_max < track_min) track_max = track_min;
+        if(desired_track_y < track_min) desired_track_y = track_min;
+        if(desired_track_y > track_max) desired_track_y = track_max;
+        uint8_t track_y = (uint8_t)desired_track_y;
 
         canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
 
@@ -2044,28 +2203,35 @@ static void simple_app_draw_evil_twin_popup(SimpleApp* app, Canvas* canvas) {
 static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     canvas_set_color(canvas, ColorBlack);
 
-    canvas_set_bitmap_mode(canvas, true);
-    canvas_draw_xbm(canvas, 115, 2, 10, 10, image_icon_0_bits);
+    if(app->section_index >= menu_section_count) {
+        app->section_index = 0;
+    }
+
+    bool show_setup_branding =
+        (app->menu_state == MenuStateItems) && (app->section_index == MENU_SECTION_SETUP);
+
+    if(show_setup_branding) {
+        canvas_set_bitmap_mode(canvas, true);
+        canvas_draw_xbm(canvas, 115, 2, 10, 10, image_icon_0_bits);
+    }
     canvas_set_bitmap_mode(canvas, false);
 
     canvas_set_font(canvas, FontSecondary);
 
-    if(app->menu_state == MenuStateSections) {
+    if(app->help_hint_visible) {
         const uint8_t help_text_x = DISPLAY_WIDTH - 2;
-        const uint8_t help_text_y = 28;
-        canvas_draw_str_aligned(canvas, help_text_x, help_text_y, AlignRight, AlignTop, "Hold OK");
-        canvas_draw_str_aligned(canvas, help_text_x, help_text_y + 8, AlignRight, AlignTop, "for Help");
+        const uint8_t help_text_y = 63;
+        canvas_draw_str_aligned(canvas, help_text_x, (int16_t)help_text_y - 8, AlignRight, AlignBottom, "Hold OK");
+        canvas_draw_str_aligned(canvas, help_text_x, help_text_y, AlignRight, AlignBottom, "for Help");
     }
 
     if(simple_app_status_message_is_active(app) && !app->status_message_fullscreen) {
         canvas_draw_str(canvas, 2, 52, app->status_message);
     }
-    char version_text[24];
-    snprintf(version_text, sizeof(version_text), "v.%s", LAB_C5_VERSION_TEXT);
-    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 1, 63, AlignRight, AlignBottom, version_text);
-
-    if(app->section_index >= menu_section_count) {
-        app->section_index = 0;
+    if(show_setup_branding) {
+        char version_text[24];
+        snprintf(version_text, sizeof(version_text), "v.%s", LAB_C5_VERSION_TEXT);
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 1, 63, AlignRight, AlignBottom, version_text);
     }
 
     if(app->menu_state == MenuStateSections) {
@@ -2089,7 +2255,7 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     const MenuSection* section = &menu_sections[app->section_index];
 
     canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 3, 12, section->title);
+    canvas_draw_str(canvas, 3, MENU_TITLE_Y, section->title);
 
     canvas_set_font(canvas, FontSecondary);
 
@@ -2105,7 +2271,7 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
         } else if(app->section_index == MENU_SECTION_TARGETS) {
             hint = "OK: Show results";
         }
-        canvas_draw_str(canvas, 3, 30, hint);
+        canvas_draw_str(canvas, 3, MENU_ITEM_BASE_Y + (MENU_ITEM_SPACING / 2), hint);
         return;
     }
 
@@ -2129,7 +2295,7 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     for(uint32_t i = 0; i < visible_count; i++) {
         uint32_t idx = app->item_offset + i;
         if(idx >= section->entry_count) break;
-        uint8_t y = 28 + i * 12;
+        uint8_t y = MENU_ITEM_BASE_Y + i * MENU_ITEM_SPACING;
 
         if(idx == app->item_index) {
             canvas_draw_str(canvas, 2, y, ">");
@@ -2141,9 +2307,9 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
 
     if(section->entry_count > visible_count) {
         const uint8_t track_width = 3;
-        uint8_t track_height = section->display_height ? section->display_height : (uint8_t)(visible_count * 12);
+        uint8_t track_height = section->display_height ? section->display_height : (uint8_t)(visible_count * MENU_ITEM_SPACING);
         const uint8_t track_x = DISPLAY_WIDTH - track_width;
-        const uint8_t track_y = 18;
+        const uint8_t track_y = MENU_SCROLL_TRACK_Y;
         canvas_draw_frame(canvas, track_x, track_y, track_width, track_height);
         uint8_t thumb_height =
             (uint8_t)(((uint32_t)visible_count * track_height) / section->entry_count);
@@ -2313,42 +2479,31 @@ static void simple_app_draw_results(SimpleApp* app, Canvas* canvas) {
     uint8_t y = RESULT_START_Y;
     size_t visible_line_budget = (app->result_max_lines > 0) ? app->result_max_lines : 1;
     size_t lines_left = visible_line_budget;
-    size_t char_limit = (app->result_char_limit > 0) ? app->result_char_limit : 1;
+    size_t entry_line_capacity =
+        (app->result_max_lines > 0) ? app->result_max_lines : RESULT_DEFAULT_MAX_LINES;
+    if(entry_line_capacity == 0) entry_line_capacity = RESULT_DEFAULT_MAX_LINES;
+    if(entry_line_capacity > RESULT_DEFAULT_MAX_LINES) {
+        entry_line_capacity = RESULT_DEFAULT_MAX_LINES;
+    }
 
     for(size_t idx = app->scan_result_offset; idx < app->visible_result_count && lines_left > 0; idx++) {
         const ScanResult* result = simple_app_visible_result_const(app, idx);
         if(!result) continue;
-        char line_full[96];
-        size_t line_len = simple_app_format_result_line(app, result, line_full, sizeof(line_full));
 
-        size_t segments_available = simple_app_result_line_count(app, result);
-        if(segments_available == 0) segments_available = 1;
+        char segments[RESULT_DEFAULT_MAX_LINES][64];
+        memset(segments, 0, sizeof(segments));
+        size_t segments_available =
+            simple_app_build_result_lines(app, result, segments, entry_line_capacity);
+        if(segments_available == 0) {
+            strncpy(segments[0], "-", sizeof(segments[0]) - 1);
+            segments[0][sizeof(segments[0]) - 1] = '\0';
+            segments_available = 1;
+        }
         if(segments_available > lines_left) {
             segments_available = lines_left;
         }
 
-        size_t consumed = 0;
         for(size_t segment = 0; segment < segments_available && lines_left > 0; segment++) {
-            size_t remaining = (line_len > consumed) ? (line_len - consumed) : 0;
-            size_t segment_len = (remaining > char_limit) ? char_limit : remaining;
-            char segment_buffer[64];
-            memset(segment_buffer, 0, sizeof(segment_buffer));
-            if(segment_len > 0) {
-                if(segment_len >= sizeof(segment_buffer)) {
-                    segment_len = sizeof(segment_buffer) - 1;
-                }
-                memcpy(segment_buffer, line_full + consumed, segment_len);
-                segment_buffer[segment_len] = '\0';
-            } else {
-                segment_buffer[0] = '\0';
-            }
-            consumed += segment_len;
-            size_t segment_length_actual = strlen(segment_buffer);
-            while(segment_length_actual > 0 && segment_buffer[0] == ' ') {
-                memmove(segment_buffer, segment_buffer + 1, segment_length_actual);
-                segment_length_actual = strlen(segment_buffer);
-            }
-
             if(segment == 0) {
                 if(idx == app->scan_result_index) {
                     canvas_draw_str(canvas, RESULT_PREFIX_X, y, ">");
@@ -2356,7 +2511,7 @@ static void simple_app_draw_results(SimpleApp* app, Canvas* canvas) {
                     canvas_draw_str(canvas, RESULT_PREFIX_X, y, " ");
                 }
             }
-            canvas_draw_str(canvas, RESULT_TEXT_X, y, segment_buffer);
+            canvas_draw_str(canvas, RESULT_TEXT_X, y, segments[segment]);
             y += app->result_line_height;
             lines_left--;
             if(lines_left == 0) break;
@@ -2588,6 +2743,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenConfirmBlackout:
         simple_app_draw_confirm_blackout(app, canvas);
         break;
+    case ScreenConfirmSnifferDos:
+        simple_app_draw_confirm_sniffer_dos(app, canvas);
+        break;
     case ScreenEvilTwinMenu:
         simple_app_draw_evil_twin_menu(app, canvas);
         break;
@@ -2711,8 +2869,11 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
         } else if(entry->action == MenuActionOpenConsole) {
             simple_app_console_enter(app);
         } else if(entry->action == MenuActionConfirmBlackout) {
-            app->confirm_blackout_yes = true;
+            app->confirm_blackout_yes = false;
             app->screen = ScreenConfirmBlackout;
+        } else if(entry->action == MenuActionConfirmSnifferDos) {
+            app->confirm_sniffer_dos_yes = false;
+            app->screen = ScreenConfirmSnifferDos;
         }
 
         view_port_update(app->viewport);
@@ -3243,6 +3404,15 @@ static void simple_app_input(InputEvent* event, void* context) {
     SimpleApp* app = context;
     if(!app || !event) return;
 
+    uint32_t now = furi_get_tick();
+    app->last_input_tick = now;
+    if(app->help_hint_visible) {
+        app->help_hint_visible = false;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+    }
+
     if(simple_app_status_message_is_active(app) && app->status_message_fullscreen) {
         if(event->type == InputTypeShort &&
            (event->key == InputKeyOk || event->key == InputKeyBack)) {
@@ -3298,6 +3468,9 @@ static void simple_app_input(InputEvent* event, void* context) {
         break;
     case ScreenConfirmBlackout:
         simple_app_handle_confirm_blackout_input(app, event->key);
+        break;
+    case ScreenConfirmSnifferDos:
+        simple_app_handle_confirm_sniffer_dos_input(app, event->key);
         break;
     case ScreenEvilTwinMenu:
         simple_app_handle_evil_twin_menu_input(app, event->key);
@@ -3371,6 +3544,8 @@ int32_t Lab_C5_app(void* p) {
     app->screen = ScreenMenu;
     app->serial_follow_tail = true;
     simple_app_reset_scan_results(app);
+    app->last_input_tick = furi_get_tick();
+    app->help_hint_visible = false;
 
     app->serial = furi_hal_serial_control_acquire(FuriHalSerialIdUsart);
     if(!app->serial) {
@@ -3410,6 +3585,26 @@ int32_t Lab_C5_app(void* p) {
 
     while(!app->exit_app) {
         simple_app_process_stream(app);
+
+        bool previous_help_hint = app->help_hint_visible;
+        bool can_show_help_hint = (app->screen == ScreenMenu) && (app->menu_state == MenuStateSections) &&
+                                  !app->hint_active && !app->evil_twin_popup_active &&
+                                  !simple_app_status_message_is_active(app);
+
+        if(can_show_help_hint) {
+            uint32_t now = furi_get_tick();
+            if(!app->help_hint_visible &&
+               (now - app->last_input_tick) >= furi_ms_to_ticks(HELP_HINT_IDLE_MS)) {
+                app->help_hint_visible = true;
+            }
+        } else {
+            app->help_hint_visible = false;
+        }
+
+        if(app->help_hint_visible != previous_help_hint && app->viewport) {
+            view_port_update(app->viewport);
+        }
+
         furi_delay_ms(20);
     }
 
