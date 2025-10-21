@@ -63,6 +63,14 @@
 #define LED_COUNT          1
 #define RMT_RES_HZ         (10 * 1000 * 1000)  // 10 MHz
 
+#define SD_PARENT_PATH "/sdcard/apps_assets"
+#define SD_BASE_PATH   SD_PARENT_PATH "/labC5"
+#define SD_HTML_DIR    SD_BASE_PATH "/htmls"
+#define SD_WARDRIVE_DIR SD_BASE_PATH "/wardrives"
+#define SD_EVILTWIN_PATH SD_BASE_PATH "/eviltwin.txt"
+#define SD_PORTALS_PATH  SD_BASE_PATH "/portals.txt"
+#define SD_WHITE_PATH    SD_BASE_PATH "/white.txt"
+
 // GPS UART pins (Marauder compatible)
 #define GPS_UART_NUM       UART_NUM_1
 #define GPS_TX_PIN         13
@@ -282,6 +290,15 @@ static int sd_html_count = 0;
 static char* custom_portal_html = NULL;
 static bool sd_card_mounted = false;
 
+typedef enum {
+    SD_TARGET_INTERNAL = 0,
+    SD_TARGET_FLIPPER = 1,
+} sd_storage_target_t;
+
+static sd_storage_target_t sd_default_target = SD_TARGET_INTERNAL;
+static sd_storage_target_t wardrive_storage_target = SD_TARGET_INTERNAL;
+static sd_storage_target_t portal_storage_target = SD_TARGET_INTERNAL;
+
 // Whitelist for BSSID protection
 #define MAX_WHITELISTED_BSSIDS 150
 typedef struct {
@@ -307,6 +324,7 @@ static int cmd_start_portal(int argc, char **argv);
 static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
 static int cmd_select_html(int argc, char **argv);
+static int cmd_set_sd_target(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
 static esp_err_t start_background_scan(void);
@@ -397,6 +415,60 @@ static const uint8_t base_srcaddr[6] = { 0x76, 0xe5, 0x49, 0x85, 0x5f, 0x71 };
 
 static uint8_t spoofed_src[6];  // really spoofed source address
 static int next_src = 0;        // spoofing index
+
+// --- Storage helpers ---
+static bool command_has_argument(int argc, char **argv, const char *needle) {
+    if (needle == NULL) {
+        return false;
+    }
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], needle) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void flipper_sd_send_block(const uint8_t *data, size_t len) {
+    if (data == NULL || len == 0) {
+        return;
+    }
+    static const char marker_begin[] = "[BUF/BEGIN]";
+    static const char marker_close[] = "[BUF/CLOSE]";
+    const size_t begin_len = sizeof(marker_begin) - 1;
+    const size_t close_len = sizeof(marker_close) - 1;
+    const size_t total_len = begin_len + len + close_len;
+
+    uint8_t *buffer = (uint8_t *)malloc(total_len);
+    if (!buffer) {
+        return;
+    }
+
+    uint8_t *it = buffer;
+    memcpy(it, marker_begin, begin_len);
+    it += begin_len;
+    memcpy(it, data, len);
+    it += len;
+    memcpy(it, marker_close, close_len);
+
+    size_t written = 0;
+    while (written < total_len) {
+        int sent = uart_write_bytes(UART_NUM_0, (const char *)(buffer + written), total_len - written);
+        if (sent < 0) {
+            break;
+        }
+        written += (size_t)sent;
+    }
+    uart_wait_tx_done(UART_NUM_0, pdMS_TO_TICKS(20));
+    free(buffer);
+}
+
+static void flipper_sd_send_string(const char *str) {
+    if (str == NULL) {
+        return;
+    }
+    flipper_sd_send_block((const uint8_t *)str, strlen(str));
+}
 
 
 static const uint8_t auth_req_sae_commit_header[] = {
@@ -1978,6 +2050,7 @@ static int cmd_stop(int argc, char **argv) {
             MY_LOG_INFO(TAG, "Wardrive task forcefully stopped.");
         }
     }
+    wardrive_storage_target = sd_default_target;
     
     // Stop portal if active
     if (portal_active) {
@@ -2035,6 +2108,7 @@ static int cmd_stop(int argc, char **argv) {
             portalSSID = NULL;
         }
     }
+    portal_storage_target = sd_default_target;
     
     // Clear LED (ignore errors if LED is in invalid state)
     esp_err_t led_err = led_strip_clear(strip);
@@ -2358,18 +2432,28 @@ static int cmd_start_karma(int argc, char **argv)
     MY_LOG_INFO(TAG, "Starting Karma attack with SSID: %s", selected_ssid);
     
     // Prepare arguments for cmd_start_portal
-    char *portal_argv[2];
+    char *portal_argv[3];
     portal_argv[0] = "start_portal";
     portal_argv[1] = selected_ssid;
+    int portal_argc = 2;
+    if (command_has_argument(argc, argv, "-serial")) {
+        portal_argv[2] = "-serial";
+        portal_argc = 3;
+    }
     
     // Call cmd_start_portal with the selected SSID
-    return cmd_start_portal(2, portal_argv);
+    return cmd_start_portal(portal_argc, portal_argv);
 }
 
 // Command: list_sd - Lists HTML files on SD card
 static int cmd_list_sd(int argc, char **argv)
 {
     (void)argc; (void)argv;
+
+    if (sd_default_target == SD_TARGET_FLIPPER) {
+        MY_LOG_INFO(TAG, "list_sd is unavailable while using Flipper SD as default storage");
+        return 1;
+    }
     
     // Initialize SD card if not already mounted
     esp_err_t ret = init_sd_card();
@@ -2378,10 +2462,14 @@ static int cmd_list_sd(int argc, char **argv)
         MY_LOG_INFO(TAG, "Make sure SD card is properly inserted.");
         return 1;
     }
+    if (create_sd_directories() != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to prepare SD directory structure at %s", SD_BASE_PATH);
+        return 1;
+    }
     
-    DIR *dir = opendir("/sdcard/lab/htmls");
+    DIR *dir = opendir(SD_HTML_DIR);
     if (dir == NULL) {
-        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/htmls directory. Error: %d (%s)", errno, strerror(errno));
+        MY_LOG_INFO(TAG, "Failed to open %s directory. Error: %d (%s)", SD_HTML_DIR, errno, strerror(errno));
         return 1;
     }
     
@@ -2427,11 +2515,11 @@ static int cmd_list_sd(int argc, char **argv)
     closedir(dir);
     
     if (sd_html_count == 0) {
-        MY_LOG_INFO(TAG, "No HTML files found on SD card.");
+        MY_LOG_INFO(TAG, "No HTML files found in %s.", SD_HTML_DIR);
         return 0;
     }
     
-    MY_LOG_INFO(TAG, "HTML files found on SD card:");
+    MY_LOG_INFO(TAG, "HTML files found in %s:", SD_HTML_DIR);
     for (int i = 0; i < sd_html_count; i++) {
         printf("%d %s\n", i + 1, sd_html_files[i]);
     }
@@ -2445,6 +2533,11 @@ static int cmd_select_html(int argc, char **argv)
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: select_html <index>");
         MY_LOG_INFO(TAG, "Run list_sd first to see available HTML files.");
+        return 1;
+    }
+
+    if (sd_default_target == SD_TARGET_FLIPPER) {
+        MY_LOG_INFO(TAG, "select_html is unavailable while using Flipper SD as default storage");
         return 1;
     }
     
@@ -2462,9 +2555,13 @@ static int cmd_select_html(int argc, char **argv)
         MY_LOG_INFO(TAG, "Make sure SD card is properly inserted.");
         return 1;
     }
+    if (create_sd_directories() != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to prepare SD directory structure at %s", SD_BASE_PATH);
+        return 1;
+    }
     
     char filepath[128];
-    snprintf(filepath, sizeof(filepath), "/sdcard/lab/htmls/%s", sd_html_files[index]);
+    snprintf(filepath, sizeof(filepath), SD_HTML_DIR "/%s", sd_html_files[index]);
     
     // Open file and get size
     FILE *f = fopen(filepath, "r");
@@ -2508,11 +2605,37 @@ static int cmd_select_html(int argc, char **argv)
     return 0;
 }
 
+// Command: sd_target <internal|flipper>
+static int cmd_set_sd_target(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: sd_target <internal|flipper>");
+        return 1;
+    }
+
+    const char *mode = argv[1];
+
+    if (strcasecmp(mode, "internal") == 0 || strcasecmp(mode, "esp") == 0) {
+        sd_default_target = SD_TARGET_INTERNAL;
+        MY_LOG_INFO(TAG, "Default storage target set to internal SD card");
+        return 0;
+    }
+
+    if (strcasecmp(mode, "flipper") == 0) {
+        sd_default_target = SD_TARGET_FLIPPER;
+        MY_LOG_INFO(TAG, "Default storage target set to Flipper SD (serial stream)");
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Unknown target '%s'. Use 'internal' or 'flipper'.", mode);
+    return 1;
+}
+
 // Wardrive task function (runs in background)
 static void wardrive_task(void *pvParameters) {
     (void)pvParameters;
     
     MY_LOG_INFO(TAG, "Wardrive task started.");
+    bool flipper_header_sent = false;
     
     // Set LED to indicate wardrive mode
     esp_err_t led_err = led_strip_set_pixel(strip, 0, 0, 255, 255); // Cyan
@@ -2520,9 +2643,13 @@ static void wardrive_task(void *pvParameters) {
         led_strip_refresh(strip);
     }
     
-    // Find the next file number by scanning existing files
-    wardrive_file_counter = find_next_wardrive_file_number();
-    MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", wardrive_file_counter);
+    if (wardrive_storage_target == SD_TARGET_INTERNAL) {
+        // Find the next file number by scanning existing files
+        wardrive_file_counter = find_next_wardrive_file_number();
+        MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", wardrive_file_counter);
+    } else {
+        MY_LOG_INFO(TAG, "Wardrive results will stream to Flipper SD (serial)");
+    }
     
     // Wait for GPS fix before starting
     MY_LOG_INFO(TAG, "Waiting for GPS fix...");
@@ -2602,38 +2729,50 @@ static void wardrive_task(void *pvParameters) {
         uint16_t scan_count = MAX_AP_CNT;
         esp_wifi_scan_get_ap_records(&scan_count, wardrive_scan_results);
         
-        // Create filename (keep it simple for FAT filesystem)
-        char filename[64];
-        snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", wardrive_file_counter);
-        
-        // Check if /sdcard/lab/wardrives directory is accessible
-        struct stat st;
-        if (stat("/sdcard/lab/wardrives", &st) != 0) {
-            MY_LOG_INFO(TAG, "Error: /sdcard/lab/wardrives directory not accessible");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
-        
-        // Open file for appending
-        FILE *file = fopen(filename, "a");
-        if (file == NULL) {
-            MY_LOG_INFO(TAG, "Failed to open file %s, errno: %d (%s)", filename, errno, strerror(errno));
+        char filename[128] = {0};
+        if (wardrive_storage_target == SD_TARGET_INTERNAL) {
+            // Create filename (keep it simple for FAT filesystem)
+            snprintf(filename, sizeof(filename), SD_WARDRIVE_DIR "/w%d.log", wardrive_file_counter);
             
-            // Try creating file with different approach
-            file = fopen(filename, "w");
-            if (file == NULL) {
-                MY_LOG_INFO(TAG, "Failed to create file %s, errno: %d (%s)", filename, errno, strerror(errno));
+            // Check if SD_WARDRIVE_DIR directory is accessible
+            struct stat st;
+            if (stat(SD_WARDRIVE_DIR, &st) != 0) {
+                MY_LOG_INFO(TAG, "Error: %s directory not accessible", SD_WARDRIVE_DIR);
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
             }
-            MY_LOG_INFO(TAG, "Successfully created file %s", filename);
         }
         
-        // Write header if file is new
-        fseek(file, 0, SEEK_END);
-        if (ftell(file) == 0) {
-            fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board,display=SPI TFT,board=ESP32C5,brand=Laboratorium\n");
-            fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
+        FILE *file = NULL;
+        const char *log_target = "Flipper SD (serial stream)";
+
+        if (wardrive_storage_target == SD_TARGET_INTERNAL) {
+            // Open file for appending
+            file = fopen(filename, "a");
+            if (file == NULL) {
+                MY_LOG_INFO(TAG, "Failed to open file %s, errno: %d (%s)", filename, errno, strerror(errno));
+                
+                // Try creating file with different approach
+                file = fopen(filename, "w");
+                if (file == NULL) {
+                    MY_LOG_INFO(TAG, "Failed to create file %s, errno: %d (%s)", filename, errno, strerror(errno));
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    continue;
+                }
+                MY_LOG_INFO(TAG, "Successfully created file %s", filename);
+            }
+            
+            // Write header if file is new
+            fseek(file, 0, SEEK_END);
+            if (ftell(file) == 0) {
+                fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board,display=SPI TFT,board=ESP32C5,brand=Laboratorium\n");
+                fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
+            }
+            log_target = filename;
+        } else if (!flipper_header_sent) {
+            flipper_sd_send_string("WigleWifi-1.4,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board,display=SPI TFT,board=ESP32C5,brand=Laboratorium\n");
+            flipper_sd_send_string("MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
+            flipper_header_sent = true;
         }
         
         // Get timestamp
@@ -2674,15 +2813,21 @@ static void wardrive_task(void *pvParameters) {
             }
             
             // Write to file and print to UART
-            fprintf(file, "%s", line);
+            if (wardrive_storage_target == SD_TARGET_INTERNAL) {
+                fprintf(file, "%s", line);
+            } else {
+                flipper_sd_send_block((const uint8_t *)line, strlen(line));
+            }
             printf("%s", line);
         }
         
         // Close file to ensure data is written
-        fclose(file);
+        if (wardrive_storage_target == SD_TARGET_INTERNAL && file != NULL) {
+            fclose(file);
+        }
         
         if (scan_count > 0) {
-            MY_LOG_INFO(TAG, "Logged %d networks to %s", scan_count, filename);
+            MY_LOG_INFO(TAG, "Logged %d networks to %s", scan_count, log_target);
         }
         
         scan_counter++;
@@ -2709,14 +2854,16 @@ static void wardrive_task(void *pvParameters) {
     
     wardrive_active = false;
     wardrive_task_handle = NULL;
-    MY_LOG_INFO(TAG, "Wardrive stopped after %d scans. Last file: w%d.log", scan_counter, wardrive_file_counter);
+    if (wardrive_storage_target == SD_TARGET_INTERNAL) {
+        MY_LOG_INFO(TAG, "Wardrive stopped after %d scans. Last file: w%d.log", scan_counter, wardrive_file_counter);
+    } else {
+        MY_LOG_INFO(TAG, "Wardrive stopped after %d scans. Results streamed to Flipper SD.", scan_counter);
+    }
     
     vTaskDelete(NULL); // Delete this task
 }
 
 static int cmd_start_wardrive(int argc, char **argv) {
-    (void)argc; (void)argv;
-    
     // Check if wardrive is already running
     if (wardrive_active || wardrive_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Wardrive already running. Use 'stop' to stop it first.");
@@ -2736,14 +2883,29 @@ static int cmd_start_wardrive(int argc, char **argv) {
     }
     MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX)", GPS_TX_PIN, GPS_RX_PIN);
     
-    // Initialize SD card
-    ret = init_sd_card();
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
-        return 1;
+    sd_storage_target_t storage_mode = sd_default_target;
+    if (command_has_argument(argc, argv, "-serial")) {
+        storage_mode = SD_TARGET_FLIPPER;
     }
-    MY_LOG_INFO(TAG, "SD card initialized on pins MISO:%d MOSI:%d CLK:%d CS:%d", 
-                SD_MISO_PIN, SD_MOSI_PIN, SD_CLK_PIN, SD_CS_PIN);
+    wardrive_storage_target = storage_mode;
+    
+    if (storage_mode == SD_TARGET_INTERNAL) {
+        // Initialize SD card
+        ret = init_sd_card();
+        if (ret != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+            return 1;
+        }
+        MY_LOG_INFO(TAG, "SD card initialized on pins MISO:%d MOSI:%d CLK:%d CS:%d", 
+                    SD_MISO_PIN, SD_MOSI_PIN, SD_CLK_PIN, SD_CS_PIN);
+        if (create_sd_directories() != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to prepare SD directory structure at %s", SD_BASE_PATH);
+            return 1;
+        }
+        MY_LOG_INFO(TAG, "Wardrive logs will be stored in %s", SD_WARDRIVE_DIR);
+    } else {
+        MY_LOG_INFO(TAG, "Wardrive output will be streamed to Flipper SD (serial)");
+    }
     
     // Start wardrive in background task
     wardrive_active = true;
@@ -3424,6 +3586,16 @@ static int cmd_start_portal(int argc, char **argv) {
     if (portalSSID != NULL) {
         strcpy(portalSSID, ssid);
     }
+
+    sd_storage_target_t storage_mode = sd_default_target;
+    if (command_has_argument(argc, argv, "-serial")) {
+        storage_mode = SD_TARGET_FLIPPER;
+    }
+    portal_storage_target = storage_mode;
+
+    if (storage_mode == SD_TARGET_FLIPPER) {
+        MY_LOG_INFO(TAG, "Portal submissions will stream to Flipper SD (serial)");
+    }
     
     MY_LOG_INFO(TAG, "Starting captive portal with SSID: %s", ssid);
     
@@ -3844,6 +4016,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&select_html_cmd));
+
+    const esp_console_cmd_t sd_target_cmd = {
+        .command = "sd_target",
+        .help = "Set SD storage target (internal|flipper)",
+        .hint = NULL,
+        .func = &cmd_set_sd_target,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&sd_target_cmd));
 }
 
 void app_main(void) {
@@ -5156,40 +5337,52 @@ static esp_err_t create_sd_directories(void) {
     
     MY_LOG_INFO(TAG, "Checking and creating SD card directories...");
     
-    // Create /sdcard/lab directory
-    if (stat("/sdcard/lab", &st) != 0) {
-        MY_LOG_INFO(TAG, "Creating /sdcard/lab directory...");
-        if (mkdir("/sdcard/lab", 0755) != 0) {
-            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab directory: %s", strerror(errno));
+    // Create /sdcard/apps_assets directory
+    if (stat(SD_PARENT_PATH, &st) != 0) {
+        MY_LOG_INFO(TAG, "Creating %s directory...", SD_PARENT_PATH);
+        if (mkdir(SD_PARENT_PATH, 0755) != 0) {
+            MY_LOG_INFO(TAG, "Failed to create %s directory: %s", SD_PARENT_PATH, strerror(errno));
             return ESP_FAIL;
         }
-        MY_LOG_INFO(TAG, "/sdcard/lab created successfully");
+        MY_LOG_INFO(TAG, "%s created successfully", SD_PARENT_PATH);
     } else {
-        MY_LOG_INFO(TAG, "/sdcard/lab already exists");
+        MY_LOG_INFO(TAG, "%s already exists", SD_PARENT_PATH);
     }
     
-    // Create /sdcard/lab/htmls directory
-    if (stat("/sdcard/lab/htmls", &st) != 0) {
-        MY_LOG_INFO(TAG, "Creating /sdcard/lab/htmls directory...");
-        if (mkdir("/sdcard/lab/htmls", 0755) != 0) {
-            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/htmls directory: %s", strerror(errno));
+    // Create /sdcard/apps_assets/labC5 directory
+    if (stat(SD_BASE_PATH, &st) != 0) {
+        MY_LOG_INFO(TAG, "Creating %s directory...", SD_BASE_PATH);
+        if (mkdir(SD_BASE_PATH, 0755) != 0) {
+            MY_LOG_INFO(TAG, "Failed to create %s directory: %s", SD_BASE_PATH, strerror(errno));
             return ESP_FAIL;
         }
-        MY_LOG_INFO(TAG, "/sdcard/lab/htmls created successfully");
+        MY_LOG_INFO(TAG, "%s created successfully", SD_BASE_PATH);
     } else {
-        MY_LOG_INFO(TAG, "/sdcard/lab/htmls already exists");
+        MY_LOG_INFO(TAG, "%s already exists", SD_BASE_PATH);
     }
     
-    // Create /sdcard/lab/wardrives directory
-    if (stat("/sdcard/lab/wardrives", &st) != 0) {
-        MY_LOG_INFO(TAG, "Creating /sdcard/lab/wardrives directory...");
-        if (mkdir("/sdcard/lab/wardrives", 0755) != 0) {
-            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/wardrives directory: %s", strerror(errno));
+    // Create /sdcard/apps_assets/labC5/htmls directory
+    if (stat(SD_HTML_DIR, &st) != 0) {
+        MY_LOG_INFO(TAG, "Creating %s directory...", SD_HTML_DIR);
+        if (mkdir(SD_HTML_DIR, 0755) != 0) {
+            MY_LOG_INFO(TAG, "Failed to create %s directory: %s", SD_HTML_DIR, strerror(errno));
             return ESP_FAIL;
         }
-        MY_LOG_INFO(TAG, "/sdcard/lab/wardrives created successfully");
+        MY_LOG_INFO(TAG, "%s created successfully", SD_HTML_DIR);
     } else {
-        MY_LOG_INFO(TAG, "/sdcard/lab/wardrives already exists");
+        MY_LOG_INFO(TAG, "%s already exists", SD_HTML_DIR);
+    }
+    
+    // Create /sdcard/apps_assets/labC5/wardrives directory
+    if (stat(SD_WARDRIVE_DIR, &st) != 0) {
+        MY_LOG_INFO(TAG, "Creating %s directory...", SD_WARDRIVE_DIR);
+        if (mkdir(SD_WARDRIVE_DIR, 0755) != 0) {
+            MY_LOG_INFO(TAG, "Failed to create %s directory: %s", SD_WARDRIVE_DIR, strerror(errno));
+            return ESP_FAIL;
+        }
+        MY_LOG_INFO(TAG, "%s created successfully", SD_WARDRIVE_DIR);
+    } else {
+        MY_LOG_INFO(TAG, "%s already exists", SD_WARDRIVE_DIR);
     }
     
     MY_LOG_INFO(TAG, "All required directories are ready");
@@ -5346,11 +5539,11 @@ static bool wait_for_gps_fix(int timeout_seconds) {
 
 static int find_next_wardrive_file_number(void) {
     int max_number = 0;
-    char filename[64];
-    MY_LOG_INFO(TAG, "Scanning for existing wardrive log files...");
+    char filename[128];
+    MY_LOG_INFO(TAG, "Scanning for existing wardrive log files in %s...", SD_WARDRIVE_DIR);
     // Scan through possible file numbers to find the highest existing one
     for (int i = 1; i <= 9999; i++) {
-        snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", i);
+        snprintf(filename, sizeof(filename), SD_WARDRIVE_DIR "/w%d.log", i);
         
         struct stat file_stat;
         if (stat(filename, &file_stat) == 0) {
@@ -5371,39 +5564,61 @@ static int find_next_wardrive_file_number(void) {
 
 // Save evil twin password to SD card
 static void save_evil_twin_password(const char* ssid, const char* password) {
+    if (portal_storage_target == SD_TARGET_FLIPPER) {
+        const char *safe_ssid = ssid ? ssid : "Unknown";
+        const char *safe_password = password ? password : "";
+        size_t needed = strlen(safe_ssid) + strlen(safe_password) + 16;
+        char *line = (char *)malloc(needed);
+        if (line == NULL) {
+            MY_LOG_INFO(TAG, "Failed to allocate buffer for Flipper password logging");
+            return;
+        }
+        int len = snprintf(line, needed, "\"%s\", \"%s\"\n", safe_ssid, safe_password);
+        if (len > 0) {
+            flipper_sd_send_block((const uint8_t *)line, (size_t)len);
+            MY_LOG_INFO(TAG, "Password streamed to Flipper SD");
+        }
+        free(line);
+        return;
+    }
+
     // Initialize SD card if not already mounted
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to initialize SD card for password logging: %s", esp_err_to_name(ret));
         return;
     }
+    if (create_sd_directories() != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to prepare SD directory structure at %s", SD_BASE_PATH);
+        return;
+    }
     
     // Check if /sdcard directory is accessible
     struct stat st;
-    if (stat("/sdcard", &st) != 0) {
-        MY_LOG_INFO(TAG, "Error: /sdcard directory not accessible");
+    if (stat(SD_BASE_PATH, &st) != 0) {
+        MY_LOG_INFO(TAG, "Error: %s directory not accessible", SD_BASE_PATH);
         return;
     }
     
     // Try to open file for appending (use short name without underscore for FAT compatibility)
-    FILE *file = fopen("/sdcard/lab/eviltwin.txt", "a");
+    FILE *file = fopen(SD_EVILTWIN_PATH, "a");
     if (file == NULL) {
-        MY_LOG_INFO(TAG, "Failed to open eviltwin.txt for append, errno: %d (%s). Trying to create...", errno, strerror(errno));
+        MY_LOG_INFO(TAG, "Failed to open %s for append, errno: %d (%s). Trying to create...", SD_EVILTWIN_PATH, errno, strerror(errno));
         
         // Try to create the file first
-        file = fopen("/sdcard/lab/eviltwin.txt", "w");
+        file = fopen(SD_EVILTWIN_PATH, "w");
         if (file == NULL) {
-            MY_LOG_INFO(TAG, "Failed to create eviltwin.txt, errno: %d (%s)", errno, strerror(errno));
+            MY_LOG_INFO(TAG, "Failed to create %s, errno: %d (%s)", SD_EVILTWIN_PATH, errno, strerror(errno));
             return;
         }
         // Close and reopen in append mode
         fclose(file);
-        file = fopen("/sdcard/lab/eviltwin.txt", "a");
+        file = fopen(SD_EVILTWIN_PATH, "a");
         if (file == NULL) {
-            MY_LOG_INFO(TAG, "Failed to reopen eviltwin.txt, errno: %d (%s)", errno, strerror(errno));
+            MY_LOG_INFO(TAG, "Failed to reopen %s, errno: %d (%s)", SD_EVILTWIN_PATH, errno, strerror(errno));
             return;
         }
-        MY_LOG_INFO(TAG, "Successfully created eviltwin.txt");
+        MY_LOG_INFO(TAG, "Successfully created %s", SD_EVILTWIN_PATH);
     }
     
     // Write SSID and password in CSV format
@@ -5413,44 +5628,66 @@ static void save_evil_twin_password(const char* ssid, const char* password) {
     fflush(file);
     fclose(file);
     
-    MY_LOG_INFO(TAG, "Password saved to eviltwin.txt");
+    MY_LOG_INFO(TAG, "Password saved to %s", SD_EVILTWIN_PATH);
 }
 
 // Save portal form data to SD card
 static void save_portal_data(const char* ssid, const char* form_data) {
+    if (portal_storage_target == SD_TARGET_FLIPPER) {
+        const char *safe_ssid = ssid ? ssid : "Unknown";
+        const char *safe_data = form_data ? form_data : "";
+        size_t needed = strlen(safe_ssid) + strlen(safe_data) + 32;
+        char *payload = (char *)malloc(needed);
+        if (payload == NULL) {
+            MY_LOG_INFO(TAG, "Failed to allocate buffer for Flipper portal logging");
+            return;
+        }
+        int len = snprintf(payload, needed, "SSID=\"%s\" DATA=\"%s\"\n", safe_ssid, safe_data);
+        if (len > 0) {
+            flipper_sd_send_block((const uint8_t *)payload, (size_t)len);
+            MY_LOG_INFO(TAG, "Portal data streamed to Flipper SD");
+        }
+        free(payload);
+        return;
+    }
+
     // Initialize SD card if not already mounted
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to initialize SD card for portal data logging: %s", esp_err_to_name(ret));
         return;
     }
+    if (create_sd_directories() != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to prepare SD directory structure at %s", SD_BASE_PATH);
+        return;
+    }
     
     // Check if /sdcard directory is accessible
     struct stat st;
-    if (stat("/sdcard", &st) != 0) {
-        MY_LOG_INFO(TAG, "Error: /sdcard directory not accessible");
+    if (stat(SD_BASE_PATH, &st) != 0) {
+        MY_LOG_INFO(TAG, "Error: %s directory not accessible", SD_BASE_PATH);
         return;
     }
     
     // Try to open file for appending
-    FILE *file = fopen("/sdcard/lab/portals.txt", "a");
+    FILE *file = fopen(SD_PORTALS_PATH, "a");
     if (file == NULL) {
-        MY_LOG_INFO(TAG, "Failed to open portals.txt for append, errno: %d (%s). Trying to create...", errno, strerror(errno));
+        MY_LOG_INFO(TAG, "Failed to open %s for append, errno: %d (%s). Trying to create...", SD_PORTALS_PATH, errno, strerror(errno));
         
         // Try to create the file first
-        file = fopen("/sdcard/lab/portals.txt", "w");
+        file = fopen(SD_PORTALS_PATH, "w");
         if (file == NULL) {
-            MY_LOG_INFO(TAG, "Failed to create portals.txt, errno: %d (%s)", errno, strerror(errno));
+            MY_LOG_INFO(TAG, "Failed to create %s, errno: %d (%s)", SD_PORTALS_PATH, errno, strerror(errno));
             return;
         }
         // Close and reopen in append mode
         fclose(file);
-        file = fopen("/sdcard/lab/portals.txt", "a");
+        file = fopen(SD_PORTALS_PATH, "a");
         if (file == NULL) {
-            MY_LOG_INFO(TAG, "Failed to reopen portals.txt, errno: %d (%s)", errno, strerror(errno));
+            MY_LOG_INFO(TAG, "Failed to reopen %s, errno: %d (%s)", SD_PORTALS_PATH, errno, strerror(errno));
             return;
         }
-        MY_LOG_INFO(TAG, "Successfully created portals.txt");
+        MY_LOG_INFO(TAG, "Successfully created %s", SD_PORTALS_PATH);
     }
     
     // Write SSID as first field
@@ -5527,14 +5764,19 @@ static void save_portal_data(const char* ssid, const char* form_data) {
     
     free(data_copy);
     
-    MY_LOG_INFO(TAG, "Portal data saved to portals.txt");
+    MY_LOG_INFO(TAG, "Portal data saved to %s", SD_PORTALS_PATH);
 }
 
 // Load whitelist from SD card
 static void load_whitelist_from_sd(void) {
     whitelistedBssidsCount = 0; // Reset count
+
+    if (sd_default_target == SD_TARGET_FLIPPER) {
+        MY_LOG_INFO(TAG, "Default storage target is Flipper SD - skipping local whitelist load");
+        return;
+    }
     
-    MY_LOG_INFO(TAG, "Checking for whitelist file (white.txt) on SD card...");
+    MY_LOG_INFO(TAG, "Checking for whitelist file (%s) on SD card...", SD_WHITE_PATH);
     
     // Try to initialize SD card (silently fail if not available)
     esp_err_t ret = init_sd_card();
@@ -5542,15 +5784,19 @@ static void load_whitelist_from_sd(void) {
         MY_LOG_INFO(TAG, "SD card not available - whitelist will be empty");
         return;
     }
-    
-    // Try to open white.txt file
-    FILE *file = fopen("/sdcard/lab/white.txt", "r");
-    if (file == NULL) {
-        MY_LOG_INFO(TAG, "white.txt not found on SD card - whitelist will be empty");
+    if (create_sd_directories() != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to prepare SD directory structure at %s", SD_BASE_PATH);
         return;
     }
     
-    MY_LOG_INFO(TAG, "Found white.txt, loading whitelisted BSSIDs...");
+    // Try to open white.txt file
+    FILE *file = fopen(SD_WHITE_PATH, "r");
+    if (file == NULL) {
+        MY_LOG_INFO(TAG, "%s not found on SD card - whitelist will be empty", SD_WHITE_PATH);
+        return;
+    }
+    
+    MY_LOG_INFO(TAG, "Found %s, loading whitelisted BSSIDs...", SD_WHITE_PATH);
     
     char line[128];
     int line_number = 0;
@@ -5603,7 +5849,7 @@ static void load_whitelist_from_sd(void) {
     if (whitelistedBssidsCount > 0) {
         MY_LOG_INFO(TAG, "Successfully loaded %d whitelisted BSSID(s)", whitelistedBssidsCount);
     } else {
-        MY_LOG_INFO(TAG, "No valid BSSIDs found in white.txt");
+        MY_LOG_INFO(TAG, "No valid BSSIDs found in %s", SD_WHITE_PATH);
     }
 }
 
