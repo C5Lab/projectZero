@@ -37,7 +37,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.14"
+#define LAB_C5_VERSION_TEXT "0.15"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -56,7 +56,7 @@ typedef enum {
 #define MENU_VISIBLE_COUNT 6
 #define MENU_VISIBLE_COUNT_SNIFFERS 4
 #define MENU_VISIBLE_COUNT_ATTACKS 4
-#define MENU_VISIBLE_COUNT_SETUP 5
+#define MENU_VISIBLE_COUNT_SETUP 4
 #define PACKAGE_MONITOR_MAX_HISTORY 96
 #define MENU_TITLE_Y 12
 #define MENU_ITEM_BASE_Y 24
@@ -3218,7 +3218,7 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     if(show_setup_branding) {
         char version_text[24];
         snprintf(version_text, sizeof(version_text), "v.%s", LAB_C5_VERSION_TEXT);
-        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 1, 63, AlignRight, AlignBottom, version_text);
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 15, 11, AlignRight, AlignBottom, version_text);
     }
 
     if(app->menu_state == MenuStateSections) {
