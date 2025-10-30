@@ -57,7 +57,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.5.7"
+#define JANOS_VERSION "0.5.8"
 
 
 #define NEOPIXEL_GPIO      27
@@ -6085,8 +6085,25 @@ static void save_portal_data(const char* ssid, const char* form_data) {
         char *equals = strchr(token, '=');
         if (equals != NULL) {
             *equals = '\0';
+            char *key = token;
             char *value = equals + 1;
-            
+
+            // URL decode the key
+            char decoded_key[128];
+            int decoded_key_len = 0;
+            for (char *p = key; *p && decoded_key_len < sizeof(decoded_key) - 1; p++) {
+                if (*p == '%' && p[1] && p[2]) {
+                    char hex[3] = {p[1], p[2], '\0'};
+                    decoded_key[decoded_key_len++] = (char)strtol(hex, NULL, 16);
+                    p += 2;
+                } else if (*p == '+') {
+                    decoded_key[decoded_key_len++] = ' ';
+                } else {
+                    decoded_key[decoded_key_len++] = *p;
+                }
+            }
+            decoded_key[decoded_key_len] = '\0';
+
             // URL decode the value
             char decoded_value[128];
             int decoded_len = 0;
@@ -6102,10 +6119,10 @@ static void save_portal_data(const char* ssid, const char* form_data) {
                 }
             }
             decoded_value[decoded_len] = '\0';
-            
-            // Write field value in CSV format
-            fprintf(file, "\"%s\"", decoded_value);
-            
+
+            // Write field name and value in CSV format as key=value
+            fprintf(file, "\"%s=%s\"", decoded_key, decoded_value);
+
             // Add comma if not last field
             current_field++;
             if (current_field < field_count) {
