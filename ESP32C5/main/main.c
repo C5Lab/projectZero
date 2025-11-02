@@ -57,7 +57,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.5.8"
+#define JANOS_VERSION "0.5.9"
 
 
 #define NEOPIXEL_GPIO      27
@@ -485,6 +485,22 @@ typedef struct {
 static whitelisted_bssid_t whiteListedBssids[MAX_WHITELISTED_BSSIDS];
 static int whitelistedBssidsCount = 0;
 
+#define VENDOR_RECORD_SIZE 64
+#define VENDOR_RECORD_NAME_BYTES (VENDOR_RECORD_SIZE - 4)
+#define MAX_VENDOR_NAME_LEN (VENDOR_RECORD_NAME_BYTES + 1)
+#define SD_OUI_BIN_PATH "/sdcard/lab/oui_wifi.bin"
+#define VENDOR_NVS_NAMESPACE "vendorcfg"
+#define VENDOR_NVS_KEY_ENABLED "enabled"
+
+static char vendor_lookup_buffer[MAX_VENDOR_NAME_LEN];
+static bool vendor_file_checked = false;
+static bool vendor_file_present = false;
+static uint8_t vendor_last_oui[3] = {0};
+static bool vendor_last_valid = false;
+static bool vendor_last_hit = false;
+static bool vendor_lookup_enabled = true;
+static size_t vendor_record_count = 0;
+
 
 // Methods forward declarations
 static int cmd_scan_networks(int argc, char **argv);
@@ -506,6 +522,7 @@ static int cmd_select_html(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
 static int cmd_led(int argc, char **argv);
+static int cmd_vendor(int argc, char **argv);
 static esp_err_t start_background_scan(void);
 static void print_scan_results(void);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
@@ -1301,14 +1318,190 @@ const char* authmode_to_string(wifi_auth_mode_t mode) {
     }
 }
 
+static void vendor_persist_state(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(VENDOR_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Vendor NVS open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint8_t value = vendor_lookup_enabled ? 1 : 0;
+    err = nvs_set_u8(handle, VENDOR_NVS_KEY_ENABLED, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Vendor NVS write failed: %s", esp_err_to_name(err));
+    }
+    nvs_close(handle);
+}
+
+static void vendor_load_state_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(VENDOR_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Vendor NVS read open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint8_t value = vendor_lookup_enabled ? 1 : 0;
+    err = nvs_get_u8(handle, VENDOR_NVS_KEY_ENABLED, &value);
+    if (err == ESP_OK) {
+        vendor_lookup_enabled = value != 0;
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "Vendor NVS get failed: %s", esp_err_to_name(err));
+    }
+    nvs_close(handle);
+}
+
+static bool vendor_is_enabled(void) {
+    return vendor_lookup_enabled;
+}
+
+static esp_err_t vendor_set_enabled(bool enabled) {
+    vendor_lookup_enabled = enabled;
+    vendor_last_valid = false;
+    vendor_last_hit = false;
+    vendor_lookup_buffer[0] = '\0';
+    vendor_file_checked = false;
+    vendor_file_present = false;
+    vendor_record_count = 0;
+    vendor_persist_state();
+    return ESP_OK;
+}
+
+static void ensure_vendor_file_checked(void) {
+    if (vendor_file_checked) {
+        return;
+    }
+    if (!sd_card_mounted) {
+        // SD card not ready yet, defer lookup until later
+        vendor_file_checked = false;
+        vendor_file_present = false;
+        vendor_record_count = 0;
+        return;
+    }
+    FILE *file = fopen(SD_OUI_BIN_PATH, "rb");
+    if (file) {
+        vendor_file_present = true;
+        if (fseek(file, 0, SEEK_END) == 0) {
+            long file_size = ftell(file);
+            if (file_size >= (long)VENDOR_RECORD_SIZE) {
+                vendor_record_count = (size_t)file_size / VENDOR_RECORD_SIZE;
+            } else {
+                vendor_record_count = 0;
+            }
+        } else {
+            vendor_record_count = 0;
+        }
+        MY_LOG_INFO(TAG, "Vendor binary file detected (%u entries)", (unsigned int)vendor_record_count);
+        fclose(file);
+        if (vendor_record_count == 0) {
+            vendor_file_present = false;
+        }
+    } else {
+        vendor_file_present = false;
+        vendor_record_count = 0;
+        MY_LOG_INFO(TAG, "Vendor binary file not found");
+    }
+    vendor_file_checked = true;
+    vendor_last_valid = false;
+    vendor_last_hit = false;
+    vendor_lookup_buffer[0] = '\0';
+}
+
+static const char* lookup_vendor_name(const uint8_t *bssid) {
+    if (!vendor_lookup_enabled || !bssid) {
+        vendor_last_valid = false;
+        return NULL;
+    }
+
+    if (vendor_last_valid && memcmp(vendor_last_oui, bssid, 3) == 0) {
+        return vendor_last_hit ? vendor_lookup_buffer : NULL;
+    }
+
+    ensure_vendor_file_checked();
+    if (!vendor_file_present) {
+        vendor_last_valid = false;
+        return NULL;
+    }
+
+    FILE *file = fopen(SD_OUI_BIN_PATH, "rb");
+    if (!file) {
+        vendor_file_present = false;
+        vendor_file_checked = false;
+        vendor_last_valid = false;
+        return NULL;
+    }
+
+    if (vendor_record_count == 0) {
+        fclose(file);
+        vendor_last_valid = false;
+        return NULL;
+    }
+
+    size_t low = 0;
+    size_t high = vendor_record_count;
+    uint8_t record[VENDOR_RECORD_SIZE];
+    bool found = false;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        long offset = (long)(mid * VENDOR_RECORD_SIZE);
+        if (fseek(file, offset, SEEK_SET) != 0) {
+            break;
+        }
+        if (fread(record, 1, VENDOR_RECORD_SIZE, file) != VENDOR_RECORD_SIZE) {
+            break;
+        }
+
+        int cmp = memcmp(record, bssid, 3);
+        if (cmp == 0) {
+            uint8_t name_len = record[3];
+            if (name_len > VENDOR_RECORD_NAME_BYTES) {
+                name_len = VENDOR_RECORD_NAME_BYTES;
+            }
+            memcpy(vendor_lookup_buffer, &record[4], name_len);
+            vendor_lookup_buffer[name_len] = '\0';
+            memcpy(vendor_last_oui, bssid, 3);
+            vendor_last_valid = true;
+            vendor_last_hit = true;
+            found = true;
+            break;
+        } else if (cmp < 0) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+
+    fclose(file);
+    if (found) {
+        return vendor_lookup_buffer;
+    }
+
+    memcpy(vendor_last_oui, bssid, 3);
+    vendor_last_valid = true;
+    vendor_last_hit = false;
+    vendor_lookup_buffer[0] = '\0';
+    return NULL;
+}
+
 
 static void print_network_csv(int index, const wifi_ap_record_t* ap) {
     char escaped_ssid[64];
     escape_csv_field((const char*)ap->ssid, escaped_ssid, sizeof(escaped_ssid));
+    char escaped_vendor[64];
+    const char *vendor_name = vendor_is_enabled() ? lookup_vendor_name(ap->bssid) : NULL;
+    escape_csv_field(vendor_name ? vendor_name : "", escaped_vendor, sizeof(escaped_vendor));
     
-    MY_LOG_INFO(TAG, "\"%d\",\"%s\",\"%02X:%02X:%02X:%02X:%02X:%02X\",\"%d\",\"%s\",\"%d\",\"%s\"",
+    MY_LOG_INFO(TAG, "\"%d\",\"%s\",\"%s\",\"%02X:%02X:%02X:%02X:%02X:%02X\",\"%d\",\"%s\",\"%d\",\"%s\"",
                 (index + 1),
                 escaped_ssid,
+                escaped_vendor,
                 ap->bssid[0], ap->bssid[1], ap->bssid[2],
                 ap->bssid[3], ap->bssid[4], ap->bssid[5],
                 ap->primary,
@@ -2859,6 +3052,67 @@ static int cmd_led(int argc, char **argv) {
     return 1;
 }
 
+static int cmd_vendor(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: vendor set <on|off> | vendor read");
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "set") == 0) {
+        if (argc < 3) {
+            MY_LOG_INFO(TAG, "Usage: vendor set <on|off>");
+            return 1;
+        }
+
+        bool enable;
+        if (strcasecmp(argv[2], "on") == 0) {
+            enable = true;
+        } else if (strcasecmp(argv[2], "off") == 0) {
+            enable = false;
+        } else {
+            MY_LOG_INFO(TAG, "Usage: vendor set <on|off>");
+            return 1;
+        }
+
+        vendor_set_enabled(enable);
+        if (enable && sd_card_mounted) {
+            ensure_vendor_file_checked();
+        }
+
+        MY_LOG_INFO(TAG, "Vendor scan: %s", vendor_is_enabled() ? "on" : "off");
+        if (vendor_is_enabled()) {
+            if (!sd_card_mounted) {
+                MY_LOG_INFO(TAG, "Vendor file: waiting for SD card");
+            } else {
+                MY_LOG_INFO(TAG, "Vendor file: %s (%u entries)",
+                            vendor_file_present ? "available" : "missing",
+                            (unsigned int)vendor_record_count);
+            }
+        }
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "read") == 0) {
+        if (vendor_is_enabled() && sd_card_mounted) {
+            ensure_vendor_file_checked();
+        }
+        MY_LOG_INFO(TAG, "Vendor scan: %s", vendor_is_enabled() ? "on" : "off");
+        if (vendor_is_enabled()) {
+            if (!sd_card_mounted) {
+                MY_LOG_INFO(TAG, "Vendor file: waiting for SD card");
+            } else {
+                MY_LOG_INFO(TAG, "Vendor file: %s (%u entries)",
+                            vendor_file_present ? "available" : "missing",
+                            (unsigned int)vendor_record_count);
+            }
+        }
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Usage: vendor set <on|off> | vendor read");
+    return 1;
+}
+
 // Command: start_karma - Starts portal with SSID from probe list
 static int cmd_start_karma(int argc, char **argv)
 {
@@ -4369,6 +4623,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&karma_cmd));
 
+    const esp_console_cmd_t vendor_cmd = {
+        .command = "vendor",
+        .help = "Controls vendor lookup: vendor set <on|off> | vendor read",
+        .hint = NULL,
+        .func = &cmd_vendor,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&vendor_cmd));
+
     const esp_console_cmd_t led_cmd = {
         .command = "led",
         .help = "Controls status LED: led set <on|off> | led level <1-100> | led read",
@@ -4468,8 +4731,13 @@ void app_main(void) {
     led_initialized = true;
     led_boot_sequence();
     MY_LOG_INFO(TAG, "Status LED ready (brightness %u%%, %s)", led_brightness_percent, led_user_enabled ? "on" : "off");
-
-
+    vendor_load_state_from_nvs();
+    vendor_last_valid = false;
+    vendor_last_hit = false;
+    vendor_lookup_buffer[0] = '\0';
+    vendor_file_checked = false;
+    vendor_file_present = false;
+    vendor_record_count = 0;
 
     ESP_ERROR_CHECK(wifi_init_ap_sta()); 
 
@@ -4508,6 +4776,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  show_probes");
     MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
     MY_LOG_INFO(TAG,"  start_sniffer_dog");
+    MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
     MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
     MY_LOG_INFO(TAG,"  stop");
     MY_LOG_INFO(TAG,"  reboot");
@@ -4552,6 +4821,9 @@ void app_main(void) {
     esp_err_t sd_init_ret = init_sd_card();
     if (sd_init_ret == ESP_OK) {
         create_sd_directories();
+        if (vendor_is_enabled()) {
+            ensure_vendor_file_checked();
+        }
     }
     
     // Load BSSID whitelist from SD card
