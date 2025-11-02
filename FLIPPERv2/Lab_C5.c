@@ -37,7 +37,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.15"
+#define LAB_C5_VERSION_TEXT "0.16"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -45,6 +45,7 @@ typedef enum {
 #define SCAN_CHANNEL_MAX_LEN 8
 #define SCAN_TYPE_MAX_LEN 16
 #define SCAN_FIELD_BUFFER_LEN 64
+#define SCAN_VENDOR_MAX_LEN 64
 #define SCAN_POWER_MIN_DBM (-110)
 #define SCAN_POWER_MAX_DBM 0
 #define SCAN_POWER_STEP 1
@@ -75,6 +76,8 @@ typedef enum {
 #define RESULT_TEXT_X 5
 #define RESULT_SCROLL_WIDTH 3
 #define RESULT_SCROLL_GAP 0
+#define RESULT_SCROLL_INTERVAL_MS 200
+#define RESULT_SCROLL_EDGE_PAUSE_STEPS 3
 #define CONSOLE_VISIBLE_LINES 4
 #define MENU_SECTION_SCANNER 0
 #define MENU_SECTION_SNIFFERS 1
@@ -144,6 +147,7 @@ typedef enum {
     ScannerOptionShowSecurity,
     ScannerOptionShowPower,
     ScannerOptionShowBand,
+    ScannerOptionShowVendor,
     ScannerOptionMinPower,
     ScannerOptionCount,
 } ScannerOption;
@@ -151,6 +155,7 @@ typedef enum {
 typedef struct {
     uint16_t number;
     char ssid[SCAN_SSID_MAX_LEN];
+    char vendor[SCAN_VENDOR_MAX_LEN];
     char bssid[SCAN_FIELD_BUFFER_LEN];
     char channel[SCAN_CHANNEL_MAX_LEN];
     char security[SCAN_TYPE_MAX_LEN];
@@ -262,6 +267,11 @@ typedef struct {
     bool scanner_show_security;
     bool scanner_show_power;
     bool scanner_show_band;
+    bool scanner_show_vendor;
+    bool vendor_scan_enabled;
+    bool vendor_read_pending;
+    char vendor_read_buffer[32];
+    size_t vendor_read_length;
     int16_t scanner_min_power;
     size_t scanner_setup_index;
     bool scanner_adjusting_power;
@@ -280,6 +290,11 @@ typedef struct {
     uint8_t result_char_limit;
     uint8_t result_max_lines;
     Font result_font;
+    uint8_t result_scroll_offset;
+    int8_t result_scroll_direction;
+    uint8_t result_scroll_hold;
+    uint32_t result_scroll_last_tick;
+    char result_scroll_text[64];
     bool hint_active;
     char hint_title[24];
     char hint_lines[HINT_MAX_LINES][HINT_LINE_CHAR_LIMIT];
@@ -303,6 +318,8 @@ typedef struct {
     size_t package_monitor_line_length;
     uint32_t package_monitor_last_channel_tick;
 } SimpleApp;
+static void simple_app_reset_result_scroll(SimpleApp* app);
+static void simple_app_update_result_scroll(SimpleApp* app);
 static void simple_app_adjust_result_offset(SimpleApp* app);
 static void simple_app_rebuild_visible_results(SimpleApp* app);
 static bool simple_app_result_is_visible(const SimpleApp* app, const ScanResult* result);
@@ -319,6 +336,10 @@ static void simple_app_send_command_quiet(SimpleApp* app, const char* command);
 static void simple_app_request_led_status(SimpleApp* app);
 static bool simple_app_handle_led_status_line(SimpleApp* app, const char* line);
 static void simple_app_led_feed(SimpleApp* app, char ch);
+static void simple_app_send_vendor_command(SimpleApp* app, bool enable);
+static void simple_app_request_vendor_status(SimpleApp* app);
+static bool simple_app_handle_vendor_status_line(SimpleApp* app, const char* line);
+static void simple_app_vendor_feed(SimpleApp* app, char ch);
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial);
 static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, size_t length);
 static void simple_app_update_otg_label(SimpleApp* app);
@@ -696,6 +717,7 @@ static void simple_app_reset_scan_results(SimpleApp* app) {
     app->scan_line_len = 0;
     app->scan_results_loading = false;
     app->visible_result_count = 0;
+    simple_app_reset_result_scroll(app);
 }
 
 static bool simple_app_result_is_visible(const SimpleApp* app, const ScanResult* result) {
@@ -725,6 +747,7 @@ static void simple_app_rebuild_visible_results(SimpleApp* app) {
     if(app->scan_result_offset > app->scan_result_index) {
         app->scan_result_offset = app->scan_result_index;
     }
+    simple_app_reset_result_scroll(app);
 }
 
 static void simple_app_modify_min_power(SimpleApp* app, int16_t delta) {
@@ -752,6 +775,7 @@ static size_t simple_app_enabled_field_count(const SimpleApp* app) {
     if(app->scanner_show_security) count++;
     if(app->scanner_show_power) count++;
     if(app->scanner_show_band) count++;
+    if(app->scanner_show_vendor) count++;
     return count;
 }
 
@@ -770,6 +794,8 @@ static bool* simple_app_scanner_option_flag(SimpleApp* app, ScannerOption option
         return &app->scanner_show_power;
     case ScannerOptionShowBand:
         return &app->scanner_show_band;
+    case ScannerOptionShowVendor:
+        return &app->scanner_show_vendor;
     default:
         return NULL;
     }
@@ -936,6 +962,84 @@ static void simple_app_led_feed(SimpleApp* app, char ch) {
     app->led_read_buffer[app->led_read_length++] = ch;
 }
 
+static void simple_app_send_vendor_command(SimpleApp* app, bool enable) {
+    if(!app || !app->serial) return;
+    app->vendor_read_pending = true;
+    app->vendor_read_length = 0;
+    app->vendor_read_buffer[0] = '\0';
+    char command[24];
+    snprintf(command, sizeof(command), "vendor set %s", enable ? "on" : "off");
+    simple_app_send_command_quiet(app, command);
+}
+
+static void simple_app_request_vendor_status(SimpleApp* app) {
+    if(!app || !app->serial) return;
+    app->vendor_read_pending = true;
+    app->vendor_read_length = 0;
+    app->vendor_read_buffer[0] = '\0';
+    simple_app_send_command_quiet(app, "vendor read");
+}
+
+static bool simple_app_handle_vendor_status_line(SimpleApp* app, const char* line) {
+    if(!app || !line) return false;
+    static const char prefix[] = "Vendor scan:";
+    size_t prefix_len = sizeof(prefix) - 1;
+    if(strncmp(line, prefix, prefix_len) != 0) {
+        return false;
+    }
+
+    const char* status = line + prefix_len;
+    while(*status == ' ' || *status == '\t') {
+        status++;
+    }
+
+    bool enabled = app->vendor_scan_enabled;
+    if((status[0] == 'o' || status[0] == 'O') && (status[1] == 'n' || status[1] == 'N')) {
+        enabled = true;
+    } else if((status[0] == 'o' || status[0] == 'O') && (status[1] == 'f' || status[1] == 'F')) {
+        enabled = false;
+    } else if(status[0] == '1' || status[0] == 'Y' || status[0] == 'y' || status[0] == 'T' ||
+              status[0] == 't') {
+        enabled = true;
+    } else if(status[0] == '0' || status[0] == 'N' || status[0] == 'n' || status[0] == 'F' ||
+              status[0] == 'f') {
+        enabled = false;
+    }
+
+    app->vendor_scan_enabled = enabled;
+    bool changed = (app->scanner_show_vendor != enabled);
+    app->scanner_show_vendor = enabled;
+    if(changed) {
+        simple_app_update_result_layout(app);
+        simple_app_rebuild_visible_results(app);
+        simple_app_adjust_result_offset(app);
+        if(app->viewport && app->screen == ScreenSetupScanner) {
+            view_port_update(app->viewport);
+        }
+    }
+    return true;
+}
+
+static void simple_app_vendor_feed(SimpleApp* app, char ch) {
+    if(!app || !app->vendor_read_pending) return;
+    if(ch == '\r') return;
+    if(ch == '\n') {
+        if(app->vendor_read_length > 0) {
+            app->vendor_read_buffer[app->vendor_read_length] = '\0';
+            if(simple_app_handle_vendor_status_line(app, app->vendor_read_buffer)) {
+                app->vendor_read_pending = false;
+            }
+        }
+        app->vendor_read_length = 0;
+        return;
+    }
+    if(app->vendor_read_length + 1 >= sizeof(app->vendor_read_buffer)) {
+        app->vendor_read_length = 0;
+        return;
+    }
+    app->vendor_read_buffer[app->vendor_read_length++] = ch;
+}
+
 static void simple_app_update_otg_label(SimpleApp* app) {
     if(!app) return;
     snprintf(
@@ -1072,13 +1176,15 @@ static size_t simple_app_build_result_lines(
     size_t truncate_limit = (char_limit < (line_cap - 1)) ? char_limit : (line_cap - 1);
     if(truncate_limit < 1) truncate_limit = 1;
 
-#define SIMPLE_APP_EMIT_LINE(buffer) \
+#define SIMPLE_APP_EMIT_LINE(buffer, allow_truncate) \
     do { \
         if(emitted < max_lines) { \
             if(store_lines) { \
                 strncpy(lines[emitted], buffer, line_cap - 1); \
                 lines[emitted][line_cap - 1] = '\0'; \
-                simple_app_truncate_text(lines[emitted], truncate_limit); \
+                if(allow_truncate) { \
+                    simple_app_truncate_text(lines[emitted], truncate_limit); \
+                } \
             } \
             emitted++; \
         } \
@@ -1088,6 +1194,8 @@ static size_t simple_app_build_result_lines(
     memset(first_line, 0, sizeof(first_line));
     snprintf(first_line, sizeof(first_line), "%u%s", (unsigned)result->number, result->selected ? "*" : "");
 
+    bool vendor_visible = app->scanner_show_vendor && result->vendor[0] != '\0';
+    bool vendor_in_first_line = false;
     bool ssid_visible = app->scanner_show_ssid && result->ssid[0] != '\0';
     if(ssid_visible) {
         size_t len = strlen(first_line);
@@ -1100,6 +1208,43 @@ static size_t simple_app_build_result_lines(
                 memcpy(first_line + len, result->ssid, ssid_len);
                 len += ssid_len;
                 first_line[len] = '\0';
+            }
+        }
+        if(vendor_visible) {
+            size_t len_after_ssid = strlen(first_line);
+            if(len_after_ssid < sizeof(first_line) - 1) {
+                size_t remaining = sizeof(first_line) - len_after_ssid - 1;
+                if(remaining > 3) {
+                    size_t vendor_len = strlen(result->vendor);
+                    if(vendor_len > remaining - 1) vendor_len = remaining - 1;
+                    if(vendor_len > 0) {
+                        first_line[len_after_ssid++] = ' ';
+                        first_line[len_after_ssid++] = '(';
+                        memcpy(first_line + len_after_ssid, result->vendor, vendor_len);
+                        len_after_ssid += vendor_len;
+                        if(len_after_ssid < sizeof(first_line) - 1) {
+                            first_line[len_after_ssid++] = ')';
+                            first_line[len_after_ssid] = '\0';
+                            vendor_in_first_line = true;
+                        } else {
+                            first_line[sizeof(first_line) - 1] = '\0';
+                        }
+                    }
+                }
+            }
+        }
+    } else if(vendor_visible) {
+        size_t len = strlen(first_line);
+        if(len < sizeof(first_line) - 1) {
+            size_t remaining = sizeof(first_line) - len - 1;
+            if(remaining > 0) {
+                first_line[len++] = ' ';
+                size_t vendor_len = strlen(result->vendor);
+                if(vendor_len > remaining) vendor_len = remaining;
+                memcpy(first_line + len, result->vendor, vendor_len);
+                len += vendor_len;
+                first_line[len] = '\0';
+                vendor_in_first_line = true;
             }
         }
     }
@@ -1121,7 +1266,7 @@ static size_t simple_app_build_result_lines(
         }
     }
 
-    SIMPLE_APP_EMIT_LINE(first_line);
+    SIMPLE_APP_EMIT_LINE(first_line, false);
 
     if(emitted < max_lines && app->scanner_show_bssid && !bssid_in_first_line &&
        result->bssid[0] != '\0') {
@@ -1139,7 +1284,25 @@ static size_t simple_app_build_result_lines(
         } else {
             bssid_line[sizeof(bssid_line) - 1] = '\0';
         }
-        SIMPLE_APP_EMIT_LINE(bssid_line);
+        SIMPLE_APP_EMIT_LINE(bssid_line, true);
+    }
+
+    if(emitted < max_lines && vendor_visible && !vendor_in_first_line) {
+        char vendor_line[line_cap];
+        memset(vendor_line, 0, sizeof(vendor_line));
+        size_t len = 0;
+        vendor_line[len++] = ' ';
+        if(len < sizeof(vendor_line) - 1) {
+            size_t remaining = sizeof(vendor_line) - len - 1;
+            size_t vendor_len = strlen(result->vendor);
+            if(vendor_len > remaining) vendor_len = remaining;
+            memcpy(vendor_line + len, result->vendor, vendor_len);
+            len += vendor_len;
+            vendor_line[len] = '\0';
+        } else {
+            vendor_line[sizeof(vendor_line) - 1] = '\0';
+        }
+        SIMPLE_APP_EMIT_LINE(vendor_line, true);
     }
 
     if(emitted < max_lines) {
@@ -1152,7 +1315,7 @@ static size_t simple_app_build_result_lines(
             simple_app_line_append_token(info_line, sizeof(info_line), NULL, result->band);
         }
         if(info_line[0] != '\0') {
-            SIMPLE_APP_EMIT_LINE(info_line);
+            SIMPLE_APP_EMIT_LINE(info_line, true);
         }
     }
 
@@ -1189,7 +1352,7 @@ static size_t simple_app_build_result_lines(
             simple_app_line_append_token(info_line, sizeof(info_line), NULL, power_value);
         }
         if(info_line[0] != '\0') {
-            SIMPLE_APP_EMIT_LINE(info_line);
+            SIMPLE_APP_EMIT_LINE(info_line, true);
         }
     }
 
@@ -1197,7 +1360,7 @@ static size_t simple_app_build_result_lines(
         char fallback_line[line_cap];
         strncpy(fallback_line, "-", sizeof(fallback_line) - 1);
         fallback_line[sizeof(fallback_line) - 1] = '\0';
-        SIMPLE_APP_EMIT_LINE(fallback_line);
+        SIMPLE_APP_EMIT_LINE(fallback_line, true);
     }
 
 #undef SIMPLE_APP_EMIT_LINE
@@ -1312,6 +1475,8 @@ static void simple_app_parse_config_line(SimpleApp* app, char* line) {
         app->scanner_show_power = simple_app_parse_bool_value(value, app->scanner_show_power);
     } else if(strcmp(key, "show_band") == 0) {
         app->scanner_show_band = simple_app_parse_bool_value(value, app->scanner_show_band);
+    } else if(strcmp(key, "show_vendor") == 0) {
+        app->scanner_show_vendor = simple_app_parse_bool_value(value, app->scanner_show_vendor);
     } else if(strcmp(key, "min_power") == 0) {
         app->scanner_min_power = (int16_t)strtol(value, NULL, 10);
     } else if(strcmp(key, "backlight_enabled") == 0) {
@@ -1352,6 +1517,7 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             "show_security=%d\n"
             "show_power=%d\n"
             "show_band=%d\n"
+            "show_vendor=%d\n"
             "min_power=%d\n"
             "backlight_enabled=%d\n"
             "otg_power_enabled=%d\n"
@@ -1362,6 +1528,7 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             app->scanner_show_security ? 1 : 0,
             app->scanner_show_power ? 1 : 0,
             app->scanner_show_band ? 1 : 0,
+            app->scanner_show_vendor ? 1 : 0,
             (int)app->scanner_min_power,
             app->backlight_enabled ? 1 : 0,
             app->otg_power_enabled ? 1 : 0,
@@ -1538,25 +1705,26 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
     if(cursor[0] != '"') return;
     if(app->scan_result_count >= MAX_SCAN_RESULTS) return;
 
-    char fields[7][SCAN_FIELD_BUFFER_LEN];
-    for(size_t i = 0; i < 7; i++) {
+    char fields[8][SCAN_FIELD_BUFFER_LEN];
+    for(size_t i = 0; i < 8; i++) {
         memset(fields[i], 0, SCAN_FIELD_BUFFER_LEN);
     }
 
-    size_t field_count = simple_app_parse_quoted_fields(cursor, fields, 7);
-    if(field_count < 7) return;
+    size_t field_count = simple_app_parse_quoted_fields(cursor, fields, 8);
+    if(field_count < 8) return;
 
     ScanResult* result = &app->scan_results[app->scan_result_count];
     memset(result, 0, sizeof(ScanResult));
     result->number = (uint16_t)strtoul(fields[0], NULL, 10);
     simple_app_copy_field(result->ssid, sizeof(result->ssid), fields[1], "<hidden>");
-    simple_app_copy_field(result->bssid, sizeof(result->bssid), fields[2], "??:??:??:??:??:??");
-    simple_app_copy_field(result->channel, sizeof(result->channel), fields[3], "?");
-    simple_app_copy_field(result->security, sizeof(result->security), fields[4], "Unknown");
-    simple_app_copy_field(result->power_display, sizeof(result->power_display), fields[5], "?");
-    simple_app_copy_field(result->band, sizeof(result->band), fields[6], "?");
+    simple_app_copy_field(result->vendor, sizeof(result->vendor), fields[2], "");
+    simple_app_copy_field(result->bssid, sizeof(result->bssid), fields[3], "??:??:??:??:??:??");
+    simple_app_copy_field(result->channel, sizeof(result->channel), fields[4], "?");
+    simple_app_copy_field(result->security, sizeof(result->security), fields[5], "Unknown");
+    simple_app_copy_field(result->power_display, sizeof(result->power_display), fields[6], "?");
+    simple_app_copy_field(result->band, sizeof(result->band), fields[7], "?");
 
-    const char* power_str = fields[5];
+    const char* power_str = fields[6];
     char* power_end = NULL;
     long power_value = strtol(power_str, &power_end, 10);
     if(power_str[0] != '\0' && power_end && *power_end == '\0') {
@@ -1616,6 +1784,137 @@ static size_t simple_app_result_offset_lines(SimpleApp* app) {
     return lines;
 }
 
+static void simple_app_reset_result_scroll(SimpleApp* app) {
+    if(!app) return;
+    app->result_scroll_offset = 0;
+    app->result_scroll_direction = 1;
+    app->result_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+    app->result_scroll_last_tick = furi_get_tick();
+    app->result_scroll_text[0] = '\0';
+}
+
+static void simple_app_update_result_scroll(SimpleApp* app) {
+    if(!app) return;
+
+    if(app->screen != ScreenResults) {
+        if(app->result_scroll_text[0] != '\0' || app->result_scroll_offset != 0) {
+            simple_app_reset_result_scroll(app);
+        }
+        return;
+    }
+
+    if(app->visible_result_count == 0) {
+        if(app->result_scroll_text[0] != '\0' || app->result_scroll_offset != 0) {
+            simple_app_reset_result_scroll(app);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    const ScanResult* result = simple_app_visible_result_const(app, app->scan_result_index);
+    if(!result) {
+        if(app->result_scroll_text[0] != '\0' || app->result_scroll_offset != 0) {
+            simple_app_reset_result_scroll(app);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    char first_line_buffer[1][64];
+    memset(first_line_buffer, 0, sizeof(first_line_buffer));
+    size_t produced = simple_app_build_result_lines(app, result, first_line_buffer, 1);
+    if(produced == 0) {
+        if(app->result_scroll_text[0] != '\0' || app->result_scroll_offset != 0) {
+            simple_app_reset_result_scroll(app);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    const char* full_line = first_line_buffer[0];
+    if(strncmp(full_line, app->result_scroll_text, sizeof(app->result_scroll_text)) != 0) {
+        strncpy(app->result_scroll_text, full_line, sizeof(app->result_scroll_text) - 1);
+        app->result_scroll_text[sizeof(app->result_scroll_text) - 1] = '\0';
+        app->result_scroll_offset = 0;
+        app->result_scroll_direction = 1;
+        app->result_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        app->result_scroll_last_tick = furi_get_tick();
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    size_t char_limit = (app->result_char_limit > 0) ? app->result_char_limit : RESULT_DEFAULT_CHAR_LIMIT;
+    if(char_limit == 0) char_limit = 1;
+    if(char_limit >= sizeof(first_line_buffer[0])) {
+        char_limit = sizeof(first_line_buffer[0]) - 1;
+        if(char_limit == 0) char_limit = 1;
+    }
+
+    size_t line_length = strlen(app->result_scroll_text);
+    if(line_length <= char_limit) {
+        if(app->result_scroll_offset != 0) {
+            app->result_scroll_offset = 0;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    size_t max_offset = line_length - char_limit;
+    uint32_t now = furi_get_tick();
+    uint32_t interval_ticks = furi_ms_to_ticks(RESULT_SCROLL_INTERVAL_MS);
+    if(interval_ticks == 0) interval_ticks = 1;
+    if((now - app->result_scroll_last_tick) < interval_ticks) {
+        return;
+    }
+    app->result_scroll_last_tick = now;
+
+    if(app->result_scroll_hold > 0) {
+        app->result_scroll_hold--;
+        return;
+    }
+
+    bool changed = false;
+    if(app->result_scroll_direction > 0) {
+        if(app->result_scroll_offset < max_offset) {
+            app->result_scroll_offset++;
+            changed = true;
+            if(app->result_scroll_offset >= max_offset) {
+                app->result_scroll_direction = -1;
+                app->result_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+            }
+        } else {
+            app->result_scroll_direction = -1;
+            app->result_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        }
+    } else {
+        if(app->result_scroll_offset > 0) {
+            app->result_scroll_offset--;
+            changed = true;
+            if(app->result_scroll_offset == 0) {
+                app->result_scroll_direction = 1;
+                app->result_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+            }
+        } else {
+            app->result_scroll_direction = 1;
+            app->result_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        }
+    }
+
+    if(changed && app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
 static void simple_app_scan_feed(SimpleApp* app, char ch) {
     if(!app || !app->scan_results_loading) return;
 
@@ -1669,6 +1968,7 @@ static void simple_app_toggle_scan_selection(SimpleApp* app, ScanResult* result)
     if(!app || !result) return;
     result->selected = !result->selected;
     simple_app_update_selected_numbers(app, result);
+    simple_app_reset_result_scroll(app);
 }
 
 static void simple_app_adjust_result_offset(SimpleApp* app) {
@@ -1858,6 +2158,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_karma_probe_feed(app, ch);
         simple_app_karma_html_feed(app, ch);
         simple_app_led_feed(app, ch);
+        simple_app_vendor_feed(app, ch);
     }
 
     if(trimmed_any && !app->serial_follow_tail) {
@@ -3425,6 +3726,10 @@ static void simple_app_draw_results(SimpleApp* app, Canvas* canvas) {
     if(entry_line_capacity > RESULT_DEFAULT_MAX_LINES) {
         entry_line_capacity = RESULT_DEFAULT_MAX_LINES;
     }
+    size_t char_limit = (app->result_char_limit > 0) ? app->result_char_limit : RESULT_DEFAULT_CHAR_LIMIT;
+    if(char_limit == 0) char_limit = RESULT_DEFAULT_CHAR_LIMIT;
+    if(char_limit == 0) char_limit = 1;
+    if(char_limit > 63) char_limit = 63;
 
     for(size_t idx = app->scan_result_offset; idx < app->visible_result_count && lines_left > 0; idx++) {
         const ScanResult* result = simple_app_visible_result_const(app, idx);
@@ -3450,8 +3755,60 @@ static void simple_app_draw_results(SimpleApp* app, Canvas* canvas) {
                 } else {
                     canvas_draw_str(canvas, RESULT_PREFIX_X, y, " ");
                 }
+
+                char display_line[64];
+                memset(display_line, 0, sizeof(display_line));
+                const char* source_line = segments[0];
+                size_t source_len = strlen(source_line);
+                size_t local_limit = char_limit;
+                if(local_limit >= sizeof(display_line)) {
+                    local_limit = sizeof(display_line) - 1;
+                }
+                if(local_limit == 0) {
+                    local_limit = 1;
+                }
+
+                if(idx == app->scan_result_index) {
+                    if(source_len <= local_limit) {
+                        strncpy(display_line, source_line, sizeof(display_line) - 1);
+                        display_line[sizeof(display_line) - 1] = '\0';
+                    } else {
+                        size_t offset = app->result_scroll_offset;
+                        size_t max_offset = source_len - local_limit;
+                        if(offset > max_offset) {
+                            offset = max_offset;
+                        }
+                        size_t copy_len = local_limit;
+                        if(offset + copy_len > source_len) {
+                            copy_len = source_len - offset;
+                        }
+                        if(copy_len > sizeof(display_line) - 1) {
+                            copy_len = sizeof(display_line) - 1;
+                        }
+                        memcpy(display_line, source_line + offset, copy_len);
+                        display_line[copy_len] = '\0';
+                    }
+                } else {
+                    strncpy(display_line, source_line, sizeof(display_line) - 1);
+                    display_line[sizeof(display_line) - 1] = '\0';
+                    if(source_len > local_limit) {
+                        size_t truncate_limit = local_limit;
+                        if(truncate_limit >= sizeof(display_line)) {
+                            truncate_limit = sizeof(display_line) - 1;
+                        }
+                        if(truncate_limit == 0) {
+                            truncate_limit = 1;
+                        }
+                        simple_app_truncate_text(display_line, truncate_limit);
+                    }
+                }
+
+                const char* render_line = (display_line[0] != '\0') ? display_line : " ";
+                canvas_draw_str(canvas, RESULT_TEXT_X, y, render_line);
+            } else {
+                const char* render_line = (segments[segment][0] != '\0') ? segments[segment] : " ";
+                canvas_draw_str(canvas, RESULT_TEXT_X, y, render_line);
             }
-            canvas_draw_str(canvas, RESULT_TEXT_X, y, segments[segment]);
             y += app->result_line_height;
             lines_left--;
             if(lines_left == 0) break;
@@ -3538,7 +3895,7 @@ static void simple_app_draw_setup_led(SimpleApp* app, Canvas* canvas) {
 static void simple_app_draw_setup_scanner(SimpleApp* app, Canvas* canvas) {
     if(!app) return;
 
-    static const char* option_labels[] = {"SSID", "BSSID", "Channel", "Security", "Power", "Band"};
+    static const char* option_labels[] = {"SSID", "BSSID", "Channel", "Security", "Power", "Band", "Vendor"};
 
     canvas_set_color(canvas, ColorBlack);
     canvas_set_font(canvas, FontPrimary);
@@ -3586,6 +3943,9 @@ static void simple_app_draw_setup_scanner(SimpleApp* app, Canvas* canvas) {
                 break;
             case ScannerOptionShowBand:
                 enabled = app->scanner_show_band;
+                break;
+            case ScannerOptionShowVendor:
+                enabled = app->scanner_show_vendor;
                 break;
             default:
                 break;
@@ -3816,6 +4176,7 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             }
             if(app->section_index == MENU_SECTION_SETUP) {
                 simple_app_request_led_status(app);
+                simple_app_request_vendor_status(app);
             }
             view_port_update(app->viewport);
             return;
@@ -3867,6 +4228,7 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             app->scanner_setup_index = 0;
             app->scanner_adjusting_power = false;
             app->scanner_view_offset = 0;
+            simple_app_request_vendor_status(app);
         } else if(entry->action == MenuActionOpenPackageMonitor) {
             simple_app_package_monitor_enter(app);
             return;
@@ -5354,6 +5716,26 @@ static void simple_app_handle_setup_scanner_input(SimpleApp* app, InputKey key) 
             app->scanner_adjusting_power = !app->scanner_adjusting_power;
             view_port_update(app->viewport);
         } else {
+            if(app->scanner_setup_index == ScannerOptionShowVendor) {
+                if(app->scanner_show_vendor && simple_app_enabled_field_count(app) <= 1) {
+                    if(app->viewport) {
+                        view_port_update(app->viewport);
+                    }
+                } else {
+                    bool new_state = !app->scanner_show_vendor;
+                    app->scanner_show_vendor = new_state;
+                    app->vendor_scan_enabled = new_state;
+                    simple_app_mark_config_dirty(app);
+                    simple_app_update_result_layout(app);
+                    simple_app_rebuild_visible_results(app);
+                    simple_app_adjust_result_offset(app);
+                    simple_app_send_vendor_command(app, new_state);
+                    if(app->viewport) {
+                        view_port_update(app->viewport);
+                    }
+                }
+                return;
+            }
             bool* flag =
                 simple_app_scanner_option_flag(app, (ScannerOption)app->scanner_setup_index);
             if(flag) {
@@ -5535,12 +5917,14 @@ static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
     if(key == InputKeyUp) {
         if(app->scan_result_index > 0) {
             app->scan_result_index--;
+            simple_app_reset_result_scroll(app);
             simple_app_adjust_result_offset(app);
             view_port_update(app->viewport);
         }
     } else if(key == InputKeyDown) {
         if(app->scan_result_index + 1 < app->visible_result_count) {
             app->scan_result_index++;
+            simple_app_reset_result_scroll(app);
             simple_app_adjust_result_offset(app);
             view_port_update(app->viewport);
         }
@@ -5722,6 +6106,11 @@ int32_t Lab_C5_app(void* p) {
     app->scanner_show_security = true;
     app->scanner_show_power = true;
     app->scanner_show_band = true;
+    app->scanner_show_vendor = false;
+    app->vendor_scan_enabled = false;
+    app->vendor_read_pending = false;
+    app->vendor_read_length = 0;
+    app->vendor_read_buffer[0] = '\0';
     app->scanner_min_power = SCAN_POWER_MIN_DBM;
     app->scanner_setup_index = 0;
     app->scanner_adjusting_power = false;
@@ -5741,6 +6130,7 @@ int32_t Lab_C5_app(void* p) {
     simple_app_apply_otg_power(app);
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
     simple_app_load_config(app);
+    app->vendor_scan_enabled = app->scanner_show_vendor;
     simple_app_update_backlight_label(app);
     simple_app_update_led_label(app);
     simple_app_apply_backlight(app);
@@ -5783,6 +6173,7 @@ int32_t Lab_C5_app(void* p) {
 
     furi_hal_serial_async_rx_start(app->serial, simple_app_serial_irq, app, false);
     simple_app_request_led_status(app);
+    simple_app_request_vendor_status(app);
 
     app->gui = furi_record_open(RECORD_GUI);
     app->viewport = view_port_alloc();
@@ -5793,6 +6184,7 @@ int32_t Lab_C5_app(void* p) {
     while(!app->exit_app) {
         simple_app_process_stream(app);
         simple_app_update_karma_sniffer(app);
+        simple_app_update_result_scroll(app);
 
         if(app->portal_input_requested && !app->portal_input_active) {
             app->portal_input_requested = false;

@@ -263,6 +263,22 @@ start_karma 2
 
 This will start 'McDonalds' network which opens your captive portal.
 
+# Vendor Lookup
+
+CLI and Flipper screens can enrich scan results with manufacturer names decoded from each BSSID OUI.
+
+- Download the latest `oui.txt` from [IEEE](https://standards-oui.ieee.org/oui/oui.txt) and place it in the repo root.
+- Generate the compact lookup table:
+  ```bash
+  python ESP32C5/tools/build_oui_binary.py --input oui.txt --output ESP32C5/binaries-esp32c5/oui_wifi.bin
+  ```
+- Copy `ESP32C5/binaries-esp32c5/oui_wifi.bin` to the SD card at `/lab/oui_wifi.bin`.
+- Toggle decoding with the CLI:
+  - `vendor set on` – enable lookups (the board streams the SD file on demand).
+  - `vendor set off` – disable lookups to speed up large scans.
+  - `vendor read` – show current state and whether the SD file was detected.
+- In the Flipper app, go to **Setup → Scanner Filters → Vendor**; enabling this option sends the same CLI command and shows vendors under Targets.
+
 # Flipper application screens and user journey
 Run the app:
 
