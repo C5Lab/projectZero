@@ -477,6 +477,10 @@ static const char hint_sniffer_results[] =
     "Display sniffer list\nAccess points sorted\nBy client activity\nUse to inspect who\nWas seen on air.";
 static const char hint_sniffer_probes[] =
     "View probe requests\nSee devices searching\nFor nearby SSIDs\nGreat for finding\nHidden networks.";
+static const char hint_sniffer_airtag_monitor[] =
+    "Track AirTags live\nSniffs rotating IDs\nShows signal levels\nStop with Back/Stop\nLab use only.";
+static const char hint_sniffer_airtag_results[] =
+    "List detected tags\nSee last seen time\nRSSI helps locate\nStart monitor first\nStay privacy aware.";
 static const char hint_sniffer_debug[] =
     "Enable verbose logs\nPrints frame details\nDecision reasoning\nHelpful diagnostics\nBut very noisy.";
 
@@ -512,6 +516,8 @@ static const MenuEntry menu_entries_sniffers[] = {
     {"Start Sniffer", "start_sniffer", MenuActionCommand, hint_sniffer_start},
     {"Show Sniffer Results", "show_sniffer_results", MenuActionCommand, hint_sniffer_results},
     {"Show Probes", "show_probes", MenuActionCommand, hint_sniffer_probes},
+    {"Start AirTag Monitor", "start_airtag_monitor", MenuActionCommand, hint_sniffer_airtag_monitor},
+    {"Show AirTags", "show_airtags", MenuActionCommand, hint_sniffer_airtag_results},
     {"Sniffer Debug", "sniffer_debug 1", MenuActionCommand, hint_sniffer_debug},
 };
 

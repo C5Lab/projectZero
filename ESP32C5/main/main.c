@@ -8,6 +8,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "sdkconfig.h"
+
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
 
@@ -47,6 +49,9 @@
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
 #include "esp_timer.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_gap_ble_api.h"
 
 #include "esp_http_server.h"
 #include "esp_netif.h"
@@ -91,6 +96,8 @@
 #define MAX_PROBE_REQUESTS 200
 
 static const char *TAG = "projectZero";
+
+#define AIRTAG_MONITOR_TASK_STACK 6144
 
 // Probe request data structure
 typedef struct {
@@ -198,6 +205,79 @@ static volatile bool sniffer_dog_active = false;
 static int sniffer_dog_current_channel = 1;
 static int sniffer_dog_channel_index = 0;
 static int64_t sniffer_dog_last_channel_hop = 0;
+
+// Wi-Fi runtime state
+static bool wifi_netif_initialized = false;
+static bool wifi_event_loop_created = false;
+static bool wifi_driver_initialized = false;
+static bool wifi_event_handler_registered = false;
+static bool wifi_running = false;
+static bool wifi_mac_logged = false;
+static esp_netif_t *wifi_ap_netif_handle = NULL;
+static esp_netif_t *wifi_sta_netif_handle = NULL;
+static esp_event_handler_instance_t wifi_event_handler_instance = NULL;
+
+// AirTag monitor state
+#define MAX_AIRTAG_DEVICES 64
+#define AIRTAG_LOG_INTERVAL_US   (10LL * 1000000LL)
+#define AIRTAG_STALE_TIMEOUT_US  (60LL * 1000000LL)
+
+typedef struct {
+    bool in_use;
+    esp_bd_addr_t addr;
+    int rssi;
+    int64_t last_seen_us;
+    int64_t last_report_us;
+    uint8_t payload_len;
+    uint8_t payload[ESP_BLE_ADV_DATA_LEN_MAX];
+} airtag_entry_t;
+
+static airtag_entry_t airtag_devices[MAX_AIRTAG_DEVICES];
+static size_t airtag_device_count = 0;
+static portMUX_TYPE airtag_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool airtag_monitor_active = false;
+static volatile bool airtag_scanning_active = false;
+static bool airtag_bt_mem_released = false;
+static bool airtag_bt_controller_initialized = false;
+static bool airtag_bt_controller_enabled = false;
+static bool airtag_bluedroid_initialized = false;
+static bool airtag_bluedroid_enabled = false;
+static bool airtag_gap_registered = false;
+static bool airtag_scan_restart_pending = false;
+static TaskHandle_t airtag_monitor_task_handle = NULL;
+static bool airtag_wifi_was_running = false;
+static bool airtag_wifi_driver_was_initialized = false;
+static airtag_entry_t airtag_summary_snapshot[MAX_AIRTAG_DEVICES];
+
+#ifdef CONFIG_BT_BLE_42_FEATURES_SUPPORTED
+static esp_ble_scan_params_t airtag_scan_params = {
+    .scan_type = BLE_SCAN_TYPE_PASSIVE,
+    .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+    .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
+    .scan_interval = 0x60,
+    .scan_window = 0x30,
+    .scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE
+};
+#endif
+
+#if defined(CONFIG_BT_BLE_50_FEATURES_SUPPORTED) && !defined(CONFIG_BT_BLE_42_FEATURES_SUPPORTED)
+static esp_ble_ext_scan_params_t airtag_ext_scan_params = {
+    .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+    .filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
+    .scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE,
+    .cfg_mask = ESP_BLE_GAP_EXT_SCAN_CFG_UNCODE_MASK,
+    .uncoded_cfg = {
+        .scan_type = BLE_SCAN_TYPE_PASSIVE,
+        .scan_interval = 0x60,
+        .scan_window = 0x30,
+    },
+    .coded_cfg = {
+        .scan_type = BLE_SCAN_TYPE_PASSIVE,
+        .scan_interval = 0x90,
+        .scan_window = 0x30,
+    },
+};
+#endif
 
 // Wardrive task
 static TaskHandle_t wardrive_task_handle = NULL;
@@ -476,6 +556,8 @@ static char sd_html_files[MAX_HTML_FILES][MAX_HTML_FILENAME];
 static int sd_html_count = 0;
 static char* custom_portal_html = NULL;
 static bool sd_card_mounted = false;
+static bool sd_card_init_failure_logged = false;
+static bool sd_spi_init_failure_logged = false;
 
 // Whitelist for BSSID protection
 #define MAX_WHITELISTED_BSSIDS 150
@@ -514,6 +596,9 @@ static int cmd_show_sniffer_results(int argc, char **argv);
 static int cmd_show_probes(int argc, char **argv);
 static int cmd_list_probes(int argc, char **argv);
 static int cmd_sniffer_debug(int argc, char **argv);
+static int cmd_start_airtag_monitor(int argc, char **argv);
+static int cmd_stop_airtag_monitor(int argc, char **argv);
+static int cmd_show_airtags(int argc, char **argv);
 static int cmd_start_blackout(int argc, char **argv);
 static int cmd_start_portal(int argc, char **argv);
 static int cmd_start_karma(int argc, char **argv);
@@ -565,10 +650,29 @@ static bool is_multicast_mac(const uint8_t *mac);
 static bool is_broadcast_bssid(const uint8_t *bssid);
 static bool is_own_device_mac(const uint8_t *mac);
 static void add_client_to_ap(int ap_index, const uint8_t *client_mac, int rssi);
+// AirTag monitor helpers
+static esp_err_t airtag_ensure_bluetooth_ready(void);
+static esp_err_t airtag_monitor_start(void);
+static void airtag_monitor_stop(void);
+static void airtag_monitor_task(void *pvParameters);
+static void airtag_log_summary(void);
+static void airtag_format_addr(const esp_bd_addr_t addr, char *buf, size_t len);
+static bool airtag_payload_matches(const uint8_t *data, size_t len);
+static void airtag_handle_scan_result(const esp_ble_gap_cb_param_t *param);
+static void airtag_cleanup_stale_entries(int64_t now_us);
+static int airtag_entry_compare(const void *lhs, const void *rhs);
+static esp_err_t airtag_gap_configure_scan_params(void);
+static esp_err_t airtag_gap_start(void);
+static esp_err_t airtag_gap_stop(void);
+static void airtag_gap_callback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
+static esp_err_t wifi_pause_for_airtag(void);
+static void wifi_resume_after_airtag(void);
+static void airtag_shutdown_bluetooth(void);
 // Wardrive functions
 static esp_err_t init_gps_uart(void);
 static esp_err_t init_sd_card(void);
 static esp_err_t create_sd_directories(void);
+static void sdcard_init_task(void *pvParameters);
 static bool parse_gps_nmea(const char* nmea_sentence);
 static void get_timestamp_string(char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
@@ -1015,49 +1119,94 @@ static void verify_password(const char* password) {
 
 // --- Wi-Fi initialization (STA, no connection yet) ---
 static esp_err_t wifi_init_ap_sta(void) {
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_err_t err;
 
-    esp_netif_create_default_wifi_ap();
-    esp_netif_create_default_wifi_sta();
-    
+    if (wifi_running) {
+        return ESP_OK;
+    }
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    if (!wifi_netif_initialized) {
+        err = esp_netif_init();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            return err;
+        }
+        wifi_netif_initialized = true;
+    }
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
+    if (!wifi_event_loop_created) {
+        err = esp_event_loop_create_default();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            return err;
+        }
+        wifi_event_loop_created = true;
+    }
+
+    if (wifi_ap_netif_handle == NULL) {
+        wifi_ap_netif_handle = esp_netif_create_default_wifi_ap();
+        if (wifi_ap_netif_handle == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (wifi_sta_netif_handle == NULL) {
+        wifi_sta_netif_handle = esp_netif_create_default_wifi_sta();
+        if (wifi_sta_netif_handle == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (!wifi_driver_initialized) {
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        err = esp_wifi_init(&cfg);
+        if (err != ESP_OK) {
+            return err;
+        }
+        wifi_driver_initialized = true;
+    }
+
+    if (!wifi_event_handler_registered) {
+        err = esp_event_handler_instance_register(WIFI_EVENT,
+                                                  ESP_EVENT_ANY_ID,
+                                                  &wifi_event_handler,
+                                                  NULL,
+                                                  &wifi_event_handler_instance);
+        if (err != ESP_OK) {
+            return err;
+        }
+        wifi_event_handler_registered = true;
+    }
 
     wifi_config_t wifi_config = { 0 };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        return err;
+    }
 
-    wifi_config_t mgmt_wifi_config = {
-            .ap = {
-                .ssid = "",
-                .ssid_len = 0,
-                .ssid_hidden = 1,
-                .password = "nevermind",
-                .max_connection = 0,
-                .authmode = WIFI_AUTH_WPA2_PSK
-            },
-        };
+    err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK) {
+        return err;
+    }
 
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &mgmt_wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    err = esp_wifi_start();
+    if (err == ESP_ERR_WIFI_NOT_STOPPED) {
+        err = ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    wifi_running = true;
 
-    uint8_t mac[6];
-    esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
-
-    if (ret == ESP_OK) {
-        MY_LOG_INFO(TAG,"JanOS version: " JANOS_VERSION);
-        MY_LOG_INFO("MAC", "MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    } else {
-        ESP_LOGE("MAC", "Failed to get MAC address");
+    if (!wifi_mac_logged) {
+        uint8_t mac[6];
+        esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
+        if (ret == ESP_OK) {
+            MY_LOG_INFO(TAG,"JanOS version: " JANOS_VERSION);
+            MY_LOG_INFO("MAC", "MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            wifi_mac_logged = true;
+        } else {
+            ESP_LOGE("MAC", "Failed to get MAC address");
+        }
     }
 
     return ESP_OK;
@@ -1074,6 +1223,12 @@ static esp_err_t start_background_scan(void) {
     if (g_scan_in_progress) {
         MY_LOG_INFO(TAG, "Scan already in progress");
         return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t wifi_err = wifi_init_ap_sta();
+    if (wifi_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to ensure Wi-Fi before scan: %s", esp_err_to_name(wifi_err));
+        return wifi_err;
     }
     
     wifi_scan_config_t scan_cfg = {
@@ -2404,7 +2559,11 @@ static int cmd_stop(int argc, char **argv) {
         
         MY_LOG_INFO(TAG, "Sniffer Dog stopped.");
     }
-    
+
+    if (airtag_monitor_active || airtag_scanning_active) {
+        airtag_monitor_stop();
+    }
+
     // Stop wardrive task if running
     if (wardrive_active || wardrive_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Stopping wardrive task...");
@@ -2470,7 +2629,14 @@ static int cmd_stop(int argc, char **argv) {
         }
         
         // Stop AP mode
-        esp_wifi_stop();
+        if (wifi_running) {
+            esp_err_t stop_err = esp_wifi_stop();
+            if (stop_err != ESP_OK && stop_err != ESP_ERR_WIFI_NOT_INIT && stop_err != ESP_ERR_WIFI_NOT_STARTED && stop_err != ESP_ERR_WIFI_STOP_STATE) {
+                ESP_LOGW(TAG, "Failed to stop Wi-Fi during portal shutdown: %s", esp_err_to_name(stop_err));
+            } else {
+                wifi_running = false;
+            }
+        }
         MY_LOG_INFO(TAG, "Portal stopped.");
         
         // Clean up portal SSID
@@ -2487,6 +2653,9 @@ static int cmd_stop(int argc, char **argv) {
     }
     
     MY_LOG_INFO(TAG, "All operations stopped.");
+
+    (void)wifi_init_ap_sta();
+
     return 0;
 }
 
@@ -2564,6 +2733,644 @@ static void packet_monitor_task(void *pvParameters) {
     packet_monitor_total = 0;
     packet_monitor_active = false;
     vTaskDelete(NULL);
+}
+
+// --- AirTag monitor implementation ---
+static void airtag_format_addr(const esp_bd_addr_t addr, char *buf, size_t len)
+{
+    if (len == 0) {
+        return;
+    }
+    if (len < 18) {
+        buf[0] = '\0';
+        return;
+    }
+    snprintf(buf, len, "%02X:%02X:%02X:%02X:%02X:%02X",
+             addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+}
+
+static bool airtag_payload_matches(const uint8_t *data, size_t len)
+{
+    if (data == NULL || len < 4) {
+        return false;
+    }
+
+    for (size_t i = 0; i + 3 < len; ++i) {
+        if (data[i] == 0x1E && data[i + 1] == 0xFF && data[i + 2] == 0x4C && data[i + 3] == 0x00) {
+            return true;
+        }
+
+        if (data[i] == 0x4C && data[i + 1] == 0x00 && data[i + 2] == 0x12) {
+            uint8_t subtype = data[i + 3];
+            if (subtype == 0x19 || subtype == 0x1A || subtype == 0x1B) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static int airtag_entry_compare(const void *lhs, const void *rhs)
+{
+    const airtag_entry_t *a = (const airtag_entry_t *)lhs;
+    const airtag_entry_t *b = (const airtag_entry_t *)rhs;
+
+    if (a->rssi == b->rssi) {
+        if (a->last_seen_us == b->last_seen_us) {
+            return 0;
+        }
+        return (a->last_seen_us > b->last_seen_us) ? -1 : 1;
+    }
+
+    return (b->rssi - a->rssi);
+}
+
+static void airtag_handle_scan_result(const esp_ble_gap_cb_param_t *param)
+{
+    const uint8_t *adv = param->scan_rst.ble_adv;
+    uint8_t adv_len = param->scan_rst.adv_data_len;
+    const uint8_t *scan_rsp = adv + adv_len;
+    uint8_t scan_rsp_len = param->scan_rst.scan_rsp_len;
+
+    bool match = airtag_payload_matches(adv, adv_len);
+    if (!match && scan_rsp_len > 0) {
+        match = airtag_payload_matches(scan_rsp, scan_rsp_len);
+    }
+
+    if (!match || !airtag_monitor_active) {
+        return;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    bool is_new = false;
+    float report_delay_s = 0.0f;
+    airtag_entry_t snapshot = {0};
+    bool snapshot_valid = false;
+
+    portENTER_CRITICAL(&airtag_lock);
+    int existing_index = -1;
+    for (size_t i = 0; i < MAX_AIRTAG_DEVICES; ++i) {
+        if (airtag_devices[i].in_use &&
+            memcmp(airtag_devices[i].addr, param->scan_rst.bda, ESP_BD_ADDR_LEN) == 0) {
+            existing_index = (int)i;
+            break;
+        }
+    }
+
+    if (existing_index >= 0) {
+        airtag_entry_t *entry = &airtag_devices[existing_index];
+        int64_t since_report_us = now_us - entry->last_report_us;
+        size_t total_len = (size_t)param->scan_rst.adv_data_len + (size_t)param->scan_rst.scan_rsp_len;
+        if (total_len > sizeof(entry->payload)) {
+            total_len = sizeof(entry->payload);
+        }
+
+        if (total_len > 0) {
+            size_t adv_copy = param->scan_rst.adv_data_len;
+            if (adv_copy > total_len) {
+                adv_copy = total_len;
+            }
+            memcpy(entry->payload, adv, adv_copy);
+            if (total_len > adv_copy) {
+                size_t remain = total_len - adv_copy;
+                memcpy(entry->payload + adv_copy, scan_rsp, remain);
+            }
+        }
+        entry->payload_len = (uint8_t)total_len;
+        entry->rssi = param->scan_rst.rssi;
+        entry->last_seen_us = now_us;
+
+        if (since_report_us >= AIRTAG_LOG_INTERVAL_US) {
+            entry->last_report_us = now_us;
+            report_delay_s = (float)since_report_us / 1000000.0f;
+            snapshot = *entry;
+            snapshot_valid = true;
+        }
+    } else {
+        for (size_t i = 0; i < MAX_AIRTAG_DEVICES; ++i) {
+            if (!airtag_devices[i].in_use) {
+                airtag_entry_t *entry = &airtag_devices[i];
+                memset(entry, 0, sizeof(*entry));
+                entry->in_use = true;
+                memcpy(entry->addr, param->scan_rst.bda, ESP_BD_ADDR_LEN);
+                entry->rssi = param->scan_rst.rssi;
+                entry->last_seen_us = now_us;
+                entry->last_report_us = now_us;
+
+                size_t total_len = (size_t)param->scan_rst.adv_data_len + (size_t)param->scan_rst.scan_rsp_len;
+                if (total_len > sizeof(entry->payload)) {
+                    total_len = sizeof(entry->payload);
+                }
+                if (total_len > 0) {
+                    size_t adv_copy = param->scan_rst.adv_data_len;
+                    if (adv_copy > total_len) {
+                        adv_copy = total_len;
+                    }
+                    memcpy(entry->payload, adv, adv_copy);
+                    if (total_len > adv_copy) {
+                        size_t remain = total_len - adv_copy;
+                        memcpy(entry->payload + adv_copy, scan_rsp, remain);
+                    }
+                }
+                entry->payload_len = (uint8_t)total_len;
+                airtag_device_count++;
+                is_new = true;
+                snapshot = *entry;
+                snapshot_valid = true;
+                break;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&airtag_lock);
+
+    if (!snapshot_valid) {
+        return;
+    }
+
+    char addr_str[18];
+    airtag_format_addr(snapshot.addr, addr_str, sizeof(addr_str));
+
+    if (is_new) {
+        MY_LOG_INFO(TAG, "AirTag discovered: %s RSSI=%d dBm", addr_str, snapshot.rssi);
+    } else {
+        MY_LOG_INFO(TAG, "AirTag update: %s RSSI=%d dBm (%.1fs since last report)", addr_str, snapshot.rssi, report_delay_s);
+    }
+}
+
+static void airtag_cleanup_stale_entries(int64_t now_us)
+{
+    uint8_t removed[MAX_AIRTAG_DEVICES][ESP_BD_ADDR_LEN];
+    size_t removed_count = 0;
+
+    portENTER_CRITICAL(&airtag_lock);
+    for (size_t i = 0; i < MAX_AIRTAG_DEVICES; ++i) {
+        airtag_entry_t *entry = &airtag_devices[i];
+        if (entry->in_use && (now_us - entry->last_seen_us) > AIRTAG_STALE_TIMEOUT_US) {
+            memcpy(removed[removed_count], entry->addr, ESP_BD_ADDR_LEN);
+            removed_count++;
+            memset(entry, 0, sizeof(*entry));
+            if (airtag_device_count > 0) {
+                airtag_device_count--;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&airtag_lock);
+
+    for (size_t i = 0; i < removed_count; ++i) {
+        char addr_str[18];
+        airtag_format_addr(removed[i], addr_str, sizeof(addr_str));
+        MY_LOG_INFO(TAG, "AirTag timed out: %s removed from cache", addr_str);
+    }
+}
+
+static esp_err_t airtag_gap_configure_scan_params(void)
+{
+#if defined(CONFIG_BT_BLE_42_FEATURES_SUPPORTED)
+    return esp_ble_gap_set_scan_params(&airtag_scan_params);
+#elif defined(CONFIG_BT_BLE_50_FEATURES_SUPPORTED)
+    return esp_ble_gap_set_ext_scan_params(&airtag_ext_scan_params);
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+static esp_err_t airtag_gap_start(void)
+{
+#if defined(CONFIG_BT_BLE_42_FEATURES_SUPPORTED)
+    return esp_ble_gap_start_scanning(0);
+#elif defined(CONFIG_BT_BLE_50_FEATURES_SUPPORTED)
+    return esp_ble_gap_start_ext_scan(0, 0);
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+static esp_err_t airtag_gap_stop(void)
+{
+#if defined(CONFIG_BT_BLE_42_FEATURES_SUPPORTED)
+    return esp_ble_gap_stop_scanning();
+#elif defined(CONFIG_BT_BLE_50_FEATURES_SUPPORTED)
+    return esp_ble_gap_stop_ext_scan();
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+static esp_err_t wifi_pause_for_airtag(void)
+{
+    airtag_wifi_was_running = wifi_running;
+    airtag_wifi_driver_was_initialized = wifi_driver_initialized;
+    esp_err_t err = ESP_OK;
+
+    if (wifi_running) {
+        err = esp_wifi_stop();
+        if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT && err != ESP_ERR_WIFI_NOT_STARTED && err != ESP_ERR_WIFI_STOP_STATE) {
+            ESP_LOGW(TAG, "Failed to stop Wi-Fi before AirTag monitor: %s", esp_err_to_name(err));
+            return err;
+        }
+        wifi_running = false;
+    }
+
+    if (wifi_event_handler_registered && wifi_event_handler_instance != NULL) {
+        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler_instance);
+        wifi_event_handler_instance = NULL;
+        wifi_event_handler_registered = false;
+    }
+
+    if (wifi_driver_initialized) {
+        err = esp_wifi_deinit();
+        if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT) {
+            ESP_LOGW(TAG, "Failed to deinit Wi-Fi before AirTag monitor: %s", esp_err_to_name(err));
+            return err;
+        }
+        wifi_driver_initialized = false;
+    }
+
+    return ESP_OK;
+}
+
+static void wifi_resume_after_airtag(void)
+{
+    bool need_resume = airtag_wifi_was_running || airtag_wifi_driver_was_initialized;
+
+    airtag_wifi_was_running = false;
+    airtag_wifi_driver_was_initialized = false;
+
+    if (!need_resume) {
+        return;
+    }
+
+    if (wifi_running) {
+        return;
+    }
+
+    esp_err_t err = wifi_init_ap_sta();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to resume Wi-Fi after AirTag monitor: %s", esp_err_to_name(err));
+        return;
+    }
+
+    MY_LOG_INFO(TAG, "Wi-Fi resumed after AirTag monitor");
+}
+
+static void airtag_shutdown_bluetooth(void)
+{
+    esp_err_t err;
+
+    if (airtag_bluedroid_enabled) {
+        err = esp_bluedroid_disable();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to disable Bluedroid: %s", esp_err_to_name(err));
+        } else {
+            airtag_bluedroid_enabled = false;
+        }
+    }
+
+    if (airtag_bluedroid_initialized) {
+        err = esp_bluedroid_deinit();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to deinit Bluedroid: %s", esp_err_to_name(err));
+        } else {
+            airtag_bluedroid_initialized = false;
+        }
+    }
+
+    if (airtag_bt_controller_enabled) {
+        err = esp_bt_controller_disable();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to disable BT controller: %s", esp_err_to_name(err));
+        } else {
+            airtag_bt_controller_enabled = false;
+        }
+    }
+
+    if (airtag_bt_controller_initialized) {
+        err = esp_bt_controller_deinit();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to deinit BT controller: %s", esp_err_to_name(err));
+        } else {
+            airtag_bt_controller_initialized = false;
+        }
+    }
+}
+
+static void airtag_log_summary(void)
+{
+    size_t count = 0;
+
+    portENTER_CRITICAL(&airtag_lock);
+    for (size_t i = 0; i < MAX_AIRTAG_DEVICES; ++i) {
+        if (airtag_devices[i].in_use) {
+            airtag_summary_snapshot[count++] = airtag_devices[i];
+        }
+    }
+    portEXIT_CRITICAL(&airtag_lock);
+
+    if (count == 0) {
+        MY_LOG_INFO(TAG, "AirTag summary: no devices detected.");
+        return;
+    }
+
+    qsort(airtag_summary_snapshot, count, sizeof(airtag_summary_snapshot[0]), airtag_entry_compare);
+
+    int64_t now_us = esp_timer_get_time();
+    MY_LOG_INFO(TAG, "AirTag summary (%u device%s):", (unsigned)count, (count == 1) ? "" : "s");
+
+    for (size_t i = 0; i < count; ++i) {
+        char addr_str[18];
+        airtag_format_addr(airtag_summary_snapshot[i].addr, addr_str, sizeof(addr_str));
+        float age_s = (float)(now_us - airtag_summary_snapshot[i].last_seen_us) / 1000000.0f;
+        MY_LOG_INFO(TAG, "  %s  RSSI=%d dBm  last seen %.1fs ago", addr_str, airtag_summary_snapshot[i].rssi, age_s);
+    }
+}
+
+static void airtag_monitor_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    int64_t last_summary_us = esp_timer_get_time();
+
+    while (airtag_monitor_active) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        if (!airtag_monitor_active) {
+            break;
+        }
+
+        int64_t now_us = esp_timer_get_time();
+        airtag_cleanup_stale_entries(now_us);
+
+        if (airtag_monitor_active && (now_us - last_summary_us) >= AIRTAG_LOG_INTERVAL_US) {
+            airtag_log_summary();
+            last_summary_us = now_us;
+        }
+    }
+
+    airtag_monitor_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void airtag_monitor_stop(void)
+{
+    bool was_active = airtag_monitor_active || airtag_scanning_active;
+    airtag_monitor_active = false;
+
+    if (airtag_scanning_active || airtag_scan_restart_pending) {
+        esp_err_t err = airtag_gap_stop();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Failed to stop AirTag scan: %s", esp_err_to_name(err));
+        }
+    }
+
+    airtag_scanning_active = false;
+    airtag_scan_restart_pending = false;
+
+    if (airtag_monitor_task_handle != NULL) {
+        for (int i = 0; i < 40 && airtag_monitor_task_handle != NULL; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+        if (airtag_monitor_task_handle != NULL) {
+            vTaskDelete(airtag_monitor_task_handle);
+            airtag_monitor_task_handle = NULL;
+        }
+    }
+
+    if (was_active) {
+        MY_LOG_INFO(TAG, "AirTag monitor stopped.");
+    }
+
+    airtag_shutdown_bluetooth();
+    wifi_resume_after_airtag();
+}
+
+static esp_err_t airtag_ensure_bluetooth_ready(void)
+{
+    esp_err_t err;
+
+    if (!airtag_bt_mem_released) {
+        err = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE && err != ESP_ERR_NOT_SUPPORTED) {
+            return err;
+        }
+        airtag_bt_mem_released = true;
+    }
+
+    if (!airtag_bt_controller_initialized) {
+        esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+        err = esp_bt_controller_init(&bt_cfg);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            return err;
+        }
+        airtag_bt_controller_initialized = true;
+    }
+
+    if (!airtag_bt_controller_enabled) {
+        err = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            return err;
+        }
+        airtag_bt_controller_enabled = true;
+    }
+
+    if (!airtag_bluedroid_initialized) {
+        err = esp_bluedroid_init();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            return err;
+        }
+        airtag_bluedroid_initialized = true;
+    }
+
+    if (!airtag_bluedroid_enabled) {
+        err = esp_bluedroid_enable();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            return err;
+        }
+        airtag_bluedroid_enabled = true;
+    }
+
+    if (!airtag_gap_registered) {
+        err = esp_ble_gap_register_callback(airtag_gap_callback);
+        if (err != ESP_OK) {
+            return err;
+        }
+        airtag_gap_registered = true;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t airtag_monitor_start(void)
+{
+    esp_err_t err = wifi_pause_for_airtag();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = airtag_ensure_bluetooth_ready();
+    if (err != ESP_OK) {
+        if (err == ESP_ERR_NO_MEM) {
+            MY_LOG_INFO(TAG, "Not enough memory to start AirTag monitor (esp_bt_controller_init).");
+        }
+        goto cleanup_bt_wifi;
+    }
+
+    portENTER_CRITICAL(&airtag_lock);
+    for (size_t i = 0; i < MAX_AIRTAG_DEVICES; ++i) {
+        airtag_devices[i].in_use = false;
+        airtag_devices[i].payload_len = 0;
+    }
+    airtag_device_count = 0;
+    portEXIT_CRITICAL(&airtag_lock);
+
+    airtag_monitor_active = true;
+    airtag_scan_restart_pending = true;
+
+    err = airtag_gap_configure_scan_params();
+    if (err == ESP_OK) {
+        // Scan start will be triggered once params are applied
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        airtag_scan_restart_pending = false;
+        err = airtag_gap_start();
+        if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+            airtag_scanning_active = true;
+            err = ESP_OK;
+        } else {
+            airtag_monitor_active = false;
+            goto cleanup_bt_wifi;
+        }
+    } else if (err == ESP_ERR_NOT_SUPPORTED) {
+        MY_LOG_INFO(TAG, "AirTag monitor not supported: BLE scan API unavailable on this build.");
+        airtag_monitor_active = false;
+        goto cleanup_bt_wifi;
+    } else {
+        airtag_monitor_active = false;
+        goto cleanup_bt_wifi;
+    }
+
+    if (airtag_monitor_task_handle == NULL) {
+        if (xTaskCreate(airtag_monitor_task, "airtag_monitor", AIRTAG_MONITOR_TASK_STACK, NULL, 5, &airtag_monitor_task_handle) != pdPASS) {
+            airtag_monitor_stop();
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    return ESP_OK;
+
+cleanup_bt_wifi:
+    airtag_shutdown_bluetooth();
+    wifi_resume_after_airtag();
+    return err;
+}
+
+static int cmd_start_airtag_monitor(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    if (airtag_monitor_active) {
+        MY_LOG_INFO(TAG, "AirTag monitor already active. Use 'stop_airtag_monitor' or 'stop' to stop it first.");
+        return 0;
+    }
+
+    esp_err_t err = airtag_monitor_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start AirTag monitor: %s", esp_err_to_name(err));
+        airtag_monitor_stop();
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "AirTag monitor starting (BLE scan running). Use 'show_airtags' for a summary.");
+    return 0;
+}
+
+static int cmd_stop_airtag_monitor(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    if (!airtag_monitor_active && !airtag_scanning_active) {
+        MY_LOG_INFO(TAG, "AirTag monitor is not running.");
+        return 0;
+    }
+
+    airtag_monitor_stop();
+    return 0;
+}
+
+static int cmd_show_airtags(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    airtag_log_summary();
+    return 0;
+}
+
+static void airtag_gap_callback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
+{
+    switch (event) {
+        case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
+            if (param->scan_param_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+                ESP_LOGW(TAG, "Failed to set AirTag scan params: 0x%02x", param->scan_param_cmpl.status);
+                airtag_monitor_stop();
+                break;
+            }
+            if (airtag_monitor_active) {
+                esp_err_t err = airtag_gap_start();
+                if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+                    ESP_LOGW(TAG, "Failed to start AirTag scan: %s", esp_err_to_name(err));
+                } else {
+                    airtag_scanning_active = true;
+                }
+            }
+            break;
+        case ESP_GAP_BLE_SCAN_START_COMPLETE_EVT:
+            if (param->scan_start_cmpl.status == ESP_BT_STATUS_SUCCESS) {
+                airtag_scanning_active = true;
+                airtag_scan_restart_pending = false;
+                if (airtag_monitor_active) {
+                    MY_LOG_INFO(TAG, "AirTag monitor scanning started.");
+                }
+            } else {
+                ESP_LOGW(TAG, "AirTag scan start failed: 0x%02x", param->scan_start_cmpl.status);
+            }
+            break;
+        case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
+            airtag_scanning_active = false;
+            airtag_scan_restart_pending = false;
+            break;
+        case ESP_GAP_BLE_SCAN_RESULT_EVT:
+            if (!airtag_monitor_active) {
+                break;
+            }
+            switch (param->scan_rst.search_evt) {
+                case ESP_GAP_SEARCH_INQ_RES_EVT:
+                case ESP_GAP_SEARCH_DISC_RES_EVT:
+                case ESP_GAP_SEARCH_DISC_BLE_RES_EVT:
+                    airtag_handle_scan_result(param);
+                    break;
+                case ESP_GAP_SEARCH_INQ_CMPL_EVT:
+                case ESP_GAP_SEARCH_DISC_CMPL_EVT:
+                case ESP_GAP_SEARCH_DI_DISC_CMPL_EVT:
+                case ESP_GAP_SEARCH_SEARCH_CANCEL_CMPL_EVT:
+                    if (airtag_monitor_active) {
+                        esp_err_t err = airtag_gap_start();
+                        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+                            ESP_LOGW(TAG, "Failed to restart AirTag scan: %s", esp_err_to_name(err));
+                        } else {
+                            airtag_scanning_active = true;
+                        }
+                    }
+                    break;
+                default:
+                    break;
+            }
+            break;
+        default:
+            break;
+    }
 }
 
 static int cmd_packet_monitor(int argc, char **argv) {
@@ -4276,14 +5083,17 @@ static int cmd_start_portal(int argc, char **argv) {
     ret = esp_wifi_start();
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to start AP: %s", esp_err_to_name(ret));
+        wifi_running = false;
         return 1;
     }
+    wifi_running = true;
     
     // Start DHCP server
     ret = esp_netif_dhcps_start(ap_netif);
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to start DHCP server: %s", esp_err_to_name(ret));
         esp_wifi_stop();
+        wifi_running = false;
         return 1;
     }
     
@@ -4302,6 +5112,7 @@ static int cmd_start_portal(int argc, char **argv) {
     if (http_ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to start HTTP server: %s", esp_err_to_name(http_ret));
         esp_wifi_stop();
+        wifi_running = false;
         return 1;
     }
     
@@ -4445,6 +5256,7 @@ static int cmd_start_portal(int argc, char **argv) {
         httpd_stop(portal_server);
         portal_server = NULL;
         esp_wifi_stop();
+        wifi_running = false;
         return 1;
     }
     
@@ -4541,6 +5353,33 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_debug_cmd));
+
+    const esp_console_cmd_t airtag_monitor_cmd = {
+        .command = "start_airtag_monitor",
+        .help = "Starts BLE AirTag monitor",
+        .hint = NULL,
+        .func = &cmd_start_airtag_monitor,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&airtag_monitor_cmd));
+
+    const esp_console_cmd_t stop_airtag_monitor_cmd = {
+        .command = "stop_airtag_monitor",
+        .help = "Stops the BLE AirTag monitor and resumes Wi-Fi",
+        .hint = NULL,
+        .func = &cmd_stop_airtag_monitor,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&stop_airtag_monitor_cmd));
+
+    const esp_console_cmd_t show_airtags_cmd = {
+        .command = "show_airtags",
+        .help = "Shows cached AirTag detections sorted by RSSI",
+        .hint = NULL,
+        .func = &cmd_show_airtags,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&show_airtags_cmd));
 
     const esp_console_cmd_t sniffer_dog_cmd = {
         .command = "start_sniffer_dog",
@@ -4739,7 +5578,8 @@ void app_main(void) {
     vendor_file_present = false;
     vendor_record_count = 0;
 
-    ESP_ERROR_CHECK(wifi_init_ap_sta()); 
+    // Initialize SD card and supporting data before enabling Wi-Fi (frees internal RAM)
+    ESP_ERROR_CHECK(wifi_init_ap_sta());
 
     wifi_country_t wifi_country = {
         .cc = "PH",
@@ -4771,7 +5611,10 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  list_sd");
     MY_LOG_INFO(TAG,"  select_html <index>");
     MY_LOG_INFO(TAG,"  start_sniffer");
+    MY_LOG_INFO(TAG,"  start_airtag_monitor");
+    MY_LOG_INFO(TAG,"  stop_airtag_monitor");
     MY_LOG_INFO(TAG,"  packet_monitor <channel>");
+    MY_LOG_INFO(TAG,"  show_airtags");
     MY_LOG_INFO(TAG,"  show_sniffer_results");
     MY_LOG_INFO(TAG,"  show_probes");
     MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
@@ -4791,6 +5634,10 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
 
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
+
+    if (xTaskCreate(sdcard_init_task, "sdcard_init", 4096, NULL, 4, NULL) != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to start SD card init task");
+    }
     vTaskDelay(pdMS_TO_TICKS(500));
 
     gpio_config_t boot_button_config = {
@@ -4817,17 +5664,6 @@ void app_main(void) {
         }
     }
     
-    // Initialize SD card and create necessary directories
-    esp_err_t sd_init_ret = init_sd_card();
-    if (sd_init_ret == ESP_OK) {
-        create_sd_directories();
-        if (vendor_is_enabled()) {
-            ensure_vendor_file_checked();
-        }
-    }
-    
-    // Load BSSID whitelist from SD card
-    load_whitelist_from_sd();
     vTaskDelay(pdMS_TO_TICKS(500));
     MY_LOG_INFO(TAG,"BOARD READY");
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -5973,29 +6809,44 @@ static esp_err_t init_sd_card(void) {
     };
     
     ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);  // DMA required for SD card
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        MY_LOG_INFO(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
+    if (ret == ESP_OK) {
+        sd_spi_init_failure_logged = false;
+        MY_LOG_INFO(TAG, "SD SPI bus initialized");
+    } else if (ret != ESP_ERR_INVALID_STATE) {
+        if (!sd_spi_init_failure_logged) {
+            sd_spi_init_failure_logged = true;
+            MY_LOG_INFO(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
+        }
         return ret;
     }
     
     // Initialize the SD card host
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = SPI2_HOST;
+    host.max_freq_khz = 10000; // Limit speed for reliability with shared SPI bus
     
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot_config.gpio_cs = SD_CS_PIN;
     slot_config.host_id = host.slot;
-    
+
     ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
     
     if (ret != ESP_OK) {
-        if (ret == ESP_FAIL) {
-            MY_LOG_INFO(TAG, "Failed to mount filesystem. If you want the card to be formatted, set format_if_mount_failed = true.");
-        } else {
-            MY_LOG_INFO(TAG, "Failed to initialize the card (%s). Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
+        if (!sd_card_init_failure_logged) {
+            sd_card_init_failure_logged = true;
+            if (ret == ESP_FAIL) {
+                MY_LOG_INFO(TAG, "Failed to mount filesystem. If you want the card to be formatted, set format_if_mount_failed = true.");
+            } else {
+                MY_LOG_INFO(TAG, "Failed to initialize the card (%s). Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
+            }
+        }
+        if (ret != ESP_ERR_INVALID_STATE) {
+            spi_bus_free(SPI2_HOST);
         }
         return ret;
     }
+
+    sd_card_init_failure_logged = false;
     
     // Print card info
     MY_LOG_INFO(TAG, "SD card mounted successfully");
@@ -6063,6 +6914,38 @@ static esp_err_t create_sd_directories(void) {
     
     MY_LOG_INFO(TAG, "All required directories are ready");
     return ESP_OK;
+}
+
+static void sdcard_init_task(void *pvParameters) {
+    (void)pvParameters;
+
+    const TickType_t initial_delay = pdMS_TO_TICKS(500);
+    const TickType_t retry_delay = pdMS_TO_TICKS(1500);
+
+    vTaskDelay(initial_delay);
+
+    int attempt = 0;
+    while (!sd_card_mounted && attempt < 3) {
+        esp_err_t ret = init_sd_card();
+        if (ret == ESP_OK) {
+            break;
+        }
+        attempt++;
+        vTaskDelay(retry_delay);
+    }
+
+    if (sd_card_mounted) {
+        if (create_sd_directories() == ESP_OK) {
+            if (vendor_is_enabled()) {
+                ensure_vendor_file_checked();
+            }
+        }
+        load_whitelist_from_sd();
+    } else {
+        MY_LOG_INFO(TAG, "SD card not mounted after automatic attempts.");
+    }
+
+    vTaskDelete(NULL);
 }
 
 static bool parse_gps_nmea(const char* nmea_sentence) {
