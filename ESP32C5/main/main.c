@@ -1703,6 +1703,12 @@ static int cmd_scan_networks(int argc, char **argv) {
 
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
+
+    esp_err_t wifi_err = wifi_init_ap_sta();
+    if (wifi_err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize Wi-Fi for Evil Twin: %s", esp_err_to_name(wifi_err));
+        return 1;
+    }
     
     // Set LED (ignore errors if LED is in invalid state)
     esp_err_t led_err = led_set_color(0, 255, 0);
@@ -2191,6 +2197,13 @@ static int cmd_start_evil_twin(int argc, char **argv) {
         if (!onlyDeauth) {
             MY_LOG_INFO(TAG,"Starting captive portal for Evil Twin attack on: %s", evilTwinSSID);
             
+            esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
+            if (ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to set APSTA mode: %s", esp_err_to_name(ret));
+                applicationState = IDLE;
+                return 1;
+            }
+            
             // Get AP netif and stop DHCP to configure custom IP
             esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
             if (!ap_netif) {
@@ -2208,7 +2221,7 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
             ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
             
-            esp_err_t             ret = esp_netif_set_ip_info(ap_netif, &ip_info);
+            ret = esp_netif_set_ip_info(ap_netif, &ip_info);
             if (ret != ESP_OK) {
                 MY_LOG_INFO(TAG, "Failed to set AP IP: %s", esp_err_to_name(ret));
                 applicationState = IDLE;
@@ -2244,13 +2257,22 @@ static int cmd_start_evil_twin(int argc, char **argv) {
                 ap_config.ap.ssid_len = strlen(evilTwinSSID);
             }
             
-            // WiFi is already running in APSTA mode from wifi_init_ap_sta()
-            // Just update the AP configuration
+            // Wi-Fi now runs in APSTA mode; update the AP configuration
             ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
             if (ret != ESP_OK) {
                 MY_LOG_INFO(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
                 applicationState = IDLE;
                 return 1;
+            }
+            
+            if (!wifi_running) {
+                ret = esp_wifi_start();
+                if (ret != ESP_OK) {
+                    MY_LOG_INFO(TAG, "Failed to start Wi-Fi for Evil Twin portal: %s", esp_err_to_name(ret));
+                    applicationState = IDLE;
+                    return 1;
+                }
+                wifi_running = true;
             }
             
             // Start DHCP server
@@ -5020,6 +5042,12 @@ static int cmd_start_portal(int argc, char **argv) {
     // Validate SSID length (WiFi SSID max is 32 characters)
     if (ssid_len == 0 || ssid_len > 32) {
         MY_LOG_INFO(TAG, "SSID length must be between 1 and 32 characters");
+        return 1;
+    }
+
+    esp_err_t wifi_err = wifi_init_ap_sta();
+    if (wifi_err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize Wi-Fi for portal: %s", esp_err_to_name(wifi_err));
         return 1;
     }
     
