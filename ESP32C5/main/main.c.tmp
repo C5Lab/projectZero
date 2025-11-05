@@ -2186,17 +2186,7 @@ static void boot_button_task(void *arg) {
 static int cmd_start_evil_twin(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
-
-    // Prevent conflicts with other operations
-    if (sae_attack_active || sae_attack_task_handle != NULL) {
-        MY_LOG_INFO(TAG, "SAE overflow attack is running. Use 'stop' before starting Evil Twin.");
-        return 1;
-    }
-    if (airtag_monitor_active || airtag_scanning_active) {
-        MY_LOG_INFO(TAG, "AirTag monitor is running. Use 'stop' before starting Evil Twin.");
-        return 1;
-    }
-
+    
     // Check if attack is already running
     if (deauth_attack_active || deauth_attack_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Deauth attack already running. Use 'stop' to stop it first.");
@@ -2233,12 +2223,47 @@ static int cmd_start_evil_twin(int argc, char **argv) {
                 wifi_running = false;
             }
 
-            // Ensure Wi-Fi is in a clean state
-            esp_wifi_set_promiscuous(false);
-            esp_wifi_set_promiscuous_rx_cb(NULL);
-            esp_wifi_set_mode(WIFI_MODE_NULL);
+            if (wifi_driver_initialized) {
+                esp_wifi_deinit();
+                wifi_driver_initialized = false;
+                wifi_event_handler_registered = false;
+                wifi_event_handler_instance = NULL;
+            }
 
-            esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
+            wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+            esp_err_t ret = esp_wifi_init(&cfg);
+            if (ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to re-init Wi-Fi for AP: %s", esp_err_to_name(ret));
+                applicationState = IDLE;
+                return 1;
+            }
+            wifi_driver_initialized = true;
+
+            if (!wifi_event_handler_registered) {
+                ret = esp_event_handler_instance_register(WIFI_EVENT,
+                                                          ESP_EVENT_ANY_ID,
+                                                          &wifi_event_handler,
+                                                          NULL,
+                                                          &wifi_event_handler_instance);
+                if (ret != ESP_OK) {
+                    MY_LOG_INFO(TAG, "Failed to register Wi-Fi event handler: %s", esp_err_to_name(ret));
+                    applicationState = IDLE;
+                    return 1;
+                }
+                wifi_event_handler_registered = true;
+            }
+
+            wifi_country_t wifi_country = {
+                .cc = "PH",
+                .schan = 1,
+                .nchan = 14,
+                .policy = WIFI_COUNTRY_POLICY_AUTO,
+            };
+            esp_wifi_set_country(&wifi_country);
+
+            esp_wifi_set_storage(WIFI_STORAGE_RAM);
+
+            ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
             if (ret != ESP_OK) {
                 MY_LOG_INFO(TAG, "Failed to set APSTA mode: %s", esp_err_to_name(ret));
                 applicationState = IDLE;
@@ -2279,7 +2304,7 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             // Configure AP with Evil Twin SSID (use safe defaults)
             wifi_config_t ap_config = { 0 };
             snprintf((char *)ap_config.ap.ssid, sizeof(ap_config.ap.ssid), "EvilTwin_AP");
-            ap_config.ap.ssid_len = 0; // derive automatically
+            ap_config.ap.ssid_len = strlen((const char *)ap_config.ap.ssid);
             ap_config.ap.channel = 1;
             snprintf((char *)ap_config.ap.password, sizeof(ap_config.ap.password), "12345678");
             ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
@@ -2521,6 +2546,14 @@ static int cmd_stop(int argc, char **argv) {
             vTaskDelete(sae_attack_task_handle);
             sae_attack_task_handle = NULL;
             MY_LOG_INFO(TAG, "SAE overflow task forcefully stopped.");
+        }
+        if (sae_attack_stack) {
+            heap_caps_free(sae_attack_stack);
+            sae_attack_stack = NULL;
+        }
+        if (sae_attack_tcb) {
+            heap_caps_free(sae_attack_tcb);
+            sae_attack_tcb = NULL;
         }
     }
     
@@ -3323,19 +3356,6 @@ static int cmd_start_airtag_monitor(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-
-    if (sae_attack_active || sae_attack_task_handle != NULL) {
-        MY_LOG_INFO(TAG, "SAE overflow attack is running. Use 'stop' before starting AirTag monitor.");
-        return 1;
-    }
-    if (deauth_attack_active || deauth_attack_task_handle != NULL) {
-        MY_LOG_INFO(TAG, "Deauth attack is running. Use 'stop' before starting AirTag monitor.");
-        return 1;
-    }
-    if (portal_active) {
-        MY_LOG_INFO(TAG, "Captive portal is running. Use 'stop' before starting AirTag monitor.");
-        return 1;
-    }
 
     if (airtag_monitor_active) {
         MY_LOG_INFO(TAG, "AirTag monitor already active. Use 'stop_airtag_monitor' or 'stop' to stop it first.");
@@ -5902,6 +5922,14 @@ static void sae_attack_task(void *pvParameters) {
     
     sae_attack_active = false;
     sae_attack_task_handle = NULL;
+    if (sae_attack_stack) {
+        heap_caps_free(sae_attack_stack);
+        sae_attack_stack = NULL;
+    }
+    if (sae_attack_tcb) {
+        heap_caps_free(sae_attack_tcb);
+        sae_attack_tcb = NULL;
+    }
     MY_LOG_INFO(TAG, "SAE overflow task finished.");
     
     // Free the allocated memory for ap_record

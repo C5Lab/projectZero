@@ -18,7 +18,10 @@ KNOWN_VENDOR_KEYWORDS = [
     "MEDIATEK", "REALTEK", "INTEL", "QUANTENNA",
     "ESPRESSIF", "NORDIC SEMICONDUCTOR", "RAK WIRELESS",
     "QUECTEL", "SIERRA WIRELESS", "TELIT", "FIBOCOM",
-    "SIMCOM",
+    "SIMCOM", "Routerboard.com", "TCT mobile ltd", "TP-LINK TECHNOLOGIES CO.,LTD.",
+    "Zioncom Electronics (Shenzhen) Ltd.", "Compal Broadband Networks, Inc.",
+    "Kaon Group Co., Ltd.", "Commscope", "HUAWEI TECHNOLOGIES CO.,LTD",
+    
 ]
 
 # Fixed record size: 3 bytes OUI + 1 byte name length + 60 bytes name (padded)
