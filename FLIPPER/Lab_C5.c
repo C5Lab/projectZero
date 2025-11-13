@@ -37,7 +37,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.16"
+#define LAB_C5_VERSION_TEXT "0.17"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -2202,6 +2202,12 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     }
 }
 
+static bool simple_app_command_requires_select_networks(const char* base_command) {
+    if(!base_command || base_command[0] == '\0') return false;
+    return (strcmp(base_command, "start_deauth") == 0 || strcmp(base_command, "start_evil_twin") == 0 ||
+            strcmp(base_command, "sae_overflow") == 0);
+}
+
 static void simple_app_send_command_with_targets(SimpleApp* app, const char* base_command) {
     if(!app || !base_command || base_command[0] == '\0') return;
     if(app->scan_selected_count == 0) {
@@ -2212,7 +2218,9 @@ static void simple_app_send_command_with_targets(SimpleApp* app, const char* bas
         return;
     }
 
-    if(strcmp(base_command, "start_deauth") == 0 || strcmp(base_command, "start_evil_twin") == 0) {
+    bool requires_select_networks = simple_app_command_requires_select_networks(base_command);
+
+    if(requires_select_networks) {
         char select_command[160];
         size_t written = snprintf(select_command, sizeof(select_command), "select_networks");
         if(written >= sizeof(select_command)) {
@@ -6261,5 +6269,3 @@ int32_t Lab_C5_app(void* p) {
 
     return 0;
 }
-
-
