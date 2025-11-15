@@ -12,7 +12,12 @@ file(MAKE_DIRECTORY "${DEST}")
 
 file(GLOB OLD_BINS "${DEST}/*.bin")
 if(OLD_BINS)
-  file(REMOVE ${OLD_BINS})
+  foreach(OLD_FILE ${OLD_BINS})
+    get_filename_component(OLD_NAME "${OLD_FILE}" NAME)
+    if(NOT OLD_NAME STREQUAL "oui_wifi.bin")
+      file(REMOVE "${OLD_FILE}")
+    endif()
+  endforeach()
 endif()
 
 set(SRCS

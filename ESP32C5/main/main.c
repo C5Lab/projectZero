@@ -19,6 +19,7 @@
 #include "esp_err.h"
 
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -56,7 +57,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.5.3"
+#define JANOS_VERSION "0.5.9"
 
 
 #define NEOPIXEL_GPIO      27
@@ -281,6 +282,7 @@ static wifi_ap_record_t g_scan_results[MAX_AP_CNT];
 static uint16_t g_scan_count = 0;
 static volatile bool g_scan_in_progress = false;
 static volatile bool g_scan_done = false;
+static volatile uint32_t g_last_scan_status = 1; // 0 => success, non-zero => failure/unknown
 
 static int g_selected_indices[MAX_AP_CNT];
 static int g_selected_count = 0;
@@ -291,6 +293,181 @@ char * portalSSID = NULL;  // SSID for standalone portal mode
 int connectAttemptCount = 0;
 led_strip_handle_t strip;
 static bool last_password_wrong = false;
+
+typedef struct {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+} led_color_t;
+
+#define LED_BRIGHTNESS_MIN        1U
+#define LED_BRIGHTNESS_MAX        100U
+#define LED_BRIGHTNESS_DEFAULT    5U
+
+static const led_color_t LED_COLOR_IDLE = {0, 255, 0};
+
+static led_color_t led_current_color = {0, 0, 0};
+static bool led_initialized = false;
+static bool led_user_enabled = true;
+static uint8_t led_brightness_percent = LED_BRIGHTNESS_DEFAULT;
+
+#define LED_NVS_NAMESPACE "ledcfg"
+#define LED_NVS_KEY_ENABLED "enabled"
+#define LED_NVS_KEY_LEVEL   "level"
+
+static uint8_t led_scale_component(uint8_t value) {
+    if (value == 0) {
+        return 0;
+    }
+    uint32_t scaled = (uint32_t)value * led_brightness_percent + 99U;
+    scaled /= 100U;
+    if (scaled > 255U) {
+        scaled = 255U;
+    }
+    return (uint8_t)scaled;
+}
+
+static esp_err_t led_commit_color(uint8_t r, uint8_t g, uint8_t b) {
+    if (!led_initialized || strip == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err;
+    if (!led_user_enabled || (r == 0 && g == 0 && b == 0)) {
+        err = led_strip_clear(strip);
+    } else {
+        err = led_strip_set_pixel(strip, 0, led_scale_component(r), led_scale_component(g), led_scale_component(b));
+    }
+
+    if (err == ESP_OK) {
+        err = led_strip_refresh(strip);
+    }
+    return err;
+}
+
+static esp_err_t led_apply_current(void) {
+    return led_commit_color(led_current_color.r, led_current_color.g, led_current_color.b);
+}
+
+static esp_err_t led_set_color(uint8_t r, uint8_t g, uint8_t b) {
+    led_current_color = (led_color_t){r, g, b};
+    return led_commit_color(r, g, b);
+}
+
+static esp_err_t led_clear(void) {
+    led_current_color = (led_color_t){0, 0, 0};
+    return led_commit_color(0, 0, 0);
+}
+
+static esp_err_t led_set_idle(void) {
+    return led_set_color(LED_COLOR_IDLE.r, LED_COLOR_IDLE.g, LED_COLOR_IDLE.b);
+}
+
+static esp_err_t led_set_enabled(bool enabled) {
+    led_user_enabled = enabled;
+    if (!led_initialized) {
+        return ESP_OK;
+    }
+    return led_apply_current();
+}
+
+static bool led_is_enabled(void) {
+    return led_user_enabled;
+}
+
+static esp_err_t led_set_brightness(uint8_t percent) {
+    if (percent < LED_BRIGHTNESS_MIN) {
+        percent = LED_BRIGHTNESS_MIN;
+    } else if (percent > LED_BRIGHTNESS_MAX) {
+        percent = LED_BRIGHTNESS_MAX;
+    }
+
+    led_brightness_percent = percent;
+
+    if (!led_initialized) {
+        return ESP_OK;
+    }
+
+    if (!led_user_enabled) {
+        return led_commit_color(0, 0, 0);
+    }
+
+    return led_apply_current();
+}
+
+static void led_persist_state(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(LED_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "LED config save open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    esp_err_t write_err = nvs_set_u8(handle, LED_NVS_KEY_ENABLED, led_user_enabled ? 1U : 0U);
+    if (write_err == ESP_OK) {
+        write_err = nvs_set_u8(handle, LED_NVS_KEY_LEVEL, led_brightness_percent);
+    }
+    if (write_err == ESP_OK) {
+        write_err = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+
+    if (write_err != ESP_OK) {
+        ESP_LOGW(TAG, "LED config save failed: %s", esp_err_to_name(write_err));
+    }
+}
+
+static void led_load_state_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(LED_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "LED config load open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint8_t enabled_value = 0;
+    err = nvs_get_u8(handle, LED_NVS_KEY_ENABLED, &enabled_value);
+    if (err == ESP_OK) {
+        led_user_enabled = enabled_value != 0;
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "LED enabled read failed: %s", esp_err_to_name(err));
+    }
+
+    uint8_t level_value = 0;
+    err = nvs_get_u8(handle, LED_NVS_KEY_LEVEL, &level_value);
+    if (err == ESP_OK) {
+        if (level_value >= LED_BRIGHTNESS_MIN && level_value <= LED_BRIGHTNESS_MAX) {
+            led_brightness_percent = level_value;
+        } else {
+            ESP_LOGW(TAG, "LED brightness %u out of range, keeping %u", level_value, led_brightness_percent);
+        }
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "LED brightness read failed: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(handle);
+}
+
+static void led_boot_sequence(void) {
+    led_user_enabled = true;
+    led_brightness_percent = LED_BRIGHTNESS_DEFAULT;
+    led_current_color = (led_color_t){0, 0, 0};
+
+    led_load_state_from_nvs();
+
+    if (!led_initialized) {
+        return;
+    }
+
+    (void)led_commit_color(0, 0, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    (void)led_set_idle();
+    vTaskDelay(pdMS_TO_TICKS(100));
+}
 
 // SD card HTML file management
 #define MAX_HTML_FILES 50
@@ -307,6 +484,22 @@ typedef struct {
 } whitelisted_bssid_t;
 static whitelisted_bssid_t whiteListedBssids[MAX_WHITELISTED_BSSIDS];
 static int whitelistedBssidsCount = 0;
+
+#define VENDOR_RECORD_SIZE 64
+#define VENDOR_RECORD_NAME_BYTES (VENDOR_RECORD_SIZE - 4)
+#define MAX_VENDOR_NAME_LEN (VENDOR_RECORD_NAME_BYTES + 1)
+#define SD_OUI_BIN_PATH "/sdcard/lab/oui_wifi.bin"
+#define VENDOR_NVS_NAMESPACE "vendorcfg"
+#define VENDOR_NVS_KEY_ENABLED "enabled"
+
+static char vendor_lookup_buffer[MAX_VENDOR_NAME_LEN];
+static bool vendor_file_checked = false;
+static bool vendor_file_present = false;
+static uint8_t vendor_last_oui[3] = {0};
+static bool vendor_last_valid = false;
+static bool vendor_last_hit = false;
+static bool vendor_lookup_enabled = true;
+static size_t vendor_record_count = 0;
 
 
 // Methods forward declarations
@@ -328,6 +521,8 @@ static int cmd_list_sd(int argc, char **argv);
 static int cmd_select_html(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
+static int cmd_led(int argc, char **argv);
+static int cmd_vendor(int argc, char **argv);
 static esp_err_t start_background_scan(void);
 static void print_scan_results(void);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
@@ -633,15 +828,16 @@ static void wifi_event_handler(void *event_handler_arg,
         case WIFI_EVENT_SCAN_DONE: {
             const wifi_event_sta_scan_done_t *e = (const wifi_event_sta_scan_done_t *)event_data;
             
-            if (!periodic_rescan_in_progress) {
+            if (!periodic_rescan_in_progress && !wardrive_active) {
                 MY_LOG_INFO(TAG, "WiFi scan completed. Found %u networks, status: %" PRIu32, e->number, e->status);
             }
             
+            g_last_scan_status = e->status;
             if (e->status == 0) { // Success
                 g_scan_count = MAX_AP_CNT;
                 esp_wifi_scan_get_ap_records(&g_scan_count, g_scan_results);
                 
-                if (!periodic_rescan_in_progress) {
+                if (!periodic_rescan_in_progress && !wardrive_active) {
                     MY_LOG_INFO(TAG, "Retrieved %u network records", g_scan_count);
                     
                     // Automatically display scan results after completion
@@ -650,7 +846,7 @@ static void wifi_event_handler(void *event_handler_arg,
                     }
                 }
             } else {
-                if (!periodic_rescan_in_progress) {
+                if (!(periodic_rescan_in_progress || wardrive_active)) {
                     MY_LOG_INFO(TAG, "Scan failed with status: %" PRIu32, e->status);
                 }
                 g_scan_count = 0;
@@ -689,17 +885,17 @@ static void wifi_event_handler(void *event_handler_arg,
                 }
                 
                 // Change LED to green for active sniffing
-                esp_err_t led_err = led_strip_set_pixel(strip, 0, 0, 255, 0); // Green
-                if (led_err == ESP_OK) {
-                    led_strip_refresh(strip);
+                esp_err_t led_err = led_set_color(0, 255, 0); // Green
+                if (led_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to set sniffer LED: %s", esp_err_to_name(led_err));
                 }
                 
                 MY_LOG_INFO(TAG, "Sniffer: Scan complete, now monitoring client traffic with dual-band channel hopping (2.4GHz + 5GHz)...");
-            } else {
-                // Clear LED when normal scan is complete (ignore errors if LED is in invalid state)
-                esp_err_t led_err = led_strip_clear(strip);
-                if (led_err == ESP_OK) {
-                    led_strip_refresh(strip);
+            } else if (!wardrive_active) {
+                // Return LED to idle when normal scan is complete
+                esp_err_t led_err = led_set_idle();
+                if (led_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to restore idle LED after scan: %s", esp_err_to_name(led_err));
                 }
             }
             break;
@@ -722,9 +918,9 @@ static void wifi_event_handler(void *event_handler_arg,
                         MY_LOG_INFO(TAG, "Resuming deauth attack - password was incorrect.");
                         
                         // Set LED to red for deauth
-                        esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 0, 0);
-                        if (led_err == ESP_OK) {
-                            led_strip_refresh(strip);
+                        esp_err_t led_err = led_set_color(255, 0, 0);
+                        if (led_err != ESP_OK) {
+                            ESP_LOGW(TAG, "Failed to set LED for deauth resume: %s", esp_err_to_name(led_err));
                         }
                         
                         // Start deauth attack in background task
@@ -791,10 +987,10 @@ static void verify_password(const char* password) {
             MY_LOG_INFO(TAG, "Deauth attack task forcefully stopped.");
         }
         
-        // Clear LED
-        esp_err_t led_err = led_strip_clear(strip);
-        if (led_err == ESP_OK) {
-            led_strip_refresh(strip);
+        // Restore LED to idle
+        esp_err_t led_err = led_set_idle();
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to restore idle LED after stopping deauth: %s", esp_err_to_name(led_err));
         }
         
         MY_LOG_INFO(TAG, "Deauth attack stopped.");
@@ -870,6 +1066,11 @@ static esp_err_t wifi_init_ap_sta(void) {
 
 // --- Start background scan ---
 static esp_err_t start_background_scan(void) {
+    if (wardrive_active || wardrive_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start background scan: wardrive is active. Use 'stop' first.");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     if (g_scan_in_progress) {
         MY_LOG_INFO(TAG, "Scan already in progress");
         return ESP_ERR_INVALID_STATE;
@@ -1117,14 +1318,190 @@ const char* authmode_to_string(wifi_auth_mode_t mode) {
     }
 }
 
+static void vendor_persist_state(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(VENDOR_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Vendor NVS open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint8_t value = vendor_lookup_enabled ? 1 : 0;
+    err = nvs_set_u8(handle, VENDOR_NVS_KEY_ENABLED, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Vendor NVS write failed: %s", esp_err_to_name(err));
+    }
+    nvs_close(handle);
+}
+
+static void vendor_load_state_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(VENDOR_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Vendor NVS read open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint8_t value = vendor_lookup_enabled ? 1 : 0;
+    err = nvs_get_u8(handle, VENDOR_NVS_KEY_ENABLED, &value);
+    if (err == ESP_OK) {
+        vendor_lookup_enabled = value != 0;
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "Vendor NVS get failed: %s", esp_err_to_name(err));
+    }
+    nvs_close(handle);
+}
+
+static bool vendor_is_enabled(void) {
+    return vendor_lookup_enabled;
+}
+
+static esp_err_t vendor_set_enabled(bool enabled) {
+    vendor_lookup_enabled = enabled;
+    vendor_last_valid = false;
+    vendor_last_hit = false;
+    vendor_lookup_buffer[0] = '\0';
+    vendor_file_checked = false;
+    vendor_file_present = false;
+    vendor_record_count = 0;
+    vendor_persist_state();
+    return ESP_OK;
+}
+
+static void ensure_vendor_file_checked(void) {
+    if (vendor_file_checked) {
+        return;
+    }
+    if (!sd_card_mounted) {
+        // SD card not ready yet, defer lookup until later
+        vendor_file_checked = false;
+        vendor_file_present = false;
+        vendor_record_count = 0;
+        return;
+    }
+    FILE *file = fopen(SD_OUI_BIN_PATH, "rb");
+    if (file) {
+        vendor_file_present = true;
+        if (fseek(file, 0, SEEK_END) == 0) {
+            long file_size = ftell(file);
+            if (file_size >= (long)VENDOR_RECORD_SIZE) {
+                vendor_record_count = (size_t)file_size / VENDOR_RECORD_SIZE;
+            } else {
+                vendor_record_count = 0;
+            }
+        } else {
+            vendor_record_count = 0;
+        }
+        MY_LOG_INFO(TAG, "Vendor binary file detected (%u entries)", (unsigned int)vendor_record_count);
+        fclose(file);
+        if (vendor_record_count == 0) {
+            vendor_file_present = false;
+        }
+    } else {
+        vendor_file_present = false;
+        vendor_record_count = 0;
+        MY_LOG_INFO(TAG, "Vendor binary file not found");
+    }
+    vendor_file_checked = true;
+    vendor_last_valid = false;
+    vendor_last_hit = false;
+    vendor_lookup_buffer[0] = '\0';
+}
+
+static const char* lookup_vendor_name(const uint8_t *bssid) {
+    if (!vendor_lookup_enabled || !bssid) {
+        vendor_last_valid = false;
+        return NULL;
+    }
+
+    if (vendor_last_valid && memcmp(vendor_last_oui, bssid, 3) == 0) {
+        return vendor_last_hit ? vendor_lookup_buffer : NULL;
+    }
+
+    ensure_vendor_file_checked();
+    if (!vendor_file_present) {
+        vendor_last_valid = false;
+        return NULL;
+    }
+
+    FILE *file = fopen(SD_OUI_BIN_PATH, "rb");
+    if (!file) {
+        vendor_file_present = false;
+        vendor_file_checked = false;
+        vendor_last_valid = false;
+        return NULL;
+    }
+
+    if (vendor_record_count == 0) {
+        fclose(file);
+        vendor_last_valid = false;
+        return NULL;
+    }
+
+    size_t low = 0;
+    size_t high = vendor_record_count;
+    uint8_t record[VENDOR_RECORD_SIZE];
+    bool found = false;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        long offset = (long)(mid * VENDOR_RECORD_SIZE);
+        if (fseek(file, offset, SEEK_SET) != 0) {
+            break;
+        }
+        if (fread(record, 1, VENDOR_RECORD_SIZE, file) != VENDOR_RECORD_SIZE) {
+            break;
+        }
+
+        int cmp = memcmp(record, bssid, 3);
+        if (cmp == 0) {
+            uint8_t name_len = record[3];
+            if (name_len > VENDOR_RECORD_NAME_BYTES) {
+                name_len = VENDOR_RECORD_NAME_BYTES;
+            }
+            memcpy(vendor_lookup_buffer, &record[4], name_len);
+            vendor_lookup_buffer[name_len] = '\0';
+            memcpy(vendor_last_oui, bssid, 3);
+            vendor_last_valid = true;
+            vendor_last_hit = true;
+            found = true;
+            break;
+        } else if (cmp < 0) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+
+    fclose(file);
+    if (found) {
+        return vendor_lookup_buffer;
+    }
+
+    memcpy(vendor_last_oui, bssid, 3);
+    vendor_last_valid = true;
+    vendor_last_hit = false;
+    vendor_lookup_buffer[0] = '\0';
+    return NULL;
+}
+
 
 static void print_network_csv(int index, const wifi_ap_record_t* ap) {
     char escaped_ssid[64];
     escape_csv_field((const char*)ap->ssid, escaped_ssid, sizeof(escaped_ssid));
+    char escaped_vendor[64];
+    const char *vendor_name = vendor_is_enabled() ? lookup_vendor_name(ap->bssid) : NULL;
+    escape_csv_field(vendor_name ? vendor_name : "", escaped_vendor, sizeof(escaped_vendor));
     
-    MY_LOG_INFO(TAG, "\"%d\",\"%s\",\"%02X:%02X:%02X:%02X:%02X:%02X\",\"%d\",\"%s\",\"%d\",\"%s\"",
+    MY_LOG_INFO(TAG, "\"%d\",\"%s\",\"%s\",\"%02X:%02X:%02X:%02X:%02X:%02X\",\"%d\",\"%s\",\"%d\",\"%s\"",
                 (index + 1),
                 escaped_ssid,
+                escaped_vendor,
                 ap->bssid[0], ap->bssid[1], ap->bssid[2],
                 ap->bssid[3], ap->bssid[4], ap->bssid[5],
                 ap->primary,
@@ -1164,22 +1541,27 @@ static void print_scan_results(void) {
 static int cmd_scan_networks(int argc, char **argv) {
     (void)argc; (void)argv;
     
+    if (wardrive_active || wardrive_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Wardrive is active. Use 'stop' to stop it first before scanning.");
+        return 1;
+    }
+
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
     
     // Set LED (ignore errors if LED is in invalid state)
-    esp_err_t led_err = led_strip_set_pixel(strip, 0, 0, 255, 0);
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    esp_err_t led_err = led_set_color(0, 255, 0);
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for scan: %s", esp_err_to_name(led_err));
     }
 
     esp_err_t err = start_background_scan();
     
     if (err != ESP_OK) {
-        // Clear LED (ignore errors if LED is in invalid state)
-        led_err = led_strip_clear(strip);
-        if (led_err == ESP_OK) {
-            led_strip_refresh(strip);
+        // Return LED to idle when scan failed
+        led_err = led_set_idle();
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to restore idle LED after scan failure: %s", esp_err_to_name(led_err));
         }
         
         if (err == ESP_ERR_INVALID_STATE) {
@@ -1280,9 +1662,9 @@ static void deauth_attack_task(void *pvParameters) {
             applicationState = IDLE;
             
             // Clean up after attack (ignore LED errors)
-            esp_err_t led_err = led_strip_clear(strip);
-            if (led_err == ESP_OK) {
-                led_strip_refresh(strip);
+            esp_err_t led_err = led_set_idle();
+            if (led_err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to restore idle LED after deauth stop: %s", esp_err_to_name(led_err));
             }
             
             break;
@@ -1295,9 +1677,9 @@ static void deauth_attack_task(void *pvParameters) {
             periodic_rescan_in_progress = true;
             
             // Set LED to yellow during re-scan
-            esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 255, 0); // Yellow
-            if (led_err == ESP_OK) {
-                led_strip_refresh(strip);
+            esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
+            if (led_err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to set LED for periodic scan: %s", esp_err_to_name(led_err));
             }
             
             // Temporarily pause deauth for scanning
@@ -1307,9 +1689,9 @@ static void deauth_attack_task(void *pvParameters) {
             }
             
             // Clear LED after re-scan (ignore errors if LED is in invalid state)
-            led_err = led_strip_clear(strip);
-            if (led_err == ESP_OK) {
-                led_strip_refresh(strip);
+            led_err = led_clear();
+            if (led_err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to clear LED after periodic scan: %s", esp_err_to_name(led_err));
             }
             
             // Clear flag after re-scan completes
@@ -1318,11 +1700,9 @@ static void deauth_attack_task(void *pvParameters) {
         
         if (applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) {
             // Send deauth frames (silent mode - no UART spam)
-            ESP_ERROR_CHECK(led_strip_set_pixel(strip, 0, 0, 0, 255));
-            ESP_ERROR_CHECK(led_strip_refresh(strip));
+            ESP_ERROR_CHECK(led_set_color(0, 0, 255));
             wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
-            ESP_ERROR_CHECK(led_strip_clear(strip));
-            ESP_ERROR_CHECK(led_strip_refresh(strip));
+            ESP_ERROR_CHECK(led_clear());
         }
         
         // Delay and yield to allow UART console processing
@@ -1331,9 +1711,9 @@ static void deauth_attack_task(void *pvParameters) {
     }
     
     // Clean up LED after attack finishes naturally (ignore LED errors)
-    esp_err_t led_err = led_strip_clear(strip);
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    esp_err_t led_err = led_set_idle();
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore idle LED after deauth task: %s", esp_err_to_name(led_err));
     }
     
     deauth_attack_active = false;
@@ -1355,9 +1735,9 @@ static void blackout_attack_task(void *pvParameters) {
     MY_LOG_INFO(TAG, "Blackout attack task started.");
     
     // Set LED to orange for blackout attack
-    esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 165, 0); // Orange
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    esp_err_t led_err = led_set_color(255, 165, 0); // Orange
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for blackout attack start: %s", esp_err_to_name(led_err));
     }
     
     // Main loop: continuously scan and attack for 3 minutes each cycle
@@ -1426,18 +1806,18 @@ static void blackout_attack_task(void *pvParameters) {
         
         while (attack_cycles < MAX_ATTACK_CYCLES && blackout_attack_active && !operation_stop_requested) {
             // Flash LED during attack (orange)
-            esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 165, 0); // Orange
-            if (led_err == ESP_OK) {
-                led_strip_refresh(strip);
+            esp_err_t led_err = led_set_color(255, 165, 0); // Orange
+            if (led_err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to set LED during blackout attack: %s", esp_err_to_name(led_err));
             }
             
             // Send deauth frames to all networks
             wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
             
             // Clear LED briefly
-            led_err = led_strip_clear(strip);
-            if (led_err == ESP_OK) {
-                led_strip_refresh(strip);
+            led_err = led_clear();
+            if (led_err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to clear LED during blackout attack: %s", esp_err_to_name(led_err));
             }
             
             attack_cycles++;
@@ -1455,9 +1835,9 @@ static void blackout_attack_task(void *pvParameters) {
     }
     
     // Clean up LED after attack finishes
-    led_err = led_strip_clear(strip);
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    led_err = led_set_idle();
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore idle LED after blackout attack: %s", esp_err_to_name(led_err));
     }
     
     // Clean up
@@ -1497,9 +1877,9 @@ static int cmd_start_sae_overflow(int argc, char **argv) {
         const wifi_ap_record_t *ap = &g_scan_results[idx];
         
         // Set LED
-        esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 0, 0);
-        if (led_err == ESP_OK) {
-            led_strip_refresh(strip);
+        esp_err_t led_err = led_set_color(255, 0, 0);
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to set LED for SAE overflow: %s", esp_err_to_name(led_err));
         }
         
         MY_LOG_INFO(TAG,"WPA3 SAE Overflow Attack");
@@ -2100,12 +2480,10 @@ static int cmd_stop(int argc, char **argv) {
         }
     }
     
-    // Clear LED (ignore errors if LED is in invalid state)
-    esp_err_t led_err = led_strip_clear(strip);
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
-    } else {
-        ESP_LOGW(TAG, "Failed to clear LED (state: %s), ignoring...", esp_err_to_name(led_err));
+    // Restore LED to idle (ignore errors if LED is in invalid state)
+    esp_err_t led_err = led_set_idle();
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore idle LED after stop (state: %s), ignoring...", esp_err_to_name(led_err));
     }
     
     MY_LOG_INFO(TAG, "All operations stopped.");
@@ -2303,6 +2681,11 @@ static int cmd_packet_monitor(int argc, char **argv) {
     }
 
     MY_LOG_INFO(TAG, "Packet monitor started on channel %ld. Type 'stop' to stop.", channel);
+
+    esp_err_t led_err = led_set_color(255, 255, 255); // White for packet monitor
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for packet monitor: %s", esp_err_to_name(led_err));
+    }
     return 0;
 }
 
@@ -2328,12 +2711,12 @@ static int cmd_start_sniffer(int argc, char **argv) {
     
     // Phase 1: Start network scan
     sniffer_active = true;
-    sniffer_scan_phase = true;
-    
-    // Set LED (ignore errors if LED is in invalid state)
-    esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 255, 0); // Yellow
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+   sniffer_scan_phase = true;
+   
+   // Set LED (ignore errors if LED is in invalid state)
+    esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for sniffer: %s", esp_err_to_name(led_err));
     }
     
     esp_err_t err = start_background_scan();
@@ -2341,10 +2724,10 @@ static int cmd_start_sniffer(int argc, char **argv) {
         sniffer_active = false;
         sniffer_scan_phase = false;
         
-        // Clear LED (ignore errors if LED is in invalid state)
-        led_err = led_strip_clear(strip);
-        if (led_err == ESP_OK) {
-            led_strip_refresh(strip);
+        // Return LED to idle (ignore errors if LED is in invalid state)
+        led_err = led_set_idle();
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to restore idle LED after sniffer failure: %s", esp_err_to_name(led_err));
         }
         
         MY_LOG_INFO(TAG, "Failed to start scan for sniffer: %s", esp_err_to_name(err));
@@ -2539,9 +2922,9 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
     sniffer_dog_active = true;
     
     // Set LED to red (aggressive mode)
-    esp_err_t led_err = led_strip_set_pixel(strip, 0, 255, 0, 0); // Red
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    esp_err_t led_err = led_set_color(255, 0, 0); // Red
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for Sniffer Dog: %s", esp_err_to_name(led_err));
     }
     
     // Set promiscuous filter
@@ -2572,10 +2955,10 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
         sniffer_dog_active = false;
         esp_wifi_set_promiscuous(false);
         
-        // Clear LED
-        led_err = led_strip_clear(strip);
-        if (led_err == ESP_OK) {
-            led_strip_refresh(strip);
+        // Return LED to idle
+        led_err = led_set_idle();
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to restore idle LED after Sniffer Dog failure: %s", esp_err_to_name(led_err));
         }
         
         return 1;
@@ -2595,6 +2978,139 @@ static int cmd_reboot(int argc, char **argv)
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
     return 0;
+}
+
+static int cmd_led(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: led set <on|off> | led level <1-100> | led read");
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "set") == 0) {
+        if (argc < 3) {
+            MY_LOG_INFO(TAG, "Usage: led set <on|off>");
+            return 1;
+        }
+
+        if (strcasecmp(argv[2], "on") == 0) {
+            esp_err_t err = led_set_enabled(true);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to enable LED: %s", esp_err_to_name(err));
+                return 1;
+            }
+            led_persist_state();
+            MY_LOG_INFO(TAG, "LED turned on (brightness %u%%)", led_brightness_percent);
+            return 0;
+        } else if (strcasecmp(argv[2], "off") == 0) {
+            esp_err_t err = led_set_enabled(false);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to disable LED: %s", esp_err_to_name(err));
+                return 1;
+            }
+            led_persist_state();
+            MY_LOG_INFO(TAG, "LED turned off (previous brightness %u%% stored)", led_brightness_percent);
+            return 0;
+        }
+
+        MY_LOG_INFO(TAG, "Usage: led set <on|off>");
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "level") == 0) {
+        if (argc < 3) {
+            MY_LOG_INFO(TAG, "Usage: led level <1-100>");
+            return 1;
+        }
+
+        int level = atoi(argv[2]);
+        if (level < (int)LED_BRIGHTNESS_MIN || level > (int)LED_BRIGHTNESS_MAX) {
+            MY_LOG_INFO(TAG, "Brightness must be between %u and %u", LED_BRIGHTNESS_MIN, LED_BRIGHTNESS_MAX);
+            return 1;
+        }
+
+        esp_err_t err = led_set_brightness((uint8_t)level);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to set LED brightness: %s", esp_err_to_name(err));
+            return 1;
+        }
+        led_persist_state();
+
+        if (led_is_enabled()) {
+            MY_LOG_INFO(TAG, "LED brightness set to %d%%", level);
+        } else {
+            MY_LOG_INFO(TAG, "LED brightness set to %d%% (LED currently off)", level);
+        }
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "read") == 0) {
+        MY_LOG_INFO(TAG, "LED status: %s, brightness %u%%", led_is_enabled() ? "on" : "off", led_brightness_percent);
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Usage: led set <on|off> | led level <1-100> | led read");
+    return 1;
+}
+
+static int cmd_vendor(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: vendor set <on|off> | vendor read");
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "set") == 0) {
+        if (argc < 3) {
+            MY_LOG_INFO(TAG, "Usage: vendor set <on|off>");
+            return 1;
+        }
+
+        bool enable;
+        if (strcasecmp(argv[2], "on") == 0) {
+            enable = true;
+        } else if (strcasecmp(argv[2], "off") == 0) {
+            enable = false;
+        } else {
+            MY_LOG_INFO(TAG, "Usage: vendor set <on|off>");
+            return 1;
+        }
+
+        vendor_set_enabled(enable);
+        if (enable && sd_card_mounted) {
+            ensure_vendor_file_checked();
+        }
+
+        MY_LOG_INFO(TAG, "Vendor scan: %s", vendor_is_enabled() ? "on" : "off");
+        if (vendor_is_enabled()) {
+            if (!sd_card_mounted) {
+                MY_LOG_INFO(TAG, "Vendor file: waiting for SD card");
+            } else {
+                MY_LOG_INFO(TAG, "Vendor file: %s (%u entries)",
+                            vendor_file_present ? "available" : "missing",
+                            (unsigned int)vendor_record_count);
+            }
+        }
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "read") == 0) {
+        if (vendor_is_enabled() && sd_card_mounted) {
+            ensure_vendor_file_checked();
+        }
+        MY_LOG_INFO(TAG, "Vendor scan: %s", vendor_is_enabled() ? "on" : "off");
+        if (vendor_is_enabled()) {
+            if (!sd_card_mounted) {
+                MY_LOG_INFO(TAG, "Vendor file: waiting for SD card");
+            } else {
+                MY_LOG_INFO(TAG, "Vendor file: %s (%u entries)",
+                            vendor_file_present ? "available" : "missing",
+                            (unsigned int)vendor_record_count);
+            }
+        }
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Usage: vendor set <on|off> | vendor read");
+    return 1;
 }
 
 // Command: start_karma - Starts portal with SSID from probe list
@@ -2789,9 +3305,9 @@ static void wardrive_task(void *pvParameters) {
     MY_LOG_INFO(TAG, "Wardrive task started.");
     
     // Set LED to indicate wardrive mode
-    esp_err_t led_err = led_strip_set_pixel(strip, 0, 0, 255, 255); // Cyan
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    esp_err_t led_err = led_set_color(0, 255, 255); // Cyan
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for wardrive: %s", esp_err_to_name(led_err));
     }
     
     // Find the next file number by scanning existing files
@@ -2801,7 +3317,8 @@ static void wardrive_task(void *pvParameters) {
     // Wait for GPS fix before starting
     MY_LOG_INFO(TAG, "Waiting for GPS fix...");
     if (!wait_for_gps_fix(120)) {  // Wait up to 120 seconds for GPS fix
-        MY_LOG_INFO(TAG, "Warning: No GPS fix obtained, continuing without GPS data");
+        MY_LOG_INFO(TAG, "Warning: No GPS fix obtained, not continuing without GPS data - please ensure clear view of the sky and try again.");
+        operation_stop_requested = true;
     } else {
         MY_LOG_INFO(TAG, "GPS fix obtained: Lat=%.7f Lon=%.7f", 
                    current_gps.latitude, current_gps.longitude);
@@ -2841,40 +3358,49 @@ static void wardrive_task(void *pvParameters) {
             .channel = 0,
             .show_hidden = true,
             .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-            .scan_time.active.min = 100,
-            .scan_time.active.max = 300,
+            .scan_time.active.min = 120,
+            .scan_time.active.max = 700,
         };
         
-        // Start non-blocking scan
-        esp_wifi_scan_start(&scan_cfg, false);
-        
-        // Wait for scan to complete with stop check
-        bool scan_done = false;
-        int timeout_ms = 10000; // 10 second timeout
-        int elapsed_ms = 0;
-        
-        while (!scan_done && elapsed_ms < timeout_ms && !operation_stop_requested) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            elapsed_ms += 100;
-            
-            // Check if scan is done by trying to get results
-            uint16_t temp_count = 0;
-            esp_err_t result = esp_wifi_scan_get_ap_num(&temp_count);
-            if (result == ESP_OK) {
-                scan_done = true;
-            }
+        // Perform blocking scan to ensure results are ready before logging
+        if (operation_stop_requested) {
+            break;
+        }
+        esp_err_t scan_err = esp_wifi_scan_start(&scan_cfg, true);
+        if (scan_err != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
         }
         
-        if (!scan_done || operation_stop_requested) {
-            esp_wifi_scan_stop();
-            if (operation_stop_requested) {
-                break; // Exit wardrive loop
+        // If driver reported failure or no results, try a blocking fallback scan
+        uint16_t scan_count = 0;
+        esp_wifi_scan_get_ap_num(&scan_count);
+        if ((scan_count == 0) || (g_last_scan_status != 0)) {
+            wifi_scan_config_t fb_cfg = scan_cfg;
+            fb_cfg.scan_time.active.min = 120;
+            fb_cfg.scan_time.active.max = 700;
+            esp_err_t fb = esp_wifi_scan_start(&fb_cfg, true); // blocking
+            if (fb != ESP_OK) {
+                continue;
             }
-            continue; // Skip this scan iteration
+            scan_count = MAX_AP_CNT;
+            esp_wifi_scan_get_ap_records(&scan_count, wardrive_scan_results);
+        } else {
+            scan_count = MAX_AP_CNT;
+            esp_wifi_scan_get_ap_records(&scan_count, wardrive_scan_results);
         }
-        
-        uint16_t scan_count = MAX_AP_CNT;
-        esp_wifi_scan_get_ap_records(&scan_count, wardrive_scan_results);
+
+        // If still no records, fall back to the buffer populated by the event handler
+        if (scan_count == 0 && g_scan_count > 0) {
+            if (g_scan_count > MAX_AP_CNT) {
+                scan_count = MAX_AP_CNT;
+            } else {
+                scan_count = g_scan_count;
+            }
+            memcpy(wardrive_scan_results, g_scan_results, scan_count * sizeof(wifi_ap_record_t));
+        }
+
+        MY_LOG_INFO(TAG, "Wardrive: scan_count=%u (status=%" PRIu32 ")", scan_count, g_last_scan_status);
         
         // Create filename (keep it simple for FAT filesystem)
         char filename[64];
@@ -2976,9 +3502,9 @@ static void wardrive_task(void *pvParameters) {
     }
     
     // Clear LED after wardrive finishes
-    led_err = led_strip_clear(strip);
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    led_err = led_set_idle();
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore idle LED after wardrive: %s", esp_err_to_name(led_err));
     }
     
     wardrive_active = false;
@@ -3930,6 +4456,11 @@ static int cmd_start_portal(int argc, char **argv) {
     MY_LOG_INFO(TAG, "Connect to '%s' WiFi network to access the portal", ssid);
     MY_LOG_INFO(TAG, "DNS server running on port 53 - all queries redirect to 172.0.0.1");
     MY_LOG_INFO(TAG, "HTTP server running on port 80");
+
+    esp_err_t led_err = led_set_color(255, 0, 255); // Purple for portal mode
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for portal mode: %s", esp_err_to_name(led_err));
+    }
     
     return 0;
 }
@@ -4092,6 +4623,24 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&karma_cmd));
 
+    const esp_console_cmd_t vendor_cmd = {
+        .command = "vendor",
+        .help = "Controls vendor lookup: vendor set <on|off> | vendor read",
+        .hint = NULL,
+        .func = &cmd_vendor,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&vendor_cmd));
+
+    const esp_console_cmd_t led_cmd = {
+        .command = "led",
+        .help = "Controls status LED: led set <on|off> | led level <1-100> | led read",
+        .hint = NULL,
+        .func = &cmd_led,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&led_cmd));
+
     const esp_console_cmd_t stop_cmd = {
         .command = "stop",
         .help = "Stop all running operations",
@@ -4177,9 +4726,18 @@ void app_main(void) {
     // 3. strip instance
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &strip));
 
-
-
     ESP_ERROR_CHECK(nvs_flash_init());
+
+    led_initialized = true;
+    led_boot_sequence();
+    MY_LOG_INFO(TAG, "Status LED ready (brightness %u%%, %s)", led_brightness_percent, led_user_enabled ? "on" : "off");
+    vendor_load_state_from_nvs();
+    vendor_last_valid = false;
+    vendor_last_hit = false;
+    vendor_lookup_buffer[0] = '\0';
+    vendor_file_checked = false;
+    vendor_file_present = false;
+    vendor_record_count = 0;
 
     ESP_ERROR_CHECK(wifi_init_ap_sta()); 
 
@@ -4218,6 +4776,8 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  show_probes");
     MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
     MY_LOG_INFO(TAG,"  start_sniffer_dog");
+    MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
+    MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
     MY_LOG_INFO(TAG,"  stop");
     MY_LOG_INFO(TAG,"  reboot");
 
@@ -4261,6 +4821,9 @@ void app_main(void) {
     esp_err_t sd_init_ret = init_sd_card();
     if (sd_init_ret == ESP_OK) {
         create_sd_directories();
+        if (vendor_is_enabled()) {
+            ensure_vendor_file_checked();
+        }
     }
     
     // Load BSSID whitelist from SD card
@@ -4397,10 +4960,10 @@ static void sae_attack_task(void *pvParameters) {
                 // Clean up after attack
                 esp_wifi_set_promiscuous(false);
                 
-                // Clear LED (ignore errors if LED is in invalid state)
-                esp_err_t led_err = led_strip_clear(strip);
-                if (led_err == ESP_OK) {
-                    led_strip_refresh(strip);
+                // Restore LED to idle (ignore errors if LED is in invalid state)
+                esp_err_t led_err = led_set_idle();
+                if (led_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to restore idle LED after SAE stop: %s", esp_err_to_name(led_err));
                 }
                 
                 break;
@@ -4418,9 +4981,9 @@ static void sae_attack_task(void *pvParameters) {
     }
     
     // Clean up LED after attack finishes naturally (ignore LED errors)
-    esp_err_t led_err = led_strip_clear(strip);
-    if (led_err == ESP_OK) {
-        led_strip_refresh(strip);
+    esp_err_t led_err = led_set_idle();
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore idle LED after SAE task: %s", esp_err_to_name(led_err));
     }
     
     // Clean up after attack
@@ -5346,14 +5909,12 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
     // Send deauth frame for more effective disconnection
 
     // Blue LED flash to indicate deauth sent
-    led_strip_set_pixel(strip, 0, 0, 0, 255); // Blue
-    led_strip_refresh(strip);
+    (void)led_set_color(0, 0, 255); // Blue
 
     wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
     deauth_sent_count++;
     
-    led_strip_set_pixel(strip, 0, 255, 0, 0); // Back to red
-    led_strip_refresh(strip);
+    (void)led_set_color(255, 0, 0); // Back to red
     
     // Log statistics for this AP-STA pair
     MY_LOG_INFO(TAG, "[SnifferDog #%lu] DEAUTH sent: AP=%02X:%02X:%02X:%02X:%02X:%02X -> STA=%02X:%02X:%02X:%02X:%02X:%02X (Ch=%d, RSSI=%d)",
@@ -5796,8 +6357,25 @@ static void save_portal_data(const char* ssid, const char* form_data) {
         char *equals = strchr(token, '=');
         if (equals != NULL) {
             *equals = '\0';
+            char *key = token;
             char *value = equals + 1;
-            
+
+            // URL decode the key
+            char decoded_key[128];
+            int decoded_key_len = 0;
+            for (char *p = key; *p && decoded_key_len < sizeof(decoded_key) - 1; p++) {
+                if (*p == '%' && p[1] && p[2]) {
+                    char hex[3] = {p[1], p[2], '\0'};
+                    decoded_key[decoded_key_len++] = (char)strtol(hex, NULL, 16);
+                    p += 2;
+                } else if (*p == '+') {
+                    decoded_key[decoded_key_len++] = ' ';
+                } else {
+                    decoded_key[decoded_key_len++] = *p;
+                }
+            }
+            decoded_key[decoded_key_len] = '\0';
+
             // URL decode the value
             char decoded_value[128];
             int decoded_len = 0;
@@ -5813,10 +6391,10 @@ static void save_portal_data(const char* ssid, const char* form_data) {
                 }
             }
             decoded_value[decoded_len] = '\0';
-            
-            // Write field value in CSV format
-            fprintf(file, "\"%s\"", decoded_value);
-            
+
+            // Write field name and value in CSV format as key=value
+            fprintf(file, "\"%s=%s\"", decoded_key, decoded_value);
+
             // Add comma if not last field
             current_field++;
             if (current_field < field_count) {
