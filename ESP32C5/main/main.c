@@ -140,6 +140,7 @@ typedef struct {
 static bool wardrive_active = false;
 static int wardrive_file_counter = 1;
 static gps_data_t current_gps = {0};
+static bool gps_uart_initialized = false;
 
 // Global stop flag for all operations
 static volatile bool operation_stop_requested = false;
@@ -5935,11 +5936,31 @@ static esp_err_t init_gps_uart(void) {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    
-    ESP_ERROR_CHECK(uart_driver_install(GPS_UART_NUM, GPS_BUF_SIZE * 2, 0, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(GPS_UART_NUM, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(GPS_UART_NUM, GPS_TX_PIN, GPS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    
+
+    esp_err_t err;
+
+    if (!gps_uart_initialized) {
+        err = uart_driver_install(GPS_UART_NUM, GPS_BUF_SIZE * 2, 0, 0, NULL, 0);
+        if (err == ESP_ERR_INVALID_STATE) {
+            // Driver already installed from a previous run
+            gps_uart_initialized = true;
+        } else if (err != ESP_OK) {
+            return err;
+        } else {
+            gps_uart_initialized = true;
+        }
+    }
+
+    err = uart_param_config(GPS_UART_NUM, &uart_config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = uart_set_pin(GPS_UART_NUM, GPS_TX_PIN, GPS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err != ESP_OK) {
+        return err;
+    }
+
     return ESP_OK;
 }
 
