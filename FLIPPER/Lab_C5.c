@@ -37,7 +37,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.17"
+#define LAB_C5_VERSION_TEXT "0.18"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -67,6 +67,8 @@ typedef enum {
 #define SERIAL_LINE_CHAR_LIMIT 22
 #define SERIAL_TEXT_LINE_HEIGHT 10
 #define DISPLAY_WIDTH 128
+#define DISPLAY_HEIGHT 64
+#define WARD_DRIVE_CONSOLE_LINES 3
 #define RESULT_DEFAULT_MAX_LINES 4
 #define RESULT_DEFAULT_LINE_HEIGHT 12
 #define RESULT_DEFAULT_CHAR_LIMIT (SERIAL_LINE_CHAR_LIMIT - 3)
@@ -199,6 +201,11 @@ typedef struct {
     bool serial_follow_tail;
     bool serial_targets_hint;
     bool blackout_view_active;
+    bool wardrive_view_active;
+    bool wardrive_status_is_numeric;
+    char wardrive_status_text[32];
+    char wardrive_line_buffer[96];
+    size_t wardrive_line_length;
     bool last_command_sent;
     bool confirm_blackout_yes;
     bool confirm_sniffer_dos_yes;
@@ -340,8 +347,12 @@ static void simple_app_send_vendor_command(SimpleApp* app, bool enable);
 static void simple_app_request_vendor_status(SimpleApp* app);
 static bool simple_app_handle_vendor_status_line(SimpleApp* app, const char* line);
 static void simple_app_vendor_feed(SimpleApp* app, char ch);
+static void simple_app_reset_wardrive_status(SimpleApp* app);
+static void simple_app_process_wardrive_line(SimpleApp* app, const char* line);
+static void simple_app_wardrive_feed(SimpleApp* app, char ch);
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial);
 static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, size_t length);
+static void simple_app_draw_wardrive_serial(SimpleApp* app, Canvas* canvas);
 static void simple_app_update_otg_label(SimpleApp* app);
 static void simple_app_apply_otg_power(SimpleApp* app);
 static void simple_app_toggle_otg_power(SimpleApp* app);
@@ -1038,6 +1049,74 @@ static void simple_app_vendor_feed(SimpleApp* app, char ch) {
         return;
     }
     app->vendor_read_buffer[app->vendor_read_length++] = ch;
+}
+
+static void simple_app_set_wardrive_status(SimpleApp* app, const char* text, bool numeric) {
+    if(!app || !text) return;
+    snprintf(app->wardrive_status_text, sizeof(app->wardrive_status_text), "%s", text);
+    app->wardrive_status_is_numeric = numeric;
+}
+
+static void simple_app_reset_wardrive_status(SimpleApp* app) {
+    if(!app) return;
+    simple_app_set_wardrive_status(app, "0", true);
+    app->wardrive_line_length = 0;
+}
+
+static void simple_app_process_wardrive_line(SimpleApp* app, const char* line) {
+    if(!app || !line || !app->wardrive_view_active) return;
+
+    if(strstr(line, "Wardrive task started") != NULL) {
+        simple_app_set_wardrive_status(app, "Starting", false);
+        return;
+    }
+
+    if(strstr(line, "Waiting for GPS fix") != NULL) {
+        simple_app_set_wardrive_status(app, "waiting for GPS signal", false);
+        return;
+    }
+
+    const char* logged_ptr = strstr(line, "Logged ");
+    if(!logged_ptr) return;
+    logged_ptr += strlen("Logged ");
+    while(*logged_ptr == ' ') {
+        logged_ptr++;
+    }
+
+    char digits[12];
+    size_t idx = 0;
+    while(isdigit((unsigned char)logged_ptr[idx]) && idx < sizeof(digits) - 1) {
+        digits[idx] = logged_ptr[idx];
+        idx++;
+    }
+    if(idx == 0) return;
+    digits[idx] = '\0';
+
+    if(strstr(line, "networks to") != NULL) {
+        simple_app_set_wardrive_status(app, digits, true);
+    }
+}
+
+static void simple_app_wardrive_feed(SimpleApp* app, char ch) {
+    if(!app) return;
+    if(!app->wardrive_view_active) {
+        app->wardrive_line_length = 0;
+        return;
+    }
+    if(ch == '\r') return;
+    if(ch == '\n') {
+        if(app->wardrive_line_length > 0) {
+            app->wardrive_line_buffer[app->wardrive_line_length] = '\0';
+            simple_app_process_wardrive_line(app, app->wardrive_line_buffer);
+        }
+        app->wardrive_line_length = 0;
+        return;
+    }
+    if(app->wardrive_line_length + 1 >= sizeof(app->wardrive_line_buffer)) {
+        app->wardrive_line_length = 0;
+        return;
+    }
+    app->wardrive_line_buffer[app->wardrive_line_length++] = ch;
 }
 
 static void simple_app_update_otg_label(SimpleApp* app) {
@@ -2078,10 +2157,22 @@ static size_t simple_app_total_display_lines(SimpleApp* app) {
     return total;
 }
 
+static size_t simple_app_visible_serial_lines(const SimpleApp* app) {
+    if(!app) return SERIAL_VISIBLE_LINES;
+    if(app->screen == ScreenConsole) {
+        return CONSOLE_VISIBLE_LINES;
+    }
+    if(app->screen == ScreenSerial && app->wardrive_view_active) {
+        return WARD_DRIVE_CONSOLE_LINES;
+    }
+    return SERIAL_VISIBLE_LINES;
+}
+
 static size_t simple_app_max_scroll(SimpleApp* app) {
     size_t total = simple_app_total_display_lines(app);
-    if(total <= SERIAL_VISIBLE_LINES) return 0;
-    return total - SERIAL_VISIBLE_LINES;
+    size_t visible_lines = simple_app_visible_serial_lines(app);
+    if(total <= visible_lines) return 0;
+    return total - visible_lines;
 }
 
 static void simple_app_update_scroll(SimpleApp* app) {
@@ -2159,6 +2250,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_karma_html_feed(app, ch);
         simple_app_led_feed(app, ch);
         simple_app_vendor_feed(app, ch);
+        simple_app_wardrive_feed(app, ch);
     }
 
     if(trimmed_any && !app->serial_follow_tail) {
@@ -2173,6 +2265,15 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
 
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial) {
     if(!app || !command || command[0] == '\0') return;
+
+    bool is_wardrive_command = strstr(command, "start_wardrive") != NULL;
+    if(is_wardrive_command) {
+        app->wardrive_view_active = true;
+        simple_app_reset_wardrive_status(app);
+    } else if(app->wardrive_view_active) {
+        app->wardrive_view_active = false;
+        simple_app_reset_wardrive_status(app);
+    }
 
     app->serial_targets_hint = false;
     if(strcmp(command, "start_blackout") != 0) {
@@ -3671,7 +3772,122 @@ static size_t simple_app_render_display_lines(SimpleApp* app, size_t skip_lines,
     return lines_filled;
 }
 
+static void simple_app_draw_wardrive_serial(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+    char display_lines[WARD_DRIVE_CONSOLE_LINES][64];
+    size_t lines_filled = simple_app_render_display_lines(
+        app, app->serial_scroll, display_lines, WARD_DRIVE_CONSOLE_LINES);
+
+    uint8_t y = 8;
+    if(lines_filled == 0) {
+        canvas_draw_str(canvas, 2, y, "No UART data");
+    } else {
+        for(size_t i = 0; i < lines_filled; i++) {
+            canvas_draw_str(canvas, 2, y, display_lines[i][0] ? display_lines[i] : " ");
+            y += SERIAL_TEXT_LINE_HEIGHT;
+        }
+    }
+
+    size_t total_lines = simple_app_total_display_lines(app);
+    if(total_lines > WARD_DRIVE_CONSOLE_LINES) {
+        size_t max_scroll = simple_app_max_scroll(app);
+        bool show_up = (app->serial_scroll > 0);
+        bool show_down = (app->serial_scroll < max_scroll);
+        if(show_up || show_down) {
+            uint8_t arrow_x = DISPLAY_WIDTH - 6;
+            int16_t content_top = 8;
+            int16_t visible_rows =
+                (WARD_DRIVE_CONSOLE_LINES > 0) ? (WARD_DRIVE_CONSOLE_LINES - 1) : 0;
+            int16_t content_bottom = 8 + (int16_t)(visible_rows * SERIAL_TEXT_LINE_HEIGHT);
+            simple_app_draw_scroll_hints(canvas, arrow_x, content_top, content_bottom, show_up, show_down);
+        }
+    }
+
+    int16_t divider_y =
+        8 + (int16_t)(WARD_DRIVE_CONSOLE_LINES * SERIAL_TEXT_LINE_HEIGHT) + 2;
+    if(divider_y >= DISPLAY_HEIGHT) {
+        divider_y = DISPLAY_HEIGHT - 2;
+    }
+    canvas_draw_line(canvas, 0, divider_y, DISPLAY_WIDTH - 1, divider_y);
+
+    const char* status = app->wardrive_status_text[0] ? app->wardrive_status_text : "0";
+    bool numeric = app->wardrive_status_is_numeric;
+    int16_t bottom_center = divider_y + ((DISPLAY_HEIGHT - divider_y) / 2);
+    if(bottom_center >= DISPLAY_HEIGHT) {
+        bottom_center = DISPLAY_HEIGHT - 2;
+    }
+
+    if(!numeric) {
+        size_t len = strlen(status);
+        if(len > 12) {
+            const char* split_ptr = NULL;
+            size_t mid = len / 2;
+            for(size_t i = mid; i > 0; i--) {
+                if(status[i] == ' ') {
+                    split_ptr = status + i;
+                    break;
+                }
+            }
+            if(!split_ptr) {
+                for(size_t i = mid; i < len; i++) {
+                    if(status[i] == ' ') {
+                        split_ptr = status + i;
+                        break;
+                    }
+                }
+            }
+            if(split_ptr) {
+                size_t first_len = (size_t)(split_ptr - status);
+                while(first_len > 0 && status[first_len - 1] == ' ') {
+                    first_len--;
+                }
+                char first_line[32];
+                if(first_len >= sizeof(first_line)) {
+                    first_len = sizeof(first_line) - 1;
+                }
+                memcpy(first_line, status, first_len);
+                first_line[first_len] = '\0';
+                const char* second_start = split_ptr + 1;
+                while(*second_start == ' ') {
+                    second_start++;
+                }
+                char second_line[32];
+                snprintf(second_line, sizeof(second_line), "%s", second_start);
+                if(first_line[0] != '\0' && second_line[0] != '\0') {
+                    canvas_set_font(canvas, FontSecondary);
+                    int16_t first_y = bottom_center - 4;
+                    int16_t second_y = bottom_center + 8;
+                    if(second_y >= DISPLAY_HEIGHT) {
+                        second_y = DISPLAY_HEIGHT - 2;
+                        first_y = second_y - 12;
+                    }
+                    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, first_y, AlignCenter, AlignCenter, first_line);
+                    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, second_y, AlignCenter, AlignCenter, second_line);
+                    return;
+                }
+            }
+        }
+    }
+
+    Font display_font = FontPrimary;
+    if(!numeric) {
+        size_t len = strlen(status);
+        if(len > 10) {
+            display_font = FontSecondary;
+        }
+    }
+    canvas_set_font(canvas, display_font);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, bottom_center, AlignCenter, AlignCenter, status);
+}
+
 static void simple_app_draw_serial(SimpleApp* app, Canvas* canvas) {
+    if(app && app->wardrive_view_active) {
+        simple_app_draw_wardrive_serial(app, canvas);
+        return;
+    }
+
     canvas_set_color(canvas, ColorBlack);
     canvas_set_font(canvas, FontSecondary);
     char display_lines[SERIAL_VISIBLE_LINES][64];
