@@ -52,13 +52,11 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 
 The Flipper application lives in `FLIPPER/Lab_C5.c` and mirrors the CLI primitives. Use it when you need to keep the board in a backpack but still see what is happening.
 
-1. Launch the app (`Gfx/app_icon.png`) and connect the ESP32-C5 when the splash screen (`Gfx/image.png`) prompts you.
-2. Run **Scan** from the main menu (`Gfx/main_menu.png`), then open **Targets** to see the same list that `show_scan_results` prints. Multi-select is done by tapping `OK` on each row and confirming via `Gfx/confirm_sel.png`.
-3. The attack selector (`Gfx/attack_menu.png`) offers Deauth, Evil Twin, SAE Overflow, Blackout, Sniffer Dog, Wardrive, Karma, and Sniffer views identical to their CLI counterparts.
-4. Live attack telemetry (`Gfx/f_deauth.png`, `Gfx/sniffer_menu.png`, `Gfx/sniffer_results.png`) uses the same counters and whitelist state as the firmware.
-5. Portal acknowledgements render on-device (`Gfx/portals.png`) right after the CLI writes to `portals.txt`.
-
-The overview GIF at the top shows how moving between Scan -> Targets -> Attack mirrors the CLI commands.
+1. Launch the app and connect the ESP32-C5 when the splash screen prompts you.
+2. Run **Scanner** from the main menu, then user Right navigation to jump in to **Targets** to see the same list that `show_scan_results` prints. Multi-select is handled by tapping OK on each row and confirming the dialog that pops up after every selection.
+3. Use the attack selector to start Deauth, Evil Twin, SAE Overflow, Blackout, Sniffer Dog, Wardrive, Karma, or Sniffer views—each mirrors the CLI command of the same name.
+4. Live attack telemetry reuses the same counters and whitelist state as the firmware, so you can monitor progress from the Flipper screen while the board stays tethered elsewhere.
+5. Portal acknowledgements show up in the UI as soon as `portals.txt` is updated. Full walkthrough notes and screenshots now live on the wiki.
 
 ## Vendor Lookup Data
 
