@@ -78,6 +78,20 @@ Enrich CLI/Flipper listings with manufacturer names by feeding a compact OUI dat
 - `/lab/portals.txt` - persistent CSV-like log of every POST field the captive portal receives.
 - `/lab/oui_wifi.bin` - vendor lookup table streamed on demand.
 
+## Flashing the ESP32-C5 Firmware
+
+1. Open a terminal in the repo and switch to the binaries folder: `cd ESP32C5/binaries-esp32c5`.
+2. Run the flasher: `python flash_board.py`. The script waits for a USB-UART bridge before streaming the binary.
+3. On the Flipper Zero, open **GPIO → GPIO → USB-UART Bridge** so it presents a serial adapter to the host PC.
+- While holding the lower **BOOT** button on the LAB C5 board, plug the board into the Flipper; release BOOT right after it clicks in.
+4. Connect the Flipper to your PC over USB; the flashing script will detect the bridge automatically (no qFlipper needed).
+5. Once the transfer begins the rest is automatic; the board reboots into the freshly flashed JanOS build.
+
+### Flashing Troubleshooting
+
+- Make sure the qFlipper application is closed; it will keep the UART bridge busy and the script will hang.
+- If you launched `flash_board.py` while the Flipper was already connected and nothing happened, unplug the USB cable, stop the script, then rerun the script before reconnecting (with BOOT held as described above).
+
 With these anchors in place the README now focuses purely on the software's primary functions-scanning, deciding, attacking, and logging-while pointing both CLI and Flipper users to the exact commands and assets that power each flow.
 
 ## About Us
