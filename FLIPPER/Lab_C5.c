@@ -37,7 +37,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.18"
+#define LAB_C5_VERSION_TEXT "0.19"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -206,6 +206,8 @@ typedef struct {
     char wardrive_status_text[32];
     char wardrive_line_buffer[96];
     size_t wardrive_line_length;
+    bool wardrive_otg_forced;
+    bool wardrive_otg_previous_state;
     bool last_command_sent;
     bool confirm_blackout_yes;
     bool confirm_sniffer_dos_yes;
@@ -350,6 +352,8 @@ static void simple_app_vendor_feed(SimpleApp* app, char ch);
 static void simple_app_reset_wardrive_status(SimpleApp* app);
 static void simple_app_process_wardrive_line(SimpleApp* app, const char* line);
 static void simple_app_wardrive_feed(SimpleApp* app, char ch);
+static void simple_app_force_otg_for_wardrive(SimpleApp* app);
+static void simple_app_restore_otg_after_wardrive(SimpleApp* app);
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial);
 static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, size_t length);
 static void simple_app_draw_wardrive_serial(SimpleApp* app, Canvas* canvas);
@@ -1117,6 +1121,28 @@ static void simple_app_wardrive_feed(SimpleApp* app, char ch) {
         return;
     }
     app->wardrive_line_buffer[app->wardrive_line_length++] = ch;
+}
+
+static void simple_app_force_otg_for_wardrive(SimpleApp* app) {
+    if(!app) return;
+    if(!app->wardrive_otg_forced) {
+        app->wardrive_otg_forced = true;
+        app->wardrive_otg_previous_state = app->otg_power_enabled;
+    }
+    if(!app->otg_power_enabled) {
+        app->otg_power_enabled = true;
+    }
+    simple_app_apply_otg_power(app);
+}
+
+static void simple_app_restore_otg_after_wardrive(SimpleApp* app) {
+    if(!app || !app->wardrive_otg_forced) return;
+    app->wardrive_otg_forced = false;
+    bool desired_state = app->wardrive_otg_previous_state;
+    if(app->otg_power_enabled != desired_state) {
+        app->otg_power_enabled = desired_state;
+    }
+    simple_app_apply_otg_power(app);
 }
 
 static void simple_app_update_otg_label(SimpleApp* app) {
@@ -2267,12 +2293,17 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     if(!app || !command || command[0] == '\0') return;
 
     bool is_wardrive_command = strstr(command, "start_wardrive") != NULL;
+    bool is_stop_command = strcmp(command, "stop") == 0;
     if(is_wardrive_command) {
         app->wardrive_view_active = true;
         simple_app_reset_wardrive_status(app);
+        simple_app_force_otg_for_wardrive(app);
     } else if(app->wardrive_view_active) {
         app->wardrive_view_active = false;
         simple_app_reset_wardrive_status(app);
+    }
+    if(is_stop_command) {
+        simple_app_restore_otg_after_wardrive(app);
     }
 
     app->serial_targets_hint = false;
