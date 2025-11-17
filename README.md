@@ -9,7 +9,7 @@ projectZero is a LAB C5 board add-on firmware that layers blackout, Sniffer Dog,
 
 The firmware focuses on a small set of repeatable operations: discover targets, decide which networks matter, disrupt or impersonate them, and log the evidence. Use the CLI for fine control or the Flipper UI when you need a glanceable dashboard. The entire `ESP32C5/main/main.c` file is JanOS, a ground-up ESP-IDF stack written by the LAB team specifically for this hardware.
 
-![GUI overview](Gfx/fap_over.gif)
+<img src="Gfx/fap_over.gif" alt="GUI overview" width="30%">
 
 - Scan once, re-use the dataset everywhere: CLI commands and the Flipper Targets list consume the same buffers from `ESP32C5/main/main.c`.
 - Attacks keep their own FreeRTOS tasks and respect the global `stop` flag, so you can stack scans, sniffing and portals without rebooting.
@@ -37,7 +37,7 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 - `start_deauth` - multi-network broadcast and targeted deauth (including DFS/high 5 GHz channels) with LED status feedback.
 - `sae_overflow` - floods a single WPA3 access point with randomized SAE commit frames until it stops accepting new stations.
 - `start_blackout` - scheduled global deauth: periodic scan + sorted channel list + broadcast attack every cycle.
-- `start_sniffer_dog` - watches for AP/STA handshakes in real time and sends targeted deauths only for the active pairs (honors the whitelist).
+- `start_sniffer_dog` - watches for data and management packets in real time and sends targeted deauths only for the active pairs (honors the whitelist).
 - Deep dive into both flows: https://github.com/C5Lab/projectZero/wiki/Blackout_SnifferDog
 - `white.txt` - place MAC addresses (one per line) on `/sdcard/lab/white.txt` to exempt them from Blackout and Sniffer Dog logic.
 
