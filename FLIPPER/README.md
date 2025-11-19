@@ -2,6 +2,20 @@
 
 The Flipper Zero companion app (`Lab_C5.fap`) mirrors the ESP32-C5 CLI workflows (scan, Targets, attacks, wardrive, Sniffer Dog, portal control) so you can steer the board from the handheld UI.
 
+## Build with compatible SDKs
+
+If you need an alternate firmware SDK that keeps the app compatible with the Unleashed or Momentum releases, refresh the toolchain and build with `ufbt`:
+
+```bash
+ufbt update --hw f7 --url="https://github.com/DarkFlippers/unleashed-firmware/releases/download/unlshd-083/flipper-z-f7-sdk-unlshd-083.zip"
+ufbt launch
+
+ufbt update --hw f7 --url="https://github.com/Next-Flip/Momentum-Firmware/releases/download/mntm-011/flipper-z-f7-sdk-mntm-011.zip"
+ufbt launch
+```
+
+Each `ufbt update` pulls the SDK that matches the specific firmware track (Unleashed or Momentum) before running `ufbt launch` to build and drop the `.fap` into `dist/`. Future firmware drops may move to different SDK names, so be prepared to pick the correct SDK zip manually from the firmware release page to keep builds in sync.
+
 ## Install the `.fap` (Windows + qFlipper)
 
 1. Build or grab the packaged binary from `FLIPPER/dist/Lab_C5.fap`.

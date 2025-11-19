@@ -57,7 +57,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.6.0"
+#define JANOS_VERSION "0.6.1"
 
 
 #define NEOPIXEL_GPIO      27
@@ -89,6 +89,18 @@
 #define MAX_CLIENTS_PER_AP 50
 #define MAX_SNIFFER_APS 100
 #define MAX_PROBE_REQUESTS 200
+
+static const uint8_t channel_view_24ghz_channels[] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+static const uint8_t channel_view_5ghz_channels[] = {
+    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165};
+
+#define CHANNEL_VIEW_24GHZ_CHANNEL_COUNT \
+    (sizeof(channel_view_24ghz_channels) / sizeof(channel_view_24ghz_channels[0]))
+#define CHANNEL_VIEW_5GHZ_CHANNEL_COUNT \
+    (sizeof(channel_view_5ghz_channels) / sizeof(channel_view_5ghz_channels[0]))
+#define CHANNEL_VIEW_SCAN_DELAY_MS 2000
+#define CHANNEL_VIEW_SCAN_TIMEOUT_ITERATIONS 200
 
 static const char *TAG = "projectZero";
 
@@ -161,6 +173,11 @@ static wifi_second_chan_t packet_monitor_prev_secondary = WIFI_SECOND_CHAN_NONE;
 static bool packet_monitor_has_prev_channel = false;
 static bool packet_monitor_promiscuous_owned = false;
 static bool packet_monitor_callback_installed = false;
+
+// Channel view monitor state
+static volatile bool channel_view_active = false;
+static volatile bool channel_view_scan_mode = false;
+static TaskHandle_t channel_view_task_handle = NULL;
 
 // Probe request storage
 static probe_request_t probe_requests[MAX_PROBE_REQUESTS];
@@ -511,6 +528,7 @@ static int cmd_start_evil_twin(int argc, char **argv);
 static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_start_sniffer(int argc, char **argv);
 static int cmd_packet_monitor(int argc, char **argv);
+static int cmd_channel_view(int argc, char **argv);
 static int cmd_show_sniffer_results(int argc, char **argv);
 static int cmd_show_probes(int argc, char **argv);
 static int cmd_list_probes(int argc, char **argv);
@@ -551,6 +569,9 @@ static esp_err_t captive_detection_handler(httpd_req_t *req);
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_process_scan_results(void);
 static void sniffer_channel_hop(void);
+static void channel_view_task(void *pvParameters);
+static void channel_view_stop(void);
+static void channel_view_publish_counts(void);
 // Packet monitor functions
 static void packet_monitor_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void packet_monitor_task(void *pvParameters);
@@ -828,17 +849,18 @@ static void wifi_event_handler(void *event_handler_arg,
         }
         case WIFI_EVENT_SCAN_DONE: {
             const wifi_event_sta_scan_done_t *e = (const wifi_event_sta_scan_done_t *)event_data;
-            
-            if (!periodic_rescan_in_progress && !wardrive_active) {
+            bool suppress_scan_logs = periodic_rescan_in_progress || wardrive_active || channel_view_scan_mode;
+
+            if (!suppress_scan_logs) {
                 MY_LOG_INFO(TAG, "WiFi scan completed. Found %u networks, status: %" PRIu32, e->number, e->status);
             }
-            
+
             g_last_scan_status = e->status;
             if (e->status == 0) { // Success
                 g_scan_count = MAX_AP_CNT;
                 esp_wifi_scan_get_ap_records(&g_scan_count, g_scan_results);
                 
-                if (!periodic_rescan_in_progress && !wardrive_active) {
+                if (!suppress_scan_logs) {
                     MY_LOG_INFO(TAG, "Retrieved %u network records", g_scan_count);
                     
                     // Automatically display scan results after completion
@@ -847,7 +869,7 @@ static void wifi_event_handler(void *event_handler_arg,
                     }
                 }
             } else {
-                if (!(periodic_rescan_in_progress || wardrive_active)) {
+                if (!suppress_scan_logs) {
                     MY_LOG_INFO(TAG, "Scan failed with status: %" PRIu32, e->status);
                 }
                 g_scan_count = 0;
@@ -2274,6 +2296,9 @@ static int cmd_stop(int argc, char **argv) {
 
     // Stop packet monitor if running
     packet_monitor_stop();
+
+    // Stop channel view monitor if running
+    channel_view_stop();
     
     // Stop deauth attack task if running
     if (deauth_attack_active || deauth_attack_task_handle != NULL) {
@@ -2687,6 +2712,171 @@ static int cmd_packet_monitor(int argc, char **argv) {
     if (led_err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to set LED for packet monitor: %s", esp_err_to_name(led_err));
     }
+    return 0;
+}
+
+static void channel_view_publish_counts(void) {
+    uint16_t counts24[CHANNEL_VIEW_24GHZ_CHANNEL_COUNT] = {0};
+    uint16_t counts5[CHANNEL_VIEW_5GHZ_CHANNEL_COUNT] = {0};
+
+    for (uint16_t i = 0; i < g_scan_count; ++i) {
+        const wifi_ap_record_t *ap = &g_scan_results[i];
+        uint8_t primary = ap->primary;
+        if (primary >= 1 && primary <= 14) {
+            counts24[primary - 1]++;
+        } else {
+            for (size_t idx = 0; idx < CHANNEL_VIEW_5GHZ_CHANNEL_COUNT; ++idx) {
+                if (channel_view_5ghz_channels[idx] == primary) {
+                    counts5[idx]++;
+                    break;
+                }
+            }
+        }
+    }
+
+    MY_LOG_INFO(TAG, "channel_view_start");
+    MY_LOG_INFO(TAG, "band:24");
+    for (size_t i = 0; i < CHANNEL_VIEW_24GHZ_CHANNEL_COUNT; ++i) {
+        MY_LOG_INFO(TAG, "ch%u:%u", channel_view_24ghz_channels[i], counts24[i]);
+    }
+    MY_LOG_INFO(TAG, "band:5");
+    for (size_t i = 0; i < CHANNEL_VIEW_5GHZ_CHANNEL_COUNT; ++i) {
+        MY_LOG_INFO(TAG, "ch%u:%u", channel_view_5ghz_channels[i], counts5[i]);
+    }
+    MY_LOG_INFO(TAG, "channel_view_end");
+}
+
+static void channel_view_task(void *pvParameters) {
+    (void)pvParameters;
+
+    const TickType_t scan_delay = pdMS_TO_TICKS(CHANNEL_VIEW_SCAN_DELAY_MS);
+    const TickType_t wait_slice = pdMS_TO_TICKS(100);
+
+    while (channel_view_active && !operation_stop_requested) {
+        esp_err_t err = start_background_scan();
+        if (err != ESP_OK) {
+            MY_LOG_INFO(TAG, "channel_view_error:scan_start %s", esp_err_to_name(err));
+            break;
+        }
+
+        int wait_iterations = 0;
+        while (channel_view_active && g_scan_in_progress &&
+               wait_iterations < CHANNEL_VIEW_SCAN_TIMEOUT_ITERATIONS) {
+            vTaskDelay(wait_slice);
+            wait_iterations++;
+        }
+
+        if (!channel_view_active || operation_stop_requested) {
+            break;
+        }
+
+        if (g_scan_in_progress) {
+            MY_LOG_INFO(TAG, "channel_view_error:timeout");
+            esp_wifi_scan_stop();
+        } else {
+            channel_view_publish_counts();
+        }
+
+        if (!channel_view_active || operation_stop_requested) {
+            break;
+        }
+
+        vTaskDelay(scan_delay);
+    }
+
+    channel_view_scan_mode = false;
+    channel_view_active = false;
+    channel_view_task_handle = NULL;
+    esp_err_t led_err = led_set_idle();
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore LED after channel view: %s", esp_err_to_name(led_err));
+    }
+    MY_LOG_INFO(TAG, "Channel view monitor stopped.");
+    vTaskDelete(NULL);
+}
+
+static void channel_view_stop(void) {
+    if (!channel_view_active && channel_view_task_handle == NULL && !channel_view_scan_mode) {
+        return;
+    }
+
+    channel_view_active = false;
+    if (channel_view_scan_mode && g_scan_in_progress) {
+        esp_wifi_scan_stop();
+    }
+
+    for (int i = 0; i < 40 && channel_view_task_handle != NULL; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (channel_view_task_handle != NULL) {
+        vTaskDelete(channel_view_task_handle);
+        channel_view_task_handle = NULL;
+    }
+
+    channel_view_scan_mode = false;
+    MY_LOG_INFO(TAG, "Channel view stopped.");
+}
+
+static int cmd_channel_view(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
+    if (channel_view_active || channel_view_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Channel view already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+
+    if (packet_monitor_active || packet_monitor_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Packet monitor is active. Use 'stop' before starting channel view.");
+        return 1;
+    }
+
+    if (sniffer_active || sniffer_scan_phase || sniffer_dog_active) {
+        MY_LOG_INFO(TAG, "Sniffer operations are active. Use 'stop' before starting channel view.");
+        return 1;
+    }
+
+    if (wardrive_active) {
+        MY_LOG_INFO(TAG, "Wardrive is active. Use 'stop' before starting channel view.");
+        return 1;
+    }
+
+    if (portal_active) {
+        MY_LOG_INFO(TAG, "Portal is active. Use 'stop' before starting channel view.");
+        return 1;
+    }
+
+    if (applicationState != IDLE) {
+        MY_LOG_INFO(TAG, "Another attack is active. Use 'stop' before starting channel view.");
+        return 1;
+    }
+
+    if (g_scan_in_progress) {
+        MY_LOG_INFO(TAG, "Scan already in progress. Wait for it to finish or use 'stop'.");
+        return 1;
+    }
+
+    operation_stop_requested = false;
+    channel_view_active = true;
+    channel_view_scan_mode = true;
+    BaseType_t task_ok =
+        xTaskCreate(channel_view_task, "channel_view", 4096, NULL, 5, &channel_view_task_handle);
+
+    if (task_ok != pdPASS) {
+        channel_view_active = false;
+        channel_view_scan_mode = false;
+        channel_view_task_handle = NULL;
+        MY_LOG_INFO(TAG, "Failed to create channel view task.");
+        return 1;
+    }
+
+    esp_err_t led_err = led_set_color(128, 0, 255); // purple-ish to indicate analyzer
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for channel view: %s", esp_err_to_name(led_err));
+    }
+
+    MY_LOG_INFO(TAG, "Channel view started. Type 'stop' to stop it.");
     return 0;
 }
 
@@ -4506,6 +4696,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&packet_monitor_cmd));
 
+    const esp_console_cmd_t channel_view_cmd = {
+        .command = "channel_view",
+        .help = "Continuously scan and print Wi-Fi channel utilization",
+        .hint = NULL,
+        .func = &cmd_channel_view,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&channel_view_cmd));
+
 
     const esp_console_cmd_t show_sniffer_cmd = {
         .command = "show_sniffer_results",
@@ -4773,6 +4972,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  select_html <index>");
     MY_LOG_INFO(TAG,"  start_sniffer");
     MY_LOG_INFO(TAG,"  packet_monitor <channel>");
+    MY_LOG_INFO(TAG,"  channel_view");
     MY_LOG_INFO(TAG,"  show_sniffer_results");
     MY_LOG_INFO(TAG,"  show_probes");
     MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");

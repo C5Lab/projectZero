@@ -26,6 +26,7 @@ typedef enum {
     ScreenSetupLed,
     ScreenConsole,
     ScreenPackageMonitor,
+    ScreenChannelView,
     ScreenConfirmBlackout,
     ScreenConfirmSnifferDos,
     ScreenKarmaMenu,
@@ -37,7 +38,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.19"
+#define LAB_C5_VERSION_TEXT "0.20"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -101,6 +102,22 @@ typedef enum {
 #define PACKAGE_MONITOR_BAR_SPACING 2
 #define PACKAGE_MONITOR_CHANNEL_SWITCH_COOLDOWN_MS 200
 
+#define CHANNEL_VIEW_COMMAND "channel_view"
+#define CHANNEL_VIEW_LINE_BUFFER 64
+
+static const uint8_t channel_view_channels_24ghz[] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+static const uint8_t channel_view_channels_5ghz[] = {
+    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165};
+
+#define CHANNEL_VIEW_24GHZ_CHANNEL_COUNT \
+    (sizeof(channel_view_channels_24ghz) / sizeof(channel_view_channels_24ghz[0]))
+#define CHANNEL_VIEW_5GHZ_CHANNEL_COUNT \
+    (sizeof(channel_view_channels_5ghz) / sizeof(channel_view_channels_5ghz[0]))
+
+#define CHANNEL_VIEW_VISIBLE_COLUMNS_24 6
+#define CHANNEL_VIEW_VISIBLE_COLUMNS_5 5
+
 #define HINT_MAX_LINES 16
 #define HINT_VISIBLE_LINES 3
 #define HINT_LINE_CHAR_LIMIT 48
@@ -132,15 +149,27 @@ typedef enum {
     MenuActionToggleOtgPower,
     MenuActionOpenScannerSetup,
     MenuActionOpenLedSetup,
-    
+
     MenuActionOpenConsole,
     MenuActionOpenPackageMonitor,
+    MenuActionOpenChannelView,
     MenuActionConfirmBlackout,
     MenuActionConfirmSnifferDos,
     MenuActionOpenEvilTwinMenu,
     MenuActionOpenKarmaMenu,
     MenuActionOpenPortalMenu,
 } MenuAction;
+
+typedef enum {
+    ChannelViewBand24,
+    ChannelViewBand5,
+} ChannelViewBand;
+
+typedef enum {
+    ChannelViewSectionNone,
+    ChannelViewSection24,
+    ChannelViewSection5,
+} ChannelViewSection;
 
 typedef enum {
     ScannerOptionShowSSID,
@@ -326,6 +355,22 @@ typedef struct {
     char package_monitor_line_buffer[64];
     size_t package_monitor_line_length;
     uint32_t package_monitor_last_channel_tick;
+    bool channel_view_active;
+    bool channel_view_dirty;
+    bool channel_view_has_data;
+    bool channel_view_dataset_active;
+    bool channel_view_has_status;
+    ChannelViewBand channel_view_band;
+    ChannelViewSection channel_view_section;
+    uint16_t channel_view_counts_24[CHANNEL_VIEW_24GHZ_CHANNEL_COUNT];
+    uint16_t channel_view_counts_5[CHANNEL_VIEW_5GHZ_CHANNEL_COUNT];
+    uint16_t channel_view_working_counts_24[CHANNEL_VIEW_24GHZ_CHANNEL_COUNT];
+    uint16_t channel_view_working_counts_5[CHANNEL_VIEW_5GHZ_CHANNEL_COUNT];
+    char channel_view_line_buffer[CHANNEL_VIEW_LINE_BUFFER];
+    size_t channel_view_line_length;
+    char channel_view_status_text[32];
+    uint8_t channel_view_offset_24;
+    uint8_t channel_view_offset_5;
 } SimpleApp;
 static void simple_app_reset_result_scroll(SimpleApp* app);
 static void simple_app_update_result_scroll(SimpleApp* app);
@@ -376,6 +421,22 @@ static void simple_app_package_monitor_process_line(SimpleApp* app, const char* 
 static void simple_app_package_monitor_feed(SimpleApp* app, char ch);
 static void simple_app_draw_package_monitor(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_package_monitor_input(SimpleApp* app, InputKey key);
+static void simple_app_channel_view_enter(SimpleApp* app);
+static void simple_app_channel_view_start(SimpleApp* app);
+static void simple_app_channel_view_stop(SimpleApp* app);
+static void simple_app_channel_view_reset(SimpleApp* app);
+static void simple_app_channel_view_begin_dataset(SimpleApp* app);
+static void simple_app_channel_view_commit_dataset(SimpleApp* app);
+static void simple_app_channel_view_process_line(SimpleApp* app, const char* line);
+static void simple_app_channel_view_feed(SimpleApp* app, char ch);
+static void simple_app_draw_channel_view(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_channel_view_input(SimpleApp* app, InputKey key);
+static void simple_app_channel_view_show_status(SimpleApp* app, const char* status);
+static int simple_app_channel_view_find_channel_index(const uint8_t* list, size_t count, uint8_t channel);
+static size_t simple_app_channel_view_visible_columns(ChannelViewBand band);
+static uint8_t simple_app_channel_view_max_offset(ChannelViewBand band);
+static uint8_t* simple_app_channel_view_offset_ptr(SimpleApp* app, ChannelViewBand band);
+static bool simple_app_channel_view_adjust_offset(SimpleApp* app, ChannelViewBand band, int delta);
 static bool simple_app_try_show_hint(SimpleApp* app);
 static void simple_app_draw_portal_menu(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key);
@@ -482,7 +543,7 @@ static const char hint_section_targets[] =
 static const char hint_section_attacks[] =
     "Test features here\nUse only on own lab\nTargets come from\nSelected networks\nFollow local laws.";
 static const char hint_section_monitoring[] =
-    "Watch live packets\nDefault channel 1\nUse Up/Down keys\nSwitch between\n2.4 & 5GHz bands.";
+    "Monitoring tools\nPacket rates +\nChannel analyzer\nSwitch views with\nUp/Down buttons.";
 static const char hint_section_setup[] =
     "General settings\nBacklight, 5V, LED\nAdjust scanner view\nConsole with logs\nUseful for debug.";
 
@@ -543,9 +604,12 @@ static const MenuEntry menu_entries_attacks[] = {
 
 static const char hint_monitor_package[] =
     "Live packet count\nShows vertical bars\nBack stops monitor\nUp/Down change ch.";
+static const char hint_monitor_channel[] =
+    "Channel usage view\nAuto scans both bands\nUp/Down swap band\nLeft/Right scroll\nOK restarts scan.";
 
 static const MenuEntry menu_entries_monitoring[] = {
     {"Package Monitor", NULL, MenuActionOpenPackageMonitor, hint_monitor_package},
+    {"Channel View", NULL, MenuActionOpenChannelView, hint_monitor_channel},
 };
 
 static char menu_label_backlight[24] = "Backlight: On";
@@ -2271,6 +2335,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         char ch = (char)data[i];
         simple_app_scan_feed(app, ch);
         simple_app_package_monitor_feed(app, ch);
+        simple_app_channel_view_feed(app, ch);
         simple_app_evil_twin_feed(app, ch);
         simple_app_karma_probe_feed(app, ch);
         simple_app_karma_html_feed(app, ch);
@@ -2972,6 +3037,397 @@ static void simple_app_handle_package_monitor_input(SimpleApp* app, InputKey key
         if(app->viewport) {
             view_port_update(app->viewport);
         }
+    }
+}
+
+static int simple_app_channel_view_find_channel_index(const uint8_t* list, size_t count, uint8_t channel) {
+    if(!list || count == 0) return -1;
+    for(size_t i = 0; i < count; i++) {
+        if(list[i] == channel) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static size_t simple_app_channel_view_visible_columns(ChannelViewBand band) {
+    return (band == ChannelViewBand5) ? CHANNEL_VIEW_VISIBLE_COLUMNS_5 : CHANNEL_VIEW_VISIBLE_COLUMNS_24;
+}
+
+static uint8_t simple_app_channel_view_max_offset(ChannelViewBand band) {
+    size_t total = (band == ChannelViewBand5) ? CHANNEL_VIEW_5GHZ_CHANNEL_COUNT : CHANNEL_VIEW_24GHZ_CHANNEL_COUNT;
+    size_t visible = simple_app_channel_view_visible_columns(band);
+    if(total <= visible) {
+        return 0;
+    }
+    return (uint8_t)(total - visible);
+}
+
+static uint8_t* simple_app_channel_view_offset_ptr(SimpleApp* app, ChannelViewBand band) {
+    return (band == ChannelViewBand5) ? &app->channel_view_offset_5 : &app->channel_view_offset_24;
+}
+
+static bool simple_app_channel_view_adjust_offset(SimpleApp* app, ChannelViewBand band, int delta) {
+    if(!app || delta == 0) return false;
+    uint8_t* offset = simple_app_channel_view_offset_ptr(app, band);
+    uint8_t max_offset = simple_app_channel_view_max_offset(band);
+    int new_offset = (int)*offset + delta;
+    if(new_offset < 0) {
+        new_offset = 0;
+    } else if(new_offset > (int)max_offset) {
+        new_offset = (int)max_offset;
+    }
+    if(new_offset == (int)*offset) {
+        return false;
+    }
+    *offset = (uint8_t)new_offset;
+    app->channel_view_dirty = true;
+    return true;
+}
+
+static void simple_app_channel_view_show_status(SimpleApp* app, const char* status) {
+    if(!app) return;
+    if(status && status[0] != '\0') {
+        strncpy(app->channel_view_status_text, status, sizeof(app->channel_view_status_text) - 1);
+        app->channel_view_status_text[sizeof(app->channel_view_status_text) - 1] = '\0';
+        app->channel_view_has_status = true;
+    } else {
+        app->channel_view_status_text[0] = '\0';
+        app->channel_view_has_status = false;
+    }
+    app->channel_view_dirty = true;
+}
+
+static void simple_app_channel_view_reset(SimpleApp* app) {
+    if(!app) return;
+    memset(app->channel_view_counts_24, 0, sizeof(app->channel_view_counts_24));
+    memset(app->channel_view_counts_5, 0, sizeof(app->channel_view_counts_5));
+    memset(app->channel_view_working_counts_24, 0, sizeof(app->channel_view_working_counts_24));
+    memset(app->channel_view_working_counts_5, 0, sizeof(app->channel_view_working_counts_5));
+    app->channel_view_line_length = 0;
+    app->channel_view_section = ChannelViewSectionNone;
+    app->channel_view_dataset_active = false;
+    app->channel_view_has_data = false;
+    app->channel_view_has_status = false;
+    app->channel_view_status_text[0] = '\0';
+    app->channel_view_dirty = true;
+}
+
+static void simple_app_channel_view_begin_dataset(SimpleApp* app) {
+    if(!app) return;
+    memset(app->channel_view_working_counts_24, 0, sizeof(app->channel_view_working_counts_24));
+    memset(app->channel_view_working_counts_5, 0, sizeof(app->channel_view_working_counts_5));
+    app->channel_view_section = ChannelViewSectionNone;
+    app->channel_view_dataset_active = true;
+}
+
+static void simple_app_channel_view_commit_dataset(SimpleApp* app) {
+    if(!app) return;
+    memcpy(app->channel_view_counts_24, app->channel_view_working_counts_24, sizeof(app->channel_view_counts_24));
+    memcpy(app->channel_view_counts_5, app->channel_view_working_counts_5, sizeof(app->channel_view_counts_5));
+    app->channel_view_dataset_active = false;
+    app->channel_view_has_data = true;
+    app->channel_view_dirty = true;
+}
+
+static void simple_app_channel_view_start(SimpleApp* app) {
+    if(!app) return;
+    simple_app_send_stop_if_needed(app);
+    simple_app_channel_view_reset(app);
+    app->channel_view_active = true;
+    simple_app_send_command(app, CHANNEL_VIEW_COMMAND, false);
+    simple_app_channel_view_show_status(app, "Scanning...");
+}
+
+static void simple_app_channel_view_stop(SimpleApp* app) {
+    if(!app) return;
+    if(app->channel_view_active) {
+        app->channel_view_active = false;
+    }
+    app->channel_view_dataset_active = false;
+    simple_app_send_stop_if_needed(app);
+    app->channel_view_dirty = true;
+}
+
+static void simple_app_channel_view_enter(SimpleApp* app) {
+    if(!app) return;
+    if(app->channel_view_band != ChannelViewBand24 && app->channel_view_band != ChannelViewBand5) {
+        app->channel_view_band = ChannelViewBand24;
+    }
+    uint8_t* offset_ptr = simple_app_channel_view_offset_ptr(app, app->channel_view_band);
+    uint8_t max_offset = simple_app_channel_view_max_offset(app->channel_view_band);
+    if(*offset_ptr > max_offset) {
+        *offset_ptr = max_offset;
+    }
+    app->screen = ScreenChannelView;
+    simple_app_channel_view_start(app);
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_channel_view_process_line(SimpleApp* app, const char* line) {
+    if(!app || !line) return;
+
+    while(*line == '>' || *line == ' ') {
+        line++;
+    }
+    if(*line == '\0') return;
+
+    if(strncmp(line, "channel_view_start", 18) == 0) {
+        simple_app_channel_view_begin_dataset(app);
+        simple_app_channel_view_show_status(app, "Scanning...");
+        return;
+    }
+
+    if(strncmp(line, "channel_view_end", 16) == 0) {
+        simple_app_channel_view_commit_dataset(app);
+        simple_app_channel_view_show_status(app, "");
+        return;
+    }
+
+    if(strncmp(line, "channel_view_error:", 19) == 0) {
+        simple_app_channel_view_show_status(app, line + 19);
+        return;
+    }
+
+    if(strncmp(line, "band:", 5) == 0) {
+        unsigned long band_value = strtoul(line + 5, NULL, 10);
+        if(band_value >= 10) {
+            app->channel_view_section = ChannelViewSection24;
+        } else {
+            app->channel_view_section = ChannelViewSection5;
+        }
+        return;
+    }
+
+    if(strncmp(line, "ch", 2) == 0) {
+        const char* colon = strchr(line, ':');
+        if(!colon) return;
+        unsigned long channel = strtoul(line + 2, NULL, 10);
+        unsigned long count = strtoul(colon + 1, NULL, 10);
+        if(count > UINT16_MAX) {
+            count = UINT16_MAX;
+        }
+        if(app->channel_view_section == ChannelViewSection24) {
+            int idx = simple_app_channel_view_find_channel_index(
+                channel_view_channels_24ghz, CHANNEL_VIEW_24GHZ_CHANNEL_COUNT, (uint8_t)channel);
+            if(idx >= 0) {
+                app->channel_view_working_counts_24[idx] = (uint16_t)count;
+            }
+        } else if(app->channel_view_section == ChannelViewSection5) {
+            int idx = simple_app_channel_view_find_channel_index(
+                channel_view_channels_5ghz, CHANNEL_VIEW_5GHZ_CHANNEL_COUNT, (uint8_t)channel);
+            if(idx >= 0) {
+                app->channel_view_working_counts_5[idx] = (uint16_t)count;
+            }
+        }
+        return;
+    }
+}
+
+static void simple_app_channel_view_feed(SimpleApp* app, char ch) {
+    if(!app) return;
+
+    if(ch == '\r') return;
+
+    if(ch == '\n') {
+        if(app->channel_view_line_length > 0) {
+            app->channel_view_line_buffer[app->channel_view_line_length] = '\0';
+            simple_app_channel_view_process_line(app, app->channel_view_line_buffer);
+        }
+        app->channel_view_line_length = 0;
+        return;
+    }
+
+    if(app->channel_view_line_length + 1 >= sizeof(app->channel_view_line_buffer)) {
+        app->channel_view_line_length = 0;
+        return;
+    }
+
+    app->channel_view_line_buffer[app->channel_view_line_length++] = ch;
+}
+
+static void simple_app_draw_channel_view(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 4, 12, "Channel View");
+
+    const bool showing_5ghz = (app->channel_view_band == ChannelViewBand5);
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(
+        canvas, DISPLAY_WIDTH - 4, 12, AlignRight, AlignBottom, showing_5ghz ? "5G" : "2.4G");
+
+    const int16_t frame_x = 2;
+    const int16_t frame_y = 18;
+    const int16_t frame_w = DISPLAY_WIDTH - 4;
+    const int16_t frame_h = DISPLAY_HEIGHT - frame_y - 4;
+    const int16_t bar_top = frame_y + 10;
+    const int16_t bar_bottom = frame_y + frame_h - 12;
+
+    canvas_draw_frame(canvas, frame_x, frame_y, frame_w, frame_h);
+
+    const char* overlay_text = NULL;
+    if(app->channel_view_has_status && app->channel_view_status_text[0] != '\0') {
+        overlay_text = app->channel_view_status_text;
+    } else if(!app->channel_view_has_data) {
+        overlay_text = app->channel_view_active ? "Scanning..." : "Press OK to restart";
+    }
+
+    if(!app->channel_view_has_data) {
+        const char* message = overlay_text;
+        if(!message) {
+            message = app->channel_view_active ? "Waiting for data..." : "Press OK to restart";
+        }
+        canvas_draw_str_aligned(
+            canvas,
+            frame_x + frame_w / 2,
+            frame_y + frame_h / 2,
+            AlignCenter,
+            AlignCenter,
+            message);
+        app->channel_view_dirty = false;
+        return;
+    }
+
+    const uint16_t* counts = showing_5ghz ? app->channel_view_counts_5 : app->channel_view_counts_24;
+    const uint8_t* channel_map =
+        showing_5ghz ? channel_view_channels_5ghz : channel_view_channels_24ghz;
+    const size_t channel_count =
+        showing_5ghz ? CHANNEL_VIEW_5GHZ_CHANNEL_COUNT : CHANNEL_VIEW_24GHZ_CHANNEL_COUNT;
+    const size_t visible_columns = simple_app_channel_view_visible_columns(app->channel_view_band);
+    const uint8_t offset = *simple_app_channel_view_offset_ptr(app, app->channel_view_band);
+
+    uint16_t max_count = 0;
+    for(size_t i = 0; i < channel_count; i++) {
+        if(counts[i] > max_count) {
+            max_count = counts[i];
+        }
+    }
+    if(max_count == 0) {
+        max_count = 1;
+    }
+
+    const int16_t column_width = (frame_w - 8) / (int16_t)visible_columns;
+    const int16_t column_gap = 2;
+    size_t drawn_columns = 0;
+    const int16_t label_padding = 8;
+    int16_t max_bar_height = bar_bottom - (bar_top + label_padding);
+    if(max_bar_height < 2) {
+        max_bar_height = 2;
+    }
+    for(size_t column = 0; column < visible_columns; column++) {
+        size_t index = offset + column;
+        if(index >= channel_count) break;
+        drawn_columns++;
+        uint16_t value = counts[index];
+        uint8_t channel = channel_map[index];
+
+        int16_t x0 = frame_x + 4 + (int16_t)column * column_width;
+        int16_t x_center = x0 + column_width / 2;
+        int16_t column_inner_width = column_width - column_gap;
+        if(column_inner_width < 2) {
+            column_inner_width = 2;
+        }
+
+        int16_t bar_height = 0;
+        if(value > 0) {
+            bar_height = (int16_t)((value * (uint32_t)max_bar_height) / max_count);
+            if(bar_height == 0) {
+                bar_height = 1;
+            }
+        }
+        int16_t column_bar_top = bar_bottom - bar_height;
+        if(bar_height > 0) {
+            canvas_draw_box(canvas, x_center - column_inner_width / 2, column_bar_top, column_inner_width, bar_height);
+        }
+
+        char value_label[6];
+        snprintf(value_label, sizeof(value_label), "%u", (unsigned)value);
+        int16_t value_y = column_bar_top - 2;
+        int16_t min_value_y = frame_y + 12;
+        if(value_y < min_value_y) {
+            value_y = min_value_y;
+        }
+        canvas_draw_str_aligned(canvas, x_center, value_y, AlignCenter, AlignBottom, value_label);
+
+        char channel_label[6];
+        snprintf(channel_label, sizeof(channel_label), "%u", (unsigned)channel);
+        canvas_draw_str_aligned(
+            canvas,
+            x_center,
+            frame_y + frame_h - 2,
+            AlignCenter,
+            AlignBottom,
+            channel_label);
+    }
+
+    if(offset > 0) {
+        canvas_draw_str(canvas, frame_x + 1, frame_y + frame_h / 2, "<");
+    }
+    size_t max_offset = simple_app_channel_view_max_offset(app->channel_view_band);
+    if(offset < max_offset) {
+        canvas_draw_str(canvas, frame_x + frame_w - 4, frame_y + frame_h / 2, ">");
+    }
+
+    app->channel_view_dirty = false;
+}
+
+static void simple_app_handle_channel_view_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+
+    if(key == InputKeyBack) {
+        simple_app_channel_view_stop(app);
+        app->menu_state = MenuStateItems;
+        app->section_index = MENU_SECTION_MONITORING;
+        app->item_index = 0;
+        app->item_offset = 0;
+        app->screen = ScreenMenu;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyUp || key == InputKeyDown) {
+        ChannelViewBand new_band =
+            (app->channel_view_band == ChannelViewBand24) ? ChannelViewBand5 : ChannelViewBand24;
+        app->channel_view_band = new_band;
+        uint8_t* offset_ptr = simple_app_channel_view_offset_ptr(app, app->channel_view_band);
+        uint8_t max_offset = simple_app_channel_view_max_offset(app->channel_view_band);
+        if(*offset_ptr > max_offset) {
+            *offset_ptr = max_offset;
+        }
+        app->channel_view_dirty = true;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyOk) {
+        simple_app_channel_view_stop(app);
+        simple_app_channel_view_start(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyLeft) {
+        if(simple_app_channel_view_adjust_offset(app, app->channel_view_band, -1) && app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyRight) {
+        if(simple_app_channel_view_adjust_offset(app, app->channel_view_band, 1) && app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
     }
 }
 
@@ -4306,6 +4762,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenPackageMonitor:
         simple_app_draw_package_monitor(app, canvas);
         break;
+    case ScreenChannelView:
+        simple_app_draw_channel_view(app, canvas);
+        break;
     case ScreenConfirmBlackout:
         simple_app_draw_confirm_blackout(app, canvas);
         break;
@@ -4486,6 +4945,9 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             simple_app_request_vendor_status(app);
         } else if(entry->action == MenuActionOpenPackageMonitor) {
             simple_app_package_monitor_enter(app);
+            return;
+        } else if(entry->action == MenuActionOpenChannelView) {
+            simple_app_channel_view_enter(app);
             return;
         } else if(entry->action == MenuActionOpenConsole) {
             simple_app_console_enter(app);
@@ -5083,7 +5545,7 @@ static void simple_app_draw_karma_probe_popup(SimpleApp* app, Canvas* canvas) {
         size_t idx = app->karma_probe_popup_offset + i;
         if(idx >= app->karma_probe_count) break;
         const KarmaProbeEntry* entry = &app->karma_probes[idx];
-        char line[48];
+        char line[64];
         snprintf(line, sizeof(line), "%u %s", (unsigned)entry->id, entry->name);
         simple_app_truncate_text(line, 28);
         uint8_t line_y = (uint8_t)(list_y + i * HINT_LINE_HEIGHT);
@@ -6294,6 +6756,9 @@ static void simple_app_input(InputEvent* event, void* context) {
     case ScreenPackageMonitor:
         simple_app_handle_package_monitor_input(app, event->key);
         break;
+    case ScreenChannelView:
+        simple_app_handle_channel_view_input(app, event->key);
+        break;
     case ScreenConfirmBlackout:
         simple_app_handle_confirm_blackout_input(app, event->key);
         break;
@@ -6334,6 +6799,9 @@ static void simple_app_process_stream(SimpleApp* app) {
     if(app->package_monitor_dirty && app->screen == ScreenPackageMonitor && app->viewport) {
         view_port_update(app->viewport);
     }
+    if(app->channel_view_dirty && app->screen == ScreenChannelView && app->viewport) {
+        view_port_update(app->viewport);
+    }
 }
 
 static void simple_app_serial_irq(FuriHalSerialHandle* handle, FuriHalSerialRxEvent event, void* context) {
@@ -6355,6 +6823,8 @@ int32_t Lab_C5_app(void* p) {
     }
     memset(app, 0, sizeof(SimpleApp));
     app->package_monitor_channel = PACKAGE_MONITOR_DEFAULT_CHANNEL;
+    app->channel_view_band = ChannelViewBand24;
+    simple_app_channel_view_reset(app);
     app->scanner_show_ssid = true;
     app->scanner_show_bssid = true;
     app->scanner_show_channel = true;
