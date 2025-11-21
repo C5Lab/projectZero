@@ -5,7 +5,6 @@ App(
     entry_point="Lab_C5_app",
     stack_size=8 * 1024,
     order=90,
-    fap_version="0.14",
     fap_icon="gfx/icon.png",
     fap_icon_assets="gfx",
     fap_category="GPIO",
