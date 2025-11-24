@@ -24,6 +24,7 @@ typedef enum {
     ScreenSetupScanner,
     ScreenSetupKarma,
     ScreenSetupLed,
+    ScreenSetupBoot,
     ScreenConsole,
     ScreenPackageMonitor,
     ScreenChannelView,
@@ -38,7 +39,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.20"
+#define LAB_C5_VERSION_TEXT "0.21"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -118,6 +119,17 @@ static const uint8_t channel_view_channels_5ghz[] = {
 #define CHANNEL_VIEW_VISIBLE_COLUMNS_24 6
 #define CHANNEL_VIEW_VISIBLE_COLUMNS_5 5
 
+#define BOOT_COMMAND_OPTION_COUNT 7
+static const char* boot_command_options[BOOT_COMMAND_OPTION_COUNT] = {
+    "start_blackout",
+    "start_sniffer_dog",
+    "channel_view",
+    "packet_monitor",
+    "start_sniffer",
+    "scan_networks",
+    "start_wardrive",
+};
+
 #define HINT_MAX_LINES 16
 #define HINT_VISIBLE_LINES 3
 #define HINT_LINE_CHAR_LIMIT 48
@@ -149,6 +161,7 @@ typedef enum {
     MenuActionToggleOtgPower,
     MenuActionOpenScannerSetup,
     MenuActionOpenLedSetup,
+    MenuActionOpenBootSetup,
 
     MenuActionOpenConsole,
     MenuActionOpenPackageMonitor,
@@ -320,6 +333,12 @@ typedef struct {
     bool led_enabled;
     uint8_t led_level;
     size_t led_setup_index;
+    bool boot_short_enabled;
+    bool boot_long_enabled;
+    uint8_t boot_short_command_index;
+    uint8_t boot_long_command_index;
+    bool boot_setup_long;
+    size_t boot_setup_index;
     bool led_read_pending;
     char led_read_buffer[64];
     size_t led_read_length;
@@ -344,6 +363,8 @@ typedef struct {
     char status_message[64];
     uint32_t status_message_until;
     bool status_message_fullscreen;
+    bool board_ready_seen;
+    bool board_sync_pending;
     uint32_t last_input_tick;
     bool help_hint_visible;
     bool package_monitor_active;
@@ -381,6 +402,7 @@ static ScanResult* simple_app_visible_result(SimpleApp* app, size_t visible_inde
 static const ScanResult* simple_app_visible_result_const(const SimpleApp* app, size_t visible_index);
 static void simple_app_update_result_layout(SimpleApp* app);
 static void simple_app_update_karma_duration_label(SimpleApp* app);
+static bool simple_app_parse_bool_value(const char* value, bool current);
 static void simple_app_apply_backlight(SimpleApp* app);
 static void simple_app_toggle_backlight(SimpleApp* app);
 static void simple_app_update_led_label(SimpleApp* app);
@@ -390,6 +412,16 @@ static void simple_app_send_command_quiet(SimpleApp* app, const char* command);
 static void simple_app_request_led_status(SimpleApp* app);
 static bool simple_app_handle_led_status_line(SimpleApp* app, const char* line);
 static void simple_app_led_feed(SimpleApp* app, char ch);
+static void simple_app_update_boot_labels(SimpleApp* app);
+static void simple_app_send_boot_status(SimpleApp* app, bool is_short, bool enabled);
+static void simple_app_send_boot_command(SimpleApp* app, bool is_short, uint8_t command_index);
+static void simple_app_request_boot_status(SimpleApp* app);
+static bool simple_app_handle_boot_status_line(SimpleApp* app, const char* line);
+static void simple_app_boot_feed(SimpleApp* app, char ch);
+static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long);
+static void simple_app_handle_board_ready(SimpleApp* app);
+static void simple_app_request_all_statuses(SimpleApp* app);
+static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas);
 static void simple_app_send_vendor_command(SimpleApp* app, bool enable);
 static void simple_app_request_vendor_status(SimpleApp* app);
 static bool simple_app_handle_vendor_status_line(SimpleApp* app, const char* line);
@@ -507,6 +539,7 @@ static void simple_app_clear_status_message(SimpleApp* app);
 static bool simple_app_status_message_is_active(SimpleApp* app);
 static void simple_app_send_command_with_targets(SimpleApp* app, const char* base_command);
 static size_t simple_app_menu_visible_count(const SimpleApp* app, uint32_t section_index);
+static void simple_app_update_scroll(SimpleApp* app);
 static size_t simple_app_render_display_lines(
     SimpleApp* app,
     size_t skip_lines,
@@ -579,6 +612,8 @@ static const char hint_setup_otg[] =
     "Control USB OTG 5V\nPower external gear\nDisable to save\nBattery capacity\nWhen unused.";
 static const char hint_setup_led[] =
     "Control status LED\nLeft/Right toggles\nSends CLI command\nAdjust brightness\nRange 1 to 100.";
+static const char hint_setup_boot[] =
+    "Assign boot button\nShort/Long actions\nToggle on/off\nPick command\nSaved in device.";
 static const char hint_setup_filters[] =
     "Choose visible fields\nSimplify result list\nHide unused data\nTailor display\nOK flips options.";
 static const char hint_setup_console[] =
@@ -615,11 +650,15 @@ static const MenuEntry menu_entries_monitoring[] = {
 static char menu_label_backlight[24] = "Backlight: On";
 static char menu_label_otg_power[24] = "5V Power: On";
 static char menu_label_led[24] = "LED: On (10)";
+static char menu_label_boot_short[40] = "Boot short: Off";
+static char menu_label_boot_long[40] = "Boot long: Off";
 
 static const MenuEntry menu_entries_setup[] = {
     {menu_label_backlight, NULL, MenuActionToggleBacklight, hint_setup_backlight},
     {menu_label_otg_power, NULL, MenuActionToggleOtgPower, hint_setup_otg},
     {menu_label_led, NULL, MenuActionOpenLedSetup, hint_setup_led},
+    {menu_label_boot_short, NULL, MenuActionOpenBootSetup, hint_setup_boot},
+    {menu_label_boot_long, NULL, MenuActionOpenBootSetup, hint_setup_boot},
     {"Scanner Filters", NULL, MenuActionOpenScannerSetup, hint_setup_filters},
     {"Console", NULL, MenuActionOpenConsole, hint_setup_console},
 };
@@ -916,6 +955,20 @@ static void simple_app_update_led_label(SimpleApp* app) {
         (unsigned long)level);
 }
 
+static void simple_app_update_boot_labels(SimpleApp* app) {
+    if(!app) return;
+    snprintf(
+        menu_label_boot_short,
+        sizeof(menu_label_boot_short),
+        "Boot short: %s",
+        app->boot_short_enabled ? "On" : "Off");
+    snprintf(
+        menu_label_boot_long,
+        sizeof(menu_label_boot_long),
+        "Boot long: %s",
+        app->boot_long_enabled ? "On" : "Off");
+}
+
 static void simple_app_send_led_power_command(SimpleApp* app) {
     if(!app || !app->serial) return;
     const char* state = app->led_enabled ? "on" : "off";
@@ -934,8 +987,199 @@ static void simple_app_send_led_level_command(SimpleApp* app) {
     simple_app_send_command_quiet(app, command);
 }
 
+static void simple_app_send_boot_status(SimpleApp* app, bool is_short, bool enabled) {
+    if(!app || !app->serial) return;
+    char command[48];
+    snprintf(command, sizeof(command), "boot_button status %s %s", is_short ? "short" : "long", enabled ? "on" : "off");
+    simple_app_send_command_quiet(app, command);
+}
+
+static void simple_app_send_boot_command(SimpleApp* app, bool is_short, uint8_t command_index) {
+    if(!app || !app->serial) return;
+    if(command_index >= BOOT_COMMAND_OPTION_COUNT) {
+        command_index = 0;
+    }
+    char command[48];
+    snprintf(
+        command,
+        sizeof(command),
+        "boot_button set %s %s",
+        is_short ? "short" : "long",
+        boot_command_options[command_index]);
+    simple_app_send_command_quiet(app, command);
+}
+
+static void simple_app_request_boot_status(SimpleApp* app) {
+    if(!app || !app->serial) return;
+    simple_app_send_command_quiet(app, "boot_button read");
+}
+
+static void simple_app_request_all_statuses(SimpleApp* app) {
+    if(!app) return;
+    simple_app_request_led_status(app);
+    simple_app_request_boot_status(app);
+    simple_app_request_vendor_status(app);
+}
+
+static bool simple_app_handle_boot_status_line(SimpleApp* app, const char* line) {
+    if(!app || !line) return false;
+    const char* short_status = "boot_short_status=";
+    const char* short_cmd = "boot_short=";
+    const char* long_status = "boot_long_status=";
+    const char* long_cmd = "boot_long=";
+
+    if(strncmp(line, short_status, strlen(short_status)) == 0) {
+        app->boot_short_enabled =
+            simple_app_parse_bool_value(line + strlen(short_status), app->boot_short_enabled);
+        simple_app_update_boot_labels(app);
+        return true;
+    }
+    if(strncmp(line, long_status, strlen(long_status)) == 0) {
+        app->boot_long_enabled =
+            simple_app_parse_bool_value(line + strlen(long_status), app->boot_long_enabled);
+        simple_app_update_boot_labels(app);
+        return true;
+    }
+    if(strncmp(line, short_cmd, strlen(short_cmd)) == 0) {
+        const char* value = line + strlen(short_cmd);
+        for(uint8_t i = 0; i < BOOT_COMMAND_OPTION_COUNT; i++) {
+            if(strcmp(value, boot_command_options[i]) == 0) {
+                app->boot_short_command_index = i;
+                simple_app_update_boot_labels(app);
+                return true;
+            }
+        }
+        return true;
+    }
+    if(strncmp(line, long_cmd, strlen(long_cmd)) == 0) {
+        const char* value = line + strlen(long_cmd);
+        for(uint8_t i = 0; i < BOOT_COMMAND_OPTION_COUNT; i++) {
+            if(strcmp(value, boot_command_options[i]) == 0) {
+                app->boot_long_command_index = i;
+                simple_app_update_boot_labels(app);
+                return true;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+static void simple_app_boot_feed(SimpleApp* app, char ch) {
+    static char line_buffer[96];
+    static size_t line_len = 0;
+    if(ch == '\r') return;
+    if(ch == '\n') {
+        if(line_len > 0) {
+            line_buffer[line_len] = '\0';
+            // Skip prompt markers and leading spaces
+            const char* line_ptr = line_buffer;
+            while(*line_ptr == '>' || *line_ptr == ' ' || *line_ptr == '\t') {
+                line_ptr++;
+            }
+
+            if(simple_app_handle_boot_status_line(app, line_ptr)) {
+                if(app->viewport) {
+                    view_port_update(app->viewport);
+                }
+            } else if(strcmp(line_ptr, "Boot Pressed") == 0) {
+                simple_app_handle_boot_trigger(app, false);
+            } else if(strcmp(line_ptr, "Boot Long Pressed") == 0) {
+                simple_app_handle_boot_trigger(app, true);
+            } else if(strcmp(line_ptr, "BOARD READY") == 0) {
+                simple_app_handle_board_ready(app);
+            }
+        }
+        line_len = 0;
+        return;
+    }
+    if(line_len + 1 >= sizeof(line_buffer)) {
+        line_len = 0;
+        return;
+    }
+    line_buffer[line_len++] = ch;
+}
+
+static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long) {
+    if(!app) return;
+
+    const char* cmd = NULL;
+    bool enabled = false;
+    if(is_long) {
+        enabled = app->boot_long_enabled;
+        if(app->boot_long_command_index < BOOT_COMMAND_OPTION_COUNT) {
+            cmd = boot_command_options[app->boot_long_command_index];
+        }
+    } else {
+        enabled = app->boot_short_enabled;
+        if(app->boot_short_command_index < BOOT_COMMAND_OPTION_COUNT) {
+            cmd = boot_command_options[app->boot_short_command_index];
+        }
+    }
+
+    char message[64];
+    if(!enabled) {
+        snprintf(message, sizeof(message), "Boot %s:\ndisabled", is_long ? "long" : "short");
+    } else if(cmd) {
+        snprintf(message, sizeof(message), "Boot %s:\n%s", is_long ? "long" : "short", cmd);
+    } else {
+        snprintf(message, sizeof(message), "Boot %s\npressed", is_long ? "long" : "short");
+    }
+
+    simple_app_show_status_message(app, message, 1500, true);
+
+    if(enabled) {
+        app->screen = ScreenSerial;
+        app->serial_follow_tail = true;
+        app->last_command_sent = true; // allow Back to send stop for boot-triggered actions
+        simple_app_update_scroll(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+    }
+}
+
+static void simple_app_handle_board_ready(SimpleApp* app) {
+    if(!app) return;
+
+    app->board_ready_seen = true;
+
+    if(app->board_sync_pending) {
+        app->board_sync_pending = false;
+        simple_app_request_all_statuses(app);
+    }
+
+    simple_app_show_status_message(app, "Board Ready", 1000, true);
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+    const char* text = app->board_ready_seen ? "Sync OK" : "Sync...";
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(
+        canvas,
+        DISPLAY_WIDTH - 2,
+        8,
+        AlignRight,
+        AlignBottom,
+        text);
+}
+
 static void simple_app_send_command_quiet(SimpleApp* app, const char* command) {
     if(!app || !command || !app->serial) return;
+
+    // Block commands until board reports ready (except reboot which triggers sync)
+    if(!app->board_ready_seen) {
+        // Allow reboot to kick off sync
+        if(strncmp(command, "reboot", 6) != 0) {
+            simple_app_show_status_message(app, "Waiting for board...", 1000, true);
+            return;
+        }
+    }
+
     char cmd[64];
     int len = snprintf(cmd, sizeof(cmd), "%s\n", command);
     if(len <= 0) return;
@@ -1593,15 +1837,25 @@ static void simple_app_mark_config_dirty(SimpleApp* app) {
 }
 
 static bool simple_app_parse_bool_value(const char* value, bool current) {
-    if(!value || value[0] == '\0') return current;
-    if((value[0] == '1' && value[1] == '\0') || value[0] == 'Y' || value[0] == 'y' ||
-       value[0] == 'T' || value[0] == 't') {
+    if(!value) return current;
+    size_t len = strlen(value);
+    if(len == 0) return current;
+
+    char c0 = (char)tolower((unsigned char)value[0]);
+    char c1 = (len > 1) ? (char)tolower((unsigned char)value[1]) : '\0';
+
+    // Textual checks: on/yes/true, off/no/false
+    if((c0 == 'o' && c1 == 'n') || (c0 == 'y' && c1 == 'e') || (c0 == 't' && c1 == 'r')) {
         return true;
     }
-    if((value[0] == '0' && value[1] == '\0') || value[0] == 'N' || value[0] == 'n' ||
-       value[0] == 'F' || value[0] == 'f') {
+    if((c0 == 'o' && c1 == 'f') || (c0 == 'n' && c1 == 'o') || (c0 == 'f' && c1 == 'a')) {
         return false;
     }
+
+    // Single digit shortcuts
+    if(c0 == '1') return true;
+    if(c0 == '0') return false;
+
     return atoi(value) != 0;
 }
 
@@ -1664,6 +1918,24 @@ static void simple_app_parse_config_line(SimpleApp* app, char* line) {
             }
             app->led_level = (uint8_t)parsed;
         }
+    } else if(strcmp(key, "boot_short_status") == 0) {
+        app->boot_short_enabled = simple_app_parse_bool_value(value, app->boot_short_enabled);
+    } else if(strcmp(key, "boot_long_status") == 0) {
+        app->boot_long_enabled = simple_app_parse_bool_value(value, app->boot_long_enabled);
+    } else if(strcmp(key, "boot_short") == 0) {
+        for(uint8_t i = 0; i < BOOT_COMMAND_OPTION_COUNT; i++) {
+            if(strcmp(value, boot_command_options[i]) == 0) {
+                app->boot_short_command_index = i;
+                break;
+            }
+        }
+    } else if(strcmp(key, "boot_long") == 0) {
+        for(uint8_t i = 0; i < BOOT_COMMAND_OPTION_COUNT; i++) {
+            if(strcmp(value, boot_command_options[i]) == 0) {
+                app->boot_long_command_index = i;
+                break;
+            }
+        }
     }
 }
 
@@ -1677,6 +1949,12 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
     bool success = false;
     if(storage_file_open(file, EXT_PATH(LAB_C5_CONFIG_FILE_PATH), FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
         char buffer[256];
+        uint8_t short_idx = (app->boot_short_command_index < BOOT_COMMAND_OPTION_COUNT)
+                                ? app->boot_short_command_index
+                                : 0;
+        uint8_t long_idx = (app->boot_long_command_index < BOOT_COMMAND_OPTION_COUNT)
+                               ? app->boot_long_command_index
+                               : 0;
         int len = snprintf(
             buffer,
             sizeof(buffer),
@@ -1690,7 +1968,11 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             "min_power=%d\n"
             "backlight_enabled=%d\n"
             "otg_power_enabled=%d\n"
-            "karma_duration=%lu\n",
+            "karma_duration=%lu\n"
+            "boot_short_status=%d\n"
+            "boot_short=%s\n"
+            "boot_long_status=%d\n"
+            "boot_long=%s\n",
             app->scanner_show_ssid ? 1 : 0,
             app->scanner_show_bssid ? 1 : 0,
             app->scanner_show_channel ? 1 : 0,
@@ -1701,7 +1983,11 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             (int)app->scanner_min_power,
             app->backlight_enabled ? 1 : 0,
             app->otg_power_enabled ? 1 : 0,
-            (unsigned long)app->karma_sniffer_duration_sec);
+            (unsigned long)app->karma_sniffer_duration_sec,
+            app->boot_short_enabled ? 1 : 0,
+            boot_command_options[short_idx],
+            app->boot_long_enabled ? 1 : 0,
+            boot_command_options[long_idx]);
         if(len > 0 && len < (int)sizeof(buffer)) {
             size_t written = storage_file_write(file, buffer, (size_t)len);
             if(written == (size_t)len) {
@@ -1773,6 +2059,12 @@ static void simple_app_load_config(SimpleApp* app) {
         app->led_level = 1;
     } else if(app->led_level > 100) {
         app->led_level = 100;
+    }
+    if(app->boot_short_command_index >= BOOT_COMMAND_OPTION_COUNT) {
+        app->boot_short_command_index = 1;
+    }
+    if(app->boot_long_command_index >= BOOT_COMMAND_OPTION_COUNT) {
+        app->boot_long_command_index = 0;
     }
     simple_app_reset_karma_probe_listing(app);
     simple_app_reset_karma_probe_listing(app);
@@ -2340,6 +2632,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_karma_probe_feed(app, ch);
         simple_app_karma_html_feed(app, ch);
         simple_app_led_feed(app, ch);
+        simple_app_boot_feed(app, ch);
         simple_app_vendor_feed(app, ch);
         simple_app_wardrive_feed(app, ch);
     }
@@ -4603,6 +4896,40 @@ static void simple_app_draw_setup_led(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str(canvas, 2, 62, footer);
 }
 
+static void simple_app_draw_setup_boot(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 10, 14, app->boot_setup_long ? "Boot Long" : "Boot Short");
+
+    canvas_set_font(canvas, FontSecondary);
+    uint8_t y = 32;
+    const char* status = app->boot_setup_long ? (app->boot_long_enabled ? "On" : "Off")
+                                              : (app->boot_short_enabled ? "On" : "Off");
+    char line[48];
+    snprintf(line, sizeof(line), "Status: %s", status);
+    if(app->boot_setup_index == 0) {
+        canvas_draw_str(canvas, 2, y, ">");
+    }
+    canvas_draw_str(canvas, 16, y, line);
+
+    y += 14;
+    uint8_t cmd_index = app->boot_setup_long ? app->boot_long_command_index : app->boot_short_command_index;
+    if(cmd_index >= BOOT_COMMAND_OPTION_COUNT) {
+        cmd_index = 0;
+    }
+    snprintf(line, sizeof(line), "Command:");
+    if(app->boot_setup_index == 1) {
+        canvas_draw_str(canvas, 2, y, ">");
+    }
+    canvas_draw_str(canvas, 16, y, line);
+
+    // Draw command value on its own line to keep it within screen width
+    y += 12;
+    canvas_draw_str(canvas, 16, y, boot_command_options[cmd_index]);
+}
+
 static void simple_app_draw_setup_scanner(SimpleApp* app, Canvas* canvas) {
     if(!app) return;
 
@@ -4737,6 +5064,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
         }
         return;
     }
+
+    simple_app_draw_sync_status(app, canvas);
+
     switch(app->screen) {
     case ScreenMenu:
         simple_app_draw_menu(app, canvas);
@@ -4752,6 +5082,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
         break;
     case ScreenSetupLed:
         simple_app_draw_setup_led(app, canvas);
+        break;
+    case ScreenSetupBoot:
+        simple_app_draw_setup_boot(app, canvas);
         break;
     case ScreenSetupKarma:
         simple_app_draw_setup_karma(app, canvas);
@@ -4890,6 +5223,7 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             }
             if(app->section_index == MENU_SECTION_SETUP) {
                 simple_app_request_led_status(app);
+                simple_app_request_boot_status(app);
                 simple_app_request_vendor_status(app);
             }
             view_port_update(app->viewport);
@@ -4937,6 +5271,11 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             app->screen = ScreenSetupLed;
             app->led_setup_index = 0;
             simple_app_request_led_status(app);
+        } else if(entry->action == MenuActionOpenBootSetup) {
+            app->screen = ScreenSetupBoot;
+            app->boot_setup_index = 0;
+            app->boot_setup_long = (entry->label == menu_label_boot_long);
+            simple_app_request_boot_status(app);
         } else if(entry->action == MenuActionOpenScannerSetup) {
             app->screen = ScreenSetupScanner;
             app->scanner_setup_index = 0;
@@ -6549,6 +6888,88 @@ static void simple_app_handle_setup_led_input(SimpleApp* app, InputKey key) {
     }
 }
 
+static void simple_app_handle_setup_boot_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+
+    if(key == InputKeyBack) {
+        simple_app_save_config_if_dirty(app, "Config saved", true);
+        app->screen = ScreenMenu;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyUp) {
+        if(app->boot_setup_index > 0) {
+            app->boot_setup_index = 0;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    if(key == InputKeyDown) {
+        if(app->boot_setup_index < 1) {
+            app->boot_setup_index = 1;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    bool is_long = app->boot_setup_long;
+    bool* enabled_ptr = is_long ? &app->boot_long_enabled : &app->boot_short_enabled;
+    uint8_t* cmd_index_ptr = is_long ? &app->boot_long_command_index : &app->boot_short_command_index;
+
+    if(app->boot_setup_index == 0) {
+        bool previous = *enabled_ptr;
+        if(key == InputKeyLeft) {
+            *enabled_ptr = false;
+        } else if(key == InputKeyRight) {
+            *enabled_ptr = true;
+        } else if(key == InputKeyOk) {
+            *enabled_ptr = !(*enabled_ptr);
+        } else {
+            return;
+        }
+        if(previous != *enabled_ptr) {
+            simple_app_mark_config_dirty(app);
+            simple_app_update_boot_labels(app);
+            simple_app_send_boot_status(app, !is_long, *enabled_ptr);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    if(app->boot_setup_index == 1) {
+        uint8_t before = *cmd_index_ptr;
+        if(key == InputKeyLeft) {
+            if(*cmd_index_ptr == 0) {
+                *cmd_index_ptr = BOOT_COMMAND_OPTION_COUNT - 1;
+            } else {
+                (*cmd_index_ptr)--;
+            }
+        } else if(key == InputKeyRight || key == InputKeyOk) {
+            *cmd_index_ptr = (uint8_t)((*cmd_index_ptr + 1) % BOOT_COMMAND_OPTION_COUNT);
+        } else {
+            return;
+        }
+        if(before != *cmd_index_ptr) {
+            simple_app_mark_config_dirty(app);
+            simple_app_update_boot_labels(app);
+            simple_app_send_boot_command(app, !is_long, *cmd_index_ptr);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    }
+}
+
 static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
     if(!app) return;
     if(app->blackout_view_active && key != InputKeyBack && key != InputKeyUp && key != InputKeyDown) {
@@ -6747,6 +7168,9 @@ static void simple_app_input(InputEvent* event, void* context) {
     case ScreenSetupLed:
         simple_app_handle_setup_led_input(app, event->key);
         break;
+    case ScreenSetupBoot:
+        simple_app_handle_setup_boot_input(app, event->key);
+        break;
     case ScreenSetupKarma:
         simple_app_handle_setup_karma_input(app, event->key);
         break;
@@ -6845,12 +7269,21 @@ int32_t Lab_C5_app(void* p) {
     app->led_enabled = true;
     app->led_level = 10;
     app->led_setup_index = 0;
+    app->board_ready_seen = false;
+    app->board_sync_pending = true;
+    app->boot_short_enabled = false;
+    app->boot_long_enabled = false;
+    app->boot_short_command_index = 1; // start_sniffer_dog
+    app->boot_long_command_index = 0;  // start_blackout
+    app->boot_setup_index = 0;
+    app->boot_setup_long = false;
     app->scanner_view_offset = 0;
     app->karma_sniffer_duration_sec = 15;
     simple_app_update_karma_duration_label(app);
     simple_app_update_result_layout(app);
     simple_app_update_backlight_label(app);
     simple_app_update_led_label(app);
+    simple_app_update_boot_labels(app);
     simple_app_update_otg_label(app);
     simple_app_apply_otg_power(app);
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
@@ -6858,6 +7291,7 @@ int32_t Lab_C5_app(void* p) {
     app->vendor_scan_enabled = app->scanner_show_vendor;
     simple_app_update_backlight_label(app);
     simple_app_update_led_label(app);
+    simple_app_update_boot_labels(app);
     simple_app_apply_backlight(app);
     simple_app_update_otg_label(app);
     simple_app_apply_otg_power(app);
@@ -6897,8 +7331,8 @@ int32_t Lab_C5_app(void* p) {
     simple_app_reset_serial_log(app, "READY");
 
     furi_hal_serial_async_rx_start(app->serial, simple_app_serial_irq, app, false);
-    simple_app_request_led_status(app);
-    simple_app_request_vendor_status(app);
+    simple_app_show_status_message(app, "Rebooting board\nfor sync", 1500, true);
+    simple_app_send_command_quiet(app, "reboot");
 
     app->gui = furi_record_open(RECORD_GUI);
     app->viewport = view_port_alloc();

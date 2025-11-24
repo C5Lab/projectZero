@@ -57,7 +57,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.6.1"
+#define JANOS_VERSION "0.6.2"
 
 
 #define NEOPIXEL_GPIO      27
@@ -510,6 +510,37 @@ static int whitelistedBssidsCount = 0;
 #define VENDOR_NVS_NAMESPACE "vendorcfg"
 #define VENDOR_NVS_KEY_ENABLED "enabled"
 
+// Boot button configuration (stored in NVS)
+#define BOOTCFG_NVS_NAMESPACE "bootcfg"
+#define BOOTCFG_KEY_SHORT_CMD  "short_cmd"
+#define BOOTCFG_KEY_LONG_CMD   "long_cmd"
+#define BOOTCFG_KEY_SHORT_EN   "short_en"
+#define BOOTCFG_KEY_LONG_EN    "long_en"
+#define BOOTCFG_CMD_MAX_LEN    32
+
+static const char* boot_allowed_commands[] = {
+    "start_blackout",
+    "start_sniffer_dog",
+    "channel_view",
+    "packet_monitor",
+    "start_sniffer",
+    "scan_networks",
+    "start_wardrive"
+};
+static const size_t boot_allowed_command_count = sizeof(boot_allowed_commands) / sizeof(boot_allowed_commands[0]);
+
+typedef struct {
+    bool enabled;
+    char command[BOOTCFG_CMD_MAX_LEN];
+} boot_action_config_t;
+
+typedef struct {
+    boot_action_config_t short_press;
+    boot_action_config_t long_press;
+} boot_config_t;
+
+static boot_config_t boot_config = {0};
+
 static char vendor_lookup_buffer[MAX_VENDOR_NAME_LEN];
 static bool vendor_file_checked = false;
 static bool vendor_file_present = false;
@@ -534,6 +565,7 @@ static int cmd_show_probes(int argc, char **argv);
 static int cmd_list_probes(int argc, char **argv);
 static int cmd_sniffer_debug(int argc, char **argv);
 static int cmd_start_blackout(int argc, char **argv);
+static int cmd_boot_button(int argc, char **argv);
 static int cmd_start_portal(int argc, char **argv);
 static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
@@ -1397,6 +1429,163 @@ static esp_err_t vendor_set_enabled(bool enabled) {
     return ESP_OK;
 }
 
+static bool boot_is_command_allowed(const char* command) {
+    if (command == NULL || command[0] == '\0') {
+        return false;
+    }
+    for (size_t i = 0; i < boot_allowed_command_count; i++) {
+        if (strcasecmp(command, boot_allowed_commands[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void boot_config_set_defaults(void) {
+    memset(&boot_config, 0, sizeof(boot_config));
+    boot_config.short_press.enabled = false;
+    strlcpy(boot_config.short_press.command, "start_sniffer_dog", sizeof(boot_config.short_press.command));
+    boot_config.long_press.enabled = false;
+    strlcpy(boot_config.long_press.command, "start_blackout", sizeof(boot_config.long_press.command));
+}
+
+static void boot_config_persist(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(BOOTCFG_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Boot cfg save open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    esp_err_t write_err = nvs_set_u8(handle, BOOTCFG_KEY_SHORT_EN, boot_config.short_press.enabled ? 1U : 0U);
+    if (write_err == ESP_OK) {
+        write_err = nvs_set_u8(handle, BOOTCFG_KEY_LONG_EN, boot_config.long_press.enabled ? 1U : 0U);
+    }
+    if (write_err == ESP_OK) {
+        write_err = nvs_set_str(handle, BOOTCFG_KEY_SHORT_CMD, boot_config.short_press.command);
+    }
+    if (write_err == ESP_OK) {
+        write_err = nvs_set_str(handle, BOOTCFG_KEY_LONG_CMD, boot_config.long_press.command);
+    }
+    if (write_err == ESP_OK) {
+        write_err = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+
+    if (write_err != ESP_OK) {
+        ESP_LOGW(TAG, "Boot cfg save failed: %s", esp_err_to_name(write_err));
+    }
+}
+
+static void boot_config_load_from_nvs(void) {
+    boot_config_set_defaults();
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(BOOTCFG_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Boot cfg load open failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint8_t value = 0;
+    err = nvs_get_u8(handle, BOOTCFG_KEY_SHORT_EN, &value);
+    if (err == ESP_OK) {
+        boot_config.short_press.enabled = value != 0;
+    }
+
+    value = 0;
+    err = nvs_get_u8(handle, BOOTCFG_KEY_LONG_EN, &value);
+    if (err == ESP_OK) {
+        boot_config.long_press.enabled = value != 0;
+    }
+
+    size_t required = 0;
+    err = nvs_get_str(handle, BOOTCFG_KEY_SHORT_CMD, NULL, &required);
+    if (err == ESP_OK && required > 0 && required <= BOOTCFG_CMD_MAX_LEN) {
+        err = nvs_get_str(handle, BOOTCFG_KEY_SHORT_CMD, boot_config.short_press.command, &required);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Boot cfg short cmd read failed: %s", esp_err_to_name(err));
+        } else if (!boot_is_command_allowed(boot_config.short_press.command)) {
+            ESP_LOGW(TAG, "Boot cfg short cmd not allowed (%s), resetting", boot_config.short_press.command);
+            strlcpy(boot_config.short_press.command, "start_sniffer_dog", sizeof(boot_config.short_press.command));
+        }
+    }
+
+    required = 0;
+    err = nvs_get_str(handle, BOOTCFG_KEY_LONG_CMD, NULL, &required);
+    if (err == ESP_OK && required > 0 && required <= BOOTCFG_CMD_MAX_LEN) {
+        err = nvs_get_str(handle, BOOTCFG_KEY_LONG_CMD, boot_config.long_press.command, &required);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Boot cfg long cmd read failed: %s", esp_err_to_name(err));
+        } else if (!boot_is_command_allowed(boot_config.long_press.command)) {
+            ESP_LOGW(TAG, "Boot cfg long cmd not allowed (%s), resetting", boot_config.long_press.command);
+            strlcpy(boot_config.long_press.command, "start_blackout", sizeof(boot_config.long_press.command));
+        }
+    }
+
+    nvs_close(handle);
+}
+
+static void boot_config_print(void) {
+    MY_LOG_INFO(TAG, "boot_short_status=%s", boot_config.short_press.enabled ? "on" : "off");
+    MY_LOG_INFO(TAG, "boot_short=%s", boot_config.short_press.command);
+    MY_LOG_INFO(TAG, "boot_long_status=%s", boot_config.long_press.enabled ? "on" : "off");
+    MY_LOG_INFO(TAG, "boot_long=%s", boot_config.long_press.command);
+}
+
+static void boot_list_allowed_commands(void) {
+    MY_LOG_INFO(TAG, "Allowed boot commands:");
+    for (size_t i = 0; i < boot_allowed_command_count; i++) {
+        MY_LOG_INFO(TAG, "  %s", boot_allowed_commands[i]);
+    }
+}
+
+static void boot_execute_command(const char* command) {
+    if (command == NULL || command[0] == '\0') {
+        return;
+    }
+
+    if (strcasecmp(command, "start_blackout") == 0) {
+        (void)cmd_start_blackout(0, NULL);
+    } else if (strcasecmp(command, "start_sniffer_dog") == 0) {
+        (void)cmd_start_sniffer_dog(0, NULL);
+    } else if (strcasecmp(command, "channel_view") == 0) {
+        (void)cmd_channel_view(0, NULL);
+    } else if (strcasecmp(command, "packet_monitor") == 0) {
+        char arg0[] = "packet_monitor";
+        char arg1[] = "1";
+        char* argv[] = { arg0, arg1, NULL };
+        (void)cmd_packet_monitor(2, argv);
+    } else if (strcasecmp(command, "start_sniffer") == 0) {
+        (void)cmd_start_sniffer(0, NULL);
+    } else if (strcasecmp(command, "scan_networks") == 0) {
+        (void)cmd_scan_networks(0, NULL);
+    } else if (strcasecmp(command, "start_wardrive") == 0) {
+        (void)cmd_start_wardrive(0, NULL);
+    } else {
+        MY_LOG_INFO(TAG, "Boot cmd '%s' not recognized", command);
+    }
+}
+
+static void boot_handle_action(bool is_long_press) {
+    const boot_action_config_t* action = is_long_press ? &boot_config.long_press : &boot_config.short_press;
+    const char* label = is_long_press ? "long" : "short";
+    if (!action->enabled) {
+        MY_LOG_INFO(TAG, "Boot %s action disabled", label);
+        return;
+    }
+    if (!boot_is_command_allowed(action->command)) {
+        MY_LOG_INFO(TAG, "Boot %s command '%s' not allowed", label, action->command);
+        return;
+    }
+    MY_LOG_INFO(TAG, "Boot %s executing: %s", label, action->command);
+    boot_execute_command(action->command);
+}
+
 static void ensure_vendor_file_checked(void) {
     if (vendor_file_checked) {
         return;
@@ -2001,14 +2190,14 @@ static void boot_button_task(void *arg) {
                 long_action_triggered = true;
                 printf("Boot Long Pressed\n");
                 fflush(stdout);
-                (void)cmd_start_blackout(0, NULL);
+                boot_handle_action(true);
             }
         } else if (prev_pressed) {
             // Falling edge - button released
             if (!long_action_triggered) {
                 printf("Boot Pressed\n");
                 fflush(stdout);
-                (void)cmd_start_sniffer_dog(0, NULL);
+                boot_handle_action(false);
             }
             long_action_triggered = false;
         }
@@ -3240,6 +3429,84 @@ static int cmd_led(int argc, char **argv) {
     }
 
     MY_LOG_INFO(TAG, "Usage: led set <on|off> | led level <1-100> | led read");
+    return 1;
+}
+
+static boot_action_config_t* boot_get_action_slot(const char* which) {
+    if (which == NULL) {
+        return NULL;
+    }
+    if (strcasecmp(which, "short") == 0) {
+        return &boot_config.short_press;
+    }
+    if (strcasecmp(which, "long") == 0) {
+        return &boot_config.long_press;
+    }
+    return NULL;
+}
+
+static int cmd_boot_button(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: boot_button read | boot_button list | boot_button set <short|long> <command> | boot_button status <short|long> <on|off>");
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "read") == 0) {
+        boot_config_print();
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "list") == 0) {
+        boot_list_allowed_commands();
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "set") == 0) {
+        if (argc < 4) {
+            MY_LOG_INFO(TAG, "Usage: boot_button set <short|long> <command>");
+            boot_list_allowed_commands();
+            return 1;
+        }
+        boot_action_config_t* slot = boot_get_action_slot(argv[2]);
+        if (slot == NULL) {
+            MY_LOG_INFO(TAG, "Unknown target '%s' (use short|long)", argv[2]);
+            return 1;
+        }
+        if (!boot_is_command_allowed(argv[3])) {
+            MY_LOG_INFO(TAG, "Command '%s' not allowed", argv[3]);
+            boot_list_allowed_commands();
+            return 1;
+        }
+        strlcpy(slot->command, argv[3], sizeof(slot->command));
+        boot_config_persist();
+        boot_config_print();
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "status") == 0) {
+        if (argc < 4) {
+            MY_LOG_INFO(TAG, "Usage: boot_button status <short|long> <on|off>");
+            return 1;
+        }
+        boot_action_config_t* slot = boot_get_action_slot(argv[2]);
+        if (slot == NULL) {
+            MY_LOG_INFO(TAG, "Unknown target '%s' (use short|long)", argv[2]);
+            return 1;
+        }
+        if (strcasecmp(argv[3], "on") == 0) {
+            slot->enabled = true;
+        } else if (strcasecmp(argv[3], "off") == 0) {
+            slot->enabled = false;
+        } else {
+            MY_LOG_INFO(TAG, "Status must be on|off");
+            return 1;
+        }
+        boot_config_persist();
+        boot_config_print();
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Unknown subcommand. Use: read | list | set | status");
     return 1;
 }
 
@@ -4832,6 +5099,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&vendor_cmd));
 
+    const esp_console_cmd_t boot_button_cmd = {
+        .command = "boot_button",
+        .help = "Configure boot button actions: boot_button read|list|set <short|long> <command>|status <short|long> <on|off>",
+        .hint = NULL,
+        .func = &cmd_boot_button,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&boot_button_cmd));
+
     const esp_console_cmd_t led_cmd = {
         .command = "led",
         .help = "Controls status LED: led set <on|off> | led level <1-100> | led read",
@@ -4938,6 +5214,7 @@ void app_main(void) {
     vendor_file_checked = false;
     vendor_file_present = false;
     vendor_record_count = 0;
+    boot_config_load_from_nvs();
 
     ESP_ERROR_CHECK(wifi_init_ap_sta()); 
 
@@ -4978,6 +5255,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
     MY_LOG_INFO(TAG,"  start_sniffer_dog");
     MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
+    MY_LOG_INFO(TAG,"  boot_button read|list|set|status");
     MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
     MY_LOG_INFO(TAG,"  stop");
     MY_LOG_INFO(TAG,"  reboot");
