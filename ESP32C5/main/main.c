@@ -565,6 +565,7 @@ static int cmd_show_probes(int argc, char **argv);
 static int cmd_list_probes(int argc, char **argv);
 static int cmd_sniffer_debug(int argc, char **argv);
 static int cmd_start_blackout(int argc, char **argv);
+static int cmd_ping(int argc, char **argv);
 static int cmd_boot_button(int argc, char **argv);
 static int cmd_start_portal(int argc, char **argv);
 static int cmd_start_karma(int argc, char **argv);
@@ -3360,6 +3361,12 @@ static int cmd_reboot(int argc, char **argv)
     return 0;
 }
 
+static int cmd_ping(int argc, char **argv) {
+    (void)argc; (void)argv;
+    MY_LOG_INFO(TAG, "pong");
+    return 0;
+}
+
 static int cmd_led(int argc, char **argv) {
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: led set <on|off> | led level <1-100> | led read");
@@ -5135,6 +5142,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&reboot_cmd));
 
+    const esp_console_cmd_t ping_cmd = {
+        .command = "ping",
+        .help = "Connectivity test: prints pong",
+        .hint = NULL,
+        .func = &cmd_ping,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&ping_cmd));
+
     const esp_console_cmd_t list_sd_cmd = {
         .command = "list_sd",
         .help = "Lists HTML files on SD card",
@@ -5257,6 +5273,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
     MY_LOG_INFO(TAG,"  boot_button read|list|set|status");
     MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
+    MY_LOG_INFO(TAG,"  ping");
     MY_LOG_INFO(TAG,"  stop");
     MY_LOG_INFO(TAG,"  reboot");
 

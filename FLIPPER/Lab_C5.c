@@ -95,6 +95,9 @@ typedef enum {
 #define LAB_C5_CONFIG_DIR_PATH "apps_assets/labC5"
 #define LAB_C5_CONFIG_FILE_PATH LAB_C5_CONFIG_DIR_PATH "/config.txt"
 
+#define BOARD_PING_INTERVAL_MS 4000
+#define BOARD_PING_TIMEOUT_MS 3000
+
 #define PACKAGE_MONITOR_CHANNELS_24GHZ 14
 #define PACKAGE_MONITOR_CHANNELS_5GHZ 23
 #define PACKAGE_MONITOR_TOTAL_CHANNELS (PACKAGE_MONITOR_CHANNELS_24GHZ + PACKAGE_MONITOR_CHANNELS_5GHZ)
@@ -365,6 +368,10 @@ typedef struct {
     bool status_message_fullscreen;
     bool board_ready_seen;
     bool board_sync_pending;
+    bool board_ping_outstanding;
+    uint32_t board_last_ping_tick;
+    uint32_t board_last_rx_tick;
+    bool board_missing_shown;
     uint32_t last_input_tick;
     bool help_hint_visible;
     bool package_monitor_active;
@@ -420,7 +427,6 @@ static bool simple_app_handle_boot_status_line(SimpleApp* app, const char* line)
 static void simple_app_boot_feed(SimpleApp* app, char ch);
 static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long);
 static void simple_app_handle_board_ready(SimpleApp* app);
-static void simple_app_request_all_statuses(SimpleApp* app);
 static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas);
 static void simple_app_send_vendor_command(SimpleApp* app, bool enable);
 static void simple_app_request_vendor_status(SimpleApp* app);
@@ -545,6 +551,9 @@ static size_t simple_app_render_display_lines(
     size_t skip_lines,
     char dest[][64],
     size_t max_lines);
+static void simple_app_send_ping(SimpleApp* app);
+static void simple_app_handle_pong(SimpleApp* app);
+static void simple_app_ping_watchdog(SimpleApp* app);
 
 typedef struct {
     const char* label;
@@ -1014,13 +1023,6 @@ static void simple_app_request_boot_status(SimpleApp* app) {
     simple_app_send_command_quiet(app, "boot_button read");
 }
 
-static void simple_app_request_all_statuses(SimpleApp* app) {
-    if(!app) return;
-    simple_app_request_led_status(app);
-    simple_app_request_boot_status(app);
-    simple_app_request_vendor_status(app);
-}
-
 static bool simple_app_handle_boot_status_line(SimpleApp* app, const char* line) {
     if(!app || !line) return false;
     const char* short_status = "boot_short_status=";
@@ -1142,22 +1144,29 @@ static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long) {
 static void simple_app_handle_board_ready(SimpleApp* app) {
     if(!app) return;
 
+    bool was_ready = app->board_ready_seen;
     app->board_ready_seen = true;
+    app->board_sync_pending = false;
+    app->board_ping_outstanding = false;
+    app->board_last_rx_tick = furi_get_tick();
+    app->board_missing_shown = false;
 
-    if(app->board_sync_pending) {
-        app->board_sync_pending = false;
-        simple_app_request_all_statuses(app);
-    }
-
-    simple_app_show_status_message(app, "Board Ready", 1000, true);
-    if(app->viewport) {
-        view_port_update(app->viewport);
+    if(!was_ready) {
+        simple_app_show_status_message(app, "Board found", 1000, true);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
     }
 }
 
 static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas) return;
-    const char* text = app->board_ready_seen ? "Sync OK" : "Sync...";
+    const char* text = "Sync...";
+    if(app->board_missing_shown) {
+        text = "No board";
+    } else if(app->board_ready_seen) {
+        text = "Sync OK";
+    }
     canvas_set_font(canvas, FontSecondary);
     canvas_draw_str_aligned(
         canvas,
@@ -1168,17 +1177,67 @@ static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas) {
         text);
 }
 
+static void simple_app_handle_pong(SimpleApp* app) {
+    if(!app) return;
+    bool was_ready = app->board_ready_seen;
+    app->board_ready_seen = true;
+    app->board_sync_pending = false;
+    app->board_ping_outstanding = false;
+    app->board_last_rx_tick = furi_get_tick();
+    app->board_missing_shown = false;
+    if(!was_ready) {
+        simple_app_show_status_message(app, "Board found", 1000, true);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+    }
+}
+
+static void simple_app_send_ping(SimpleApp* app) {
+    if(!app || !app->serial) return;
+    const char* cmd = "ping\n";
+    furi_hal_serial_tx(app->serial, (const uint8_t*)cmd, strlen(cmd));
+    furi_hal_serial_tx_wait_complete(app->serial);
+    app->board_ping_outstanding = true;
+    app->board_last_ping_tick = furi_get_tick();
+}
+
+static void simple_app_ping_watchdog(SimpleApp* app) {
+    if(!app) return;
+    uint32_t now = furi_get_tick();
+
+    // Only ping when idle on main menu (section list) and no modal status
+    bool idle_menu = (app->screen == ScreenMenu) && (app->menu_state == MenuStateSections) &&
+                     !simple_app_status_message_is_active(app);
+
+    if(idle_menu && !app->board_ping_outstanding &&
+       (now - app->board_last_ping_tick) >= BOARD_PING_INTERVAL_MS) {
+        simple_app_send_ping(app);
+    }
+
+    if(app->board_ping_outstanding &&
+       (now - app->board_last_ping_tick) >= BOARD_PING_TIMEOUT_MS) {
+        app->board_ping_outstanding = false;
+        app->board_ready_seen = false;
+        if(!app->board_missing_shown) {
+            app->board_missing_shown = true;
+            simple_app_show_status_message(app, "No board", 1500, true);
+        }
+    }
+}
+
 static void simple_app_send_command_quiet(SimpleApp* app, const char* command) {
     if(!app || !command || !app->serial) return;
 
     // Block commands until board reports ready (except reboot which triggers sync)
     if(!app->board_ready_seen) {
         // Allow reboot to kick off sync
-        if(strncmp(command, "reboot", 6) != 0) {
+        if(strncmp(command, "reboot", 6) != 0 && strncmp(command, "ping", 4) != 0) {
             simple_app_show_status_message(app, "Waiting for board...", 1000, true);
             return;
         }
     }
+    app->board_ping_outstanding = false;
 
     char cmd[64];
     int len = snprintf(cmd, sizeof(cmd), "%s\n", command);
@@ -2039,7 +2098,7 @@ static void simple_app_load_config(SimpleApp* app) {
     storage_file_free(file);
     furi_record_close(RECORD_STORAGE);
     if(loaded) {
-        simple_app_show_status_message(app, "Config loaded", 1000, true);
+        simple_app_show_status_message(app, "Config loaded", 2000, true);
         app->config_dirty = false;
     } else {
         simple_app_save_config(app, NULL, false);
@@ -5065,7 +5124,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
         return;
     }
 
-    simple_app_draw_sync_status(app, canvas);
+    if(app->screen == ScreenMenu && app->menu_state == MenuStateSections) {
+        simple_app_draw_sync_status(app, canvas);
+    }
 
     switch(app->screen) {
     case ScreenMenu:
@@ -7213,6 +7274,15 @@ static void simple_app_process_stream(SimpleApp* app) {
     while(true) {
         size_t received = furi_stream_buffer_receive(app->rx_stream, chunk, sizeof(chunk), 0);
         if(received == 0) break;
+
+        // Detect pong in incoming chunk
+        for(size_t i = 0; i + 3 < received; i++) {
+            if(chunk[i] == 'p' && chunk[i + 1] == 'o' && chunk[i + 2] == 'n' && chunk[i + 3] == 'g') {
+                simple_app_handle_pong(app);
+                break;
+            }
+        }
+
         simple_app_append_serial_data(app, chunk, received);
         updated = true;
     }
@@ -7235,6 +7305,7 @@ static void simple_app_serial_irq(FuriHalSerialHandle* handle, FuriHalSerialRxEv
     do {
         uint8_t byte = furi_hal_serial_async_rx(handle);
         furi_stream_buffer_send(app->rx_stream, &byte, 1, 0);
+        app->board_last_rx_tick = furi_get_tick();
     } while(furi_hal_serial_async_rx_available(handle));
 }
 
@@ -7271,6 +7342,10 @@ int32_t Lab_C5_app(void* p) {
     app->led_setup_index = 0;
     app->board_ready_seen = false;
     app->board_sync_pending = true;
+    app->board_ping_outstanding = false;
+    app->board_last_ping_tick = 0;
+    app->board_last_rx_tick = furi_get_tick();
+    app->board_missing_shown = false;
     app->boot_short_enabled = false;
     app->boot_long_enabled = false;
     app->boot_short_command_index = 1; // start_sniffer_dog
@@ -7331,8 +7406,8 @@ int32_t Lab_C5_app(void* p) {
     simple_app_reset_serial_log(app, "READY");
 
     furi_hal_serial_async_rx_start(app->serial, simple_app_serial_irq, app, false);
-    simple_app_show_status_message(app, "Rebooting board\nfor sync", 1500, true);
-    simple_app_send_command_quiet(app, "reboot");
+    simple_app_show_status_message(app, "Board detection", 1500, true);
+    simple_app_send_ping(app);
 
     app->gui = furi_record_open(RECORD_GUI);
     app->viewport = view_port_alloc();
@@ -7344,6 +7419,7 @@ int32_t Lab_C5_app(void* p) {
         simple_app_process_stream(app);
         simple_app_update_karma_sniffer(app);
         simple_app_update_result_scroll(app);
+        simple_app_ping_watchdog(app);
 
         if(app->portal_input_requested && !app->portal_input_active) {
             app->portal_input_requested = false;
