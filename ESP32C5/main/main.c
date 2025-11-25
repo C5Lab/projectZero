@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <ctype.h>
 
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
@@ -57,7 +58,7 @@
 #include "lwip/dhcp.h"
 
 //Version number
-#define JANOS_VERSION "0.6.2"
+#define JANOS_VERSION "0.6.4"
 
 
 #define NEOPIXEL_GPIO      27
@@ -497,6 +498,9 @@ static char sd_html_files[MAX_HTML_FILES][MAX_HTML_FILENAME];
 static int sd_html_count = 0;
 static char* custom_portal_html = NULL;
 static bool sd_card_mounted = false;
+#define MAX_SSID_PRESETS 64
+#define MAX_SSID_NAME_LEN 32
+#define SSID_PRESET_PATH "/sdcard/lab/ssid.txt"
 
 // Whitelist for BSSID protection
 #define MAX_WHITELISTED_BSSIDS 150
@@ -573,6 +577,7 @@ static int cmd_boot_button(int argc, char **argv);
 static int cmd_start_portal(int argc, char **argv);
 static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
+static int cmd_list_ssid(int argc, char **argv);
 static int cmd_select_html(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
@@ -3650,6 +3655,92 @@ static int cmd_start_karma(int argc, char **argv)
     return cmd_start_portal(2, portal_argv);
 }
 
+// Load preset SSIDs from /sdcard/lab/ssid.txt
+static int load_ssid_presets(char ssids[][MAX_SSID_NAME_LEN + 1], int max_entries) {
+    if (max_entries <= 0) {
+        return 0;
+    }
+
+    FILE *f = fopen(SSID_PRESET_PATH, "r");
+    if (f == NULL) {
+        return -1;
+    }
+
+    char line[96];
+    int count = 0;
+    while ((count < max_entries) && fgets(line, sizeof(line), f)) {
+        char *start = line;
+        while (*start && isspace((unsigned char)*start)) {
+            start++;
+        }
+        if (*start == '\0') {
+            continue;
+        }
+        char *end = start + strlen(start);
+        while (end > start && (end[-1] == '\n' || end[-1] == '\r')) {
+            *--end = '\0';
+        }
+        while (end > start && isspace((unsigned char)end[-1])) {
+            *--end = '\0';
+        }
+        if (*start == '\0') {
+            continue;
+        }
+        size_t len = strlen(start);
+        if (len > MAX_SSID_NAME_LEN) {
+            start[MAX_SSID_NAME_LEN] = '\0';
+        }
+        strncpy(ssids[count], start, MAX_SSID_NAME_LEN);
+        ssids[count][MAX_SSID_NAME_LEN] = '\0';
+        count++;
+    }
+
+    fclose(f);
+    return count;
+}
+
+static void report_ssid_file_status(void) {
+    char ssids[MAX_SSID_PRESETS][MAX_SSID_NAME_LEN + 1];
+    int count = load_ssid_presets(ssids, MAX_SSID_PRESETS);
+    if (count < 0) {
+        MY_LOG_INFO(TAG, "ssid.txt not found - manual SSID entry only");
+        return;
+    }
+    MY_LOG_INFO(TAG, "ssid.txt found with %d preset SSID(s)", count);
+}
+
+// Command: list_ssid - Lists SSIDs from ssid.txt on SD card
+static int cmd_list_ssid(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        MY_LOG_INFO(TAG, "Make sure SD card is properly inserted.");
+        return 1;
+    }
+
+    char ssids[MAX_SSID_PRESETS][MAX_SSID_NAME_LEN + 1];
+    int count = load_ssid_presets(ssids, MAX_SSID_PRESETS);
+    if (count < 0) {
+        MY_LOG_INFO(TAG, "ssid.txt not found on SD card.");
+        return 0;
+    }
+
+    if (count == 0) {
+        MY_LOG_INFO(TAG, "ssid.txt is empty - manual SSID entry only.");
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "SSID presets from ssid.txt:");
+    for (int i = 0; i < count; i++) {
+        printf("%d %s\n", i + 1, ssids[i]);
+    }
+
+    return 0;
+}
+
 // Command: list_sd - Lists HTML files on SD card
 static int cmd_list_sd(int argc, char **argv)
 {
@@ -5189,6 +5280,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&list_sd_cmd));
 
+    const esp_console_cmd_t list_ssid_cmd = {
+        .command = "list_ssid",
+        .help = "Lists SSIDs from /sdcard/lab/ssid.txt",
+        .hint = NULL,
+        .func = &cmd_list_ssid,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&list_ssid_cmd));
+
     const esp_console_cmd_t select_html_cmd = {
         .command = "select_html",
         .help = "Load custom HTML from SD card: select_html <index>",
@@ -5291,6 +5391,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  start_wardrive");
     MY_LOG_INFO(TAG,"  start_portal <SSID>");
     MY_LOG_INFO(TAG,"  list_sd");
+    MY_LOG_INFO(TAG,"  list_ssid");
     MY_LOG_INFO(TAG,"  select_html <index>");
     MY_LOG_INFO(TAG,"  start_sniffer");
     MY_LOG_INFO(TAG,"  packet_monitor <channel>");
@@ -5346,6 +5447,7 @@ void app_main(void) {
     esp_err_t sd_init_ret = init_sd_card();
     if (sd_init_ret == ESP_OK) {
         create_sd_directories();
+        report_ssid_file_status();
         if (vendor_is_enabled()) {
             ensure_vendor_file_checked();
         }

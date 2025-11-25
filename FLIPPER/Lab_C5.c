@@ -39,7 +39,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.21"
+#define LAB_C5_VERSION_TEXT "0.22"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -148,6 +148,8 @@ static const char* boot_command_options[BOOT_COMMAND_OPTION_COUNT] = {
 #define KARMA_MENU_OPTION_COUNT 5
 #define PORTAL_MENU_OPTION_COUNT 3
 #define PORTAL_VISIBLE_COUNT 2
+#define PORTAL_MAX_SSID_PRESETS 48
+#define PORTAL_SSID_POPUP_VISIBLE_LINES 3
 #define KARMA_MAX_HTML_FILES EVIL_TWIN_MAX_HTML_FILES
 #define KARMA_HTML_NAME_MAX EVIL_TWIN_HTML_NAME_MAX
 #define KARMA_SNIFFER_DURATION_MIN_SEC 5
@@ -229,6 +231,11 @@ typedef struct {
 } KarmaHtmlEntry;
 
 typedef struct {
+    uint8_t id;
+    char ssid[SCAN_SSID_MAX_LEN];
+} PortalSsidEntry;
+
+typedef struct {
     bool exit_app;
     MenuState menu_state;
     uint32_t section_index;
@@ -274,6 +281,16 @@ typedef struct {
     size_t portal_menu_offset;
     bool portal_input_requested;
     bool portal_input_active;
+    PortalSsidEntry portal_ssid_entries[PORTAL_MAX_SSID_PRESETS];
+    size_t portal_ssid_count;
+    size_t portal_ssid_popup_index;
+    size_t portal_ssid_popup_offset;
+    bool portal_ssid_popup_active;
+    bool portal_ssid_listing_active;
+    bool portal_ssid_list_header_seen;
+    char portal_ssid_list_buffer[64];
+    size_t portal_ssid_list_length;
+    bool portal_ssid_missing;
     size_t karma_menu_index;
     size_t karma_menu_offset;
     KarmaProbeEntry karma_probes[KARMA_MAX_PROBES];
@@ -478,9 +495,17 @@ static bool simple_app_channel_view_adjust_offset(SimpleApp* app, ChannelViewBan
 static bool simple_app_try_show_hint(SimpleApp* app);
 static void simple_app_draw_portal_menu(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key);
+static void simple_app_reset_portal_ssid_listing(SimpleApp* app);
+static void simple_app_request_portal_ssid_list(SimpleApp* app);
 static void simple_app_copy_portal_ssid(SimpleApp* app, const char* source);
 static void simple_app_portal_prompt_ssid(SimpleApp* app);
 static void simple_app_portal_sync_offset(SimpleApp* app);
+static void simple_app_open_portal_ssid_popup(SimpleApp* app);
+static void simple_app_finish_portal_ssid_listing(SimpleApp* app);
+static void simple_app_process_portal_ssid_line(SimpleApp* app, const char* line);
+static void simple_app_portal_ssid_feed(SimpleApp* app, char ch);
+static void simple_app_draw_portal_ssid_popup(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_portal_ssid_popup_event(SimpleApp* app, const InputEvent* event);
 static bool simple_app_portal_run_text_input(SimpleApp* app);
 static void simple_app_portal_text_input_result(void* context);
 static bool simple_app_portal_text_input_navigation(void* context);
@@ -2687,6 +2712,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_scan_feed(app, ch);
         simple_app_package_monitor_feed(app, ch);
         simple_app_channel_view_feed(app, ch);
+        simple_app_portal_ssid_feed(app, ch);
         simple_app_evil_twin_feed(app, ch);
         simple_app_karma_probe_feed(app, ch);
         simple_app_karma_html_feed(app, ch);
@@ -4033,19 +4059,25 @@ static void simple_app_draw_portal_menu(SimpleApp* app, Canvas* canvas) {
 
         const char* label = "Start Portal";
         char detail[48];
+        char detail_extra[48];
         detail[0] = '\0';
+        detail_extra[0] = '\0';
         bool show_detail_line = false;
+        bool show_detail_extra = false;
 
         switch(idx) {
         case 0:
             label = "SSID";
-            if(app->portal_ssid[0] != '\0') {
-                snprintf(detail, sizeof(detail), "Current: %s", app->portal_ssid);
-            } else {
-                snprintf(detail, sizeof(detail), "Current: <none>");
-            }
-            simple_app_truncate_text(detail, 26);
+            snprintf(detail, sizeof(detail), "Current:");
             show_detail_line = true;
+            if(app->portal_ssid[0] != '\0') {
+                strncpy(detail_extra, app->portal_ssid, sizeof(detail_extra) - 1);
+                detail_extra[sizeof(detail_extra) - 1] = '\0';
+            } else {
+                snprintf(detail_extra, sizeof(detail_extra), "<none>");
+            }
+            simple_app_truncate_text(detail_extra, 28);
+            show_detail_extra = true;
             break;
         case 1:
             label = "Select HTML";
@@ -4080,6 +4112,10 @@ static void simple_app_draw_portal_menu(SimpleApp* app, Canvas* canvas) {
             canvas_draw_str(canvas, 14, (uint8_t)(y + 10), detail);
             item_height += 10;
         }
+        if(show_detail_extra) {
+            canvas_draw_str(canvas, 14, (uint8_t)(y + item_height), detail_extra);
+            item_height += 10;
+        }
         y = (uint8_t)(y + item_height);
         list_bottom_y = y;
     }
@@ -4102,6 +4138,10 @@ static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key) {
     if(!app) return;
 
     if(key == InputKeyBack || key == InputKeyLeft) {
+        if(app->portal_ssid_listing_active) {
+            simple_app_reset_portal_ssid_listing(app);
+        }
+        app->portal_ssid_popup_active = false;
         if(app->karma_html_listing_active) {
             simple_app_reset_karma_html_listing(app);
         }
@@ -4134,7 +4174,20 @@ static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key) {
         }
     } else if(key == InputKeyOk) {
         if(app->portal_menu_index == 0) {
-            simple_app_portal_prompt_ssid(app);
+            if(app->portal_ssid_listing_active) {
+                simple_app_show_status_message(app, "Listing already\nin progress", 1200, true);
+                if(app->viewport) {
+                    view_port_update(app->viewport);
+                }
+                return;
+            }
+            if(app->portal_ssid_count > 0 && !app->portal_ssid_missing) {
+                simple_app_open_portal_ssid_popup(app);
+            } else if(app->portal_ssid_missing) {
+                simple_app_portal_prompt_ssid(app);
+            } else {
+                simple_app_request_portal_ssid_list(app);
+            }
         } else if(app->portal_menu_index == 1) {
             if(app->karma_html_listing_active || app->karma_html_count == 0) {
                 simple_app_request_karma_html_list(app);
@@ -4155,6 +4208,193 @@ static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key) {
         } else {
             simple_app_start_portal(app);
         }
+    }
+}
+
+static void simple_app_reset_portal_ssid_listing(SimpleApp* app) {
+    if(!app) return;
+    app->portal_ssid_listing_active = false;
+    app->portal_ssid_list_header_seen = false;
+    app->portal_ssid_list_length = 0;
+    app->portal_ssid_count = 0;
+    app->portal_ssid_popup_index = 0;
+    app->portal_ssid_popup_offset = 0;
+    app->portal_ssid_popup_active = false;
+    app->portal_ssid_missing = false;
+}
+
+static void simple_app_open_portal_ssid_popup(SimpleApp* app) {
+    if(!app || app->portal_ssid_count == 0) return;
+
+    size_t total_options = app->portal_ssid_count + 1; // +1 for manual entry
+    size_t target_index = 0; // manual by default
+    if(app->portal_ssid[0] != '\0') {
+        for(size_t i = 0; i < app->portal_ssid_count; i++) {
+            if(strncmp(app->portal_ssid_entries[i].ssid, app->portal_ssid, SCAN_SSID_MAX_LEN - 1) == 0) {
+                target_index = i + 1;
+                break;
+            }
+        }
+    }
+
+    app->portal_ssid_popup_index = target_index;
+    size_t visible = total_options;
+    if(visible > PORTAL_SSID_POPUP_VISIBLE_LINES) {
+        visible = PORTAL_SSID_POPUP_VISIBLE_LINES;
+    }
+    if(visible == 0) visible = 1;
+
+    if(total_options > visible && target_index >= visible) {
+        app->portal_ssid_popup_offset = target_index - visible + 1;
+    } else {
+        app->portal_ssid_popup_offset = 0;
+    }
+    size_t max_offset = (total_options > visible) ? (total_options - visible) : 0;
+    if(app->portal_ssid_popup_offset > max_offset) {
+        app->portal_ssid_popup_offset = max_offset;
+    }
+
+    app->portal_ssid_popup_active = true;
+    simple_app_clear_status_message(app);
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_finish_portal_ssid_listing(SimpleApp* app) {
+    if(!app || !app->portal_ssid_listing_active) return;
+    app->portal_ssid_listing_active = false;
+    app->portal_ssid_list_length = 0;
+    app->portal_ssid_list_header_seen = false;
+    app->last_command_sent = false;
+    simple_app_clear_status_message(app);
+
+    if(app->portal_ssid_count == 0) {
+        app->portal_ssid_popup_active = false;
+        if(app->screen == ScreenPortalMenu) {
+            simple_app_show_status_message(app, "SSID presets\nnot available", 1500, true);
+            simple_app_portal_prompt_ssid(app);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    app->portal_ssid_missing = false;
+    if(app->screen == ScreenPortalMenu) {
+        simple_app_open_portal_ssid_popup(app);
+    }
+}
+
+static void simple_app_process_portal_ssid_line(SimpleApp* app, const char* line) {
+    if(!app || !line || !app->portal_ssid_listing_active) return;
+
+    const char* cursor = line;
+    while(*cursor == ' ' || *cursor == '\t') {
+        cursor++;
+    }
+
+    if(*cursor == '\0') {
+        if(app->portal_ssid_count > 0) {
+            simple_app_finish_portal_ssid_listing(app);
+        }
+        return;
+    }
+
+    if(strncmp(cursor, "ssid.txt not found", 19) == 0 ||
+       strncmp(cursor, "ssid.txt is empty", 18) == 0 ||
+       strncmp(cursor, "No SSID", 7) == 0) {
+        app->portal_ssid_missing = true;
+        app->portal_ssid_count = 0;
+        simple_app_finish_portal_ssid_listing(app);
+        return;
+    }
+
+    if(strncmp(cursor, "SSID presets", 12) == 0) {
+        app->portal_ssid_list_header_seen = true;
+        return;
+    }
+
+    if(!isdigit((unsigned char)cursor[0])) {
+        if(app->portal_ssid_count > 0) {
+            simple_app_finish_portal_ssid_listing(app);
+        }
+        return;
+    }
+
+    char* endptr = NULL;
+    long id = strtol(cursor, &endptr, 10);
+    if(id <= 0 || id > 255 || !endptr) {
+        return;
+    }
+    while(*endptr == ' ' || *endptr == '\t') {
+        endptr++;
+    }
+    if(*endptr == '\0') {
+        return;
+    }
+
+    if(app->portal_ssid_count >= PORTAL_MAX_SSID_PRESETS) {
+        return;
+    }
+
+    PortalSsidEntry* entry = &app->portal_ssid_entries[app->portal_ssid_count++];
+    entry->id = (uint8_t)id;
+    strncpy(entry->ssid, endptr, SCAN_SSID_MAX_LEN - 1);
+    entry->ssid[SCAN_SSID_MAX_LEN - 1] = '\0';
+
+    size_t len = strlen(entry->ssid);
+    while(len > 0 &&
+          (entry->ssid[len - 1] == '\r' || entry->ssid[len - 1] == '\n' ||
+           entry->ssid[len - 1] == ' ' || entry->ssid[len - 1] == '\t')) {
+        entry->ssid[--len] = '\0';
+    }
+
+    app->portal_ssid_list_header_seen = true;
+}
+
+static void simple_app_portal_ssid_feed(SimpleApp* app, char ch) {
+    if(!app || !app->portal_ssid_listing_active) return;
+    if(ch == '\r') return;
+
+    if(ch == '>') {
+        if(app->portal_ssid_list_length > 0) {
+            app->portal_ssid_list_buffer[app->portal_ssid_list_length] = '\0';
+            simple_app_process_portal_ssid_line(app, app->portal_ssid_list_buffer);
+            app->portal_ssid_list_length = 0;
+        }
+        simple_app_finish_portal_ssid_listing(app);
+        return;
+    }
+
+    if(ch == '\n') {
+        if(app->portal_ssid_list_length > 0) {
+            app->portal_ssid_list_buffer[app->portal_ssid_list_length] = '\0';
+            simple_app_process_portal_ssid_line(app, app->portal_ssid_list_buffer);
+        } else if(app->portal_ssid_list_header_seen || app->portal_ssid_missing) {
+            simple_app_finish_portal_ssid_listing(app);
+        }
+        app->portal_ssid_list_length = 0;
+        return;
+    }
+
+    if(app->portal_ssid_list_length + 1 >= sizeof(app->portal_ssid_list_buffer)) {
+        app->portal_ssid_list_length = 0;
+        return;
+    }
+
+    app->portal_ssid_list_buffer[app->portal_ssid_list_length++] = ch;
+}
+
+static void simple_app_request_portal_ssid_list(SimpleApp* app) {
+    if(!app) return;
+    simple_app_reset_portal_ssid_listing(app);
+    app->portal_ssid_listing_active = true;
+    simple_app_show_status_message(app, "Listing SSID...", 0, false);
+    simple_app_send_command(app, "list_ssid", false);
+    if(app->viewport) {
+        view_port_update(app->viewport);
     }
 }
 
@@ -4300,8 +4540,161 @@ static bool simple_app_portal_run_text_input(SimpleApp* app) {
     return accepted;
 }
 
+static void simple_app_draw_portal_ssid_popup(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas || !app->portal_ssid_popup_active) return;
+
+    const uint8_t bubble_x = 4;
+    const uint8_t bubble_y = 4;
+    const uint8_t bubble_w = DISPLAY_WIDTH - (bubble_x * 2);
+    const uint8_t bubble_h = 56;
+    const uint8_t radius = 9;
+
+    canvas_set_color(canvas, ColorWhite);
+    canvas_draw_rbox(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+    canvas_set_color(canvas, ColorBlack);
+    canvas_draw_rframe(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, bubble_x + 8, bubble_y + 16, "Select SSID");
+
+    canvas_set_font(canvas, FontSecondary);
+    uint8_t list_y = bubble_y + 28;
+
+    if(app->portal_ssid_count == 0) {
+        canvas_draw_str(canvas, bubble_x + 10, list_y, "No presets found");
+        canvas_draw_str(canvas, bubble_x + 10, (uint8_t)(list_y + HINT_LINE_HEIGHT), "Back returns");
+        return;
+    }
+
+    size_t total_options = app->portal_ssid_count + 1; // manual option first
+    size_t visible = total_options;
+    if(visible > PORTAL_SSID_POPUP_VISIBLE_LINES) {
+        visible = PORTAL_SSID_POPUP_VISIBLE_LINES;
+    }
+
+    if(app->portal_ssid_popup_offset >= total_options) {
+        app->portal_ssid_popup_offset =
+            (total_options > visible) ? (total_options - visible) : 0;
+    }
+
+    for(size_t i = 0; i < visible; i++) {
+        size_t idx = app->portal_ssid_popup_offset + i;
+        if(idx >= total_options) break;
+        char line[48];
+        if(idx == 0) {
+            strncpy(line, "Manual select", sizeof(line) - 1);
+            line[sizeof(line) - 1] = '\0';
+        } else {
+            const PortalSsidEntry* entry = &app->portal_ssid_entries[idx - 1];
+            snprintf(line, sizeof(line), "%u %s", (unsigned)entry->id, entry->ssid);
+        }
+        simple_app_truncate_text(line, 28);
+        uint8_t line_y = (uint8_t)(list_y + i * HINT_LINE_HEIGHT);
+        if(idx == app->portal_ssid_popup_index) {
+            canvas_draw_str(canvas, bubble_x + 4, line_y, ">");
+        }
+        canvas_draw_str(canvas, bubble_x + 14, line_y, line);
+    }
+
+    if(total_options > visible) {
+        bool show_up = (app->portal_ssid_popup_offset > 0);
+        bool show_down = (app->portal_ssid_popup_offset + visible < total_options);
+        if(show_up || show_down) {
+            uint8_t arrow_x = (uint8_t)(bubble_x + bubble_w - 10);
+            int16_t content_top = list_y;
+            int16_t content_bottom =
+                list_y + (int16_t)((visible > 0 ? (visible - 1) : 0) * HINT_LINE_HEIGHT);
+            int16_t min_base = bubble_y + 12;
+            int16_t max_base = bubble_y + bubble_h - 12;
+            simple_app_draw_scroll_hints_clamped(
+                canvas, arrow_x, content_top, content_bottom, show_up, show_down, min_base, max_base);
+        }
+    }
+}
+
+static void simple_app_handle_portal_ssid_popup_event(SimpleApp* app, const InputEvent* event) {
+    if(!app || !event || !app->portal_ssid_popup_active) return;
+    if(event->type != InputTypeShort && event->type != InputTypeRepeat && event->type != InputTypeLong) return;
+
+    InputKey key = event->key;
+    bool is_short = (event->type == InputTypeShort);
+
+    size_t total_options = app->portal_ssid_count + 1;
+    size_t visible = total_options;
+    if(visible > PORTAL_SSID_POPUP_VISIBLE_LINES) {
+        visible = PORTAL_SSID_POPUP_VISIBLE_LINES;
+    }
+    if(visible == 0) visible = 1;
+
+    if(is_short && key == InputKeyBack) {
+        app->portal_ssid_popup_active = false;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(total_options == 0) {
+        return;
+    }
+
+    if(key == InputKeyUp) {
+        if(app->portal_ssid_popup_index > 0) {
+            app->portal_ssid_popup_index--;
+            if(app->portal_ssid_popup_index < app->portal_ssid_popup_offset) {
+                app->portal_ssid_popup_offset = app->portal_ssid_popup_index;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(key == InputKeyDown) {
+        if(app->portal_ssid_popup_index + 1 < total_options) {
+            app->portal_ssid_popup_index++;
+            if(total_options > visible &&
+               app->portal_ssid_popup_index >= app->portal_ssid_popup_offset + visible) {
+                app->portal_ssid_popup_offset =
+                    app->portal_ssid_popup_index - visible + 1;
+            }
+            size_t max_offset = (total_options > visible) ? (total_options - visible) : 0;
+            if(app->portal_ssid_popup_offset > max_offset) {
+                app->portal_ssid_popup_offset = max_offset;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(is_short && key == InputKeyOk) {
+        size_t idx = app->portal_ssid_popup_index;
+        if(idx == 0) {
+            app->portal_ssid_popup_active = false;
+            simple_app_portal_prompt_ssid(app);
+        } else if(idx - 1 < app->portal_ssid_count) {
+            const PortalSsidEntry* entry = &app->portal_ssid_entries[idx - 1];
+            simple_app_copy_portal_ssid(app, entry->ssid);
+            char message[64];
+            snprintf(message, sizeof(message), "SSID set:\n%s", entry->ssid);
+            simple_app_show_status_message(app, message, 1200, true);
+            app->portal_menu_index = 1;
+            simple_app_portal_sync_offset(app);
+            app->portal_ssid_popup_active = false;
+        }
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+    }
+}
+
 static void simple_app_start_portal(SimpleApp* app) {
     if(!app) return;
+
+    if(app->portal_ssid_listing_active) {
+        simple_app_show_status_message(app, "Wait for list\ncompletion", 1500, true);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
 
     if(app->karma_html_listing_active) {
         simple_app_show_status_message(app, "Wait for list\ncompletion", 1500, true);
@@ -5179,7 +5572,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
         break;
     }
 
-    if(app->karma_probe_popup_active) {
+    if(app->portal_ssid_popup_active) {
+        simple_app_draw_portal_ssid_popup(app, canvas);
+    } else if(app->karma_probe_popup_active) {
         simple_app_draw_karma_probe_popup(app, canvas);
     } else if(app->karma_html_popup_active) {
         simple_app_draw_karma_html_popup(app, canvas);
@@ -7177,6 +7572,11 @@ static void simple_app_input(InputEvent* event, void* context) {
         return;
     }
 
+    if(app->portal_ssid_popup_active) {
+        simple_app_handle_portal_ssid_popup_event(app, event);
+        return;
+    }
+
     if(app->karma_probe_popup_active) {
         simple_app_handle_karma_probe_popup_event(app, event);
         return;
@@ -7425,6 +7825,7 @@ int32_t Lab_C5_app(void* p) {
             app->portal_input_requested = false;
             bool accepted = simple_app_portal_run_text_input(app);
             if(accepted) {
+                app->portal_ssid_missing = false;
                 if(app->portal_ssid[0] != '\0') {
                     simple_app_show_status_message(app, "SSID updated", 1000, true);
                     app->portal_menu_index = 1;
@@ -7441,6 +7842,7 @@ int32_t Lab_C5_app(void* p) {
         bool previous_help_hint = app->help_hint_visible;
         bool can_show_help_hint = (app->screen == ScreenMenu) && (app->menu_state == MenuStateSections) &&
                                   !app->hint_active && !app->evil_twin_popup_active &&
+                                  !app->portal_ssid_popup_active &&
                                   !simple_app_status_message_is_active(app);
 
         if(can_show_help_hint) {
