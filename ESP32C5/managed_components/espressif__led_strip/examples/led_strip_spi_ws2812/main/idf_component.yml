@@ -1,4 +1,0 @@
-dependencies:
-  espressif/led_strip:
-    version: ^3
-  idf: '>=5.1'

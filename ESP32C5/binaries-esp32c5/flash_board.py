@@ -3,6 +3,10 @@ import sys
 import subprocess
 import os
 import argparse
+import re
+
+MIN_ESPTOOL = "5.0.0"
+VERSION = "0.2"
 
 def ensure_packages():
     missing = []
@@ -10,18 +14,49 @@ def ensure_packages():
         import serial.tools.list_ports  # noqa
     except ImportError:
         missing.append("pyserial")
+
+    try:
+        import colorama  # noqa
+    except ImportError:
+        missing.append("colorama")
+
+    def version_ok(installed, minimum):
+        try:
+            from packaging.version import Version  # type: ignore
+            return Version(installed) >= Version(minimum)
+        except Exception:
+            def _split(ver):
+                return tuple(int(p) for p in re.split(r"[^\d]+", ver) if p)
+
+            return _split(installed) >= _split(minimum)
+
+    esptool_req = f"esptool>={MIN_ESPTOOL}"
+    try:
+        import importlib.metadata as importlib_metadata  # type: ignore
+    except ImportError:  # pragma: no cover - Python <3.8 fallback
+        import importlib_metadata as importlib_metadata  # type: ignore
+
     try:
         import esptool  # noqa
+        installed_version = importlib_metadata.version("esptool")
+        if not version_ok(installed_version, MIN_ESPTOOL):
+            missing.append(esptool_req)
     except ImportError:
-        missing.append("esptool")
+        missing.append(esptool_req)
     if missing:
         print("\033[93mInstalling missing packages: " + ", ".join(missing) + "\033[0m")
         subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 ensure_packages()
+import colorama
 import serial
 import serial.tools.list_ports
+# Older colorama versions may not have just_fix_windows_console
+if hasattr(colorama, "just_fix_windows_console"):
+    colorama.just_fix_windows_console()
+else:
+    colorama.init()
 
 # Colors
 RED = "\033[91m"; GREEN = "\033[92m"; YELLOW = "\033[93m"; CYAN = "\033[96m"; RESET = "\033[0m"
@@ -145,6 +180,7 @@ def monitor(port, baud=115200):
 
 def main():
     parser = argparse.ArgumentParser(description="ESP32-C5 flasher with robust reboot handling")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("--port", help="Known serial port (e.g., COM10 or /dev/ttyACM0)")
     parser.add_argument("--baud", type=int, default=460800)
     parser.add_argument("--monitor", action="store_true", help="Open serial monitor after flashing")
