@@ -3,38 +3,6 @@ import sys
 import subprocess
 import os
 import argparse
-import re
-
-MIN_ESPTOOL = "5.0.0"
-VERSION = "0.2"
-VENV_DIR = ".venv_flash"
-ENV_FLAG = "FLASH_BOARD_IN_VENV"
-
-# Require Python 3.8+ (esptool and subprocess.run rely on it)
-if sys.version_info < (3, 8):
-    sys.stderr.write("This tool requires Python 3.8+. Run with `python3` (3.8+) or create a venv.\n")
-    sys.exit(1)
-
-def in_venv():
-    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
-
-def venv_python():
-    if os.name == "nt":
-        return os.path.join(VENV_DIR, "Scripts", "python.exe")
-    return os.path.join(VENV_DIR, "bin", "python")
-
-def bootstrap_venv():
-    """Create/enter a local venv to avoid PEP 668 (Homebrew) restrictions."""
-    if in_venv():
-        return
-    py = venv_python()
-    if not os.path.exists(py):
-        print("\033[93mCreating local venv {}...\033[0m".format(VENV_DIR))
-        subprocess.check_call([sys.executable, "-m", "venv", VENV_DIR])
-        subprocess.check_call([py, "-m", "pip", "install", "--upgrade", "pip"])
-    env = os.environ.copy()
-    env[ENV_FLAG] = "1"
-    os.execve(py, [py] + sys.argv, env)
 
 def ensure_packages():
     missing = []
@@ -42,62 +10,18 @@ def ensure_packages():
         import serial.tools.list_ports  # noqa
     except ImportError:
         missing.append("pyserial")
-
-    try:
-        import colorama  # noqa
-    except ImportError:
-        missing.append("colorama")
-
-    def version_ok(installed, minimum):
-        try:
-            from packaging.version import Version  # type: ignore
-            return Version(installed) >= Version(minimum)
-        except Exception:
-            def _split(ver):
-                return tuple(int(p) for p in re.split(r"[^\d]+", ver) if p)
-
-            return _split(installed) >= _split(minimum)
-
-    esptool_req = "esptool>={}".format(MIN_ESPTOOL)
-    try:
-        import importlib.metadata as importlib_metadata  # type: ignore
-    except ImportError:  # pragma: no cover - Python <3.8 fallback
-        import importlib_metadata as importlib_metadata  # type: ignore
-
     try:
         import esptool  # noqa
-        installed_version = importlib_metadata.version("esptool")
-        if not version_ok(installed_version, MIN_ESPTOOL):
-            missing.append(esptool_req)
     except ImportError:
-        missing.append(esptool_req)
+        missing.append("esptool")
     if missing:
         print("\033[93mInstalling missing packages: " + ", ".join(missing) + "\033[0m")
-
-        # If we are not in a venv, enter/create one first to avoid PEP 668 issues on macOS/Homebrew
-        if not in_venv():
-            bootstrap_venv()
-
-        pip_cmd = [sys.executable, "-m", "pip", "install"]
-        try:
-            subprocess.check_call(pip_cmd + missing)
-        except subprocess.CalledProcessError:
-            sys.stderr.write(
-                "Automatic install failed inside venv. Install manually:\n"
-                "  {} -m pip install {}\n".format(sys.executable, " ".join(missing))
-            )
-            sys.exit(1)
+        subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 ensure_packages()
-import colorama
 import serial
 import serial.tools.list_ports
-# Older colorama versions may not have just_fix_windows_console
-if hasattr(colorama, "just_fix_windows_console"):
-    colorama.just_fix_windows_console()
-else:
-    colorama.init()
 
 # Colors
 RED = "\033[91m"; GREEN = "\033[92m"; YELLOW = "\033[93m"; CYAN = "\033[96m"; RESET = "\033[0m"
@@ -114,39 +38,39 @@ OFFSETS = {
 def check_files():
     missing = [f for f in REQUIRED_FILES if not os.path.exists(f)]
     if missing:
-        print("{}Missing files: {}{}".format(RED, ", ".join(missing), RESET))
+        print(f"{RED}Missing files: {', '.join(missing)}{RESET}")
         sys.exit(1)
-    print("{}All required files found.{}".format(GREEN, RESET))
+    print(f"{GREEN}All required files found.{RESET}")
 
 def list_ports():
     return set(p.device for p in serial.tools.list_ports.comports())
 
 def wait_for_new_port(before, timeout=20.0):
-    print("{}Hold BOOT and connect the board to enter ROM mode.{}".format(CYAN, RESET))
+    print(f"{CYAN}Hold BOOT and connect the board to enter ROM mode.{RESET}")
     spinner = ['|','/','-','\\']
-    print("{}Waiting for new serial port...{}".format(YELLOW, RESET))
+    print(f"{YELLOW}Waiting for new serial port...{RESET}")
     t0 = time.time()
     i = 0
     while time.time() - t0 < timeout:
         after = list_ports()
         new_ports = after - before
-        sys.stdout.write("\r{} ".format(spinner[i % len(spinner)])); sys.stdout.flush()
+        sys.stdout.write(f"\r{spinner[i % len(spinner)]} "); sys.stdout.flush()
         i += 1
         if new_ports:
             sys.stdout.write("\r"); sys.stdout.flush()
             return new_ports.pop()
         time.sleep(0.15)
-    print("\n{}No new serial port detected.{}".format(RED, RESET))
+    print(f"\n{RED}No new serial port detected.{RESET}")
     sys.exit(1)
 
 def erase_all(port, baud):
     cmd = [sys.executable, "-m", "esptool", "-p", port, "-b", str(baud),
            "--before", "default-reset", "--after", "no_reset", "--chip", "esp32c5",
            "erase_flash"]
-    print("{}Erasing full flash:{} {}".format(CYAN, RESET, " ".join(cmd)))
+    print(f"{CYAN}Erasing full flash:{RESET} {' '.join(cmd)}")
     res = subprocess.run(cmd)
     if res.returncode != 0:
-        print("{}Erase failed with code {}.{}".format(RED, res.returncode, RESET))
+        print(f"{RED}Erase failed with code {res.returncode}.{RESET}")
         sys.exit(res.returncode)
 
 def do_flash(port, baud, flash_mode, flash_freq):
@@ -165,10 +89,10 @@ def do_flash(port, baud, flash_mode, flash_freq):
         OFFSETS["partition-table.bin"], "partition-table.bin",
         OFFSETS["projectZero.bin"], "projectZero.bin",
     ]
-    print("{}Flashing command:{} {}".format(CYAN, RESET, " ".join(cmd)))
+    print(f"{CYAN}Flashing command:{RESET} {' '.join(cmd)}")
     res = subprocess.run(cmd)
     if res.returncode != 0:
-        print("{}Flash failed with code {}.{}".format(RED, res.returncode, RESET))
+        print(f"{RED}Flash failed with code {res.returncode}.{RESET}")
         sys.exit(res.returncode)
 
 def pulse(ser, dtr=None, rts=None, delay=0.06):
@@ -188,7 +112,7 @@ def reset_to_app(port):
       - DTR=False  (GPIO0 HIGH, i.e., not in ROM)
       - pulse EN low via RTS=True then RTS=False
     """
-    print("{}Issuing post-flash reset (RTS/DTR) to run app...{}".format(YELLOW, RESET))
+    print(f"{YELLOW}Issuing post-flash reset (RTS/DTR) to run app...{RESET}")
     try:
         with serial.Serial(port, 115200, timeout=0.1) as ser:
             # Make sure BOOT is released
@@ -196,14 +120,14 @@ def reset_to_app(port):
             # Short EN reset
             pulse(ser, rts=True)
             pulse(ser, rts=False)
-        print("{}Reset sent. If not Press the board's RESET button manually.{}".format(GREEN, RESET))
+        print(f"{GREEN}Reset sent. If not Press the board's RESET button manually.{RESET}")
         
     except Exception as e:
-        print("{}RTS/DTR reset failed: {}{}".format(RED, e, RESET))
-        print("{}Press the board's RESET button manually.{}".format(YELLOW, RESET))
+        print(f"{RED}RTS/DTR reset failed: {e}{RESET}")
+        print(f"{YELLOW}Press the board's RESET button manually.{RESET}")
 
 def monitor(port, baud=115200):
-    print("{}Opening serial monitor on {} @ {} (Ctrl+C to exit)...{}".format(CYAN, port, baud, RESET))
+    print(f"{CYAN}Opening serial monitor on {port} @ {baud} (Ctrl+C to exit)...{RESET}")
     try:
         # A brief delay to let the port re-enumerate after reset
         time.sleep(0.3)
@@ -217,11 +141,10 @@ def monitor(port, baud=115200):
                 except KeyboardInterrupt:
                     break
     except Exception as e:
-        print("{}Monitor failed: {}{}".format(RED, e, RESET))
+        print(f"{RED}Monitor failed: {e}{RESET}")
 
 def main():
     parser = argparse.ArgumentParser(description="ESP32-C5 flasher with robust reboot handling")
-    parser.add_argument("--version", action="version", version="%(prog)s {}".format(VERSION))
     parser.add_argument("--port", help="Known serial port (e.g., COM10 or /dev/ttyACM0)")
     parser.add_argument("--baud", type=int, default=460800)
     parser.add_argument("--monitor", action="store_true", help="Open serial monitor after flashing")
@@ -240,8 +163,8 @@ def main():
         before = list_ports()
         port = wait_for_new_port(before)
 
-    print("{}Detected serial port: {}{}".format(GREEN, port, RESET))
-    print("{}Tip: release the BOOT button before programming finishes.{}".format(YELLOW, RESET))
+    print(f"{GREEN}Detected serial port: {port}{RESET}")
+    print(f"{YELLOW}Tip: release the BOOT button before programming finishes.{RESET}")
 
     if args.erase:
         erase_all(port, args.baud)
