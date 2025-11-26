@@ -50,16 +50,23 @@ def ensure_packages():
         missing.append(esptool_req)
     if missing:
         print("\033[93mInstalling missing packages: " + ", ".join(missing) + "\033[0m")
+        pip_cmd = [sys.executable, "-m", "pip", "install"]
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
-        except subprocess.CalledProcessError as e:
-            sys.stderr.write(
-                "Automatic install failed (externally managed env?). "
-                "Try a virtualenv:\n"
-                "  python3 -m venv .venv && source .venv/bin/activate\n"
-                "  pip install {}\n".format(" ".join(missing))
-            )
-            sys.exit(e.returncode)
+            subprocess.check_call(pip_cmd + missing)
+        except subprocess.CalledProcessError:
+            # macOS/Homebrew often blocks system installs (PEP 668); retry with --user
+            try:
+                subprocess.check_call(pip_cmd + ["--user"] + missing)
+            except subprocess.CalledProcessError as e:
+                sys.stderr.write(
+                    "Automatic install failed (likely externally managed env).\n"
+                    "Options:\n"
+                    "  1) Create a venv: python3 -m venv .venv && source .venv/bin/activate\n"
+                    "     then: pip install {}\n"
+                    "  2) Or use pipx: pipx install esptool pyserial colorama\n"
+                    "  3) As last resort: pip install --break-system-packages {}\n".format(" ".join(missing))
+                )
+                sys.exit(e.returncode)
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 ensure_packages()
