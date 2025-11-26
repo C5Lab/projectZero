@@ -7,11 +7,20 @@ import re
 
 MIN_ESPTOOL = "5.0.0"
 VERSION = "0.2"
+VENV_DIR = ".venv_flash"
 
 # Require Python 3.8+ (esptool and subprocess.run rely on it)
 if sys.version_info < (3, 8):
     sys.stderr.write("This tool requires Python 3.8+. Run with `python3` (3.8+) or create a venv.\n")
     sys.exit(1)
+
+def in_venv():
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+
+def venv_python():
+    if os.name == "nt":
+        return os.path.join(VENV_DIR, "Scripts", "python.exe")
+    return os.path.join(VENV_DIR, "bin", "python")
 
 def ensure_packages():
     missing = []
@@ -58,15 +67,32 @@ def ensure_packages():
             try:
                 subprocess.check_call(pip_cmd + ["--user"] + missing)
             except subprocess.CalledProcessError as e:
-                sys.stderr.write(
-                    "Automatic install failed (likely externally managed env).\n"
-                    "Options:\n"
-                    "  1) Create a venv: python3 -m venv .venv && source .venv/bin/activate\n"
-                    "     then: pip install {}\n"
-                    "  2) Or use pipx: pipx install esptool pyserial colorama\n"
-                    "  3) As last resort: pip install --break-system-packages {}\n".format(" ".join(missing))
-                )
-                sys.exit(e.returncode)
+                # As a fallback, auto-create a local venv and install there for consistency across macOS/Linux/Win
+                if not in_venv():
+                    print("\033[93mCreating local venv {} and installing dependencies...\033[0m".format(VENV_DIR))
+                    try:
+                        subprocess.check_call([sys.executable, "-m", "venv", VENV_DIR])
+                        py = venv_python()
+                        subprocess.check_call([py, "-m", "pip", "install", "--upgrade", "pip"])
+                        subprocess.check_call([py, "-m", "pip", "install"] + missing)
+                        os.execv(py, [py] + sys.argv)
+                    except subprocess.CalledProcessError as e2:
+                        sys.stderr.write(
+                            "Automatic install failed (likely externally managed env).\n"
+                            "Options:\n"
+                            "  1) Activate the venv manually: source {}/bin/activate (or {}\\Scripts\\activate) and rerun.\n"
+                            "  2) Use pipx: pipx install esptool pyserial colorama\n"
+                            "  3) As last resort: pip install --break-system-packages {}\n".format(
+                                VENV_DIR, VENV_DIR, " ".join(missing)
+                            )
+                        )
+                        sys.exit(e2.returncode)
+                else:
+                    sys.stderr.write(
+                        "Automatic install failed inside venv. Install manually:\n"
+                        "  pip install {}\n".format(" ".join(missing))
+                    )
+                    sys.exit(e.returncode)
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 ensure_packages()
