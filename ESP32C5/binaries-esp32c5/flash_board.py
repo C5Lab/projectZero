@@ -8,6 +8,7 @@ import re
 MIN_ESPTOOL = "5.0.0"
 VERSION = "0.2"
 VENV_DIR = ".venv_flash"
+ENV_FLAG = "FLASH_BOARD_IN_VENV"
 
 # Require Python 3.8+ (esptool and subprocess.run rely on it)
 if sys.version_info < (3, 8):
@@ -21,6 +22,19 @@ def venv_python():
     if os.name == "nt":
         return os.path.join(VENV_DIR, "Scripts", "python.exe")
     return os.path.join(VENV_DIR, "bin", "python")
+
+def bootstrap_venv():
+    """Create/enter a local venv to avoid PEP 668 (Homebrew) restrictions."""
+    if in_venv():
+        return
+    py = venv_python()
+    if not os.path.exists(py):
+        print("\033[93mCreating local venv {}...\033[0m".format(VENV_DIR))
+        subprocess.check_call([sys.executable, "-m", "venv", VENV_DIR])
+        subprocess.check_call([py, "-m", "pip", "install", "--upgrade", "pip"])
+    env = os.environ.copy()
+    env[ENV_FLAG] = "1"
+    os.execve(py, [py] + sys.argv, env)
 
 def ensure_packages():
     missing = []
@@ -59,40 +73,20 @@ def ensure_packages():
         missing.append(esptool_req)
     if missing:
         print("\033[93mInstalling missing packages: " + ", ".join(missing) + "\033[0m")
+
+        # If we are not in a venv, enter/create one first to avoid PEP 668 issues on macOS/Homebrew
+        if not in_venv():
+            bootstrap_venv()
+
         pip_cmd = [sys.executable, "-m", "pip", "install"]
         try:
             subprocess.check_call(pip_cmd + missing)
         except subprocess.CalledProcessError:
-            # macOS/Homebrew often blocks system installs (PEP 668); retry with --user
-            try:
-                subprocess.check_call(pip_cmd + ["--user"] + missing)
-            except subprocess.CalledProcessError as e:
-                # As a fallback, auto-create a local venv and install there for consistency across macOS/Linux/Win
-                if not in_venv():
-                    print("\033[93mCreating local venv {} and installing dependencies...\033[0m".format(VENV_DIR))
-                    try:
-                        subprocess.check_call([sys.executable, "-m", "venv", VENV_DIR])
-                        py = venv_python()
-                        subprocess.check_call([py, "-m", "pip", "install", "--upgrade", "pip"])
-                        subprocess.check_call([py, "-m", "pip", "install"] + missing)
-                        os.execv(py, [py] + sys.argv)
-                    except subprocess.CalledProcessError as e2:
-                        sys.stderr.write(
-                            "Automatic install failed (likely externally managed env).\n"
-                            "Options:\n"
-                            "  1) Activate the venv manually: source {}/bin/activate (or {}\\Scripts\\activate) and rerun.\n"
-                            "  2) Use pipx: pipx install esptool pyserial colorama\n"
-                            "  3) As last resort: pip install --break-system-packages {}\n".format(
-                                VENV_DIR, VENV_DIR, " ".join(missing)
-                            )
-                        )
-                        sys.exit(e2.returncode)
-                else:
-                    sys.stderr.write(
-                        "Automatic install failed inside venv. Install manually:\n"
-                        "  pip install {}\n".format(" ".join(missing))
-                    )
-                    sys.exit(e.returncode)
+            sys.stderr.write(
+                "Automatic install failed inside venv. Install manually:\n"
+                "  {} -m pip install {}\n".format(sys.executable, " ".join(missing))
+            )
+            sys.exit(1)
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 ensure_packages()
