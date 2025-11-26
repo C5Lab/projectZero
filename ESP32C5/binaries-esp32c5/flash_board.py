@@ -8,6 +8,11 @@ import re
 MIN_ESPTOOL = "5.0.0"
 VERSION = "0.2"
 
+# Require Python 3.8+ (esptool and subprocess.run rely on it)
+if sys.version_info < (3, 8):
+    sys.stderr.write("This tool requires Python 3.8+. Run with `python3` (3.8+) or create a venv.\n")
+    sys.exit(1)
+
 def ensure_packages():
     missing = []
     try:
@@ -30,7 +35,7 @@ def ensure_packages():
 
             return _split(installed) >= _split(minimum)
 
-    esptool_req = f"esptool>={MIN_ESPTOOL}"
+    esptool_req = "esptool>={}".format(MIN_ESPTOOL)
     try:
         import importlib.metadata as importlib_metadata  # type: ignore
     except ImportError:  # pragma: no cover - Python <3.8 fallback
@@ -45,7 +50,16 @@ def ensure_packages():
         missing.append(esptool_req)
     if missing:
         print("\033[93mInstalling missing packages: " + ", ".join(missing) + "\033[0m")
-        subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
+        except subprocess.CalledProcessError as e:
+            sys.stderr.write(
+                "Automatic install failed (externally managed env?). "
+                "Try a virtualenv:\n"
+                "  python3 -m venv .venv && source .venv/bin/activate\n"
+                "  pip install {}\n".format(" ".join(missing))
+            )
+            sys.exit(e.returncode)
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 ensure_packages()
@@ -73,39 +87,39 @@ OFFSETS = {
 def check_files():
     missing = [f for f in REQUIRED_FILES if not os.path.exists(f)]
     if missing:
-        print(f"{RED}Missing files: {', '.join(missing)}{RESET}")
+        print("{}Missing files: {}{}".format(RED, ", ".join(missing), RESET))
         sys.exit(1)
-    print(f"{GREEN}All required files found.{RESET}")
+    print("{}All required files found.{}".format(GREEN, RESET))
 
 def list_ports():
     return set(p.device for p in serial.tools.list_ports.comports())
 
 def wait_for_new_port(before, timeout=20.0):
-    print(f"{CYAN}Hold BOOT and connect the board to enter ROM mode.{RESET}")
+    print("{}Hold BOOT and connect the board to enter ROM mode.{}".format(CYAN, RESET))
     spinner = ['|','/','-','\\']
-    print(f"{YELLOW}Waiting for new serial port...{RESET}")
+    print("{}Waiting for new serial port...{}".format(YELLOW, RESET))
     t0 = time.time()
     i = 0
     while time.time() - t0 < timeout:
         after = list_ports()
         new_ports = after - before
-        sys.stdout.write(f"\r{spinner[i % len(spinner)]} "); sys.stdout.flush()
+        sys.stdout.write("\r{} ".format(spinner[i % len(spinner)])); sys.stdout.flush()
         i += 1
         if new_ports:
             sys.stdout.write("\r"); sys.stdout.flush()
             return new_ports.pop()
         time.sleep(0.15)
-    print(f"\n{RED}No new serial port detected.{RESET}")
+    print("\n{}No new serial port detected.{}".format(RED, RESET))
     sys.exit(1)
 
 def erase_all(port, baud):
     cmd = [sys.executable, "-m", "esptool", "-p", port, "-b", str(baud),
            "--before", "default-reset", "--after", "no_reset", "--chip", "esp32c5",
            "erase_flash"]
-    print(f"{CYAN}Erasing full flash:{RESET} {' '.join(cmd)}")
+    print("{}Erasing full flash:{} {}".format(CYAN, RESET, " ".join(cmd)))
     res = subprocess.run(cmd)
     if res.returncode != 0:
-        print(f"{RED}Erase failed with code {res.returncode}.{RESET}")
+        print("{}Erase failed with code {}.{}".format(RED, res.returncode, RESET))
         sys.exit(res.returncode)
 
 def do_flash(port, baud, flash_mode, flash_freq):
@@ -124,10 +138,10 @@ def do_flash(port, baud, flash_mode, flash_freq):
         OFFSETS["partition-table.bin"], "partition-table.bin",
         OFFSETS["projectZero.bin"], "projectZero.bin",
     ]
-    print(f"{CYAN}Flashing command:{RESET} {' '.join(cmd)}")
+    print("{}Flashing command:{} {}".format(CYAN, RESET, " ".join(cmd)))
     res = subprocess.run(cmd)
     if res.returncode != 0:
-        print(f"{RED}Flash failed with code {res.returncode}.{RESET}")
+        print("{}Flash failed with code {}.{}".format(RED, res.returncode, RESET))
         sys.exit(res.returncode)
 
 def pulse(ser, dtr=None, rts=None, delay=0.06):
@@ -147,7 +161,7 @@ def reset_to_app(port):
       - DTR=False  (GPIO0 HIGH, i.e., not in ROM)
       - pulse EN low via RTS=True then RTS=False
     """
-    print(f"{YELLOW}Issuing post-flash reset (RTS/DTR) to run app...{RESET}")
+    print("{}Issuing post-flash reset (RTS/DTR) to run app...{}".format(YELLOW, RESET))
     try:
         with serial.Serial(port, 115200, timeout=0.1) as ser:
             # Make sure BOOT is released
@@ -155,14 +169,14 @@ def reset_to_app(port):
             # Short EN reset
             pulse(ser, rts=True)
             pulse(ser, rts=False)
-        print(f"{GREEN}Reset sent. If not Press the board's RESET button manually.{RESET}")
+        print("{}Reset sent. If not Press the board's RESET button manually.{}".format(GREEN, RESET))
         
     except Exception as e:
-        print(f"{RED}RTS/DTR reset failed: {e}{RESET}")
-        print(f"{YELLOW}Press the board's RESET button manually.{RESET}")
+        print("{}RTS/DTR reset failed: {}{}".format(RED, e, RESET))
+        print("{}Press the board's RESET button manually.{}".format(YELLOW, RESET))
 
 def monitor(port, baud=115200):
-    print(f"{CYAN}Opening serial monitor on {port} @ {baud} (Ctrl+C to exit)...{RESET}")
+    print("{}Opening serial monitor on {} @ {} (Ctrl+C to exit)...{}".format(CYAN, port, baud, RESET))
     try:
         # A brief delay to let the port re-enumerate after reset
         time.sleep(0.3)
@@ -176,11 +190,11 @@ def monitor(port, baud=115200):
                 except KeyboardInterrupt:
                     break
     except Exception as e:
-        print(f"{RED}Monitor failed: {e}{RESET}")
+        print("{}Monitor failed: {}{}".format(RED, e, RESET))
 
 def main():
     parser = argparse.ArgumentParser(description="ESP32-C5 flasher with robust reboot handling")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument("--version", action="version", version="%(prog)s {}".format(VERSION))
     parser.add_argument("--port", help="Known serial port (e.g., COM10 or /dev/ttyACM0)")
     parser.add_argument("--baud", type=int, default=460800)
     parser.add_argument("--monitor", action="store_true", help="Open serial monitor after flashing")
@@ -199,8 +213,8 @@ def main():
         before = list_ports()
         port = wait_for_new_port(before)
 
-    print(f"{GREEN}Detected serial port: {port}{RESET}")
-    print(f"{YELLOW}Tip: release the BOOT button before programming finishes.{RESET}")
+    print("{}Detected serial port: {}{}".format(GREEN, port, RESET))
+    print("{}Tip: release the BOOT button before programming finishes.{}".format(YELLOW, RESET))
 
     if args.erase:
         erase_all(port, args.baud)
