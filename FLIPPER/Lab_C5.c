@@ -16,6 +16,9 @@
 #include <furi/core/stream_buffer.h>
 #include <gui/view_dispatcher.h>
 #include <gui/modules/text_input.h>
+#include <furi_hal_usb.h>
+#include <furi_hal_usb_cdc.h>
+#include <usb_cdc.h>
 
 typedef enum {
     ScreenMenu,
@@ -33,13 +36,14 @@ typedef enum {
     ScreenKarmaMenu,
     ScreenEvilTwinMenu,
     ScreenPortalMenu,
+    ScreenDownloadBridge,
 } AppScreen;
 
 typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.22"
+#define LAB_C5_VERSION_TEXT "0.23"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -55,7 +59,7 @@ typedef enum {
 #define BACKLIGHT_OFF_LEVEL 0
 
 #define SERIAL_BUFFER_SIZE 4096
-#define UART_STREAM_SIZE 1024
+#define UART_STREAM_SIZE 4096
 #define MENU_VISIBLE_COUNT 6
 #define MENU_VISIBLE_COUNT_SNIFFERS 4
 #define MENU_VISIBLE_COUNT_ATTACKS 4
@@ -167,6 +171,7 @@ typedef enum {
     MenuActionOpenScannerSetup,
     MenuActionOpenLedSetup,
     MenuActionOpenBootSetup,
+    MenuActionOpenDownload,
 
     MenuActionOpenConsole,
     MenuActionOpenPackageMonitor,
@@ -416,6 +421,15 @@ typedef struct {
     char channel_view_status_text[32];
     uint8_t channel_view_offset_24;
     uint8_t channel_view_offset_5;
+    // Download/bridge state
+    bool download_bridge_active;
+    uint8_t download_cdc_if;
+    FuriHalUsbInterface* download_usb_prev;
+    FuriThread* download_thread;
+    uint32_t download_baud;
+    uint32_t download_baud_new;
+    uint32_t download_uart_to_usb;
+    uint32_t download_usb_to_uart;
 } SimpleApp;
 static void simple_app_reset_result_scroll(SimpleApp* app);
 static void simple_app_update_result_scroll(SimpleApp* app);
@@ -442,6 +456,11 @@ static void simple_app_send_boot_command(SimpleApp* app, bool is_short, uint8_t 
 static void simple_app_request_boot_status(SimpleApp* app);
 static bool simple_app_handle_boot_status_line(SimpleApp* app, const char* line);
 static void simple_app_boot_feed(SimpleApp* app, char ch);
+static void simple_app_serial_irq(
+    FuriHalSerialHandle* handle, FuriHalSerialRxEvent event, void* context);
+static void simple_app_draw_download_bridge(SimpleApp* app, Canvas* canvas);
+static bool simple_app_download_bridge_start(SimpleApp* app);
+static void simple_app_download_bridge_stop(SimpleApp* app);
 static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long);
 static void simple_app_handle_board_ready(SimpleApp* app);
 static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas);
@@ -652,6 +671,8 @@ static const char hint_setup_filters[] =
     "Choose visible fields\nSimplify result list\nHide unused data\nTailor display\nOK flips options.";
 static const char hint_setup_console[] =
     "Open live console\nStream UART output\nWatch commands\nDebug operations\nClose with Back.";
+static const char hint_setup_download[] =
+    "Send download cmd\nThen open UART GPIO\nbridge manually and\nreconnect USB to PC\nfor flashing.";
 
 static const MenuEntry menu_entries_sniffers[] = {
     {"Start Sniffer", "start_sniffer", MenuActionCommand, hint_sniffer_start},
@@ -694,6 +715,7 @@ static const MenuEntry menu_entries_setup[] = {
     {menu_label_boot_short, NULL, MenuActionOpenBootSetup, hint_setup_boot},
     {menu_label_boot_long, NULL, MenuActionOpenBootSetup, hint_setup_boot},
     {"Scanner Filters", NULL, MenuActionOpenScannerSetup, hint_setup_filters},
+    {"Download Mode", NULL, MenuActionOpenDownload, hint_setup_download},
     {"Console", NULL, MenuActionOpenConsole, hint_setup_console},
 };
 
@@ -5567,6 +5589,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenPortalMenu:
         simple_app_draw_portal_menu(app, canvas);
         break;
+    case ScreenDownloadBridge:
+        simple_app_draw_download_bridge(app, canvas);
+        break;
     default:
         simple_app_draw_results(app, canvas);
         break;
@@ -5732,6 +5757,8 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             app->boot_setup_index = 0;
             app->boot_setup_long = (entry->label == menu_label_boot_long);
             simple_app_request_boot_status(app);
+        } else if(entry->action == MenuActionOpenDownload) {
+            simple_app_download_bridge_start(app);
         } else if(entry->action == MenuActionOpenScannerSetup) {
             app->screen = ScreenSetupScanner;
             app->scanner_setup_index = 0;
@@ -7659,6 +7686,11 @@ static void simple_app_input(InputEvent* event, void* context) {
     case ScreenPortalMenu:
         simple_app_handle_portal_menu_input(app, event->key);
         break;
+    case ScreenDownloadBridge:
+        if(event->key == InputKeyBack) {
+            simple_app_download_bridge_stop(app);
+        }
+        break;
     default:
         simple_app_handle_results_input(app, event->key);
         break;
@@ -7698,6 +7730,17 @@ static void simple_app_process_stream(SimpleApp* app) {
     }
 }
 
+static bool simple_app_download_bridge_start(SimpleApp* app) {
+    if(!app) return false;
+    simple_app_send_command_quiet(app, "download");
+    simple_app_show_status_message(app, "Download sent.\nStart UART bridge\nand reconnect USB.", 5000, true);
+    return true;
+}
+
+static void simple_app_download_bridge_stop(SimpleApp* app) {
+    (void)app;
+}
+
 static void simple_app_serial_irq(FuriHalSerialHandle* handle, FuriHalSerialRxEvent event, void* context) {
     SimpleApp* app = context;
     if(!app || !app->rx_stream || !(event & FuriHalSerialRxEventData)) return;
@@ -7707,6 +7750,26 @@ static void simple_app_serial_irq(FuriHalSerialHandle* handle, FuriHalSerialRxEv
         furi_stream_buffer_send(app->rx_stream, &byte, 1, 0);
         app->board_last_rx_tick = furi_get_tick();
     } while(furi_hal_serial_async_rx_available(handle));
+}
+
+static void simple_app_draw_download_bridge(SimpleApp* app, Canvas* canvas) {
+    if(!app) return;
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 14, AlignCenter, AlignCenter, "Download mode");
+    canvas_set_font(canvas, FontSecondary);
+    char line1[32];
+    char line2[32];
+    snprintf(line1, sizeof(line1), "Baud: %lu", (unsigned long)app->download_baud);
+    snprintf(
+        line2,
+        sizeof(line2),
+        "TX:%lu RX:%lu",
+        (unsigned long)app->download_uart_to_usb,
+        (unsigned long)app->download_usb_to_uart);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 28, AlignCenter, AlignCenter, line1);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 40, AlignCenter, AlignCenter, line2);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 52, AlignCenter, AlignCenter, "Back = exit bridge");
 }
 
 int32_t Lab_C5_app(void* p) {
@@ -7816,12 +7879,14 @@ int32_t Lab_C5_app(void* p) {
     gui_add_view_port(app->gui, app->viewport, GuiLayerFullscreen);
 
     while(!app->exit_app) {
-        simple_app_process_stream(app);
-        simple_app_update_karma_sniffer(app);
-        simple_app_update_result_scroll(app);
-        simple_app_ping_watchdog(app);
+        if(!app->download_bridge_active) {
+            simple_app_process_stream(app);
+            simple_app_update_karma_sniffer(app);
+            simple_app_update_result_scroll(app);
+            simple_app_ping_watchdog(app);
+        }
 
-        if(app->portal_input_requested && !app->portal_input_active) {
+        if(!app->download_bridge_active && app->portal_input_requested && !app->portal_input_active) {
             app->portal_input_requested = false;
             bool accepted = simple_app_portal_run_text_input(app);
             if(accepted) {
@@ -7859,7 +7924,11 @@ int32_t Lab_C5_app(void* p) {
             view_port_update(app->viewport);
         }
 
-        furi_delay_ms(20);
+        furi_delay_ms(app->download_bridge_active ? 1 : 20);
+    }
+
+    if(app->download_bridge_active) {
+        simple_app_download_bridge_stop(app);
     }
 
     simple_app_save_config_if_dirty(app, NULL, false);
