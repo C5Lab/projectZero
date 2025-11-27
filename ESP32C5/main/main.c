@@ -56,9 +56,28 @@
 #include "lwip/netdb.h"
 #include "lwip/dns.h"
 #include "lwip/dhcp.h"
+#include "esp_rom_sys.h"
+#include "soc/soc.h"
+
+#if defined(__has_include)
+#if __has_include("soc/rtc_cntl_reg.h")
+#include "soc/rtc_cntl_reg.h"
+#define HAS_RTC_CNTL_REG 1
+#endif
+#if __has_include("soc/lp_aon_reg.h")
+#include "soc/lp_aon_reg.h"
+#define HAS_LP_AON_REG 1
+#endif
+#endif
+#ifndef HAS_RTC_CNTL_REG
+#define HAS_RTC_CNTL_REG 0
+#endif
+#ifndef HAS_LP_AON_REG
+#define HAS_LP_AON_REG 0
+#endif
 
 //Version number
-#define JANOS_VERSION "0.6.4"
+#define JANOS_VERSION "0.6.5"
 
 
 #define NEOPIXEL_GPIO      27
@@ -583,6 +602,7 @@ static int cmd_stop(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
 static int cmd_led(int argc, char **argv);
 static int cmd_vendor(int argc, char **argv);
+static int cmd_download(int argc, char **argv);
 static esp_err_t start_background_scan(void);
 static void print_scan_results(void);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
@@ -3287,6 +3307,50 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_download(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
+#if HAS_RTC_CNTL_REG && defined(RTC_CNTL_OPTION1_REG) && defined(RTC_CNTL_FORCE_DOWNLOAD_BOOT)
+    MY_LOG_INFO(TAG, "Preparing to enter UART download mode. Stopping tasks...");
+    (void)cmd_stop(0, NULL);
+
+    // Give Wi-Fi stack a moment to settle before rebooting
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Force next boot into the ROM download (serial flashing) mode
+    REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+#if defined(RTC_CNTL_SW_CPU_STALL_REG)
+    REG_WRITE(RTC_CNTL_SW_CPU_STALL_REG, 0);
+#endif
+    MY_LOG_INFO(TAG, "Rebooting into download mode. Connect via UART/USB-UART bridge to flash.");
+    esp_rom_software_reset_system();
+
+    // Should never reach here
+    return 0;
+#elif HAS_LP_AON_REG && defined(LP_AON_SYS_CFG_REG) && defined(LP_AON_FORCE_DOWNLOAD_BOOT) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_S) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_M)
+    MY_LOG_INFO(TAG, "Preparing to enter UART/USB download mode (LP AON). Stopping tasks...");
+    (void)cmd_stop(0, NULL);
+
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Set LP_AON_FORCE_DOWNLOAD_BOOT to 01 (boot0 download)
+    uint32_t cfg = REG_READ(LP_AON_SYS_CFG_REG);
+    cfg &= ~LP_AON_FORCE_DOWNLOAD_BOOT_M;
+    cfg |= (1U << LP_AON_FORCE_DOWNLOAD_BOOT_S);
+    REG_WRITE(LP_AON_SYS_CFG_REG, cfg);
+
+    MY_LOG_INFO(TAG, "Rebooting into download mode (LP AON). Connect via UART/USB-UART bridge to flash.");
+    esp_rom_software_reset_system();
+    return 0;
+#else
+    MY_LOG_INFO(TAG, "Download mode forcing not supported on this target/SDK.");
+    return 1;
+#endif
+}
+
 static int cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -5093,6 +5157,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&led_cmd));
 
+    const esp_console_cmd_t download_cmd = {
+        .command = "download",
+        .help = "Force reboot into ROM download (UART flashing) mode",
+        .hint = NULL,
+        .func = &cmd_download,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&download_cmd));
+
     const esp_console_cmd_t stop_cmd = {
         .command = "stop",
         .help = "Stop all running operations",
@@ -5252,6 +5325,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
     MY_LOG_INFO(TAG,"  boot_button read|list|set|status");
     MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
+    MY_LOG_INFO(TAG,"  download");
     MY_LOG_INFO(TAG,"  ping");
     MY_LOG_INFO(TAG,"  stop");
     MY_LOG_INFO(TAG,"  reboot");
