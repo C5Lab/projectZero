@@ -30,8 +30,7 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 - `start_portal <ssid>` - launches the captive portal locally on the C5, adds DNS redirection, and stores submissions inside `/sdcard/lab/portals.txt`.
 - `list_sd` / `select_html <index>` - browse `/sdcard/lab/htmls/` for custom captive-portal templates (limited to 800 KB each) and push them into RAM.
 - `start_karma <probe_index>` - re-broadcasts one of the sniffed probe SSIDs so the portal can masquerade as whatever nearby phones expect.
-
-![Portal confirmation](Gfx/f_pass.png)
+- `start_handshake` - exclusive LAB feature that spins up a dedicated WPA handshake capture task (shown as **Handshaker** inside the Flipper UI).
 
 ### Disruption & Containment
 - `start_deauth` - multi-network broadcast and targeted deauth (including DFS/high 5 GHz channels) with LED status feedback.
@@ -54,7 +53,7 @@ The Flipper application lives in `FLIPPER/Lab_C5.c` and mirrors the CLI primitiv
 
 1. Launch the app and connect the ESP32-C5 when the splash screen prompts you.
 2. Run **Scanner** from the main menu, then user Right navigation to jump in to **Targets** to see the same list that `show_scan_results` prints. Multi-select is handled by tapping OK on each row and confirming the dialog that pops up after every selection.
-3. Use the attack selector to start Deauth, Evil Twin, SAE Overflow, Blackout, Sniffer Dog, Wardrive, Karma, or Sniffer views—each mirrors the CLI command of the same name.
+3. Use the attack selector to start Deauth, Evil Twin, SAE Overflow, Blackout, Sniffer Dog, Handshaker, Wardrive, Karma, or Sniffer views—each mirrors the CLI command of the same name.
 4. Live attack telemetry reuses the same counters and whitelist state as the firmware, so you can monitor progress from the Flipper screen while the board stays tethered elsewhere.
 5. Portal acknowledgements show up in the UI as soon as `portals.txt` is updated. Full walkthrough notes and screenshots now live on the wiki.
 
@@ -102,3 +101,7 @@ We're regular tinkerers who got bored and decided to design the full stack ourse
 
 - Full technical documentation, wiring notes, and troubleshooting live on the wiki: https://github.com/C5Lab/projectZero/wiki
 - Join the LAB Discord server to discuss ESP32-C5 builds and projectZero workflows: https://discord.gg/57wmJzzR8C
+
+## Last Changes
+- 2025-11-28 JanOS 0.7.0 - Added WPA handshake capture via `start_handshake`.
+- 2025-11-28 FAP 0.24 - Attack / Handshaker.
