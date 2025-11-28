@@ -860,7 +860,8 @@ static void wifi_event_handler(void *event_handler_arg,
         }
         case WIFI_EVENT_AP_STADISCONNECTED: {
             const wifi_event_ap_stadisconnected_t *e = (const wifi_event_ap_stadisconnected_t *)event_data;
-            // Client disconnected
+            MY_LOG_INFO(TAG, "AP: Client disconnected - MAC: %02X:%02X:%02X:%02X:%02X:%02X, AID: %u, reason: %u",
+                        e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5], e->aid, e->reason);
             
             // Decrement connected clients counter
             if (portal_connected_clients > 0) {
