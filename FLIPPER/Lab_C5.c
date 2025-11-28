@@ -646,7 +646,7 @@ static const char hint_attack_blackout[] =
     "Sends broadcast deauth \npackets to all networks \naround you.";
 static const char hint_attack_deauth[] =
     "Disconnects clients \nof all selected networks.";
-static const char hint_attack_handshake[] =
+static const char hint_attack_handshaker[] =
     "Collect WPA handshakes\nWorks with or without\nselected networks.\nNo selection grabs\nall in the air.";
 static const char hint_attack_evil_twin[] =
     "Creates fake network \nwith captive portal in the \nname of the first selected.";
@@ -686,7 +686,7 @@ static const MenuEntry menu_entries_sniffers[] = {
 static const MenuEntry menu_entries_attacks[] = {
     {"Blackout", NULL, MenuActionConfirmBlackout, hint_attack_blackout},
     {"Deauth", "start_deauth", MenuActionCommandWithTargets, hint_attack_deauth},
-    {"Handshake", "start_handshake", MenuActionCommandWithTargets, hint_attack_handshake},
+    {"Handshaker", "start_handshake", MenuActionCommandWithTargets, hint_attack_handshaker},
     {"Evil Twin", NULL, MenuActionOpenEvilTwinMenu, hint_attack_evil_twin},
     {"Portal", NULL, MenuActionOpenPortalMenu, hint_attack_portal},
     {"Karma", NULL, MenuActionOpenKarmaMenu, hint_attack_karma},
