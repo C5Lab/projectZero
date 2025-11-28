@@ -1,6 +1,6 @@
 # projectZero
 
-projectZero is a LAB C5 board add-on firmware that layers blackout, Sniffer Dog, wardriving, and captive portal tools on top of ESP32-C5 dual-band (2.4/5 GHz) radios. Dive deeper into blackout/Sniffer Dog internals here: https://github.com/C5Lab/projectZero/wiki/Blackout_SnifferDog  
+projectZero is a LAB C5 board add-on firmware that layers blackout, Sniffer Dog, wardriving, and captive portal tools on top of ESP32-C5 dual-band (2.4/5 GHz) radios—and is the first to ship working WPA handshake capture on ESP32-C5 using ESP-IDF.
 - **ESP32-C5-WROOM-1** (USB CLI) scans, runs the embedded evil-twin portal, captures credentials, and verifies WPA2/WPA3 passwords—everything lives on the same board now.  
 - **Flipper Zero companion app** mirrors the CLI features and keeps the handheld navigation lightweight.
 - **LAB C5 board** is available on Tindie: https://www.tindie.com/products/lab/lab-esp32c5-flipper-zero-marauder/
