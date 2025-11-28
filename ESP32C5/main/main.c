@@ -1811,6 +1811,24 @@ static int cmd_select_networks(int argc, char **argv) {
         ESP_LOGW(TAG,"Syntax: select_networks <index1> [index2] ...");
         return 1;
     }
+
+    // Wait for scan to finish to avoid selecting with empty results
+    if (g_scan_in_progress) {
+        MY_LOG_INFO(TAG, "Scan in progress - waiting to finish before selecting networks...");
+        int wait_loops = 0;
+        // wait up to ~10s (100ms * 100) for scan to complete
+        while (g_scan_in_progress && wait_loops < 100) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            wait_loops++;
+        }
+    }
+
+    // If still no results, abort selection
+    if (!g_scan_done || g_scan_count == 0) {
+        ESP_LOGW(TAG,"No scan results yet. Run scan_networks and wait for completion.");
+        return 1;
+    }
+
     g_selected_count = 0;
     for (int i = 1; i < argc && g_selected_count < MAX_AP_CNT; ++i) {
         int idx = atoi(argv[i]);
@@ -2374,13 +2392,44 @@ static int cmd_start_deauth(int argc, char **argv) {
 }
 
 static int cmd_start_handshake(int argc, char **argv) {
-    // Avoid compiler warnings
-    (void)argc; (void)argv;
-    
     // Check if handshake attack is already running
     if (handshake_attack_active || handshake_attack_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Handshake attack already running. Use 'stop' to stop it first.");
         return 1;
+    }
+
+    // Optional: allow passing indexes directly (like "start_handshake 13 14")
+    if (argc > 1) {
+        // If a scan is still running, wait briefly for completion
+        if (g_scan_in_progress) {
+            MY_LOG_INFO(TAG, "Scan in progress - waiting to finish before starting handshake...");
+            int wait_loops = 0;
+            while (g_scan_in_progress && wait_loops < 100) { // ~10s max
+                vTaskDelay(pdMS_TO_TICKS(100));
+                wait_loops++;
+            }
+        }
+
+        if (!g_scan_done || g_scan_count == 0) {
+            MY_LOG_INFO(TAG, "No scan results yet. Run scan_networks first.");
+            return 1;
+        }
+
+        // Build selection from provided indexes (1-based like UI)
+        g_selected_count = 0;
+        for (int i = 1; i < argc && g_selected_count < MAX_AP_CNT; ++i) {
+            int idx = atoi(argv[i]) - 1;
+            if (idx < 0 || idx >= (int)g_scan_count) {
+                ESP_LOGW(TAG,"Index %d out of bounds (1..%u)", idx + 1, g_scan_count);
+                continue;
+            }
+            g_selected_indices[g_selected_count++] = idx;
+        }
+
+        if (g_selected_count == 0) {
+            MY_LOG_INFO(TAG, "No valid targets from arguments. Aborting handshake.");
+            return 1;
+        }
     }
     
     // Reset stop flag
