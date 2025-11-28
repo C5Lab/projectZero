@@ -2253,26 +2253,36 @@ static void handshake_attack_task(void *pvParameters) {
             }
         }
         
-        // Pwnagotchi-style attack: Quick scan all channels, then attack ALL networks
-        MY_LOG_INFO(TAG, "===== Pwnagotchi-style attack strategy =====");
-        MY_LOG_INFO(TAG, "1. Quick scan ALL channels (2.4GHz + 5GHz)");
-        MY_LOG_INFO(TAG, "2. Attack ALL networks found (no filtering)");
-        MY_LOG_INFO(TAG, "3. Deauth burst (5 packets) every 1s, 3 bursts per network");
+        // Pwnagotchi-style attack strategy
+        if (handshake_selected_mode) {
+            MY_LOG_INFO(TAG, "===== Selected Networks Mode =====");
+            MY_LOG_INFO(TAG, "Attacking %d selected networks in loop until all captured", handshake_target_count);
+            MY_LOG_INFO(TAG, "Strategy: Deauth burst (5 packets) every 1s, 3 bursts per network");
+        } else {
+            MY_LOG_INFO(TAG, "===== Scan-All Mode (Pwnagotchi-style) =====");
+            MY_LOG_INFO(TAG, "1. Quick scan ALL channels (2.4GHz + 5GHz)");
+            MY_LOG_INFO(TAG, "2. Attack ALL networks found (no filtering)");
+            MY_LOG_INFO(TAG, "3. Deauth burst (5 packets) every 1s, 3 bursts per network");
+            
+            // PHASE 1: Quick scan all channels (only in scan-all mode)
+            MY_LOG_INFO(TAG, "");
+            MY_LOG_INFO(TAG, "===== PHASE 1: Quick Channel Scan =====");
+            
+            int total_channels = NUM_CHANNELS_24GHZ + NUM_CHANNELS_5GHZ;
+            MY_LOG_INFO(TAG, "Scanning %d channels (%d x 2.4GHz + %d x 5GHz) @ 500ms each...",
+                       total_channels, NUM_CHANNELS_24GHZ, NUM_CHANNELS_5GHZ);
+            
+            // This will take about: (13 + 25) * 0.5s = 19 seconds
+            quick_scan_all_channels();
+        }
         
-        // PHASE 1: Quick scan all channels
+        // PHASE 2: Attack networks
         MY_LOG_INFO(TAG, "");
-        MY_LOG_INFO(TAG, "===== PHASE 1: Quick Channel Scan =====");
-        
-        int total_channels = NUM_CHANNELS_24GHZ + NUM_CHANNELS_5GHZ;
-        MY_LOG_INFO(TAG, "Scanning %d channels (%d x 2.4GHz + %d x 5GHz) @ 500ms each...",
-                   total_channels, NUM_CHANNELS_24GHZ, NUM_CHANNELS_5GHZ);
-        
-        // This will take about: (13 + 25) * 0.5s = 19 seconds
-        quick_scan_all_channels();
-        
-        // PHASE 2: Attack all networks
-        MY_LOG_INFO(TAG, "");
-        MY_LOG_INFO(TAG, "===== PHASE 2: Attack All Networks =====");
+        if (handshake_selected_mode) {
+            MY_LOG_INFO(TAG, "===== Attacking Selected Networks =====");
+        } else {
+            MY_LOG_INFO(TAG, "===== PHASE 2: Attack All Networks =====");
+        }
         MY_LOG_INFO(TAG, "Attacking %d networks...", handshake_target_count);
         
         // Attack all networks regardless of signal strength
@@ -2320,32 +2330,33 @@ static void handshake_attack_task(void *pvParameters) {
         
         MY_LOG_INFO(TAG, "");
         MY_LOG_INFO(TAG, "===== Attack Cycle Complete =====");
-        MY_LOG_INFO(TAG, "Total networks found: %d", handshake_target_count);
-        MY_LOG_INFO(TAG, "Networks attacked: %d", attacked_count);
-        MY_LOG_INFO(TAG, "Handshakes captured: %d", captured_count);
+        MY_LOG_INFO(TAG, "Total networks: %d", handshake_target_count);
+        MY_LOG_INFO(TAG, "Networks attacked this cycle: %d", attacked_count);
+        MY_LOG_INFO(TAG, "Handshakes captured so far: %d", captured_count);
         
         // Check if all selected networks captured (for selected mode)
         if (handshake_selected_mode) {
             bool all_done = true;
+            int remaining = 0;
             for (int i = 0; i < handshake_target_count; i++) {
                 if (!handshake_captured[i]) {
                     all_done = false;
-                    break;
+                    remaining++;
                 }
             }
+            
             if (all_done) {
-                MY_LOG_INFO(TAG, "All selected networks captured! Attack complete.");
+                MY_LOG_INFO(TAG, "✓✓✓ All selected networks captured! Attack complete. ✓✓✓");
                 break;
             }
-        }
-        
-        // In non-selected mode, loop continues indefinitely
-        if (!handshake_selected_mode) {
-            MY_LOG_INFO(TAG, "Completed one attack cycle. Waiting for next scan interval...");
-            vTaskDelay(pdMS_TO_TICKS(10000)); // Wait 10 seconds before checking scan interval
+            
+            // Continue looping until all captured
+            MY_LOG_INFO(TAG, "Selected mode: %d networks still need handshakes, repeating attack cycle...", remaining);
+            vTaskDelay(pdMS_TO_TICKS(3000)); // Small delay before next loop
         } else {
-            // In selected mode, we're done after one pass
-            break;
+            // In non-selected mode, wait before next scan cycle
+            MY_LOG_INFO(TAG, "Scan-all mode: Waiting for next scan interval...");
+            vTaskDelay(pdMS_TO_TICKS(10000)); // Wait 10 seconds before checking scan interval
         }
     }
     
