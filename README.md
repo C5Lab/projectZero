@@ -103,5 +103,6 @@ We're regular tinkerers who got bored and decided to design the full stack ourse
 - Join the LAB Discord server to discuss ESP32-C5 builds and projectZero workflows: https://discord.gg/57wmJzzR8C
 
 ## Last Changes
+- 2025-11-29 FAP 0.25 - Fixed missing propagation of `config.txt` (config load/create popups now appear and settings persist).
 - 2025-11-28 JanOS 0.7.0 - Added WPA handshake capture via `start_handshake`.
 - 2025-11-28 FAP 0.24 - Attack / Handshaker.
