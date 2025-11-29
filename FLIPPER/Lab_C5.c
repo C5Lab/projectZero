@@ -20,6 +20,8 @@
 #include <furi_hal_usb_cdc.h>
 #include <usb_cdc.h>
 
+#define TAG "Lab_C5"
+
 typedef enum {
     ScreenMenu,
     ScreenSerial,
@@ -2056,8 +2058,8 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
     storage_simply_mkdir(storage, EXT_PATH(LAB_C5_CONFIG_DIR_PATH));
     File* file = storage_file_alloc(storage);
     bool success = false;
-    if(storage_file_open(file, EXT_PATH(LAB_C5_CONFIG_FILE_PATH), FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        char buffer[256];
+    if(storage_file_open(file, EXT_PATH(LAB_C5_CONFIG_FILE_PATH), FSAM_READ_WRITE, FSOM_CREATE_ALWAYS)) {
+        char buffer[512];
         uint8_t short_idx = (app->boot_short_command_index < BOOT_COMMAND_OPTION_COUNT)
                                 ? app->boot_short_command_index
                                 : 0;
@@ -2101,9 +2103,15 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             size_t written = storage_file_write(file, buffer, (size_t)len);
             if(written == (size_t)len) {
                 success = true;
+            } else {
+                FURI_LOG_E(TAG, "Config write short (%u/%u)", (unsigned)written, (unsigned)len);
             }
+        } else {
+            FURI_LOG_E(TAG, "Config buffer overflow (%d)", len);
         }
         storage_file_close(file);
+    } else {
+        FURI_LOG_E(TAG, "Config open for write failed");
     }
     storage_file_free(file);
     furi_record_close(RECORD_STORAGE);
@@ -2112,6 +2120,8 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
         if(success_message) {
             simple_app_show_status_message(app, success_message, 2000, fullscreen);
         }
+    } else if(success_message) {
+        simple_app_show_status_message(app, "Config save failed", 2000, true);
     }
     return success;
 }
@@ -2120,6 +2130,8 @@ static void simple_app_load_config(SimpleApp* app) {
     if(!app) return;
     Storage* storage = furi_record_open(RECORD_STORAGE);
     if(!storage) return;
+    storage_simply_mkdir(storage, EXT_PATH("apps_assets"));
+    storage_simply_mkdir(storage, EXT_PATH(LAB_C5_CONFIG_DIR_PATH));
     File* file = storage_file_alloc(storage);
     bool loaded = false;
     if(storage_file_open(file, EXT_PATH(LAB_C5_CONFIG_FILE_PATH), FSAM_READ, FSOM_OPEN_EXISTING)) {
@@ -2148,11 +2160,17 @@ static void simple_app_load_config(SimpleApp* app) {
     storage_file_free(file);
     furi_record_close(RECORD_STORAGE);
     if(loaded) {
-        simple_app_show_status_message(app, "Config loaded", 2000, true);
+        simple_app_show_status_message(app, "Config loaded", 2500, true);
         app->config_dirty = false;
     } else {
-        simple_app_save_config(app, NULL, false);
-        simple_app_show_status_message(app, "Config created", 1000, true);
+        bool created = simple_app_save_config(app, NULL, false);
+        if(created) {
+            simple_app_show_status_message(app, "Config created", 2500, true);
+            app->config_dirty = false;
+        } else {
+            simple_app_show_status_message(app, "Config write failed", 2000, true);
+            simple_app_mark_config_dirty(app);
+        }
     }
     if(app->scanner_min_power > SCAN_POWER_MAX_DBM) {
         app->scanner_min_power = SCAN_POWER_MAX_DBM;
@@ -7827,14 +7845,6 @@ int32_t Lab_C5_app(void* p) {
     simple_app_update_otg_label(app);
     simple_app_apply_otg_power(app);
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
-    simple_app_load_config(app);
-    app->vendor_scan_enabled = app->scanner_show_vendor;
-    simple_app_update_backlight_label(app);
-    simple_app_update_led_label(app);
-    simple_app_update_boot_labels(app);
-    simple_app_apply_backlight(app);
-    simple_app_update_otg_label(app);
-    simple_app_apply_otg_power(app);
     app->menu_state = MenuStateSections;
     app->screen = ScreenMenu;
     app->serial_follow_tail = true;
@@ -7871,14 +7881,29 @@ int32_t Lab_C5_app(void* p) {
     simple_app_reset_serial_log(app, "READY");
 
     furi_hal_serial_async_rx_start(app->serial, simple_app_serial_irq, app, false);
-    simple_app_show_status_message(app, "Board detection", 1500, true);
-    simple_app_send_ping(app);
 
     app->gui = furi_record_open(RECORD_GUI);
     app->viewport = view_port_alloc();
     view_port_draw_callback_set(app->viewport, simple_app_draw, app);
     view_port_input_callback_set(app->viewport, simple_app_input, app);
     gui_add_view_port(app->gui, app->viewport, GuiLayerFullscreen);
+
+    simple_app_load_config(app);
+    app->vendor_scan_enabled = app->scanner_show_vendor;
+    simple_app_update_backlight_label(app);
+    simple_app_update_led_label(app);
+    simple_app_update_boot_labels(app);
+    simple_app_apply_backlight(app);
+    simple_app_update_otg_label(app);
+    simple_app_apply_otg_power(app);
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+
+    if(!simple_app_status_message_is_active(app)) {
+        simple_app_show_status_message(app, "Board detection", 1500, true);
+    }
+    simple_app_send_ping(app);
 
     while(!app->exit_app) {
         if(!app->download_bridge_active) {
