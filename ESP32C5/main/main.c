@@ -81,7 +81,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "0.7.0"
+#define JANOS_VERSION "0.7.1"
 
 
 #define NEOPIXEL_GPIO      27
@@ -532,6 +532,7 @@ static void led_boot_sequence(void) {
 // SD card HTML file management
 #define MAX_HTML_FILES 50
 #define MAX_HTML_FILENAME 64
+#define SD_PATH_MAX 192
 static char sd_html_files[MAX_HTML_FILES][MAX_HTML_FILENAME];
 static int sd_html_count = 0;
 static char* custom_portal_html = NULL;
@@ -617,8 +618,10 @@ static int cmd_boot_button(int argc, char **argv);
 static int cmd_start_portal(int argc, char **argv);
 static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
+static int cmd_list_dir(int argc, char **argv);
 static int cmd_list_ssid(int argc, char **argv);
 static int cmd_select_html(int argc, char **argv);
+static int cmd_file_delete(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
 static int cmd_led(int argc, char **argv);
@@ -4291,6 +4294,117 @@ static int cmd_list_sd(int argc, char **argv)
     return 0;
 }
 
+static bool build_sd_path(char *dest, size_t dest_size, const char *input_path)
+{
+    if (!dest || dest_size == 0 || !input_path || input_path[0] == '\0') {
+        return false;
+    }
+
+    if (input_path[0] == '/') {
+        strncpy(dest, input_path, dest_size - 1);
+        dest[dest_size - 1] = '\0';
+    } else {
+        snprintf(dest, dest_size, "/sdcard/%s", input_path);
+    }
+
+    size_t len = strlen(dest);
+    while (len > 1 && dest[len - 1] == '/') {
+        dest[--len] = '\0';
+    }
+
+    return dest[0] != '\0';
+}
+
+// Command: list_dir [path] - Lists files inside a directory on SD card
+static int cmd_list_dir(int argc, char **argv)
+{
+    const char *input_path = (argc >= 2) ? argv[1] : "lab/handshakes";
+    char full_path[SD_PATH_MAX];
+
+    if (!build_sd_path(full_path, sizeof(full_path), input_path)) {
+        MY_LOG_INFO(TAG, "Invalid path provided.");
+        return 1;
+    }
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    DIR *dir = opendir(full_path);
+    if (dir == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open %s. Error: %d (%s)", full_path, errno, strerror(errno));
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "Files in %s:", full_path);
+
+    struct dirent *entry;
+    int file_count = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (entry->d_name[0] == '.' || entry->d_name[0] == '_') {
+            continue;
+        }
+        file_count++;
+        printf("%d %s\n", file_count, entry->d_name);
+    }
+
+    closedir(dir);
+
+    if (file_count == 0) {
+        MY_LOG_INFO(TAG, "No files found in %s", full_path);
+    } else {
+        MY_LOG_INFO(TAG, "Found %d file(s) in %s", file_count, full_path);
+    }
+
+    return 0;
+}
+
+// Command: file_delete <path> - Deletes a file on SD card
+static int cmd_file_delete(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: file_delete <path>");
+        MY_LOG_INFO(TAG, "Example: file_delete lab/handshakes/sample.pcap");
+        return 1;
+    }
+
+    char full_path[SD_PATH_MAX];
+    if (!build_sd_path(full_path, sizeof(full_path), argv[1])) {
+        MY_LOG_INFO(TAG, "Invalid path provided.");
+        return 1;
+    }
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    struct stat st;
+    if (stat(full_path, &st) != 0) {
+        MY_LOG_INFO(TAG, "File not found: %s (errno: %d)", full_path, errno);
+        return 1;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        MY_LOG_INFO(TAG, "Refusing to delete directory: %s", full_path);
+        return 1;
+    }
+
+    if (unlink(full_path) != 0) {
+        MY_LOG_INFO(TAG, "Failed to delete %s: %s", full_path, strerror(errno));
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "Deleted %s", full_path);
+    return 0;
+}
+
 // Command: select_html [index] - Loads HTML file from SD card
 static int cmd_select_html(int argc, char **argv)
 {
@@ -5732,6 +5846,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&list_sd_cmd));
 
+    const esp_console_cmd_t list_dir_cmd = {
+        .command = "list_dir",
+        .help = "List files inside a directory on SD card: list_dir [path]",
+        .hint = NULL,
+        .func = &cmd_list_dir,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&list_dir_cmd));
+
     const esp_console_cmd_t list_ssid_cmd = {
         .command = "list_ssid",
         .help = "Lists SSIDs from /sdcard/lab/ssid.txt",
@@ -5740,6 +5863,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&list_ssid_cmd));
+
+    const esp_console_cmd_t file_delete_cmd = {
+        .command = "file_delete",
+        .help = "Delete a file on SD card: file_delete <path>",
+        .hint = NULL,
+        .func = &cmd_file_delete,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&file_delete_cmd));
 
     const esp_console_cmd_t select_html_cmd = {
         .command = "select_html",
@@ -5859,8 +5991,10 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  start_wardrive");
     MY_LOG_INFO(TAG,"  start_portal <SSID>");
     MY_LOG_INFO(TAG,"  list_sd");
+    MY_LOG_INFO(TAG,"  list_dir <path>");
     MY_LOG_INFO(TAG,"  list_ssid");
     MY_LOG_INFO(TAG,"  select_html <index>");
+    MY_LOG_INFO(TAG,"  file_delete <path>");
     MY_LOG_INFO(TAG,"  start_sniffer");
     MY_LOG_INFO(TAG,"  packet_monitor <channel>");
     MY_LOG_INFO(TAG,"  channel_view");
@@ -7190,6 +7324,18 @@ static esp_err_t create_sd_directories(void) {
         MY_LOG_INFO(TAG, "/sdcard/lab/htmls created successfully");
     } else {
         MY_LOG_INFO(TAG, "/sdcard/lab/htmls already exists");
+    }
+    
+    // Create /sdcard/lab/handshakes directory
+    if (stat("/sdcard/lab/handshakes", &st) != 0) {
+        MY_LOG_INFO(TAG, "Creating /sdcard/lab/handshakes directory...");
+        if (mkdir("/sdcard/lab/handshakes", 0755) != 0) {
+            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/handshakes directory: %s", strerror(errno));
+            return ESP_FAIL;
+        }
+        MY_LOG_INFO(TAG, "/sdcard/lab/handshakes created successfully");
+    } else {
+        MY_LOG_INFO(TAG, "/sdcard/lab/handshakes already exists");
     }
     
     // Create /sdcard/lab/wardrives directory

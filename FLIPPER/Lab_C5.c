@@ -30,6 +30,7 @@ typedef enum {
     ScreenSetupKarma,
     ScreenSetupLed,
     ScreenSetupBoot,
+    ScreenSetupSdManager,
     ScreenConsole,
     ScreenPackageMonitor,
     ScreenChannelView,
@@ -45,7 +46,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.25"
+#define LAB_C5_VERSION_TEXT "0.26"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -163,6 +164,11 @@ static const char* boot_command_options[BOOT_COMMAND_OPTION_COUNT] = {
 #define KARMA_SNIFFER_DURATION_STEP 5
 #define KARMA_AUTO_LIST_DELAY_MS 500
 #define HELP_HINT_IDLE_MS 3000
+#define SD_MANAGER_MAX_FILES 64
+#define SD_MANAGER_FILE_NAME_MAX 64
+#define SD_MANAGER_POPUP_VISIBLE_LINES 3
+#define SD_MANAGER_FOLDER_LABEL_MAX 24
+#define SD_MANAGER_PATH_MAX 160
 
 typedef enum {
     MenuActionCommand,
@@ -174,6 +180,7 @@ typedef enum {
     MenuActionOpenLedSetup,
     MenuActionOpenBootSetup,
     MenuActionOpenDownload,
+    MenuActionOpenSdManager,
 
     MenuActionOpenConsole,
     MenuActionOpenPackageMonitor,
@@ -243,6 +250,15 @@ typedef struct {
 } PortalSsidEntry;
 
 typedef struct {
+    const char* label;
+    const char* path;
+} SdFolderOption;
+
+typedef struct {
+    char name[SD_MANAGER_FILE_NAME_MAX];
+} SdFileEntry;
+
+typedef struct {
     bool exit_app;
     MenuState menu_state;
     uint32_t section_index;
@@ -298,6 +314,32 @@ typedef struct {
     char portal_ssid_list_buffer[64];
     size_t portal_ssid_list_length;
     bool portal_ssid_missing;
+    size_t sd_folder_index;
+    size_t sd_folder_offset;
+    bool sd_folder_popup_active;
+    SdFileEntry sd_files[SD_MANAGER_MAX_FILES];
+    size_t sd_file_count;
+    size_t sd_file_popup_index;
+    size_t sd_file_popup_offset;
+    bool sd_file_popup_active;
+    bool sd_listing_active;
+    bool sd_list_header_seen;
+    char sd_list_buffer[160];
+    size_t sd_list_length;
+    char sd_current_folder_label[SD_MANAGER_FOLDER_LABEL_MAX];
+    char sd_current_folder_path[SD_MANAGER_PATH_MAX];
+    char sd_delete_target_name[SD_MANAGER_FILE_NAME_MAX];
+    char sd_delete_target_path[SD_MANAGER_PATH_MAX];
+    bool sd_delete_confirm_active;
+    bool sd_delete_confirm_yes;
+    bool sd_refresh_pending;
+    uint32_t sd_refresh_tick;
+    uint8_t sd_scroll_offset;
+    int8_t sd_scroll_direction;
+    uint8_t sd_scroll_hold;
+    uint32_t sd_scroll_last_tick;
+    uint8_t sd_scroll_char_limit;
+    char sd_scroll_text[SD_MANAGER_FILE_NAME_MAX];
     size_t karma_menu_index;
     size_t karma_menu_offset;
     KarmaProbeEntry karma_probes[KARMA_MAX_PROBES];
@@ -531,6 +573,25 @@ static bool simple_app_portal_run_text_input(SimpleApp* app);
 static void simple_app_portal_text_input_result(void* context);
 static bool simple_app_portal_text_input_navigation(void* context);
 static void simple_app_start_portal(SimpleApp* app);
+static void simple_app_open_sd_manager(SimpleApp* app);
+static void simple_app_copy_sd_folder(SimpleApp* app, const SdFolderOption* folder);
+static void simple_app_draw_setup_sd_manager(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_setup_sd_manager_input(SimpleApp* app, InputKey key);
+static void simple_app_draw_sd_folder_popup(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_sd_folder_popup_event(SimpleApp* app, const InputEvent* event);
+static void simple_app_request_sd_listing(SimpleApp* app, const SdFolderOption* folder);
+static void simple_app_reset_sd_listing(SimpleApp* app);
+static void simple_app_finish_sd_listing(SimpleApp* app);
+static void simple_app_process_sd_line(SimpleApp* app, const char* line);
+static void simple_app_sd_feed(SimpleApp* app, char ch);
+static void simple_app_draw_sd_file_popup(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_sd_file_popup_event(SimpleApp* app, const InputEvent* event);
+static void simple_app_draw_sd_delete_confirm(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_sd_delete_confirm_event(SimpleApp* app, const InputEvent* event);
+static void simple_app_reset_sd_scroll(SimpleApp* app);
+static void simple_app_sd_scroll_buffer(
+    SimpleApp* app, const char* text, size_t char_limit, char* out, size_t out_size);
+static void simple_app_update_sd_scroll(SimpleApp* app);
 static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key);
 static void simple_app_draw_scroll_arrow(Canvas* canvas, uint8_t base_left_x, int16_t base_y, bool upwards);
@@ -677,6 +738,16 @@ static const char hint_setup_console[] =
     "Open live console\nStream UART output\nWatch commands\nDebug operations\nClose with Back.";
 static const char hint_setup_download[] =
     "Send download cmd\nThen open UART GPIO\nbridge manually and\nreconnect USB to PC\nfor flashing.";
+static const char hint_setup_sd_manager[] =
+    "Browse SD folders\nPick lab captures\nDelete safely\nDefault: handshakes.";
+
+static const SdFolderOption sd_folder_options[] = {
+    {"Handshakes", "lab/handshakes"},
+    {"HTML portals", "lab/htmls"},
+    {"Wardrives", "lab/wardrives"},
+};
+
+static const size_t sd_folder_option_count = sizeof(sd_folder_options) / sizeof(sd_folder_options[0]);
 
 static const MenuEntry menu_entries_sniffers[] = {
     {"Start Sniffer", "start_sniffer", MenuActionCommand, hint_sniffer_start},
@@ -720,6 +791,7 @@ static const MenuEntry menu_entries_setup[] = {
     {menu_label_boot_short, NULL, MenuActionOpenBootSetup, hint_setup_boot},
     {menu_label_boot_long, NULL, MenuActionOpenBootSetup, hint_setup_boot},
     {"Scanner Filters", NULL, MenuActionOpenScannerSetup, hint_setup_filters},
+    {"SD Manager", NULL, MenuActionOpenSdManager, hint_setup_sd_manager},
     {"Download Mode", NULL, MenuActionOpenDownload, hint_setup_download},
     {"Console", NULL, MenuActionOpenConsole, hint_setup_console},
 };
@@ -2381,6 +2453,16 @@ static void simple_app_reset_result_scroll(SimpleApp* app) {
     app->result_scroll_text[0] = '\0';
 }
 
+static void simple_app_reset_sd_scroll(SimpleApp* app) {
+    if(!app) return;
+    app->sd_scroll_offset = 0;
+    app->sd_scroll_direction = 1;
+    app->sd_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+    app->sd_scroll_last_tick = furi_get_tick();
+    app->sd_scroll_char_limit = 0;
+    app->sd_scroll_text[0] = '\0';
+}
+
 static void simple_app_update_result_scroll(SimpleApp* app) {
     if(!app) return;
 
@@ -2495,6 +2577,78 @@ static void simple_app_update_result_scroll(SimpleApp* app) {
         } else {
             app->result_scroll_direction = 1;
             app->result_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        }
+    }
+
+    if(changed && app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_update_sd_scroll(SimpleApp* app) {
+    if(!app) return;
+
+    bool sd_popup_active =
+        app->sd_folder_popup_active || app->sd_file_popup_active || app->sd_delete_confirm_active;
+
+    if(!sd_popup_active || app->sd_scroll_char_limit == 0 || app->sd_scroll_text[0] == '\0') {
+        if(app->sd_scroll_text[0] != '\0' || app->sd_scroll_offset != 0) {
+            simple_app_reset_sd_scroll(app);
+        }
+        return;
+    }
+
+    size_t len = strlen(app->sd_scroll_text);
+    size_t char_limit = app->sd_scroll_char_limit;
+    if(char_limit == 0) char_limit = 1;
+    if(len <= char_limit) {
+        if(app->sd_scroll_offset != 0) {
+            simple_app_reset_sd_scroll(app);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    size_t max_offset = len - char_limit;
+    uint32_t now = furi_get_tick();
+    uint32_t interval_ticks = furi_ms_to_ticks(RESULT_SCROLL_INTERVAL_MS);
+    if(interval_ticks == 0) interval_ticks = 1;
+    if((now - app->sd_scroll_last_tick) < interval_ticks) {
+        return;
+    }
+    app->sd_scroll_last_tick = now;
+
+    if(app->sd_scroll_hold > 0) {
+        app->sd_scroll_hold--;
+        return;
+    }
+
+    bool changed = false;
+    if(app->sd_scroll_direction > 0) {
+        if(app->sd_scroll_offset < max_offset) {
+            app->sd_scroll_offset++;
+            changed = true;
+            if(app->sd_scroll_offset >= max_offset) {
+                app->sd_scroll_direction = -1;
+                app->sd_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+            }
+        } else {
+            app->sd_scroll_direction = -1;
+            app->sd_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        }
+    } else {
+        if(app->sd_scroll_offset > 0) {
+            app->sd_scroll_offset--;
+            changed = true;
+            if(app->sd_scroll_offset == 0) {
+                app->sd_scroll_direction = 1;
+                app->sd_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+            }
+        } else {
+            app->sd_scroll_direction = 1;
+            app->sd_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
         }
     }
 
@@ -2756,6 +2910,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_package_monitor_feed(app, ch);
         simple_app_channel_view_feed(app, ch);
         simple_app_portal_ssid_feed(app, ch);
+        simple_app_sd_feed(app, ch);
         simple_app_evil_twin_feed(app, ch);
         simple_app_karma_probe_feed(app, ch);
         simple_app_karma_html_feed(app, ch);
@@ -2797,7 +2952,7 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
         app->blackout_view_active = false;
     }
 
-    char cmd[64];
+    char cmd[160];
     snprintf(cmd, sizeof(cmd), "%s\n", command);
 
     furi_hal_serial_tx(app->serial, (const uint8_t*)cmd, strlen(cmd));
@@ -5424,6 +5579,752 @@ static void simple_app_draw_setup_boot(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str(canvas, 16, y, boot_command_options[cmd_index]);
 }
 
+static void simple_app_reset_sd_listing(SimpleApp* app) {
+    if(!app) return;
+    app->sd_listing_active = false;
+    app->sd_list_header_seen = false;
+    app->sd_list_length = 0;
+    app->sd_file_count = 0;
+    app->sd_file_popup_index = 0;
+    app->sd_file_popup_offset = 0;
+    app->sd_file_popup_active = false;
+    app->sd_delete_confirm_active = false;
+    app->sd_delete_confirm_yes = false;
+    app->sd_delete_target_name[0] = '\0';
+    app->sd_delete_target_path[0] = '\0';
+    simple_app_reset_sd_scroll(app);
+}
+
+static void simple_app_copy_sd_folder(SimpleApp* app, const SdFolderOption* folder) {
+    if(!app) return;
+    if(folder) {
+        strncpy(app->sd_current_folder_label, folder->label, SD_MANAGER_FOLDER_LABEL_MAX - 1);
+        app->sd_current_folder_label[SD_MANAGER_FOLDER_LABEL_MAX - 1] = '\0';
+        strncpy(app->sd_current_folder_path, folder->path, SD_MANAGER_PATH_MAX - 1);
+        app->sd_current_folder_path[SD_MANAGER_PATH_MAX - 1] = '\0';
+    } else {
+        app->sd_current_folder_label[0] = '\0';
+        app->sd_current_folder_path[0] = '\0';
+    }
+
+    size_t len = strlen(app->sd_current_folder_path);
+    while(len > 0 && app->sd_current_folder_path[len - 1] == '/') {
+        app->sd_current_folder_path[--len] = '\0';
+    }
+}
+
+static void simple_app_open_sd_manager(SimpleApp* app) {
+    if(!app) return;
+
+    app->screen = ScreenSetupSdManager;
+    simple_app_reset_sd_scroll(app);
+    if(app->sd_folder_index >= sd_folder_option_count) {
+        app->sd_folder_index = 0;
+    }
+    app->sd_folder_offset = 0;
+    simple_app_reset_sd_listing(app);
+    app->sd_refresh_pending = false;
+
+    if(sd_folder_option_count > 0) {
+        simple_app_copy_sd_folder(app, &sd_folder_options[app->sd_folder_index]);
+    } else {
+        simple_app_copy_sd_folder(app, NULL);
+    }
+
+    app->sd_folder_popup_active = (sd_folder_option_count > 0);
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_request_sd_listing(SimpleApp* app, const SdFolderOption* folder) {
+    if(!app || !folder) return;
+
+    app->sd_folder_popup_active = false;
+    simple_app_reset_sd_listing(app);
+    simple_app_copy_sd_folder(app, folder);
+    app->sd_listing_active = true;
+    app->sd_refresh_pending = false;
+
+    simple_app_show_status_message(app, "Listing files...", 0, false);
+
+    char command[200];
+    if(app->sd_current_folder_path[0] != '\0') {
+        snprintf(command, sizeof(command), "list_dir \"%s\"", app->sd_current_folder_path);
+    } else {
+        snprintf(command, sizeof(command), "list_dir");
+    }
+    simple_app_send_command(app, command, false);
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_finish_sd_listing(SimpleApp* app) {
+    if(!app || !app->sd_listing_active) return;
+
+    app->sd_listing_active = false;
+    app->sd_list_length = 0;
+    app->sd_list_header_seen = false;
+    app->last_command_sent = false;
+    simple_app_clear_status_message(app);
+
+    if(app->sd_file_count == 0) {
+        simple_app_show_status_message(app, "No files in\nselected folder", 1500, true);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    app->sd_file_popup_index = 0;
+    size_t visible = app->sd_file_count;
+    if(visible > SD_MANAGER_POPUP_VISIBLE_LINES) {
+        visible = SD_MANAGER_POPUP_VISIBLE_LINES;
+    }
+        app->sd_file_popup_offset = 0;
+        if(app->sd_file_popup_index >= app->sd_file_count) {
+            app->sd_file_popup_index = app->sd_file_count - 1;
+        }
+
+        app->sd_file_popup_active = true;
+        simple_app_reset_sd_scroll(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+    }
+
+static void simple_app_sd_scroll_buffer(
+    SimpleApp* app, const char* text, size_t char_limit, char* out, size_t out_size) {
+    if(!app || !text || !out || out_size == 0) return;
+    if(char_limit == 0) char_limit = 1;
+    if(char_limit >= out_size) {
+        char_limit = out_size - 1;
+    }
+    size_t len = strlen(text);
+    if(len <= char_limit) {
+        simple_app_reset_sd_scroll(app);
+        strncpy(out, text, out_size - 1);
+        out[out_size - 1] = '\0';
+        return;
+    }
+
+    if(strncmp(text, app->sd_scroll_text, sizeof(app->sd_scroll_text)) != 0 ||
+       app->sd_scroll_char_limit != char_limit) {
+        strncpy(app->sd_scroll_text, text, sizeof(app->sd_scroll_text) - 1);
+        app->sd_scroll_text[sizeof(app->sd_scroll_text) - 1] = '\0';
+        app->sd_scroll_char_limit = (uint8_t)char_limit;
+        app->sd_scroll_offset = 0;
+        app->sd_scroll_direction = 1;
+        app->sd_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        app->sd_scroll_last_tick = furi_get_tick();
+    }
+
+    size_t max_offset = len - char_limit;
+    if(app->sd_scroll_offset > max_offset) {
+        app->sd_scroll_offset = max_offset;
+    }
+
+    const char* start = text + app->sd_scroll_offset;
+    strncpy(out, start, char_limit);
+    out[char_limit] = '\0';
+}
+
+static void simple_app_process_sd_line(SimpleApp* app, const char* line) {
+    if(!app || !line || !app->sd_listing_active) return;
+
+    const char* cursor = line;
+    while(*cursor == ' ' || *cursor == '\t') {
+        cursor++;
+    }
+
+    if(*cursor == '\0') {
+        if(app->sd_list_header_seen || app->sd_file_count > 0) {
+            simple_app_finish_sd_listing(app);
+        }
+        return;
+    }
+
+    if(strncmp(cursor, "Files in", 8) == 0 || strncmp(cursor, "Found", 5) == 0) {
+        app->sd_list_header_seen = true;
+        return;
+    }
+
+    if(strncmp(cursor, "No files", 8) == 0) {
+        app->sd_file_count = 0;
+        simple_app_finish_sd_listing(app);
+        return;
+    }
+
+    if(strncmp(cursor, "Failed", 6) == 0 || strncmp(cursor, "Invalid", 7) == 0) {
+        simple_app_reset_sd_listing(app);
+        app->last_command_sent = false;
+        simple_app_show_status_message(app, "SD listing failed", 1500, true);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(!isdigit((unsigned char)cursor[0])) {
+        return;
+    }
+
+    char* endptr = NULL;
+    long id = strtol(cursor, &endptr, 10);
+    if(id <= 0 || !endptr) {
+        return;
+    }
+    while(*endptr == ' ' || *endptr == '\t') {
+        endptr++;
+    }
+    if(*endptr == '\0') {
+        return;
+    }
+    if(app->sd_file_count >= SD_MANAGER_MAX_FILES) {
+        return;
+    }
+
+    SdFileEntry* entry = &app->sd_files[app->sd_file_count++];
+    strncpy(entry->name, endptr, SD_MANAGER_FILE_NAME_MAX - 1);
+    entry->name[SD_MANAGER_FILE_NAME_MAX - 1] = '\0';
+
+    size_t len = strlen(entry->name);
+    while(len > 0 &&
+          (entry->name[len - 1] == '\r' || entry->name[len - 1] == '\n' || entry->name[len - 1] == ' ')) {
+        entry->name[--len] = '\0';
+    }
+
+    app->sd_list_header_seen = true;
+}
+
+static void simple_app_sd_feed(SimpleApp* app, char ch) {
+    if(!app || !app->sd_listing_active) return;
+    if(ch == '\r') return;
+
+    if(ch == '>') {
+        if(app->sd_list_length > 0) {
+            app->sd_list_buffer[app->sd_list_length] = '\0';
+            simple_app_process_sd_line(app, app->sd_list_buffer);
+            app->sd_list_length = 0;
+        }
+        if(app->sd_file_count > 0 || app->sd_list_header_seen) {
+            simple_app_finish_sd_listing(app);
+        }
+        return;
+    }
+
+    if(ch == '\n') {
+        if(app->sd_list_length > 0) {
+            app->sd_list_buffer[app->sd_list_length] = '\0';
+            simple_app_process_sd_line(app, app->sd_list_buffer);
+        } else if(app->sd_list_header_seen) {
+            simple_app_finish_sd_listing(app);
+        }
+        app->sd_list_length = 0;
+        return;
+    }
+
+    if(app->sd_list_length + 1 >= sizeof(app->sd_list_buffer)) {
+        app->sd_list_length = 0;
+        return;
+    }
+
+    app->sd_list_buffer[app->sd_list_length++] = ch;
+}
+
+static void simple_app_draw_sd_folder_popup(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas || !app->sd_folder_popup_active) return;
+
+    const uint8_t bubble_x = 4;
+    const uint8_t bubble_y = 4;
+    const uint8_t bubble_w = DISPLAY_WIDTH - (bubble_x * 2);
+    const uint8_t bubble_h = 56;
+    const uint8_t radius = 9;
+
+    canvas_set_color(canvas, ColorWhite);
+    canvas_draw_rbox(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+    canvas_set_color(canvas, ColorBlack);
+    canvas_draw_rframe(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, bubble_x + 8, bubble_y + 16, "Select folder");
+
+    canvas_set_font(canvas, FontSecondary);
+    uint8_t list_y = bubble_y + 28;
+
+    if(sd_folder_option_count == 0) {
+        canvas_draw_str(canvas, bubble_x + 8, list_y, "No folders configured");
+        return;
+    }
+
+    size_t visible = sd_folder_option_count;
+    if(visible > SD_MANAGER_POPUP_VISIBLE_LINES) {
+        visible = SD_MANAGER_POPUP_VISIBLE_LINES;
+    }
+
+    if(app->sd_folder_index >= sd_folder_option_count) {
+        app->sd_folder_index = sd_folder_option_count - 1;
+    }
+    if(app->sd_folder_offset + visible <= app->sd_folder_index) {
+        app->sd_folder_offset = app->sd_folder_index - visible + 1;
+    }
+    if(app->sd_folder_offset >= sd_folder_option_count) {
+        app->sd_folder_offset = 0;
+    }
+
+    for(size_t i = 0; i < visible; i++) {
+        size_t idx = app->sd_folder_offset + i;
+        if(idx >= sd_folder_option_count) break;
+        const SdFolderOption* option = &sd_folder_options[idx];
+        char full_line[64];
+        snprintf(full_line, sizeof(full_line), "%s (%s)", option->label, option->path);
+
+        char line[32];
+        if(idx == app->sd_folder_index) {
+            simple_app_sd_scroll_buffer(app, full_line, 23, line, sizeof(line));
+        } else {
+            strncpy(line, full_line, sizeof(line) - 1);
+            line[sizeof(line) - 1] = '\0';
+            simple_app_truncate_text(line, 23);
+        }
+
+        uint8_t line_y = (uint8_t)(list_y + i * HINT_LINE_HEIGHT);
+        if(idx == app->sd_folder_index) {
+            canvas_draw_str(canvas, bubble_x + 4, line_y, ">");
+        }
+        canvas_draw_str(canvas, bubble_x + 8, line_y, line);
+    }
+
+    if(sd_folder_option_count > SD_MANAGER_POPUP_VISIBLE_LINES) {
+        bool show_up = (app->sd_folder_offset > 0);
+        bool show_down = (app->sd_folder_offset + visible < sd_folder_option_count);
+        if(show_up || show_down) {
+            uint8_t arrow_x = (uint8_t)(bubble_x + bubble_w - 10);
+            int16_t content_top = list_y;
+            int16_t content_bottom =
+                list_y + (int16_t)((visible > 0 ? (visible - 1) : 0) * HINT_LINE_HEIGHT);
+            int16_t min_base = bubble_y + 12;
+            int16_t max_base = bubble_y + bubble_h - 12;
+            simple_app_draw_scroll_hints_clamped(
+                canvas, arrow_x, content_top, content_bottom, show_up, show_down, min_base, max_base);
+        }
+    }
+}
+
+static void simple_app_draw_sd_file_popup(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas || !app->sd_file_popup_active) return;
+
+    const uint8_t bubble_x = 4;
+    const uint8_t bubble_y = 4;
+    const uint8_t bubble_w = DISPLAY_WIDTH - (bubble_x * 2);
+    const uint8_t bubble_h = 56;
+    const uint8_t radius = 9;
+
+    canvas_set_color(canvas, ColorWhite);
+    canvas_draw_rbox(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+    canvas_set_color(canvas, ColorBlack);
+    canvas_draw_rframe(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+
+    canvas_set_font(canvas, FontPrimary);
+    char title[48];
+    snprintf(
+        title,
+        sizeof(title),
+        "Files: %s",
+        (app->sd_current_folder_label[0] != '\0') ? app->sd_current_folder_label : "Unknown");
+    simple_app_truncate_text(title, 28);
+    canvas_draw_str(canvas, bubble_x + 8, bubble_y + 16, title);
+
+    canvas_set_font(canvas, FontSecondary);
+    uint8_t list_y = bubble_y + 28;
+
+    if(app->sd_file_count == 0) {
+        canvas_draw_str(canvas, bubble_x + 8, list_y, "No files found");
+        return;
+    }
+
+    size_t visible = app->sd_file_count;
+    if(visible > SD_MANAGER_POPUP_VISIBLE_LINES) {
+        visible = SD_MANAGER_POPUP_VISIBLE_LINES;
+    }
+
+    if(app->sd_file_popup_index >= app->sd_file_count) {
+        app->sd_file_popup_index = (app->sd_file_count > 0) ? (app->sd_file_count - 1) : 0;
+    }
+
+    if(app->sd_file_count > visible &&
+       app->sd_file_popup_index >= app->sd_file_popup_offset + visible) {
+        app->sd_file_popup_offset = app->sd_file_popup_index - visible + 1;
+    }
+
+    size_t max_offset = (app->sd_file_count > visible) ? (app->sd_file_count - visible) : 0;
+    if(app->sd_file_popup_offset > max_offset) {
+        app->sd_file_popup_offset = max_offset;
+    }
+
+    for(size_t i = 0; i < visible; i++) {
+        size_t idx = app->sd_file_popup_offset + i;
+        if(idx >= app->sd_file_count) break;
+        const SdFileEntry* entry = &app->sd_files[idx];
+        char line[48];
+        if(idx == app->sd_file_popup_index) {
+            simple_app_sd_scroll_buffer(app, entry->name, 20, line, sizeof(line));
+        } else {
+            strncpy(line, entry->name, sizeof(line) - 1);
+            line[sizeof(line) - 1] = '\0';
+            simple_app_truncate_text(line, 20);
+        }
+        uint8_t line_y = (uint8_t)(list_y + i * HINT_LINE_HEIGHT);
+        if(idx == app->sd_file_popup_index) {
+            canvas_draw_str(canvas, bubble_x + 4, line_y, ">");
+        }
+        canvas_draw_str(canvas, bubble_x + 8, line_y, line);
+    }
+
+    if(app->sd_file_count > SD_MANAGER_POPUP_VISIBLE_LINES) {
+        bool show_up = (app->sd_file_popup_offset > 0);
+        bool show_down = (app->sd_file_popup_offset + visible < app->sd_file_count);
+        if(show_up || show_down) {
+            uint8_t arrow_x = (uint8_t)(bubble_x + bubble_w - 10);
+            int16_t content_top = list_y;
+            int16_t content_bottom =
+                list_y + (int16_t)((visible > 0 ? (visible - 1) : 0) * HINT_LINE_HEIGHT);
+            int16_t min_base = bubble_y + 12;
+            int16_t max_base = bubble_y + bubble_h - 12;
+            simple_app_draw_scroll_hints_clamped(
+                canvas, arrow_x, content_top, content_bottom, show_up, show_down, min_base, max_base);
+        }
+    }
+}
+
+static void simple_app_draw_sd_delete_confirm(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas || !app->sd_delete_confirm_active) return;
+
+    const uint8_t bubble_x = 4;
+    const uint8_t bubble_y = 8;
+    const uint8_t bubble_w = DISPLAY_WIDTH - (bubble_x * 2);
+    const uint8_t bubble_h = 48;
+    const uint8_t radius = 9;
+
+    canvas_set_color(canvas, ColorWhite);
+    canvas_draw_rbox(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+    canvas_set_color(canvas, ColorBlack);
+    canvas_draw_rframe(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, bubble_x + 10, bubble_y + 14, "Delete file?");
+
+    canvas_set_font(canvas, FontSecondary);
+    char name_line[48];
+    simple_app_sd_scroll_buffer(app, app->sd_delete_target_name, 18, name_line, sizeof(name_line));
+    canvas_draw_str(canvas, bubble_x + 10, bubble_y + 28, name_line);
+
+    const char* options =
+        app->sd_delete_confirm_yes ? "No        > Yes" : "> No        Yes";
+    canvas_draw_str(canvas, bubble_x + 18, bubble_y + 44, options);
+}
+
+static void simple_app_draw_setup_sd_manager(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 10, 14, "SD Manager");
+
+    canvas_set_font(canvas, FontSecondary);
+    char line[64];
+    if(app->sd_current_folder_label[0] != '\0') {
+        snprintf(line, sizeof(line), "Folder: %s", app->sd_current_folder_label);
+    } else {
+        snprintf(line, sizeof(line), "Folder: <select>");
+    }
+    simple_app_truncate_text(line, 30);
+    canvas_draw_str(canvas, 8, 30, line);
+
+    if(app->sd_current_folder_path[0] != '\0') {
+        snprintf(
+            line,
+            sizeof(line),
+            "Path: %.54s",
+            app->sd_current_folder_path);
+    } else {
+        snprintf(line, sizeof(line), "Path: <not set>");
+    }
+    simple_app_truncate_text(line, 30);
+    canvas_draw_str(canvas, 8, 42, line);
+
+    if(app->sd_listing_active) {
+        canvas_draw_str(canvas, 8, 54, "Listing files...");
+    } else {
+        snprintf(
+            line,
+            sizeof(line),
+            "Cached files: %u",
+            (unsigned)((app->sd_file_count > 0) ? app->sd_file_count : 0));
+        simple_app_truncate_text(line, 28);
+        canvas_draw_str(canvas, 8, 54, line);
+    }
+
+    canvas_draw_str(canvas, 8, 62, "OK=folders  Right=refresh");
+}
+
+static void simple_app_handle_sd_folder_popup_event(SimpleApp* app, const InputEvent* event) {
+    if(!app || !event || !app->sd_folder_popup_active) return;
+
+    if(event->type != InputTypeShort && event->type != InputTypeRepeat) return;
+
+    InputKey key = event->key;
+    if(event->type == InputTypeShort && key == InputKeyBack) {
+        app->sd_folder_popup_active = false;
+        simple_app_reset_sd_scroll(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(sd_folder_option_count == 0) {
+        if(event->type == InputTypeShort && key == InputKeyOk) {
+            app->sd_folder_popup_active = false;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    size_t visible = sd_folder_option_count;
+    if(visible > SD_MANAGER_POPUP_VISIBLE_LINES) {
+        visible = SD_MANAGER_POPUP_VISIBLE_LINES;
+    }
+
+    if(key == InputKeyUp) {
+        if(app->sd_folder_index > 0) {
+            app->sd_folder_index--;
+            simple_app_reset_sd_scroll(app);
+            if(app->sd_folder_index < app->sd_folder_offset) {
+                app->sd_folder_offset = app->sd_folder_index;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(key == InputKeyDown) {
+        if(app->sd_folder_index + 1 < sd_folder_option_count) {
+            app->sd_folder_index++;
+            simple_app_reset_sd_scroll(app);
+            if(sd_folder_option_count > visible &&
+               app->sd_folder_index >= app->sd_folder_offset + visible) {
+                app->sd_folder_offset = app->sd_folder_index - visible + 1;
+            }
+            size_t max_offset =
+                (sd_folder_option_count > visible) ? (sd_folder_option_count - visible) : 0;
+            if(app->sd_folder_offset > max_offset) {
+                app->sd_folder_offset = max_offset;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(event->type == InputTypeShort && key == InputKeyOk) {
+        if(app->sd_folder_index < sd_folder_option_count) {
+            const SdFolderOption* folder = &sd_folder_options[app->sd_folder_index];
+            simple_app_request_sd_listing(app, folder);
+        }
+    }
+}
+
+static void simple_app_handle_sd_file_popup_event(SimpleApp* app, const InputEvent* event) {
+    if(!app || !event || !app->sd_file_popup_active) return;
+    if(event->type != InputTypeShort && event->type != InputTypeRepeat) return;
+
+    InputKey key = event->key;
+    if(event->type == InputTypeShort && key == InputKeyBack) {
+        app->sd_file_popup_active = false;
+        simple_app_reset_sd_scroll(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(app->sd_file_count == 0) {
+        if(event->type == InputTypeShort && key == InputKeyOk) {
+            app->sd_file_popup_active = false;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    size_t visible = app->sd_file_count;
+    if(visible > SD_MANAGER_POPUP_VISIBLE_LINES) {
+        visible = SD_MANAGER_POPUP_VISIBLE_LINES;
+    }
+
+    if(key == InputKeyUp) {
+        if(app->sd_file_popup_index > 0) {
+            app->sd_file_popup_index--;
+            simple_app_reset_sd_scroll(app);
+            if(app->sd_file_popup_index < app->sd_file_popup_offset) {
+                app->sd_file_popup_offset = app->sd_file_popup_index;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(key == InputKeyDown) {
+        if(app->sd_file_popup_index + 1 < app->sd_file_count) {
+            app->sd_file_popup_index++;
+            simple_app_reset_sd_scroll(app);
+            if(app->sd_file_count > visible &&
+               app->sd_file_popup_index >= app->sd_file_popup_offset + visible) {
+                app->sd_file_popup_offset = app->sd_file_popup_index - visible + 1;
+            }
+            size_t max_offset =
+                (app->sd_file_count > visible) ? (app->sd_file_count - visible) : 0;
+            if(app->sd_file_popup_offset > max_offset) {
+                app->sd_file_popup_offset = max_offset;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    } else if(event->type == InputTypeShort && key == InputKeyOk) {
+        if(app->sd_file_popup_index < app->sd_file_count) {
+            const SdFileEntry* entry = &app->sd_files[app->sd_file_popup_index];
+            simple_app_reset_sd_scroll(app);
+            strncpy(app->sd_delete_target_name, entry->name, SD_MANAGER_FILE_NAME_MAX - 1);
+            app->sd_delete_target_name[SD_MANAGER_FILE_NAME_MAX - 1] = '\0';
+
+            if(app->sd_current_folder_path[0] != '\0') {
+                size_t max_total = sizeof(app->sd_delete_target_path) - 1;
+                size_t folder_len = strnlen(app->sd_current_folder_path, max_total);
+                size_t remaining = (folder_len < max_total) ? (max_total - folder_len - 1) : 0; // minus slash
+                size_t name_len = strnlen(entry->name, remaining);
+                snprintf(
+                    app->sd_delete_target_path,
+                    sizeof(app->sd_delete_target_path),
+                    "%.*s/%.*s",
+                    (int)folder_len,
+                    app->sd_current_folder_path,
+                    (int)name_len,
+                    entry->name);
+            } else {
+                strncpy(
+                    app->sd_delete_target_path,
+                    entry->name,
+                    sizeof(app->sd_delete_target_path) - 1);
+                app->sd_delete_target_path[sizeof(app->sd_delete_target_path) - 1] = '\0';
+            }
+
+            app->sd_delete_confirm_yes = false;
+            app->sd_delete_confirm_active = true;
+            app->sd_file_popup_active = false;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+    }
+}
+
+static void simple_app_handle_sd_delete_confirm_event(SimpleApp* app, const InputEvent* event) {
+    if(!app || !event || !app->sd_delete_confirm_active) return;
+    if(event->type != InputTypeShort && event->type != InputTypeRepeat) return;
+
+    InputKey key = event->key;
+    if(event->type == InputTypeShort && key == InputKeyBack) {
+        app->sd_delete_confirm_active = false;
+        app->sd_delete_confirm_yes = false;
+        app->sd_file_popup_active = true;
+        simple_app_reset_sd_scroll(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyLeft || key == InputKeyRight) {
+        app->sd_delete_confirm_yes = !app->sd_delete_confirm_yes;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(event->type == InputTypeShort && key == InputKeyOk) {
+        if(app->sd_delete_confirm_yes) {
+            char command[220];
+            snprintf(command, sizeof(command), "file_delete \"%s\"", app->sd_delete_target_path);
+            simple_app_send_command(app, command, false);
+            simple_app_show_status_message(app, "Deleting...", 800, false);
+            app->sd_refresh_pending = true;
+            app->sd_refresh_tick = furi_get_tick() + furi_ms_to_ticks(400);
+            simple_app_reset_sd_listing(app);
+        } else {
+            app->sd_file_popup_active = true;
+        }
+        app->sd_delete_confirm_active = false;
+        app->sd_delete_confirm_yes = false;
+        simple_app_reset_sd_scroll(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+    }
+}
+
+static void simple_app_handle_setup_sd_manager_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+
+    if(key == InputKeyBack) {
+        app->sd_folder_popup_active = false;
+        app->sd_file_popup_active = false;
+        app->sd_delete_confirm_active = false;
+        app->sd_refresh_pending = false;
+        simple_app_reset_sd_listing(app);
+        simple_app_reset_sd_scroll(app);
+        app->screen = ScreenMenu;
+        app->menu_state = MenuStateItems;
+        app->section_index = MENU_SECTION_SETUP;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyOk) {
+        app->sd_folder_popup_active = true;
+        app->sd_file_popup_active = false;
+        app->sd_delete_confirm_active = false;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyDown) {
+        if(app->sd_file_count > 0 && !app->sd_listing_active) {
+            app->sd_file_popup_active = true;
+            app->sd_file_popup_index = 0;
+            app->sd_file_popup_offset = 0;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    if(key == InputKeyRight) {
+        if(!app->sd_listing_active && sd_folder_option_count > 0 &&
+           app->sd_folder_index < sd_folder_option_count) {
+            simple_app_request_sd_listing(app, &sd_folder_options[app->sd_folder_index]);
+        }
+        return;
+    }
+}
+
 static void simple_app_draw_setup_scanner(SimpleApp* app, Canvas* canvas) {
     if(!app) return;
 
@@ -5582,6 +6483,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenSetupBoot:
         simple_app_draw_setup_boot(app, canvas);
         break;
+    case ScreenSetupSdManager:
+        simple_app_draw_setup_sd_manager(app, canvas);
+        break;
     case ScreenSetupKarma:
         simple_app_draw_setup_karma(app, canvas);
         break;
@@ -5617,7 +6521,13 @@ static void simple_app_draw(Canvas* canvas, void* context) {
         break;
     }
 
-    if(app->portal_ssid_popup_active) {
+    if(app->sd_delete_confirm_active) {
+        simple_app_draw_sd_delete_confirm(app, canvas);
+    } else if(app->sd_file_popup_active) {
+        simple_app_draw_sd_file_popup(app, canvas);
+    } else if(app->sd_folder_popup_active) {
+        simple_app_draw_sd_folder_popup(app, canvas);
+    } else if(app->portal_ssid_popup_active) {
         simple_app_draw_portal_ssid_popup(app, canvas);
     } else if(app->karma_probe_popup_active) {
         simple_app_draw_karma_probe_popup(app, canvas);
@@ -5777,6 +6687,9 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             app->boot_setup_index = 0;
             app->boot_setup_long = (entry->label == menu_label_boot_long);
             simple_app_request_boot_status(app);
+        } else if(entry->action == MenuActionOpenSdManager) {
+            simple_app_open_sd_manager(app);
+            return;
         } else if(entry->action == MenuActionOpenDownload) {
             simple_app_download_bridge_start(app);
         } else if(entry->action == MenuActionOpenScannerSetup) {
@@ -7619,6 +8532,21 @@ static void simple_app_input(InputEvent* event, void* context) {
         return;
     }
 
+    if(app->sd_delete_confirm_active) {
+        simple_app_handle_sd_delete_confirm_event(app, event);
+        return;
+    }
+
+    if(app->sd_file_popup_active) {
+        simple_app_handle_sd_file_popup_event(app, event);
+        return;
+    }
+
+    if(app->sd_folder_popup_active) {
+        simple_app_handle_sd_folder_popup_event(app, event);
+        return;
+    }
+
     if(app->portal_ssid_popup_active) {
         simple_app_handle_portal_ssid_popup_event(app, event);
         return;
@@ -7678,6 +8606,9 @@ static void simple_app_input(InputEvent* event, void* context) {
         break;
     case ScreenSetupBoot:
         simple_app_handle_setup_boot_input(app, event->key);
+        break;
+    case ScreenSetupSdManager:
+        simple_app_handle_setup_sd_manager_input(app, event->key);
         break;
     case ScreenSetupKarma:
         simple_app_handle_setup_karma_input(app, event->key);
@@ -7842,6 +8773,13 @@ int32_t Lab_C5_app(void* p) {
     simple_app_update_backlight_label(app);
     simple_app_update_led_label(app);
     simple_app_update_boot_labels(app);
+    app->sd_folder_index = 0;
+    app->sd_folder_offset = 0;
+    app->sd_refresh_pending = false;
+    simple_app_reset_sd_listing(app);
+    if(sd_folder_option_count > 0) {
+        simple_app_copy_sd_folder(app, &sd_folder_options[0]);
+    }
     simple_app_update_otg_label(app);
     simple_app_apply_otg_power(app);
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
@@ -7910,6 +8848,7 @@ int32_t Lab_C5_app(void* p) {
             simple_app_process_stream(app);
             simple_app_update_karma_sniffer(app);
             simple_app_update_result_scroll(app);
+            simple_app_update_sd_scroll(app);
             simple_app_ping_watchdog(app);
         }
 
@@ -7931,10 +8870,20 @@ int32_t Lab_C5_app(void* p) {
             }
         }
 
+        if(app->sd_refresh_pending && !app->sd_listing_active &&
+           app->screen == ScreenSetupSdManager) {
+            uint32_t now = furi_get_tick();
+            if(now >= app->sd_refresh_tick && sd_folder_option_count > 0 &&
+               app->sd_folder_index < sd_folder_option_count) {
+                simple_app_request_sd_listing(app, &sd_folder_options[app->sd_folder_index]);
+            }
+        }
+
         bool previous_help_hint = app->help_hint_visible;
         bool can_show_help_hint = (app->screen == ScreenMenu) && (app->menu_state == MenuStateSections) &&
                                   !app->hint_active && !app->evil_twin_popup_active &&
-                                  !app->portal_ssid_popup_active &&
+                                  !app->portal_ssid_popup_active && !app->sd_folder_popup_active &&
+                                  !app->sd_file_popup_active && !app->sd_delete_confirm_active &&
                                   !simple_app_status_message_is_active(app);
 
         if(can_show_help_hint) {
