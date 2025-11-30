@@ -555,7 +555,64 @@ static bool is_handshake_complete(hccapx_t *hccapx) {
 }
 
 /**
+ * @brief Sanitizes SSID for use in filename (whitelist approach)
+ * 
+ * Allowed characters: a-z, A-Z, 0-9, hyphen, underscore, dot, space
+ * All other characters are replaced with underscore.
+ * 
+ * @param dest destination buffer
+ * @param src source SSID string
+ * @param max_len maximum length to copy (including null terminator)
+ */
+static void sanitize_ssid_for_filename(char *dest, const char *src, size_t max_len) {
+    if (!dest || !src || max_len == 0) {
+        return;
+    }
+    
+    size_t i;
+    for (i = 0; i < max_len - 1 && src[i] != '\0'; i++) {
+        char c = src[i];
+        // Whitelist: alphanumeric, hyphen, underscore, dot, space
+        if ((c >= 'a' && c <= 'z') || 
+            (c >= 'A' && c <= 'Z') || 
+            (c >= '0' && c <= '9') || 
+            c == '-' || c == '_' || c == '.' || c == ' ') {
+            dest[i] = c;
+        } else {
+            // Replace any other character with underscore
+            dest[i] = '_';
+        }
+    }
+    dest[i] = '\0';
+}
+
+/**
+ * @brief Formats last 6 hex digits of MAC address
+ * 
+ * Extracts last 3 bytes of MAC address and formats as 6 uppercase hex digits.
+ * Used to avoid filename collisions when different SSIDs sanitize to same name.
+ * 
+ * @param mac_addr 6-byte MAC address
+ * @param output buffer for output string (minimum 7 bytes for 6 chars + null)
+ */
+static void format_mac_suffix(const uint8_t *mac_addr, char *output) {
+    if (!mac_addr || !output) {
+        return;
+    }
+    
+    // Use last 3 bytes of MAC address (6 hex digits)
+    snprintf(output, 7, "%02X%02X%02X", 
+             mac_addr[3], mac_addr[4], mac_addr[5]);
+}
+
+/**
  * @brief Saves complete handshake to SD card
+ * 
+ * Files are saved to /sdcard/lab/handshakes/ with format:
+ * {SSID_sanitized}_{MAC_suffix}_{timestamp}.{pcap|hccapx}
+ * 
+ * SSID is sanitized using whitelist (alphanumeric, -, _, ., space).
+ * MAC suffix (6 hex digits from AP MAC) prevents filename collisions.
  * 
  * @return true if handshake was complete and saved successfully
  * @return false if no complete handshake or save failed
@@ -592,25 +649,26 @@ bool attack_handshake_save_to_sd() {
         ESP_LOGI(TAG, "Created /sdcard/lab/handshakes directory");
     }
     
-    // Generate filename with SSID and timestamp
+    // Generate filename with SSID, MAC suffix, and timestamp
     char filename[128];
     char ssid_safe[33];
+    char mac_suffix[7]; // 6 hex digits + null terminator
     
-    // Sanitize SSID for filename (replace spaces and special chars with underscore)
-    strncpy(ssid_safe, (char *)hccapx->essid, sizeof(ssid_safe) - 1);
-    ssid_safe[sizeof(ssid_safe) - 1] = '\0';
-    for (int i = 0; ssid_safe[i]; i++) {
-        if (ssid_safe[i] == ' ' || ssid_safe[i] == '/' || ssid_safe[i] == '\\') {
-            ssid_safe[i] = '_';
-        }
-    }
+    // Sanitize SSID for filename using whitelist approach
+    // Allowed: a-z, A-Z, 0-9, hyphen, underscore, dot, space
+    sanitize_ssid_for_filename(ssid_safe, (char *)hccapx->essid, sizeof(ssid_safe));
+    
+    // Get MAC suffix to avoid filename collisions (e.g., *SSID vs <SSID -> _SSID)
+    // Uses last 6 hex digits of AP MAC address
+    format_mac_suffix(hccapx->mac_ap, mac_suffix);
     
     // Use timestamp for unique filename
     uint64_t timestamp = esp_timer_get_time() / 1000; // milliseconds
     
     // Save PCAP file
-    snprintf(filename, sizeof(filename), "/sdcard/lab/handshakes/%s_%llu.pcap", 
-             ssid_safe, (unsigned long long)timestamp);
+    // Format: /sdcard/lab/handshakes/{SSID}_{MAC_SUFFIX}_{TIMESTAMP}.pcap
+    snprintf(filename, sizeof(filename), "/sdcard/lab/handshakes/%s_%s_%llu.pcap", 
+             ssid_safe, mac_suffix, (unsigned long long)timestamp);
     
     FILE *f = fopen(filename, "wb");
     if (!f) {
@@ -646,8 +704,9 @@ bool attack_handshake_save_to_sd() {
     }
     
     // Save HCCAPX file
-    snprintf(filename, sizeof(filename), "/sdcard/lab/handshakes/%s_%llu.hccapx", 
-             ssid_safe, (unsigned long long)timestamp);
+    // Format: /sdcard/lab/handshakes/{SSID}_{MAC_SUFFIX}_{TIMESTAMP}.hccapx
+    snprintf(filename, sizeof(filename), "/sdcard/lab/handshakes/%s_%s_%llu.hccapx", 
+             ssid_safe, mac_suffix, (unsigned long long)timestamp);
     
     f = fopen(filename, "wb");
     if (!f) {
@@ -664,8 +723,8 @@ bool attack_handshake_save_to_sd() {
     }
     
     ESP_LOGI(TAG, "✓ HCCAPX saved: %s (%zu bytes)", filename, sizeof(hccapx_t));
-    ESP_LOGI(TAG, "✓ Complete 4-way handshake saved for SSID: %s (message_pair: %d)", 
-             ssid_safe, hccapx->message_pair);
+    ESP_LOGI(TAG, "✓ Complete 4-way handshake saved for SSID: %s (MAC: %s, message_pair: %d)", 
+             ssid_safe, mac_suffix, hccapx->message_pair);
     
     return true;
 }

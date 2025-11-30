@@ -57,7 +57,11 @@ void *attack_handshake_get_hccapx();
  * @brief Saves complete handshake to SD card
  * 
  * Only saves if a complete 4-way handshake was captured.
- * Files are saved to /sdcard/lab/handshakes/ with SSID and timestamp in filename.
+ * Files are saved to /sdcard/lab/handshakes/ with format:
+ * {SSID_sanitized}_{MAC_suffix}_{timestamp}.{pcap|hccapx}
+ * 
+ * SSID is sanitized (alphanumeric, -, _, ., space allowed).
+ * MAC suffix prevents filename collisions when different SSIDs sanitize to same name.
  * 
  * @return true if handshake was complete and saved successfully
  * @return false if no complete handshake or save failed
