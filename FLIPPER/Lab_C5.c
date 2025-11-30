@@ -22,6 +22,14 @@
 
 #define TAG "Lab_C5"
 
+static size_t simple_app_bounded_strlen(const char* s, size_t max_len) {
+    size_t len = 0;
+    while(len < max_len && s[len] != '\0') {
+        len++;
+    }
+    return len;
+}
+
 typedef enum {
     ScreenMenu,
     ScreenSerial,
@@ -6201,9 +6209,9 @@ static void simple_app_handle_sd_file_popup_event(SimpleApp* app, const InputEve
 
             if(app->sd_current_folder_path[0] != '\0') {
                 size_t max_total = sizeof(app->sd_delete_target_path) - 1;
-                size_t folder_len = strnlen(app->sd_current_folder_path, max_total);
+                size_t folder_len = simple_app_bounded_strlen(app->sd_current_folder_path, max_total);
                 size_t remaining = (folder_len < max_total) ? (max_total - folder_len - 1) : 0; // minus slash
-                size_t name_len = strnlen(entry->name, remaining);
+                size_t name_len = simple_app_bounded_strlen(entry->name, remaining);
                 snprintf(
                     app->sd_delete_target_path,
                     sizeof(app->sd_delete_target_path),
