@@ -26,6 +26,8 @@ import serial.tools.list_ports
 # Colors
 RED = "\033[91m"; GREEN = "\033[92m"; YELLOW = "\033[93m"; CYAN = "\033[96m"; RESET = "\033[0m"
 
+VERSION = "v02"
+DEFAULT_BAUD = 460800  # Original default; can be overridden via CLI
 REQUIRED_FILES = ["bootloader.bin", "partition-table.bin", "projectZero.bin"]
 
 # >>> DO NOT CHANGE: keep your original offsets <<<
@@ -63,7 +65,7 @@ def wait_for_new_port(before, timeout=20.0):
     print(f"\n{RED}No new serial port detected.{RESET}")
     sys.exit(1)
 
-def erase_all(port, baud):
+def erase_all(port, baud=DEFAULT_BAUD):
     cmd = [sys.executable, "-m", "esptool", "-p", port, "-b", str(baud),
            "--before", "default-reset", "--after", "no_reset", "--chip", "esp32c5",
            "erase_flash"]
@@ -73,7 +75,7 @@ def erase_all(port, baud):
         print(f"{RED}Erase failed with code {res.returncode}.{RESET}")
         sys.exit(res.returncode)
 
-def do_flash(port, baud, flash_mode, flash_freq):
+def do_flash(port, baud=DEFAULT_BAUD, flash_mode="dio", flash_freq="80m"):
     cmd = [
         sys.executable, "-m", "esptool",
         "-p", port,
@@ -126,7 +128,7 @@ def reset_to_app(port):
         print(f"{RED}RTS/DTR reset failed: {e}{RESET}")
         print(f"{YELLOW}Press the board's RESET button manually.{RESET}")
 
-def monitor(port, baud=115200):
+def monitor(port, baud=DEFAULT_BAUD):
     print(f"{CYAN}Opening serial monitor on {port} @ {baud} (Ctrl+C to exit)...{RESET}")
     try:
         # A brief delay to let the port re-enumerate after reset
@@ -145,8 +147,10 @@ def monitor(port, baud=115200):
 
 def main():
     parser = argparse.ArgumentParser(description="ESP32-C5 flasher with robust reboot handling")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("--port", help="Known serial port (e.g., COM10 or /dev/ttyACM0)")
-    parser.add_argument("--baud", type=int, default=460800)
+    parser.add_argument("baud", nargs="?", type=int, default=DEFAULT_BAUD,
+                        help=f"Optional baud rate (default: {DEFAULT_BAUD})")
     parser.add_argument("--monitor", action="store_true", help="Open serial monitor after flashing")
     parser.add_argument("--erase", action="store_true", help="Full erase before flashing (fixes stale NVS/partitions)")
     parser.add_argument("--flash-mode", default="dio", choices=["dio", "qio", "dout", "qout"],
@@ -156,6 +160,9 @@ def main():
     args = parser.parse_args()
 
     check_files()
+
+    print(f"{CYAN}ESP32-C5 flasher version: {VERSION}{RESET}")
+    print(f"{CYAN}Using baud rate: {args.baud}{RESET}")
 
     if args.port:
         port = args.port
@@ -169,12 +176,12 @@ def main():
     if args.erase:
         erase_all(port, args.baud)
 
-    do_flash(port, args.baud, args.flash_mode, args.flash_freq)
+    do_flash(port, baud=args.baud, flash_mode=args.flash_mode, flash_freq=args.flash_freq)
 
     reset_to_app(port)
 
     if args.monitor:
-        monitor(port, 115200)
+        monitor(port, args.baud)
 
 if __name__ == "__main__":
     main()
