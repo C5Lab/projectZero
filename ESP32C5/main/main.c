@@ -81,7 +81,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "0.7.1"
+#define JANOS_VERSION "0.7.3"
 
 
 #define NEOPIXEL_GPIO      27

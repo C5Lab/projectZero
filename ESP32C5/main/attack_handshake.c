@@ -37,6 +37,26 @@ static wifi_ap_record_t current_ap_record;
 static esp_timer_handle_t deauth_timer_handle = NULL;
 static bool attack_running = false;
 
+/**
+ * @brief Calculates actual SSID length from wifi_ap_record_t
+ * 
+ * SSIDs can contain any byte values including null bytes, so strlen() is unsafe.
+ * This function finds the actual length by scanning for null terminator or max length.
+ * 
+ * @param ssid SSID buffer (max 33 bytes in wifi_ap_record_t)
+ * @return actual SSID length (0-32)
+ */
+static size_t get_ssid_length(const uint8_t *ssid) {
+    // SSID max length is 32 bytes (33rd byte is null terminator in wifi_ap_record_t)
+    size_t len = 0;
+    for (len = 0; len < 32; len++) {
+        if (ssid[len] == 0) {
+            break;
+        }
+    }
+    return len;
+}
+
 // Track which handshake messages we've captured to avoid duplicates in PCAP
 static bool captured_m1 = false;
 static bool captured_m2 = false;
@@ -290,9 +310,26 @@ void attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_
         attack_handshake_stop();
     }
     
-    ESP_LOGI(TAG, "Starting handshake attack...");
-    ESP_LOGI(TAG, "Target SSID: %s", ap_record->ssid);
-    ESP_LOGI(TAG, "Target Channel: %d", ap_record->primary);
+    // Calculate actual SSID length (don't use strlen - SSIDs can contain null bytes!)
+    size_t ssid_len = get_ssid_length(ap_record->ssid);
+    
+    printf("Starting handshake attack...\n");
+    printf("Target SSID: %s (length: %zu bytes)\n", ap_record->ssid, ssid_len);
+    
+    // Debug: Show SSID hex dump for special characters
+    if (ssid_len > 0 && ssid_len <= 32) {
+        char hex_dump[100];
+        int offset = 0;
+        for (size_t i = 0; i < ssid_len && i < 16; i++) {
+            offset += snprintf(hex_dump + offset, sizeof(hex_dump) - offset, "%02X ", ap_record->ssid[i]);
+        }
+        if (ssid_len > 16) {
+            snprintf(hex_dump + offset, sizeof(hex_dump) - offset, "...");
+        }
+        printf("SSID hex: %s\n", hex_dump);
+    }
+    
+    printf("Target Channel: %d\n", ap_record->primary);
     
     // Verify WiFi mode
     wifi_mode_t mode;
@@ -314,9 +351,9 @@ void attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_
     method = attack_method;
     memcpy(&current_ap_record, ap_record, sizeof(wifi_ap_record_t));
     
-    // Initialize serializers
+    // Initialize serializers with proper SSID length
     pcap_serializer_init();
-    hccapx_serializer_init(ap_record->ssid, strlen((char *)ap_record->ssid));
+    hccapx_serializer_init(ap_record->ssid, ssid_len);
     
     // Set channel BEFORE enabling promiscuous mode
     ESP_LOGI(TAG, "Setting channel to %d", ap_record->primary);
@@ -482,74 +519,80 @@ static bool is_zero_array(const uint8_t *array, size_t size) {
  */
 static bool is_handshake_complete(hccapx_t *hccapx) {
     if (!hccapx) {
-        ESP_LOGW(TAG, "✗ HCCAPX structure is NULL");
+        printf("✗ HCCAPX structure is NULL\n");
         return false;
     }
     
-    ESP_LOGI(TAG, "=== Handshake Validation ===");
+    printf("=== Handshake Validation ===\n");
     
     // Check message_pair (should not be 255 = unset)
     if (hccapx->message_pair == 255) {
-        ESP_LOGW(TAG, "✗ message_pair is unset (255) - no handshake captured");
+        printf("✗ message_pair is unset (255) - no handshake captured\n");
+        printf("  No EAPOL frames were successfully processed by HCCAPX serializer\n");
         return false;
     }
-    ESP_LOGI(TAG, "✓ message_pair: %d", hccapx->message_pair);
+    printf("✓ message_pair: %d\n", hccapx->message_pair);
     
     // Check ANonce (from AP)
     if (is_zero_array(hccapx->nonce_ap, 32)) {
-        ESP_LOGW(TAG, "✗ ANonce is empty - missing AP message (M1 or M3)");
+        printf("✗ ANonce is empty - missing AP message (M1 or M3)\n");
         return false;
     }
-    ESP_LOGI(TAG, "✓ ANonce present (from AP)");
+    printf("✓ ANonce present (from AP)\n");
     
     // Check SNonce (from STA)
     if (is_zero_array(hccapx->nonce_sta, 32)) {
-        ESP_LOGW(TAG, "✗ SNonce is empty - missing STA message (M2)");
+        printf("✗ SNonce is empty - missing STA message (M2)\n");
         return false;
     }
-    ESP_LOGI(TAG, "✓ SNonce present (from STA)");
+    printf("✓ SNonce present (from STA)\n");
     
     // Check Key MIC
     if (is_zero_array(hccapx->keymic, 16)) {
-        ESP_LOGW(TAG, "✗ Key MIC is empty - missing authenticated message");
+        printf("✗ Key MIC is empty - missing authenticated message\n");
         return false;
     }
-    ESP_LOGI(TAG, "✓ Key MIC present");
+    printf("✓ Key MIC present\n");
     
     // Check AP MAC
     if (is_zero_array(hccapx->mac_ap, 6)) {
-        ESP_LOGW(TAG, "✗ AP MAC is empty");
+        printf("✗ AP MAC is empty\n");
         return false;
     }
-    ESP_LOGI(TAG, "✓ AP MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+    printf("✓ AP MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
              hccapx->mac_ap[0], hccapx->mac_ap[1], hccapx->mac_ap[2],
              hccapx->mac_ap[3], hccapx->mac_ap[4], hccapx->mac_ap[5]);
     
     // Check STA MAC
     if (is_zero_array(hccapx->mac_sta, 6)) {
-        ESP_LOGW(TAG, "✗ STA MAC is empty");
+        printf("✗ STA MAC is empty\n");
         return false;
     }
-    ESP_LOGI(TAG, "✓ STA MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+    printf("✓ STA MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
              hccapx->mac_sta[0], hccapx->mac_sta[1], hccapx->mac_sta[2],
              hccapx->mac_sta[3], hccapx->mac_sta[4], hccapx->mac_sta[5]);
     
     // Check EAPOL data
     if (hccapx->eapol_len == 0 || hccapx->eapol_len > 256) {
-        ESP_LOGW(TAG, "✗ EAPOL length invalid: %d", hccapx->eapol_len);
+        printf("✗ EAPOL length invalid: %d\n", hccapx->eapol_len);
         return false;
     }
-    ESP_LOGI(TAG, "✓ EAPOL data: %d bytes", hccapx->eapol_len);
+    printf("✓ EAPOL data: %d bytes\n", hccapx->eapol_len);
     
     // Check SSID
     if (hccapx->essid_len == 0 || hccapx->essid_len > 32) {
-        ESP_LOGW(TAG, "✗ SSID length invalid: %d", hccapx->essid_len);
+        printf("✗ SSID length invalid: %d\n", hccapx->essid_len);
+        if (hccapx->essid_len == 0) {
+            printf("  PROBABLE CAUSE: SSID length was calculated as 0 during init\n");
+            printf("  This happens when strlen() is used on SSIDs with special characters\n");
+            printf("  or when SSID contains null bytes. Check SSID initialization.\n");
+        }
         return false;
     }
-    ESP_LOGI(TAG, "✓ SSID: %.*s (%d bytes)", hccapx->essid_len, hccapx->essid, hccapx->essid_len);
+    printf("✓ SSID: %.*s (%d bytes)\n", hccapx->essid_len, hccapx->essid, hccapx->essid_len);
     
-    ESP_LOGI(TAG, "=========================");
-    ESP_LOGI(TAG, "✓✓✓ HANDSHAKE IS COMPLETE AND VALID ✓✓✓");
+    printf("=========================\n");
+    printf("✓✓✓ HANDSHAKE IS COMPLETE AND VALID ✓✓✓\n");
     
     return true;
 }
@@ -579,8 +622,8 @@ static void sanitize_ssid_for_filename(char *dest, const char *src, size_t max_l
             c == '-' || c == '_' || c == '.' || c == ' ') {
             dest[i] = c;
         } else {
-            // Replace any other character with underscore
-            dest[i] = '_';
+            // Replace any other character with hyphen (not underscore, as list_dir filters those)
+            dest[i] = '-';
         }
     }
     dest[i] = '\0';
@@ -618,17 +661,29 @@ static void format_mac_suffix(const uint8_t *mac_addr, char *output) {
  * @return false if no complete handshake or save failed
  */
 bool attack_handshake_save_to_sd() {
+    printf("=== Attempting to save handshake to SD card ===\n");
+    
     // Check if we have a complete handshake
     hccapx_t *hccapx = (hccapx_t *)hccapx_serializer_get();
     
     if (!hccapx) {
-        ESP_LOGW(TAG, "No handshake data available");
+        printf("✗ SAVE FAILED: No handshake data available from HCCAPX serializer\n");
+        printf("  This usually means HCCAPX serializer was not properly initialized\n");
+        printf("  or no EAPOL frames were processed.\n");
         return false;
     }
     
+    // Log what we got from HCCAPX
+    printf("HCCAPX data retrieved:\n");
+    printf("  SSID length: %d bytes\n", hccapx->essid_len);
+    printf("  SSID: %.*s\n", hccapx->essid_len, hccapx->essid);
+    printf("  Message pair: %d\n", hccapx->message_pair);
+    printf("  EAPOL length: %d bytes\n", hccapx->eapol_len);
+    
     // Validate handshake completeness
     if (!is_handshake_complete(hccapx)) {
-        ESP_LOGW(TAG, "Handshake validation failed - not saving");
+        printf("✗ SAVE FAILED: Handshake validation failed - not saving\n");
+        printf("  See validation details above for specific missing fields\n");
         return false;
     }
     
@@ -638,7 +693,7 @@ bool attack_handshake_save_to_sd() {
     pcap_size = pcap_serializer_get_size();
     
     if (!pcap_buf || pcap_size == 0) {
-        ESP_LOGW(TAG, "No PCAP data to save");
+        printf("✗ No PCAP data to save\n");
         return false;
     }
     
@@ -646,7 +701,7 @@ bool attack_handshake_save_to_sd() {
     struct stat st = {0};
     if (stat("/sdcard/lab/handshakes", &st) == -1) {
         mkdir("/sdcard/lab/handshakes", 0700);
-        ESP_LOGI(TAG, "Created /sdcard/lab/handshakes directory");
+        printf("Created /sdcard/lab/handshakes directory\n");
     }
     
     // Generate filename with SSID, MAC suffix, and timestamp
@@ -672,7 +727,7 @@ bool attack_handshake_save_to_sd() {
     
     FILE *f = fopen(filename, "wb");
     if (!f) {
-        ESP_LOGE(TAG, "Failed to open file for writing: %s", filename);
+        printf("✗ Failed to open file for writing: %s\n", filename);
         return false;
     }
     
@@ -680,27 +735,27 @@ bool attack_handshake_save_to_sd() {
     fclose(f);
     
     if (written != pcap_size) {
-        ESP_LOGE(TAG, "Failed to write complete PCAP (%zu/%u bytes)", written, pcap_size);
+        printf("✗ Failed to write complete PCAP (%zu/%u bytes)\n", written, pcap_size);
         return false;
     }
     
-    ESP_LOGI(TAG, "✓ PCAP saved: %s (%u bytes)", filename, pcap_size);
+    printf("✓ PCAP saved: %s (%u bytes)\n", filename, pcap_size);
     
     // Analyze PCAP content
-    ESP_LOGI(TAG, "  PCAP Analysis:");
-    ESP_LOGI(TAG, "    - Total PCAP size: %u bytes", pcap_size);
-    ESP_LOGI(TAG, "    - PCAP header: 24 bytes");
-    ESP_LOGI(TAG, "    - Frame data: ~%u bytes", pcap_size - 24);
-    ESP_LOGI(TAG, "    - Captured BEACON: %s", captured_beacon ? "YES" : "NO");
-    ESP_LOGI(TAG, "    - Unique handshake frames: %d/4", handshake_frame_count);
+    printf("  PCAP Analysis:\n");
+    printf("    - Total PCAP size: %u bytes\n", pcap_size);
+    printf("    - PCAP header: 24 bytes\n");
+    printf("    - Frame data: ~%u bytes\n", pcap_size - 24);
+    printf("    - Captured BEACON: %s\n", captured_beacon ? "YES" : "NO");
+    printf("    - Unique handshake frames: %d/4\n", handshake_frame_count);
     
     if (!captured_beacon) {
-        ESP_LOGW(TAG, "  WARNING: No BEACON frame! PCAP may fail validation.");
-        ESP_LOGW(TAG, "  Tools need BEACON/PROBE RESPONSE for ESSID to calculate PMK.");
+        printf("  WARNING: No BEACON frame! PCAP may fail validation.\n");
+        printf("  Tools need BEACON/PROBE RESPONSE for ESSID to calculate PMK.\n");
     }
     
     if (handshake_frame_count < 4) {
-        ESP_LOGW(TAG, "  WARNING: Incomplete handshake (%d/4 frames)", handshake_frame_count);
+        printf("  WARNING: Incomplete handshake (%d/4 frames)\n", handshake_frame_count);
     }
     
     // Save HCCAPX file
@@ -710,7 +765,7 @@ bool attack_handshake_save_to_sd() {
     
     f = fopen(filename, "wb");
     if (!f) {
-        ESP_LOGE(TAG, "Failed to open HCCAPX file: %s", filename);
+        printf("✗ Failed to open HCCAPX file: %s\n", filename);
         return false;
     }
     
@@ -718,12 +773,12 @@ bool attack_handshake_save_to_sd() {
     fclose(f);
     
     if (written != sizeof(hccapx_t)) {
-        ESP_LOGE(TAG, "Failed to write complete HCCAPX");
+        printf("✗ Failed to write complete HCCAPX\n");
         return false;
     }
     
-    ESP_LOGI(TAG, "✓ HCCAPX saved: %s (%zu bytes)", filename, sizeof(hccapx_t));
-    ESP_LOGI(TAG, "✓ Complete 4-way handshake saved for SSID: %s (MAC: %s, message_pair: %d)", 
+    printf("✓ HCCAPX saved: %s (%zu bytes)\n", filename, sizeof(hccapx_t));
+    printf("✓ Complete 4-way handshake saved for SSID: %s (MAC: %s, message_pair: %d)\n", 
              ssid_safe, mac_suffix, hccapx->message_pair);
     
     return true;
