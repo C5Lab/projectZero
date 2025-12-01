@@ -103,6 +103,7 @@ We're regular tinkerers who got bored and decided to design the full stack ourse
 - Join the LAB Discord server to discuss ESP32-C5 builds and projectZero workflows: https://discord.gg/57wmJzzR8C
 
 ## Last Changes
+- 2025-11-30 JanOS 0.7.5 / FAP 0.27 - Added Sniffer start with selected targets; Back stops and returns to Sniffers on Show Sniffer Results.
 - 2025-11-29 FAP 0.26 - Setup → SD Manager with folder picker, file listing, delete + scrolling for long names.
 - 2025-11-29 JanOS 0.7.1 - Added `list_dir [path]` and `file_delete <path>` for SD browsing/cleanup alongside `list_sd`.
 - 2025-11-29 FAP 0.25 - Fixed missing propagation of `config.txt` (config load/create popups now appear and settings persist).
