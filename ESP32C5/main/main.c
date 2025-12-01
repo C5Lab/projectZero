@@ -81,7 +81,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "0.7.3"
+#define JANOS_VERSION "0.7.4"
 
 
 #define NEOPIXEL_GPIO      27
@@ -187,6 +187,9 @@ static int sniffer_ap_count = 0;
 static volatile bool sniffer_active = false;
 static volatile bool sniffer_scan_phase = false;
 static int sniff_debug = 0; // Debug flag for detailed packet logging
+static bool sniffer_selected_mode = false; // Flag for selected networks mode
+static int sniffer_selected_channels[MAX_AP_CNT]; // Unique channels from selected networks
+static int sniffer_selected_channels_count = 0; // Number of unique channels
 
 // Packet monitor state
 static volatile bool packet_monitor_active = false;
@@ -658,6 +661,7 @@ static esp_err_t captive_detection_handler(httpd_req_t *req);
 // Sniffer functions
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_process_scan_results(void);
+static void sniffer_init_selected_networks(void);
 static void sniffer_channel_hop(void);
 static void channel_view_task(void *pvParameters);
 static void channel_view_stop(void);
@@ -3069,6 +3073,11 @@ static int cmd_stop(int argc, char **argv) {
         sniffer_current_channel = dual_band_channels[0];
         sniffer_last_channel_hop = 0;
         
+        // Reset selected networks mode state
+        sniffer_selected_mode = false;
+        sniffer_selected_channels_count = 0;
+        memset(sniffer_selected_channels, 0, sizeof(sniffer_selected_channels));
+        
         // Note: sniffer_aps and sniffer_ap_count are preserved for show_sniffer_results
         MY_LOG_INFO(TAG, "Sniffer stopped. Data preserved - use 'show_sniffer_results' to view.");
     }
@@ -3551,42 +3560,93 @@ static int cmd_start_sniffer(int argc, char **argv) {
         return 1;
     }
     
-    MY_LOG_INFO(TAG, "Starting sniffer mode...");
-    
     // Clear previous sniffer data when starting new session
     sniffer_ap_count = 0;
     memset(sniffer_aps, 0, sizeof(sniffer_aps));
     probe_request_count = 0;
     memset(probe_requests, 0, sizeof(probe_requests));
-    MY_LOG_INFO(TAG, "Cleared previous sniffer data.");
     
-    // Phase 1: Start network scan
-    sniffer_active = true;
-   sniffer_scan_phase = true;
-   
-   // Set LED (ignore errors if LED is in invalid state)
-    esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for sniffer: %s", esp_err_to_name(led_err));
-    }
-    
-    esp_err_t err = start_background_scan();
-    if (err != ESP_OK) {
-        sniffer_active = false;
-        sniffer_scan_phase = false;
+    // Check if networks were selected
+    if (g_selected_count > 0 && g_scan_done) {
+        // Selected networks mode - skip scan, use selected networks only
+        MY_LOG_INFO(TAG, "Starting sniffer in SELECTED NETWORKS mode...");
+        MY_LOG_INFO(TAG, "Will monitor %d pre-selected network(s)", g_selected_count);
         
-        // Return LED to idle (ignore errors if LED is in invalid state)
-        led_err = led_set_idle();
-        if (led_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to restore idle LED after sniffer failure: %s", esp_err_to_name(led_err));
+        sniffer_active = true;
+        sniffer_scan_phase = false; // Skip scan phase
+        sniffer_selected_mode = true;
+        
+        // Initialize sniffer with selected networks
+        sniffer_init_selected_networks();
+        
+        if (sniffer_ap_count == 0 || sniffer_selected_channels_count == 0) {
+            MY_LOG_INFO(TAG, "Failed to initialize selected networks for sniffer");
+            sniffer_active = false;
+            sniffer_selected_mode = false;
+            return 1;
         }
         
-        MY_LOG_INFO(TAG, "Failed to start scan for sniffer: %s", esp_err_to_name(err));
-        return 1;
+        // Set LED to green for active sniffing
+        esp_err_t led_err = led_set_color(0, 255, 0); // Green
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to set LED for sniffer: %s", esp_err_to_name(led_err));
+        }
+        
+        // Set promiscuous filter
+        esp_wifi_set_promiscuous_filter(&sniffer_filter);
+        
+        // Enable promiscuous mode
+        esp_wifi_set_promiscuous_rx_cb(sniffer_promiscuous_callback);
+        esp_wifi_set_promiscuous(true);
+        
+        // Initialize channel hopping with selected channels
+        sniffer_channel_index = 0;
+        sniffer_current_channel = sniffer_selected_channels[0];
+        sniffer_last_channel_hop = esp_timer_get_time() / 1000;
+        esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE);
+        
+        // Start channel hopping task
+        if (sniffer_channel_task_handle == NULL) {
+            xTaskCreate(sniffer_channel_task, "sniffer_channel", 2048, NULL, 5, &sniffer_channel_task_handle);
+            MY_LOG_INFO(TAG, "Started sniffer channel hopping task");
+        }
+        
+        MY_LOG_INFO(TAG, "Sniffer: Now monitoring selected networks (no scan performed)");
+        MY_LOG_INFO(TAG, "Use 'show_sniffer_results' to see captured clients or 'stop' to stop.");
+        
+    } else {
+        // Normal mode - scan all networks
+        MY_LOG_INFO(TAG, "Starting sniffer in NORMAL mode (scanning all networks)...");
+        
+        sniffer_active = true;
+        sniffer_scan_phase = true;
+        sniffer_selected_mode = false;
+        
+        // Set LED (ignore errors if LED is in invalid state)
+        esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to set LED for sniffer: %s", esp_err_to_name(led_err));
+        }
+        
+        esp_err_t err = start_background_scan();
+        if (err != ESP_OK) {
+            sniffer_active = false;
+            sniffer_scan_phase = false;
+            sniffer_selected_mode = false;
+            
+            // Return LED to idle (ignore errors if LED is in invalid state)
+            led_err = led_set_idle();
+            if (led_err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to restore idle LED after sniffer failure: %s", esp_err_to_name(led_err));
+            }
+            
+            MY_LOG_INFO(TAG, "Failed to start scan for sniffer: %s", esp_err_to_name(err));
+            return 1;
+        }
+        
+        MY_LOG_INFO(TAG, "Sniffer started - scanning networks...");
+        MY_LOG_INFO(TAG, "Use 'show_sniffer_results' to see captured clients or 'stop' to stop.");
     }
-    
-    MY_LOG_INFO(TAG, "Sniffer started - scanning networks...");
-    MY_LOG_INFO(TAG, "Use 'show_sniffer_results' to see captured clients or 'stop' to stop.");
     
     return 0;
 }
@@ -6574,17 +6634,100 @@ static void sniffer_process_scan_results(void) {
     MY_LOG_INFO(TAG, "Initialized %d APs for sniffer monitoring", sniffer_ap_count);
 }
 
+static void sniffer_init_selected_networks(void) {
+    if (g_selected_count == 0 || !g_scan_done) {
+        MY_LOG_INFO(TAG, "Cannot initialize selected networks - no selection or scan data");
+        return;
+    }
+    
+    MY_LOG_INFO(TAG, "Initializing sniffer for %d selected networks...", g_selected_count);
+    
+    // Clear existing sniffer data
+    sniffer_ap_count = 0;
+    memset(sniffer_aps, 0, sizeof(sniffer_aps));
+    
+    // Clear channel list
+    sniffer_selected_channels_count = 0;
+    memset(sniffer_selected_channels, 0, sizeof(sniffer_selected_channels));
+    
+    // Copy selected networks to sniffer structure
+    for (int i = 0; i < g_selected_count && sniffer_ap_count < MAX_SNIFFER_APS; i++) {
+        int idx = g_selected_indices[i];
+        
+        if (idx < 0 || idx >= (int)g_scan_count) {
+            MY_LOG_INFO(TAG, "Warning: Invalid selected index %d, skipping", idx);
+            continue;
+        }
+        
+        wifi_ap_record_t *scan_ap = &g_scan_results[idx];
+        sniffer_ap_t *sniffer_ap = &sniffer_aps[sniffer_ap_count++];
+        
+        memcpy(sniffer_ap->bssid, scan_ap->bssid, 6);
+        strncpy(sniffer_ap->ssid, (char*)scan_ap->ssid, sizeof(sniffer_ap->ssid) - 1);
+        sniffer_ap->ssid[sizeof(sniffer_ap->ssid) - 1] = '\0';
+        sniffer_ap->channel = scan_ap->primary;
+        sniffer_ap->authmode = scan_ap->authmode;
+        sniffer_ap->rssi = scan_ap->rssi;
+        sniffer_ap->client_count = 0;
+        sniffer_ap->last_seen = esp_timer_get_time() / 1000; // ms
+        
+        // Add channel to unique channel list
+        bool channel_exists = false;
+        for (int j = 0; j < sniffer_selected_channels_count; j++) {
+            if (sniffer_selected_channels[j] == scan_ap->primary) {
+                channel_exists = true;
+                break;
+            }
+        }
+        
+        if (!channel_exists && sniffer_selected_channels_count < MAX_AP_CNT) {
+            sniffer_selected_channels[sniffer_selected_channels_count++] = scan_ap->primary;
+        }
+        
+        MY_LOG_INFO(TAG, "  [%d] SSID='%s' Ch=%d BSSID=%02x:%02x:%02x:%02x:%02x:%02x", 
+                   i + 1, sniffer_ap->ssid, sniffer_ap->channel,
+                   sniffer_ap->bssid[0], sniffer_ap->bssid[1], sniffer_ap->bssid[2],
+                   sniffer_ap->bssid[3], sniffer_ap->bssid[4], sniffer_ap->bssid[5]);
+    }
+    
+    MY_LOG_INFO(TAG, "Sniffer initialized: %d networks on %d unique channel(s)", 
+               sniffer_ap_count, sniffer_selected_channels_count);
+    
+    // Log channels
+    if (sniffer_selected_channels_count > 0) {
+        char channel_list[128] = {0};
+        int offset = 0;
+        for (int i = 0; i < sniffer_selected_channels_count && offset < 120; i++) {
+            offset += snprintf(channel_list + offset, sizeof(channel_list) - offset, 
+                             "%d%s", sniffer_selected_channels[i], 
+                             (i < sniffer_selected_channels_count - 1) ? ", " : "");
+        }
+        MY_LOG_INFO(TAG, "Channel hopping list: [%s]", channel_list);
+    }
+}
+
 static void sniffer_channel_hop(void) {
     if (!sniffer_active || sniffer_scan_phase) {
         return;
     }
     
-    // Use dual-band channel hopping (like Marauder)
-    sniffer_current_channel = dual_band_channels[sniffer_channel_index];
-    
-    sniffer_channel_index++;
-    if (sniffer_channel_index >= dual_band_channels_count) {
-        sniffer_channel_index = 0;
+    // Check if we're in selected networks mode
+    if (sniffer_selected_mode && sniffer_selected_channels_count > 0) {
+        // Use selected channels only
+        sniffer_current_channel = sniffer_selected_channels[sniffer_channel_index];
+        
+        sniffer_channel_index++;
+        if (sniffer_channel_index >= sniffer_selected_channels_count) {
+            sniffer_channel_index = 0;
+        }
+    } else {
+        // Use dual-band channel hopping (like Marauder)
+        sniffer_current_channel = dual_band_channels[sniffer_channel_index];
+        
+        sniffer_channel_index++;
+        if (sniffer_channel_index >= dual_band_channels_count) {
+            sniffer_channel_index = 0;
+        }
     }
     
     esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE);
@@ -6861,8 +7004,9 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                     }
                 }
                 
-                // If AP not found, create it dynamically
-                if (ap_index < 0 && sniffer_ap_count < MAX_SNIFFER_APS) {
+                // If AP not found, create it dynamically (only in normal mode)
+                // In selected mode, only monitor pre-selected networks
+                if (ap_index < 0 && !sniffer_selected_mode && sniffer_ap_count < MAX_SNIFFER_APS) {
                     ap_index = sniffer_ap_count++;
                     memcpy(sniffer_aps[ap_index].bssid, ap_mac, 6);
                     snprintf(sniffer_aps[ap_index].ssid, sizeof(sniffer_aps[ap_index].ssid), 
@@ -6973,8 +7117,9 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
             }
         }
         
-        // If AP not found, try to add it dynamically (like Marauder does)
-        if (ap_index < 0 && sniffer_ap_count < MAX_SNIFFER_APS) {
+        // If AP not found, try to add it dynamically (only in normal mode)
+        // In selected mode, only monitor pre-selected networks
+        if (ap_index < 0 && !sniffer_selected_mode && sniffer_ap_count < MAX_SNIFFER_APS) {
             ap_index = sniffer_ap_count++;
             memcpy(sniffer_aps[ap_index].bssid, ap_mac, 6);
             snprintf(sniffer_aps[ap_index].ssid, sizeof(sniffer_aps[ap_index].ssid), 
