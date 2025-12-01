@@ -54,7 +54,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.26"
+#define LAB_C5_VERSION_TEXT "0.27"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -292,6 +292,7 @@ typedef struct {
     bool wardrive_otg_forced;
     bool wardrive_otg_previous_state;
     bool last_command_sent;
+    bool sniffer_show_results_on_back;
     bool confirm_blackout_yes;
     bool confirm_sniffer_dos_yes;
     uint32_t last_attack_index;
@@ -525,6 +526,8 @@ static void simple_app_process_wardrive_line(SimpleApp* app, const char* line);
 static void simple_app_wardrive_feed(SimpleApp* app, char ch);
 static void simple_app_force_otg_for_wardrive(SimpleApp* app);
 static void simple_app_restore_otg_after_wardrive(SimpleApp* app);
+static bool simple_app_is_start_sniffer_command(const char* command);
+static void simple_app_send_start_sniffer(SimpleApp* app);
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial);
 static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, size_t length);
 static void simple_app_draw_wardrive_serial(SimpleApp* app, Canvas* canvas);
@@ -771,6 +774,7 @@ static const MenuEntry menu_entries_attacks[] = {
     {"Evil Twin", NULL, MenuActionOpenEvilTwinMenu, hint_attack_evil_twin},
     {"Portal", NULL, MenuActionOpenPortalMenu, hint_attack_portal},
     {"Karma", NULL, MenuActionOpenKarmaMenu, hint_attack_karma},
+    {"Sniffer", "start_sniffer", MenuActionCommand, hint_sniffer_start},
     {"SAE Overflow", "sae_overflow", MenuActionCommandWithTargets, hint_attack_sae_overflow},
     {"Sniffer Dog", NULL, MenuActionConfirmSnifferDos, hint_attack_sniffer_dog},
     {"Wardrive", "start_wardrive", MenuActionCommand, hint_attack_wardrive},
@@ -851,6 +855,30 @@ static void simple_app_focus_attacks_menu(SimpleApp* app) {
         app->item_index = entry_count - 1;
     }
     if(entry_count <= visible_count) {
+        app->item_offset = 0;
+    } else {
+        size_t max_offset = entry_count - visible_count;
+        size_t desired_offset =
+            (app->item_index >= visible_count) ? (app->item_index - visible_count + 1) : 0;
+        if(desired_offset > max_offset) {
+            desired_offset = max_offset;
+        }
+        app->item_offset = desired_offset;
+    }
+}
+
+static void simple_app_focus_sniffer_results(SimpleApp* app) {
+    if(!app) return;
+    app->screen = ScreenMenu;
+    app->menu_state = MenuStateItems;
+    app->section_index = MENU_SECTION_SNIFFERS;
+    const MenuSection* section = &menu_sections[MENU_SECTION_SNIFFERS];
+    size_t entry_count = section->entry_count;
+    size_t target_index = (entry_count > 1) ? 1 : 0;
+    app->item_index = (entry_count > 0) ? target_index : 0;
+    size_t visible_count = simple_app_menu_visible_count(app, MENU_SECTION_SNIFFERS);
+    if(visible_count == 0) visible_count = 1;
+    if(entry_count <= visible_count || app->item_index < visible_count) {
         app->item_offset = 0;
     } else {
         size_t max_offset = entry_count - visible_count;
@@ -2938,11 +2966,68 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
     simple_app_update_scroll(app);
 }
 
+static bool simple_app_is_start_sniffer_command(const char* command) {
+    if(!command) return false;
+    const char* cursor = command;
+    const char* needle = "start_sniffer";
+    size_t needle_len = strlen(needle);
+    while(true) {
+        const char* found = strstr(cursor, needle);
+        if(!found) return false;
+        char before = (found == command) ? ' ' : *(found - 1);
+        char after = *(found + needle_len);
+        bool before_ok = (before == ' ' || before == '\n' || before == '\t');
+        bool after_ok = (after == '\0' || after == ' ' || after == '\n' || after == '\t');
+        if(before_ok && after_ok) return true;
+        cursor = found + needle_len;
+    }
+}
+
+static void simple_app_send_start_sniffer(SimpleApp* app) {
+    if(!app) return;
+    if(app->scan_selected_count == 0) {
+        simple_app_send_command(app, "start_sniffer", true);
+        return;
+    }
+
+    char select_command[160];
+    size_t written = snprintf(select_command, sizeof(select_command), "select_networks");
+    if(written >= sizeof(select_command)) written = sizeof(select_command) - 1;
+
+    for(size_t i = 0; i < app->scan_selected_count && written < sizeof(select_command) - 1; i++) {
+        int added = snprintf(
+            select_command + written,
+            sizeof(select_command) - written,
+            " %u",
+            (unsigned)app->scan_selected_numbers[i]);
+        if(added < 0) break;
+        written += (size_t)added;
+        if(written >= sizeof(select_command)) {
+            written = sizeof(select_command) - 1;
+            select_command[written] = '\0';
+            break;
+        }
+    }
+
+    char combined_command[256];
+    int combined_written =
+        snprintf(combined_command, sizeof(combined_command), "%s\n%s", select_command, "start_sniffer");
+    if(combined_written < 0) {
+        simple_app_send_command(app, "start_sniffer", true);
+    } else {
+        if((size_t)combined_written >= sizeof(combined_command)) {
+            combined_command[sizeof(combined_command) - 1] = '\0';
+        }
+        simple_app_send_command(app, combined_command, true);
+    }
+}
+
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial) {
     if(!app || !command || command[0] == '\0') return;
 
     bool is_wardrive_command = strstr(command, "start_wardrive") != NULL;
     bool is_stop_command = strcmp(command, "stop") == 0;
+    bool is_start_sniffer = simple_app_is_start_sniffer_command(command);
     if(is_wardrive_command) {
         app->wardrive_view_active = true;
         simple_app_reset_wardrive_status(app);
@@ -2953,6 +3038,11 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     }
     if(is_stop_command) {
         simple_app_restore_otg_after_wardrive(app);
+    }
+    if(is_stop_command) {
+        app->sniffer_show_results_on_back = false;
+    } else {
+        app->sniffer_show_results_on_back = is_start_sniffer;
     }
 
     app->serial_targets_hint = false;
@@ -6665,7 +6755,11 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             simple_app_send_command_with_targets(app, entry->command);
         } else if(entry->action == MenuActionCommand) {
             if(entry->command && entry->command[0] != '\0') {
-                simple_app_send_command(app, entry->command, true);
+                if(strcmp(entry->command, "start_sniffer") == 0) {
+                    simple_app_send_start_sniffer(app);
+                } else {
+                    simple_app_send_command(app, entry->command, true);
+                }
             }
         } else if(entry->action == MenuActionOpenKarmaMenu) {
             app->screen = ScreenKarmaMenu;
@@ -8401,9 +8495,13 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
     }
 
     if(key == InputKeyBack) {
+        bool focus_sniffer_results = app->sniffer_show_results_on_back;
         simple_app_send_stop_if_needed(app);
         app->serial_targets_hint = false;
-        if(app->blackout_view_active) {
+        if(focus_sniffer_results) {
+            simple_app_focus_sniffer_results(app);
+            app->sniffer_show_results_on_back = false;
+        } else if(app->blackout_view_active) {
             app->blackout_view_active = false;
             simple_app_focus_attacks_menu(app);
         } else {
