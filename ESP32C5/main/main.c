@@ -81,7 +81,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "0.7.4"
+#define JANOS_VERSION "0.7.5"
 
 
 #define NEOPIXEL_GPIO      27
@@ -216,6 +216,8 @@ static int sniffer_channel_index = 0;
 static int64_t sniffer_last_channel_hop = 0;
 static const int sniffer_channel_hop_delay_ms = 250; // 250ms per channel like Marauder
 static TaskHandle_t sniffer_channel_task_handle = NULL;
+static uint32_t sniffer_packet_counter = 0;
+static uint32_t sniffer_last_debug_packet = 0;
 
 // Deauth/Evil Twin attack task
 static TaskHandle_t deauth_attack_task_handle = NULL;
@@ -3565,6 +3567,10 @@ static int cmd_start_sniffer(int argc, char **argv) {
     memset(sniffer_aps, 0, sizeof(sniffer_aps));
     probe_request_count = 0;
     memset(probe_requests, 0, sizeof(probe_requests));
+    sniffer_selected_channels_count = 0;
+    memset(sniffer_selected_channels, 0, sizeof(sniffer_selected_channels));
+    sniffer_packet_counter = 0;
+    sniffer_last_debug_packet = 0;
     
     // Check if networks were selected
     if (g_selected_count > 0 && g_scan_done) {
@@ -6764,30 +6770,28 @@ static void sniffer_channel_task(void *pvParameters) {
 }
 
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
-    static uint32_t packet_counter = 0;
-    static uint32_t last_debug_packet = 0;
-    packet_counter++;
+    sniffer_packet_counter++;
     
     if (!sniffer_active || sniffer_scan_phase) {
         return; // No debug logging here - too frequent
     }
     
     // Show packet count every 20 packets when debug is OFF
-    if (!sniff_debug && (packet_counter % 20) == 0) {
-        printf("Sniffer packet count: %lu\n", packet_counter);
+    if (!sniff_debug && (sniffer_packet_counter % 20) == 0) {
+        printf("Sniffer packet count: %lu\n", sniffer_packet_counter);
     }
     
     // Perform packet-based channel hopping (10 packets OR time-based task will handle it)
-    if ((packet_counter % 10) == 0) {
+    if ((sniffer_packet_counter % 10) == 0) {
         //MY_LOG_INFO(TAG, "Sniffer: Packet-based channel hop (10 packets)");
         sniffer_channel_hop();
     }
     
     // Throttle debug logging - only every 100th packet when debug is on
-    bool should_debug = sniff_debug && ((packet_counter - last_debug_packet) >= 100);
+    bool should_debug = sniff_debug && ((sniffer_packet_counter - sniffer_last_debug_packet) >= 100);
     if (should_debug) {
-        last_debug_packet = packet_counter;
-        printf("DEBUG_CHECKPOINT: Processing packet %lu\n", packet_counter);
+        sniffer_last_debug_packet = sniffer_packet_counter;
+        printf("DEBUG_CHECKPOINT: Processing packet %lu\n", sniffer_packet_counter);
     }
     
     const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
@@ -6800,11 +6804,11 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                               (type == WIFI_PKT_CTRL) ? "CTRL" : "UNKNOWN";
         
         MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Type=%s, Len=%d, Ch=%d, RSSI=%d", 
-                   packet_counter, type_str, len, sniffer_current_channel, pkt->rx_ctrl.rssi);
+                   sniffer_packet_counter, type_str, len, sniffer_current_channel, pkt->rx_ctrl.rssi);
         
         if (len >= 24) {
             MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Addr1=%02X:%02X:%02X:%02X:%02X:%02X, Addr2=%02X:%02X:%02X:%02X:%02X:%02X, Addr3=%02X:%02X:%02X:%02X:%02X:%02X",
-                       packet_counter,
+                       sniffer_packet_counter,
                        frame[4], frame[5], frame[6], frame[7], frame[8], frame[9],
                        frame[10], frame[11], frame[12], frame[13], frame[14], frame[15],
                        frame[16], frame[17], frame[18], frame[19], frame[20], frame[21]);
@@ -6842,13 +6846,13 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
     
     if (sniff_debug) {
         // Minimal debug logging to avoid blocking
-        printf("PKT_%lu: %s T=%d F=%d\n", packet_counter, 
+        printf("PKT_%lu: %s T=%d F=%d\n", sniffer_packet_counter, 
                (type == WIFI_PKT_MGMT) ? "MGMT" : "DATA", to_ds, from_ds);
     }
     
     // Process MGMT packets for client detection (like Marauder)
     if (type == WIFI_PKT_MGMT) {
-        if (should_debug) printf("DEBUG: Processing MGMT packet %lu\n", packet_counter);
+        if (should_debug) printf("DEBUG: Processing MGMT packet %lu\n", sniffer_packet_counter);
         
         uint8_t *client_mac = NULL;
         uint8_t *ap_mac = NULL;
@@ -6859,7 +6863,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                 ap_mac = addr2; // Source is AP
                 if (sniff_debug) {
                     MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Beacon from AP: %02X:%02X:%02X:%02X:%02X:%02X", 
-                               packet_counter, ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
+                               sniffer_packet_counter, ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
                 }
                 // Update AP info if exists
                 for (int i = 0; i < sniffer_ap_count; i++) {
@@ -6876,7 +6880,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                 is_client_frame = true;
                 if (sniff_debug) {
                     MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Probe Request from client: %02X:%02X:%02X:%02X:%02X:%02X", 
-                               packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5]);
+                               sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5]);
                 }
                 break;
                 
@@ -6886,7 +6890,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                 is_client_frame = true;
                 if (sniff_debug) {
                     MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Association Request from client %02X:%02X:%02X:%02X:%02X:%02X to AP %02X:%02X:%02X:%02X:%02X:%02X", 
-                               packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5],
+                               sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5],
                                ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
                 }
                 break;
@@ -6897,14 +6901,14 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                 is_client_frame = true;
                 if (sniff_debug) {
                     MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Authentication from client %02X:%02X:%02X:%02X:%02X:%02X to AP %02X:%02X:%02X:%02X:%02X:%02X", 
-                               packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5],
+                               sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5],
                                ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
                 }
                 break;
                 
             default:
                 if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - Other MGMT frame type 0x%02X", packet_counter, frame_type);
+                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - Other MGMT frame type 0x%02X", sniffer_packet_counter, frame_type);
                 }
                 return;
         }
@@ -6914,7 +6918,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
             // Skip multicast/broadcast client MAC
             if (is_multicast_mac(client_mac) || is_own_device_mac(client_mac)) {
                 if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - multicast or own device MAC", packet_counter);
+                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - multicast or own device MAC", sniffer_packet_counter);
                 }
                 return;
             }
@@ -6985,7 +6989,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                             
                             if (sniff_debug) {
                                 MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Stored probe request for SSID '%s' from %02X:%02X:%02X:%02X:%02X:%02X", 
-                                           packet_counter, ssid,
+                                           sniffer_packet_counter, ssid,
                                            client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5]);
                             }
                         }
@@ -7019,20 +7023,20 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                     
                     if (sniff_debug) {
                         MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: CREATED new AP %s from MGMT frame", 
-                                   packet_counter, sniffer_aps[ap_index].ssid);
+                                   sniffer_packet_counter, sniffer_aps[ap_index].ssid);
                     }
                 }
                 
                 if (ap_index >= 0) {
                     if (sniff_debug) {
                         MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: ACCEPTED - Adding client %02X:%02X:%02X:%02X:%02X:%02X to AP %s", 
-                                   packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5],
+                                   sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5],
                                    sniffer_aps[ap_index].ssid);
                     }
                     add_client_to_ap(ap_index, client_mac, pkt->rx_ctrl.rssi);
                 } else {
                     if (sniff_debug) {
-                        MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - AP list full, cannot create new AP", packet_counter);
+                        MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - AP list full, cannot create new AP", sniffer_packet_counter);
                     }
                 }
             }
@@ -7042,14 +7046,14 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
     
     // Process DATA packets using 802.11 ToDS/FromDS logic (like Marauder)
     if (type == WIFI_PKT_DATA) {
-        if (should_debug) printf("DEBUG: Processing DATA packet %lu\n", packet_counter);
+        if (should_debug) printf("DEBUG: Processing DATA packet %lu\n", sniffer_packet_counter);
         
         uint8_t *client_mac = NULL;
         uint8_t *ap_mac = NULL;
         
         if (sniff_debug) {
             MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Processing DATA packet, ToDS=%d, FromDS=%d", 
-                       packet_counter, to_ds, from_ds);
+                       sniffer_packet_counter, to_ds, from_ds);
         }
         
         // Determine AP and client MAC based on ToDS/FromDS bits (802.11 standard)
@@ -7058,33 +7062,33 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
             ap_mac = addr1;      // Destination is AP
             client_mac = addr2;  // Source is client
             if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: STA->AP direction", packet_counter);
+                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: STA->AP direction", sniffer_packet_counter);
             }
         } else if (!to_ds && from_ds) {
             // AP -> STA: addr1=STA, addr2=AP, addr3=SA  
             ap_mac = addr2;      // Source is AP
             client_mac = addr1;  // Destination is client
             if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: AP->STA direction", packet_counter);
+                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: AP->STA direction", sniffer_packet_counter);
             }
         } else if (!to_ds && !from_ds) {
             // IBSS (ad-hoc): addr1=DA, addr2=SA, addr3=BSSID
             ap_mac = addr3;      // BSSID
             client_mac = addr2;  // Source
             if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: IBSS direction", packet_counter);
+                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: IBSS direction", sniffer_packet_counter);
             }
         } else {
             // WDS (to_ds && from_ds) - skip for now
             if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - WDS frame (ToDS=1, FromDS=1)", packet_counter);
+                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - WDS frame (ToDS=1, FromDS=1)", sniffer_packet_counter);
             }
             return;
         }
         
         if (sniff_debug) {
             MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: AP MAC: %02X:%02X:%02X:%02X:%02X:%02X, Client MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
-                       packet_counter, 
+                       sniffer_packet_counter, 
                        ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
                        client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5]);
         }
@@ -7092,7 +7096,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
         // Skip multicast/broadcast client MAC
         if (is_multicast_mac(client_mac)) {
             if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - client is multicast/broadcast", packet_counter);
+                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - client is multicast/broadcast", sniffer_packet_counter);
             }
             return;
         }
@@ -7100,7 +7104,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
         // Skip our own device as client
         if (is_own_device_mac(client_mac)) {
             if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - client is our own device", packet_counter);
+                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - client is our own device", sniffer_packet_counter);
             }
             return;
         }
@@ -7132,7 +7136,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
             
             if (sniff_debug) {
                 MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: CREATED new AP %s for BSSID %02X:%02X:%02X:%02X:%02X:%02X", 
-                           packet_counter, sniffer_aps[ap_index].ssid,
+                           sniffer_packet_counter, sniffer_aps[ap_index].ssid,
                            ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
             }
         }
@@ -7140,14 +7144,14 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
         if (ap_index >= 0) {
             if (sniff_debug) {
                 MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: ACCEPTED - Adding client %02X:%02X:%02X:%02X:%02X:%02X to AP %s", 
-                           packet_counter, client_mac[0], client_mac[1], client_mac[2], 
+                           sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], 
                            client_mac[3], client_mac[4], client_mac[5], sniffer_aps[ap_index].ssid);
             }
             add_client_to_ap(ap_index, client_mac, pkt->rx_ctrl.rssi);
         } else {
             if (sniff_debug) {
                 MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - AP list full (%d/%d), cannot add new AP %02X:%02X:%02X:%02X:%02X:%02X", 
-                           packet_counter, sniffer_ap_count, MAX_SNIFFER_APS,
+                           sniffer_packet_counter, sniffer_ap_count, MAX_SNIFFER_APS,
                            ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
             }
         }
