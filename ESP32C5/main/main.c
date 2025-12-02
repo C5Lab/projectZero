@@ -681,10 +681,7 @@ static int cmd_reboot(int argc, char **argv);
 static int cmd_led(int argc, char **argv);
 static int cmd_vendor(int argc, char **argv);
 static int cmd_download(int argc, char **argv);
-static int cmd_set_min_channel_time(int argc, char **argv);
-static int cmd_set_max_channel_time(int argc, char **argv);
-static int cmd_get_min_channel_time(int argc, char **argv);
-static int cmd_get_max_channel_time(int argc, char **argv);
+static int cmd_channel_time(int argc, char **argv);
 static esp_err_t start_background_scan(void);
 static void print_scan_results(void);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
@@ -4080,70 +4077,69 @@ static int cmd_led(int argc, char **argv) {
     return 1;
 }
 
-static int cmd_set_min_channel_time(int argc, char **argv) {
+static int cmd_channel_time(int argc, char **argv) {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: setMinChannelTime <value_ms>");
-        MY_LOG_INFO(TAG, "Valid range: 1-10000 ms");
+        MY_LOG_INFO(TAG, "Usage: channel_time set <min|max> <ms> | channel_time read <min|max>");
         return 1;
     }
-    
-    int value = atoi(argv[1]);
-    if (value < 1 || value > 10000) {
-        MY_LOG_INFO(TAG, "Invalid value: %d. Valid range: 1-10000 ms", value);
-        return 1;
-    }
-    
-    g_scan_min_channel_time = (uint32_t)value;
-    
-    // Ensure min <= max
-    if (g_scan_min_channel_time > g_scan_max_channel_time) {
-        g_scan_max_channel_time = g_scan_min_channel_time;
-        MY_LOG_INFO(TAG, "Min channel time set to %u ms (max adjusted to %u ms)", 
-                    (unsigned int)g_scan_min_channel_time, (unsigned int)g_scan_max_channel_time);
-    } else {
-        MY_LOG_INFO(TAG, "Min channel time set to %u ms", (unsigned int)g_scan_min_channel_time);
-    }
-    channel_time_persist_state();
-    return 0;
-}
 
-static int cmd_set_max_channel_time(int argc, char **argv) {
-    if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: setMaxChannelTime <value_ms>");
-        MY_LOG_INFO(TAG, "Valid range: 1-10000 ms");
+    if (strcasecmp(argv[1], "set") == 0) {
+        if (argc < 4) {
+            MY_LOG_INFO(TAG, "Usage: channel_time set <min|max> <ms>");
+            return 1;
+        }
+        
+        int value = atoi(argv[3]);
+        if (value < 1 || value > 10000) {
+            MY_LOG_INFO(TAG, "Invalid value: %d. Valid range: 1-10000 ms", value);
+            return 1;
+        }
+
+        if (strcasecmp(argv[2], "min") == 0) {
+            g_scan_min_channel_time = (uint32_t)value;
+            if (g_scan_min_channel_time > g_scan_max_channel_time) {
+                g_scan_max_channel_time = g_scan_min_channel_time;
+                MY_LOG_INFO(TAG, "Min channel time set to %u ms (max adjusted to %u ms)", 
+                            (unsigned int)g_scan_min_channel_time, (unsigned int)g_scan_max_channel_time);
+            } else {
+                MY_LOG_INFO(TAG, "Min channel time set to %u ms", (unsigned int)g_scan_min_channel_time);
+            }
+            channel_time_persist_state();
+            return 0;
+        } else if (strcasecmp(argv[2], "max") == 0) {
+            g_scan_max_channel_time = (uint32_t)value;
+            if (g_scan_max_channel_time < g_scan_min_channel_time) {
+                g_scan_min_channel_time = g_scan_max_channel_time;
+                MY_LOG_INFO(TAG, "Max channel time set to %u ms (min adjusted to %u ms)", 
+                            (unsigned int)g_scan_max_channel_time, (unsigned int)g_scan_min_channel_time);
+            } else {
+                MY_LOG_INFO(TAG, "Max channel time set to %u ms", (unsigned int)g_scan_max_channel_time);
+            }
+            channel_time_persist_state();
+            return 0;
+        }
+        MY_LOG_INFO(TAG, "Usage: channel_time set <min|max> <ms>");
         return 1;
     }
-    
-    int value = atoi(argv[1]);
-    if (value < 1 || value > 10000) {
-        MY_LOG_INFO(TAG, "Invalid value: %d. Valid range: 1-10000 ms", value);
+
+    if (strcasecmp(argv[1], "read") == 0) {
+        if (argc < 3) {
+            MY_LOG_INFO(TAG, "Usage: channel_time read <min|max>");
+            return 1;
+        }
+        if (strcasecmp(argv[2], "min") == 0) {
+            MY_LOG_INFO(TAG, "%u", (unsigned int)g_scan_min_channel_time);
+            return 0;
+        } else if (strcasecmp(argv[2], "max") == 0) {
+            MY_LOG_INFO(TAG, "%u", (unsigned int)g_scan_max_channel_time);
+            return 0;
+        }
+        MY_LOG_INFO(TAG, "Usage: channel_time read <min|max>");
         return 1;
     }
-    
-    g_scan_max_channel_time = (uint32_t)value;
-    
-    // Ensure max >= min
-    if (g_scan_max_channel_time < g_scan_min_channel_time) {
-        g_scan_min_channel_time = g_scan_max_channel_time;
-        MY_LOG_INFO(TAG, "Max channel time set to %u ms (min adjusted to %u ms)", 
-                    (unsigned int)g_scan_max_channel_time, (unsigned int)g_scan_min_channel_time);
-    } else {
-        MY_LOG_INFO(TAG, "Max channel time set to %u ms", (unsigned int)g_scan_max_channel_time);
-    }
-    channel_time_persist_state();
-    return 0;
-}
 
-static int cmd_get_min_channel_time(int argc, char **argv) {
-    (void)argc; (void)argv;
-    MY_LOG_INFO(TAG, "Min channel time: %u ms", (unsigned int)g_scan_min_channel_time);
-    return 0;
-}
-
-static int cmd_get_max_channel_time(int argc, char **argv) {
-    (void)argc; (void)argv;
-    MY_LOG_INFO(TAG, "Max channel time: %u ms", (unsigned int)g_scan_max_channel_time);
-    return 0;
+    MY_LOG_INFO(TAG, "Usage: channel_time set <min|max> <ms> | channel_time read <min|max>");
+    return 1;
 }
 
 static boot_action_config_t* boot_get_action_slot(const char* which) {
@@ -5994,41 +5990,14 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&led_cmd));
 
-    const esp_console_cmd_t set_min_channel_time_cmd = {
-        .command = "setMinChannelTime",
-        .help = "Sets min scan channel time: setMinChannelTime <value_ms>",
+    const esp_console_cmd_t channel_time_cmd = {
+        .command = "channel_time",
+        .help = "Controls scan channel time: channel_time set <min|max> <ms> | channel_time read <min|max>",
         .hint = NULL,
-        .func = &cmd_set_min_channel_time,
+        .func = &cmd_channel_time,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&set_min_channel_time_cmd));
-
-    const esp_console_cmd_t set_max_channel_time_cmd = {
-        .command = "setMaxChannelTime",
-        .help = "Sets max scan channel time: setMaxChannelTime <value_ms>",
-        .hint = NULL,
-        .func = &cmd_set_max_channel_time,
-        .argtable = NULL
-    };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&set_max_channel_time_cmd));
-
-    const esp_console_cmd_t get_min_channel_time_cmd = {
-        .command = "getMinChannelTime",
-        .help = "Gets current min scan channel time",
-        .hint = NULL,
-        .func = &cmd_get_min_channel_time,
-        .argtable = NULL
-    };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&get_min_channel_time_cmd));
-
-    const esp_console_cmd_t get_max_channel_time_cmd = {
-        .command = "getMaxChannelTime",
-        .help = "Gets current max scan channel time",
-        .hint = NULL,
-        .func = &cmd_get_max_channel_time,
-        .argtable = NULL
-    };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&get_max_channel_time_cmd));
+    ESP_ERROR_CHECK(esp_console_cmd_register(&channel_time_cmd));
 
     const esp_console_cmd_t download_cmd = {
         .command = "download",
@@ -6236,10 +6205,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
     MY_LOG_INFO(TAG,"  boot_button read|list|set|status");
     MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
-    MY_LOG_INFO(TAG,"  setMinChannelTime <value_ms>");
-    MY_LOG_INFO(TAG,"  setMaxChannelTime <value_ms>");
-    MY_LOG_INFO(TAG,"  getMinChannelTime");
-    MY_LOG_INFO(TAG,"  getMaxChannelTime");
+    MY_LOG_INFO(TAG,"  channel_time set <min|max> <ms> | channel_time read <min|max>");
     MY_LOG_INFO(TAG,"  download");
     MY_LOG_INFO(TAG,"  ping");
     MY_LOG_INFO(TAG,"  stop");
