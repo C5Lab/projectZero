@@ -35,6 +35,7 @@ typedef enum {
     ScreenSerial,
     ScreenResults,
     ScreenSetupScanner,
+    ScreenSetupScannerTiming,
     ScreenSetupKarma,
     ScreenSetupLed,
     ScreenSetupBoot,
@@ -54,7 +55,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.27"
+#define LAB_C5_VERSION_TEXT "0.28"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -124,6 +125,12 @@ typedef enum {
 #define CHANNEL_VIEW_COMMAND "channel_view"
 #define CHANNEL_VIEW_LINE_BUFFER 64
 
+#define SCANNER_CHANNEL_TIME_MIN_MS 10
+#define SCANNER_CHANNEL_TIME_MAX_MS 2000
+#define SCANNER_CHANNEL_TIME_STEP_MS 10
+#define SCANNER_CHANNEL_TIME_DEFAULT_MIN 100
+#define SCANNER_CHANNEL_TIME_DEFAULT_MAX 300
+
 static const uint8_t channel_view_channels_24ghz[] = {
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
 static const uint8_t channel_view_channels_5ghz[] = {
@@ -185,6 +192,7 @@ typedef enum {
     MenuActionToggleBacklight,
     MenuActionToggleOtgPower,
     MenuActionOpenScannerSetup,
+    MenuActionOpenScannerTiming,
     MenuActionOpenLedSetup,
     MenuActionOpenBootSetup,
     MenuActionOpenDownload,
@@ -402,6 +410,13 @@ typedef struct {
     char vendor_read_buffer[32];
     size_t vendor_read_length;
     int16_t scanner_min_power;
+    uint16_t scanner_min_channel_time;
+    uint16_t scanner_max_channel_time;
+    size_t scanner_timing_index;
+    bool scanner_timing_min_pending;
+    bool scanner_timing_max_pending;
+    char scanner_timing_read_buffer[32];
+    size_t scanner_timing_read_length;
     size_t scanner_setup_index;
     bool scanner_adjusting_power;
     bool otg_power_enabled;
@@ -521,6 +536,12 @@ static void simple_app_send_vendor_command(SimpleApp* app, bool enable);
 static void simple_app_request_vendor_status(SimpleApp* app);
 static bool simple_app_handle_vendor_status_line(SimpleApp* app, const char* line);
 static void simple_app_vendor_feed(SimpleApp* app, char ch);
+static void simple_app_request_scanner_timing(SimpleApp* app);
+static void simple_app_request_channel_time(SimpleApp* app, bool request_min);
+static void simple_app_send_channel_time(SimpleApp* app, bool is_min, uint16_t value);
+static bool simple_app_handle_scanner_timing_line(SimpleApp* app, const char* line);
+static void simple_app_scanner_timing_feed(SimpleApp* app, char ch);
+static void simple_app_modify_channel_time(SimpleApp* app, bool is_min, int32_t delta);
 static void simple_app_reset_wardrive_status(SimpleApp* app);
 static void simple_app_process_wardrive_line(SimpleApp* app, const char* line);
 static void simple_app_wardrive_feed(SimpleApp* app, char ch);
@@ -745,6 +766,8 @@ static const char hint_setup_boot[] =
     "Assign boot button\nShort/Long actions\nToggle on/off\nPick command\nSaved in device.";
 static const char hint_setup_filters[] =
     "Choose visible fields\nSimplify result list\nHide unused data\nTailor display\nOK flips options.";
+static const char hint_setup_scanner_timing[] =
+    "Channel dwell times\nLeft/Right adjusts\nMin/Max per channel\nSync with board\nStored in config.";
 static const char hint_setup_console[] =
     "Open live console\nStream UART output\nWatch commands\nDebug operations\nClose with Back.";
 static const char hint_setup_download[] =
@@ -803,6 +826,7 @@ static const MenuEntry menu_entries_setup[] = {
     {menu_label_boot_short, NULL, MenuActionOpenBootSetup, hint_setup_boot},
     {menu_label_boot_long, NULL, MenuActionOpenBootSetup, hint_setup_boot},
     {"Scanner Filters", NULL, MenuActionOpenScannerSetup, hint_setup_filters},
+    {"Scanner Timing", NULL, MenuActionOpenScannerTiming, hint_setup_scanner_timing},
     {"SD Manager", NULL, MenuActionOpenSdManager, hint_setup_sd_manager},
     {"Download Mode", NULL, MenuActionOpenDownload, hint_setup_download},
     {"Console", NULL, MenuActionOpenConsole, hint_setup_console},
@@ -1582,6 +1606,190 @@ static void simple_app_vendor_feed(SimpleApp* app, char ch) {
     app->vendor_read_buffer[app->vendor_read_length++] = ch;
 }
 
+static uint16_t simple_app_clamp_channel_time(uint32_t value) {
+    if(value < SCANNER_CHANNEL_TIME_MIN_MS) {
+        value = SCANNER_CHANNEL_TIME_MIN_MS;
+    } else if(value > SCANNER_CHANNEL_TIME_MAX_MS) {
+        value = SCANNER_CHANNEL_TIME_MAX_MS;
+    }
+    return (uint16_t)value;
+}
+
+static bool simple_app_extract_first_uint(const char* line, uint32_t* value_out) {
+    if(!line || !value_out) return false;
+    const char* cursor = line;
+    while(*cursor && !isdigit((unsigned char)*cursor)) {
+        cursor++;
+    }
+    if(*cursor == '\0') return false;
+    char* endptr = NULL;
+    uint32_t parsed = (uint32_t)strtoul(cursor, &endptr, 10);
+    if(endptr == cursor) return false;
+    *value_out = parsed;
+    return true;
+}
+
+static bool simple_app_set_channel_time(SimpleApp* app, bool is_min, uint16_t value, bool from_remote) {
+    if(!app) return false;
+    uint16_t clamped = simple_app_clamp_channel_time(value);
+    uint16_t before_min = app->scanner_min_channel_time;
+    uint16_t before_max = app->scanner_max_channel_time;
+
+    if(is_min) {
+        app->scanner_min_channel_time = clamped;
+        if(app->scanner_max_channel_time < clamped) {
+            app->scanner_max_channel_time = clamped;
+        }
+    } else {
+        app->scanner_max_channel_time = clamped;
+        if(app->scanner_min_channel_time > clamped) {
+            app->scanner_min_channel_time = clamped;
+        }
+    }
+
+    bool changed = (before_min != app->scanner_min_channel_time) ||
+                   (before_max != app->scanner_max_channel_time);
+
+    if(changed && !from_remote) {
+        simple_app_mark_config_dirty(app);
+    }
+
+    if(changed && app->viewport && app->screen == ScreenSetupScannerTiming) {
+        view_port_update(app->viewport);
+    }
+
+    return changed;
+}
+
+static void simple_app_request_channel_time(SimpleApp* app, bool request_min) {
+    if(!app || !app->serial) return;
+    if(request_min) {
+        app->scanner_timing_min_pending = true;
+    } else {
+        app->scanner_timing_max_pending = true;
+    }
+    app->scanner_timing_read_length = 0;
+    app->scanner_timing_read_buffer[0] = '\0';
+    simple_app_send_command_quiet(app, request_min ? "getMinChannelTime" : "getMaxChannelTime");
+}
+
+static void simple_app_request_scanner_timing(SimpleApp* app) {
+    if(!app || !app->serial) return;
+    app->scanner_timing_min_pending = true;
+    app->scanner_timing_max_pending = true;
+    app->scanner_timing_read_length = 0;
+    app->scanner_timing_read_buffer[0] = '\0';
+    simple_app_send_command_quiet(app, "getMinChannelTime\ngetMaxChannelTime");
+}
+
+static void simple_app_send_channel_time(SimpleApp* app, bool is_min, uint16_t value) {
+    if(!app || !app->serial) return;
+    char command[48];
+    snprintf(
+        command,
+        sizeof(command),
+        "%s %u",
+        is_min ? "setMinChannelTime" : "setMaxChannelTime",
+        (unsigned)value);
+    simple_app_send_command_quiet(app, command);
+    simple_app_request_channel_time(app, is_min);
+}
+
+static bool simple_app_handle_scanner_timing_line(SimpleApp* app, const char* line) {
+    if(!app || !line) return false;
+
+    char lower[96];
+    size_t len = simple_app_bounded_strlen(line, sizeof(lower) - 1);
+    for(size_t i = 0; i < len; i++) {
+        lower[i] = (char)tolower((unsigned char)line[i]);
+    }
+    lower[len] = '\0';
+
+    bool mentions_min = strstr(lower, "minchanneltime") != NULL ||
+                        strstr(lower, "min channel time") != NULL ||
+                        strstr(lower, "min channel scan") != NULL;
+    bool mentions_max = strstr(lower, "maxchanneltime") != NULL ||
+                        strstr(lower, "max channel time") != NULL ||
+                        strstr(lower, "max channel scan") != NULL;
+
+    if(!mentions_min && !mentions_max) {
+        if(app->scanner_timing_min_pending && !app->scanner_timing_max_pending) {
+            mentions_min = true;
+        } else if(app->scanner_timing_max_pending && !app->scanner_timing_min_pending) {
+            mentions_max = true;
+        } else if(app->scanner_timing_min_pending) {
+            mentions_min = true;
+        } else if(app->scanner_timing_max_pending) {
+            mentions_max = true;
+        } else {
+            return false;
+        }
+    }
+
+    if(mentions_min && mentions_max) {
+        if(app->scanner_timing_min_pending && !app->scanner_timing_max_pending) {
+            mentions_max = false;
+        } else if(app->scanner_timing_max_pending && !app->scanner_timing_min_pending) {
+            mentions_min = false;
+        }
+    }
+
+    uint32_t parsed = 0;
+    if(!simple_app_extract_first_uint(line, &parsed)) {
+        return false;
+    }
+
+    bool handled = false;
+    if(mentions_min) {
+        handled = simple_app_set_channel_time(app, true, (uint16_t)parsed, true) || handled;
+        app->scanner_timing_min_pending = false;
+    }
+    if(mentions_max) {
+        handled = simple_app_set_channel_time(app, false, (uint16_t)parsed, true) || handled;
+        app->scanner_timing_max_pending = false;
+    }
+
+    return handled;
+}
+
+static void simple_app_scanner_timing_feed(SimpleApp* app, char ch) {
+    if(!app || (!app->scanner_timing_min_pending && !app->scanner_timing_max_pending)) return;
+    if(ch == '\r') return;
+    if(ch == '\n') {
+        if(app->scanner_timing_read_length > 0) {
+            app->scanner_timing_read_buffer[app->scanner_timing_read_length] = '\0';
+            simple_app_handle_scanner_timing_line(app, app->scanner_timing_read_buffer);
+        }
+        app->scanner_timing_read_length = 0;
+        return;
+    }
+    if(app->scanner_timing_read_length + 1 >= sizeof(app->scanner_timing_read_buffer)) {
+        app->scanner_timing_read_length = 0;
+        return;
+    }
+    app->scanner_timing_read_buffer[app->scanner_timing_read_length++] = ch;
+}
+
+static void simple_app_modify_channel_time(SimpleApp* app, bool is_min, int32_t delta) {
+    if(!app || delta == 0) return;
+    uint16_t target = is_min ? app->scanner_min_channel_time : app->scanner_max_channel_time;
+    int32_t proposed = (int32_t)target + delta;
+    if(proposed < 0) {
+        proposed = 0;
+    }
+    uint16_t before_min = app->scanner_min_channel_time;
+    uint16_t before_max = app->scanner_max_channel_time;
+
+    if(simple_app_set_channel_time(app, is_min, (uint16_t)proposed, false)) {
+        if(app->scanner_min_channel_time != before_min) {
+            simple_app_send_channel_time(app, true, app->scanner_min_channel_time);
+        }
+        if(app->scanner_max_channel_time != before_max) {
+            simple_app_send_channel_time(app, false, app->scanner_max_channel_time);
+        }
+    }
+}
+
 static void simple_app_set_wardrive_status(SimpleApp* app, const char* text, bool numeric) {
     if(!app || !text) return;
     snprintf(app->wardrive_status_text, sizeof(app->wardrive_status_text), "%s", text);
@@ -2121,6 +2329,10 @@ static void simple_app_parse_config_line(SimpleApp* app, char* line) {
         app->scanner_show_vendor = simple_app_parse_bool_value(value, app->scanner_show_vendor);
     } else if(strcmp(key, "min_power") == 0) {
         app->scanner_min_power = (int16_t)strtol(value, NULL, 10);
+    } else if(strcmp(key, "min_channel_time") == 0) {
+        app->scanner_min_channel_time = (uint16_t)strtoul(value, NULL, 10);
+    } else if(strcmp(key, "max_channel_time") == 0) {
+        app->scanner_max_channel_time = (uint16_t)strtoul(value, NULL, 10);
     } else if(strcmp(key, "backlight_enabled") == 0) {
         app->backlight_enabled = simple_app_parse_bool_value(value, app->backlight_enabled);
     } else if(strcmp(key, "otg_power_enabled") == 0) {
@@ -2185,6 +2397,8 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             "show_band=%d\n"
             "show_vendor=%d\n"
             "min_power=%d\n"
+            "min_channel_time=%u\n"
+            "max_channel_time=%u\n"
             "backlight_enabled=%d\n"
             "otg_power_enabled=%d\n"
             "karma_duration=%lu\n"
@@ -2200,6 +2414,8 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             app->scanner_show_band ? 1 : 0,
             app->scanner_show_vendor ? 1 : 0,
             (int)app->scanner_min_power,
+            (unsigned)app->scanner_min_channel_time,
+            (unsigned)app->scanner_max_channel_time,
             app->backlight_enabled ? 1 : 0,
             app->otg_power_enabled ? 1 : 0,
             (unsigned long)app->karma_sniffer_duration_sec,
@@ -2284,6 +2500,19 @@ static void simple_app_load_config(SimpleApp* app) {
         app->scanner_min_power = SCAN_POWER_MAX_DBM;
     } else if(app->scanner_min_power < SCAN_POWER_MIN_DBM) {
         app->scanner_min_power = SCAN_POWER_MIN_DBM;
+    }
+    if(app->scanner_min_channel_time < SCANNER_CHANNEL_TIME_MIN_MS) {
+        app->scanner_min_channel_time = SCANNER_CHANNEL_TIME_MIN_MS;
+    } else if(app->scanner_min_channel_time > SCANNER_CHANNEL_TIME_MAX_MS) {
+        app->scanner_min_channel_time = SCANNER_CHANNEL_TIME_MAX_MS;
+    }
+    if(app->scanner_max_channel_time < SCANNER_CHANNEL_TIME_MIN_MS) {
+        app->scanner_max_channel_time = SCANNER_CHANNEL_TIME_MIN_MS;
+    } else if(app->scanner_max_channel_time > SCANNER_CHANNEL_TIME_MAX_MS) {
+        app->scanner_max_channel_time = SCANNER_CHANNEL_TIME_MAX_MS;
+    }
+    if(app->scanner_min_channel_time > app->scanner_max_channel_time) {
+        app->scanner_max_channel_time = app->scanner_min_channel_time;
     }
     if(app->karma_sniffer_duration_sec < KARMA_SNIFFER_DURATION_MIN_SEC) {
         app->karma_sniffer_duration_sec = KARMA_SNIFFER_DURATION_MIN_SEC;
@@ -2953,6 +3182,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_led_feed(app, ch);
         simple_app_boot_feed(app, ch);
         simple_app_vendor_feed(app, ch);
+        simple_app_scanner_timing_feed(app, ch);
         simple_app_wardrive_feed(app, ch);
     }
 
@@ -6516,6 +6746,43 @@ static void simple_app_draw_setup_scanner(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str(canvas, 2, 62, footer);
 }
 
+static void simple_app_draw_setup_scanner_timing(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 6, 14, "Scanner Timing");
+
+    canvas_set_font(canvas, FontSecondary);
+    uint8_t y = 32;
+    char line[48];
+
+    snprintf(
+        line,
+        sizeof(line),
+        "Min Channel Scan: %ums",
+        (unsigned)app->scanner_min_channel_time);
+    simple_app_truncate_text(line, 26);
+    if(app->scanner_timing_index == 0) {
+        canvas_draw_str(canvas, 2, y, ">");
+    }
+    canvas_draw_str(canvas, 12, y, line);
+
+    y += 14;
+    snprintf(
+        line,
+        sizeof(line),
+        "Max Channel Scan: %ums",
+        (unsigned)app->scanner_max_channel_time);
+    simple_app_truncate_text(line, 26);
+    if(app->scanner_timing_index == 1) {
+        canvas_draw_str(canvas, 2, y, ">");
+    }
+    canvas_draw_str(canvas, 12, y, line);
+
+    canvas_draw_str(canvas, 2, 62, "Left/Right adjust, Back exit");
+}
+
 static void simple_app_draw(Canvas* canvas, void* context) {
     SimpleApp* app = context;
     canvas_clear(canvas);
@@ -6574,6 +6841,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
         break;
     case ScreenSetupScanner:
         simple_app_draw_setup_scanner(app, canvas);
+        break;
+    case ScreenSetupScannerTiming:
+        simple_app_draw_setup_scanner_timing(app, canvas);
         break;
     case ScreenSetupLed:
         simple_app_draw_setup_led(app, canvas);
@@ -6734,6 +7004,7 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
                 simple_app_request_led_status(app);
                 simple_app_request_boot_status(app);
                 simple_app_request_vendor_status(app);
+                simple_app_request_scanner_timing(app);
             }
             view_port_update(app->viewport);
             return;
@@ -6794,6 +7065,10 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             return;
         } else if(entry->action == MenuActionOpenDownload) {
             simple_app_download_bridge_start(app);
+        } else if(entry->action == MenuActionOpenScannerTiming) {
+            app->screen = ScreenSetupScannerTiming;
+            app->scanner_timing_index = 0;
+            simple_app_request_scanner_timing(app);
         } else if(entry->action == MenuActionOpenScannerSetup) {
             app->screen = ScreenSetupScanner;
             app->scanner_setup_index = 0;
@@ -8328,6 +8603,47 @@ static void simple_app_handle_setup_scanner_input(SimpleApp* app, InputKey key) 
     }
 }
 
+static void simple_app_handle_setup_scanner_timing_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+
+    if(key == InputKeyBack) {
+        simple_app_save_config_if_dirty(app, "Config saved", true);
+        app->screen = ScreenMenu;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyUp) {
+        if(app->scanner_timing_index > 0) {
+            app->scanner_timing_index = 0;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    if(key == InputKeyDown) {
+        if(app->scanner_timing_index < 1) {
+            app->scanner_timing_index = 1;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    if(key == InputKeyLeft) {
+        simple_app_modify_channel_time(app, app->scanner_timing_index == 0, -SCANNER_CHANNEL_TIME_STEP_MS);
+    } else if(key == InputKeyRight) {
+        simple_app_modify_channel_time(app, app->scanner_timing_index == 0, SCANNER_CHANNEL_TIME_STEP_MS);
+    } else if(key == InputKeyOk) {
+        simple_app_request_channel_time(app, app->scanner_timing_index == 0);
+    }
+}
+
 static void simple_app_handle_setup_led_input(SimpleApp* app, InputKey key) {
     if(!app) return;
 
@@ -8707,6 +9023,9 @@ static void simple_app_input(InputEvent* event, void* context) {
     case ScreenSetupScanner:
         simple_app_handle_setup_scanner_input(app, event->key);
         break;
+    case ScreenSetupScannerTiming:
+        simple_app_handle_setup_scanner_timing_input(app, event->key);
+        break;
     case ScreenSetupLed:
         simple_app_handle_setup_led_input(app, event->key);
         break;
@@ -8852,6 +9171,13 @@ int32_t Lab_C5_app(void* p) {
     app->vendor_read_length = 0;
     app->vendor_read_buffer[0] = '\0';
     app->scanner_min_power = SCAN_POWER_MIN_DBM;
+    app->scanner_min_channel_time = SCANNER_CHANNEL_TIME_DEFAULT_MIN;
+    app->scanner_max_channel_time = SCANNER_CHANNEL_TIME_DEFAULT_MAX;
+    app->scanner_timing_index = 0;
+    app->scanner_timing_min_pending = false;
+    app->scanner_timing_max_pending = false;
+    app->scanner_timing_read_length = 0;
+    app->scanner_timing_read_buffer[0] = '\0';
     app->scanner_setup_index = 0;
     app->scanner_adjusting_power = false;
     app->otg_power_initial_state = furi_hal_power_is_otg_enabled();
