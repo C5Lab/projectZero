@@ -81,7 +81,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "0.7.5"
+#define JANOS_VERSION "0.7.6"
 
 
 #define NEOPIXEL_GPIO      27
@@ -297,7 +297,55 @@ static const wifi_promiscuous_filter_t sniffer_filter = {
 static char wardrive_gps_buffer[GPS_BUF_SIZE];
 static wifi_ap_record_t wardrive_scan_results[MAX_AP_CNT];
 
+// Configurable scan channel time (in ms)
+static uint32_t g_scan_min_channel_time = 100;
+static uint32_t g_scan_max_channel_time = 300;
 
+#define SCAN_TIME_NVS_NAMESPACE "scancfg"
+#define SCAN_TIME_NVS_KEY_MIN   "min_time"
+#define SCAN_TIME_NVS_KEY_MAX   "max_time"
+
+static void channel_time_persist_state(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(SCAN_TIME_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Channel time NVS open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_u32(handle, SCAN_TIME_NVS_KEY_MIN, g_scan_min_channel_time);
+    if (err == ESP_OK) {
+        err = nvs_set_u32(handle, SCAN_TIME_NVS_KEY_MAX, g_scan_max_channel_time);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Channel time NVS save failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void channel_time_load_state_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(SCAN_TIME_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Channel time NVS read open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    uint32_t min_val = 0, max_val = 0;
+    err = nvs_get_u32(handle, SCAN_TIME_NVS_KEY_MIN, &min_val);
+    if (err == ESP_OK && min_val >= 1 && min_val <= 10000) {
+        g_scan_min_channel_time = min_val;
+    }
+    err = nvs_get_u32(handle, SCAN_TIME_NVS_KEY_MAX, &max_val);
+    if (err == ESP_OK && max_val >= 1 && max_val <= 10000) {
+        g_scan_max_channel_time = max_val;
+    }
+    nvs_close(handle);
+}
 
 /**
  * @brief Deauthentication frame template
@@ -348,6 +396,7 @@ static uint16_t g_scan_count = 0;
 static volatile bool g_scan_in_progress = false;
 static volatile bool g_scan_done = false;
 static volatile uint32_t g_last_scan_status = 1; // 0 => success, non-zero => failure/unknown
+static int64_t g_scan_start_time_us = 0;
 
 static int g_selected_indices[MAX_AP_CNT];
 static int g_selected_count = 0;
@@ -632,6 +681,10 @@ static int cmd_reboot(int argc, char **argv);
 static int cmd_led(int argc, char **argv);
 static int cmd_vendor(int argc, char **argv);
 static int cmd_download(int argc, char **argv);
+static int cmd_set_min_channel_time(int argc, char **argv);
+static int cmd_set_max_channel_time(int argc, char **argv);
+static int cmd_get_min_channel_time(int argc, char **argv);
+static int cmd_get_max_channel_time(int argc, char **argv);
 static esp_err_t start_background_scan(void);
 static void print_scan_results(void);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
@@ -897,7 +950,13 @@ static void wifi_event_handler(void *event_handler_arg,
                 esp_wifi_scan_get_ap_records(&g_scan_count, g_scan_results);
                 
                 if (!suppress_scan_logs) {
-                    MY_LOG_INFO(TAG, "Retrieved %u network records", g_scan_count);
+                    if (g_scan_start_time_us > 0) {
+                        int64_t elapsed_us = esp_timer_get_time() - g_scan_start_time_us;
+                        float elapsed_s = elapsed_us / 1000000.0f;
+                        MY_LOG_INFO(TAG, "Retrieved %u network records in %.1fs", g_scan_count, elapsed_s);
+                    } else {
+                        MY_LOG_INFO(TAG, "Retrieved %u network records", g_scan_count);
+                    }
                     
                     // Automatically display scan results after completion
                     if (g_scan_count > 0 && !sniffer_active) {
@@ -1141,8 +1200,8 @@ static esp_err_t start_background_scan(void) {
         .channel = 0,
         .show_hidden = true,
         .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active.min = 100,
-        .scan_time.active.max = 300,
+        .scan_time.active.min = g_scan_min_channel_time,
+        .scan_time.active.max = g_scan_max_channel_time,
     };
     
     g_scan_in_progress = true;
@@ -1788,7 +1847,9 @@ static int cmd_scan_networks(int argc, char **argv) {
         return 1;
     }
     
-    MY_LOG_INFO(TAG, "Background scan started. Wait approx 15s..");
+    g_scan_start_time_us = esp_timer_get_time();
+    MY_LOG_INFO(TAG, "Background scan started (min: %u ms, max: %u ms per channel)", 
+                (unsigned int)g_scan_min_channel_time, (unsigned int)g_scan_max_channel_time);
     return 0;
 }
 
@@ -4019,6 +4080,72 @@ static int cmd_led(int argc, char **argv) {
     return 1;
 }
 
+static int cmd_set_min_channel_time(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: setMinChannelTime <value_ms>");
+        MY_LOG_INFO(TAG, "Valid range: 1-10000 ms");
+        return 1;
+    }
+    
+    int value = atoi(argv[1]);
+    if (value < 1 || value > 10000) {
+        MY_LOG_INFO(TAG, "Invalid value: %d. Valid range: 1-10000 ms", value);
+        return 1;
+    }
+    
+    g_scan_min_channel_time = (uint32_t)value;
+    
+    // Ensure min <= max
+    if (g_scan_min_channel_time > g_scan_max_channel_time) {
+        g_scan_max_channel_time = g_scan_min_channel_time;
+        MY_LOG_INFO(TAG, "Min channel time set to %u ms (max adjusted to %u ms)", 
+                    (unsigned int)g_scan_min_channel_time, (unsigned int)g_scan_max_channel_time);
+    } else {
+        MY_LOG_INFO(TAG, "Min channel time set to %u ms", (unsigned int)g_scan_min_channel_time);
+    }
+    channel_time_persist_state();
+    return 0;
+}
+
+static int cmd_set_max_channel_time(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: setMaxChannelTime <value_ms>");
+        MY_LOG_INFO(TAG, "Valid range: 1-10000 ms");
+        return 1;
+    }
+    
+    int value = atoi(argv[1]);
+    if (value < 1 || value > 10000) {
+        MY_LOG_INFO(TAG, "Invalid value: %d. Valid range: 1-10000 ms", value);
+        return 1;
+    }
+    
+    g_scan_max_channel_time = (uint32_t)value;
+    
+    // Ensure max >= min
+    if (g_scan_max_channel_time < g_scan_min_channel_time) {
+        g_scan_min_channel_time = g_scan_max_channel_time;
+        MY_LOG_INFO(TAG, "Max channel time set to %u ms (min adjusted to %u ms)", 
+                    (unsigned int)g_scan_max_channel_time, (unsigned int)g_scan_min_channel_time);
+    } else {
+        MY_LOG_INFO(TAG, "Max channel time set to %u ms", (unsigned int)g_scan_max_channel_time);
+    }
+    channel_time_persist_state();
+    return 0;
+}
+
+static int cmd_get_min_channel_time(int argc, char **argv) {
+    (void)argc; (void)argv;
+    MY_LOG_INFO(TAG, "Min channel time: %u ms", (unsigned int)g_scan_min_channel_time);
+    return 0;
+}
+
+static int cmd_get_max_channel_time(int argc, char **argv) {
+    (void)argc; (void)argv;
+    MY_LOG_INFO(TAG, "Max channel time: %u ms", (unsigned int)g_scan_max_channel_time);
+    return 0;
+}
+
 static boot_action_config_t* boot_get_action_slot(const char* which) {
     if (which == NULL) {
         return NULL;
@@ -5867,6 +5994,42 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&led_cmd));
 
+    const esp_console_cmd_t set_min_channel_time_cmd = {
+        .command = "setMinChannelTime",
+        .help = "Sets min scan channel time: setMinChannelTime <value_ms>",
+        .hint = NULL,
+        .func = &cmd_set_min_channel_time,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_min_channel_time_cmd));
+
+    const esp_console_cmd_t set_max_channel_time_cmd = {
+        .command = "setMaxChannelTime",
+        .help = "Sets max scan channel time: setMaxChannelTime <value_ms>",
+        .hint = NULL,
+        .func = &cmd_set_max_channel_time,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_max_channel_time_cmd));
+
+    const esp_console_cmd_t get_min_channel_time_cmd = {
+        .command = "getMinChannelTime",
+        .help = "Gets current min scan channel time",
+        .hint = NULL,
+        .func = &cmd_get_min_channel_time,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&get_min_channel_time_cmd));
+
+    const esp_console_cmd_t get_max_channel_time_cmd = {
+        .command = "getMaxChannelTime",
+        .help = "Gets current max scan channel time",
+        .hint = NULL,
+        .func = &cmd_get_max_channel_time,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&get_max_channel_time_cmd));
+
     const esp_console_cmd_t download_cmd = {
         .command = "download",
         .help = "Force reboot into ROM download (UART flashing) mode",
@@ -5989,6 +6152,8 @@ void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
     printf("NVS initialized OK\n");
 
+    channel_time_load_state_from_nvs();
+
     printf("Step 4: Init LED strip\n");
     // 1. LED strip configuration
     led_strip_config_t strip_cfg = {
@@ -6071,6 +6236,10 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
     MY_LOG_INFO(TAG,"  boot_button read|list|set|status");
     MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
+    MY_LOG_INFO(TAG,"  setMinChannelTime <value_ms>");
+    MY_LOG_INFO(TAG,"  setMaxChannelTime <value_ms>");
+    MY_LOG_INFO(TAG,"  getMinChannelTime");
+    MY_LOG_INFO(TAG,"  getMaxChannelTime");
     MY_LOG_INFO(TAG,"  download");
     MY_LOG_INFO(TAG,"  ping");
     MY_LOG_INFO(TAG,"  stop");
