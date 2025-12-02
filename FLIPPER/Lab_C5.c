@@ -1670,16 +1670,13 @@ static void simple_app_request_channel_time(SimpleApp* app, bool request_min) {
     }
     app->scanner_timing_read_length = 0;
     app->scanner_timing_read_buffer[0] = '\0';
-    simple_app_send_command_quiet(app, request_min ? "getMinChannelTime" : "getMaxChannelTime");
+    simple_app_send_command_quiet(app, request_min ? "channel_time read min" : "channel_time read max");
 }
 
 static void simple_app_request_scanner_timing(SimpleApp* app) {
     if(!app || !app->serial) return;
-    app->scanner_timing_min_pending = true;
-    app->scanner_timing_max_pending = true;
-    app->scanner_timing_read_length = 0;
-    app->scanner_timing_read_buffer[0] = '\0';
-    simple_app_send_command_quiet(app, "getMinChannelTime\ngetMaxChannelTime");
+    simple_app_request_channel_time(app, true);
+    simple_app_request_channel_time(app, false);
 }
 
 static void simple_app_send_channel_time(SimpleApp* app, bool is_min, uint16_t value) {
@@ -1688,8 +1685,8 @@ static void simple_app_send_channel_time(SimpleApp* app, bool is_min, uint16_t v
     snprintf(
         command,
         sizeof(command),
-        "%s %u",
-        is_min ? "setMinChannelTime" : "setMaxChannelTime",
+        "channel_time set %s %u",
+        is_min ? "min" : "max",
         (unsigned)value);
     simple_app_send_command_quiet(app, command);
     simple_app_request_channel_time(app, is_min);
@@ -1705,13 +1702,13 @@ static bool simple_app_handle_scanner_timing_line(SimpleApp* app, const char* li
     }
     lower[len] = '\0';
 
-    bool mentions_min = strstr(lower, "minchanneltime") != NULL ||
-                        strstr(lower, "min channel time") != NULL ||
-                        strstr(lower, "min channel scan") != NULL;
-    bool mentions_max = strstr(lower, "maxchanneltime") != NULL ||
-                        strstr(lower, "max channel time") != NULL ||
-                        strstr(lower, "max channel scan") != NULL;
+    bool mentions_min = strstr(lower, "min") != NULL;
+    bool mentions_max = strstr(lower, "max") != NULL;
 
+    uint32_t parsed = 0;
+    bool has_number = simple_app_extract_first_uint(line, &parsed);
+
+    // If no explicit min/max marker, use pending flags to decide target.
     if(!mentions_min && !mentions_max) {
         if(app->scanner_timing_min_pending && !app->scanner_timing_max_pending) {
             mentions_min = true;
@@ -1721,23 +1718,11 @@ static bool simple_app_handle_scanner_timing_line(SimpleApp* app, const char* li
             mentions_min = true;
         } else if(app->scanner_timing_max_pending) {
             mentions_max = true;
-        } else {
-            return false;
         }
     }
 
-    if(mentions_min && mentions_max) {
-        if(app->scanner_timing_min_pending && !app->scanner_timing_max_pending) {
-            mentions_max = false;
-        } else if(app->scanner_timing_max_pending && !app->scanner_timing_min_pending) {
-            mentions_min = false;
-        }
-    }
-
-    uint32_t parsed = 0;
-    if(!simple_app_extract_first_uint(line, &parsed)) {
-        return false;
-    }
+    if(!mentions_min && !mentions_max) return false;
+    if(!has_number) return false;
 
     bool handled = false;
     if(mentions_min) {
