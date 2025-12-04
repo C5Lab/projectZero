@@ -56,7 +56,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.29"
+#define LAB_C5_VERSION_TEXT "0.30"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -466,6 +466,8 @@ typedef struct {
     uint32_t board_last_ping_tick;
     uint32_t board_last_rx_tick;
     bool board_missing_shown;
+    bool board_bootstrap_active;
+    bool board_bootstrap_reboot_sent;
     uint32_t last_input_tick;
     bool help_hint_visible;
     bool package_monitor_active;
@@ -537,6 +539,7 @@ static void simple_app_prepare_exit(SimpleApp* app);
 static void simple_app_request_viewport_update(SimpleApp* app);
 static void simple_app_flush_viewport(SimpleApp* app);
 static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long);
+static void simple_app_on_board_online(SimpleApp* app, const char* source);
 static void simple_app_handle_board_ready(SimpleApp* app);
 static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas);
 static void simple_app_send_vendor_command(SimpleApp* app, bool enable);
@@ -1333,7 +1336,12 @@ static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long) {
 }
 
 static void simple_app_handle_board_ready(SimpleApp* app) {
+    simple_app_on_board_online(app, "ready");
+}
+
+static void simple_app_on_board_online(SimpleApp* app, const char* source) {
     if(!app) return;
+    (void)source;
 
     bool was_ready = app->board_ready_seen;
     app->board_ready_seen = true;
@@ -1342,8 +1350,31 @@ static void simple_app_handle_board_ready(SimpleApp* app) {
     app->board_last_rx_tick = furi_get_tick();
     app->board_missing_shown = false;
 
+    if(app->board_bootstrap_active) {
+        if(app->board_bootstrap_reboot_sent) {
+            app->board_bootstrap_active = false;
+            app->board_bootstrap_reboot_sent = false;
+            simple_app_show_status_message(app, "Board ready", 1200, true);
+        } else {
+            simple_app_show_status_message(
+                app,
+                "Board discovery\nBoard Found\nRebooting\nfor stability",
+                0,
+                true);
+            app->board_bootstrap_reboot_sent = true;
+            simple_app_send_command_quiet(app, "reboot");
+            app->board_ready_seen = false;
+            app->board_ping_outstanding = false;
+            app->board_last_ping_tick = furi_get_tick() - BOARD_PING_INTERVAL_MS;
+        }
+        if(app->viewport) {
+            simple_app_request_viewport_update(app);
+        }
+        return;
+    }
+
     if(!was_ready) {
-        simple_app_show_status_message(app, "Board found", 1000, true);
+        simple_app_show_status_message(app, "Board Found", 1000, true);
         if(app->viewport) {
             simple_app_request_viewport_update(app);
         }
@@ -1369,19 +1400,7 @@ static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas) {
 }
 
 static void simple_app_handle_pong(SimpleApp* app) {
-    if(!app) return;
-    bool was_ready = app->board_ready_seen;
-    app->board_ready_seen = true;
-    app->board_sync_pending = false;
-    app->board_ping_outstanding = false;
-    app->board_last_rx_tick = furi_get_tick();
-    app->board_missing_shown = false;
-    if(!was_ready) {
-        simple_app_show_status_message(app, "Board found", 1000, true);
-        if(app->viewport) {
-            simple_app_request_viewport_update(app);
-        }
-    }
+    simple_app_on_board_online(app, "pong");
 }
 
 static void simple_app_send_ping(SimpleApp* app) {
@@ -1397,11 +1416,12 @@ static void simple_app_ping_watchdog(SimpleApp* app) {
     if(!app) return;
     uint32_t now = furi_get_tick();
 
-    // Only ping when idle on main menu (section list) and no modal status
-    bool idle_menu = (app->screen == ScreenMenu) && (app->menu_state == MenuStateSections) &&
-                     !simple_app_status_message_is_active(app);
+    bool status_active = simple_app_status_message_is_active(app);
+    // Ping on idle menu (no modal) or whenever we are running the bootstrap discovery
+    bool idle_menu = (app->screen == ScreenMenu) && (app->menu_state == MenuStateSections);
+    bool allow_ping = ((idle_menu && !status_active) || app->board_bootstrap_active);
 
-    if(idle_menu && !app->board_ping_outstanding &&
+    if(allow_ping && !app->board_ping_outstanding &&
        (now - app->board_last_ping_tick) >= BOARD_PING_INTERVAL_MS) {
         simple_app_send_ping(app);
     }
@@ -1410,6 +1430,18 @@ static void simple_app_ping_watchdog(SimpleApp* app) {
        (now - app->board_last_ping_tick) >= BOARD_PING_TIMEOUT_MS) {
         app->board_ping_outstanding = false;
         app->board_ready_seen = false;
+
+        if(app->board_bootstrap_active) {
+            const char* waiting_msg = app->board_bootstrap_reboot_sent
+                                          ? "Rebooting\nfor stability\nWaiting for board..."
+                                          : "Board discovery\nWaiting for board...";
+            simple_app_show_status_message(app, waiting_msg, 0, true);
+            if(app->viewport) {
+                simple_app_request_viewport_update(app);
+            }
+            return;
+        }
+
         if(!app->board_missing_shown) {
             app->board_missing_shown = true;
             simple_app_show_status_message(app, "No board", 1500, true);
@@ -9287,6 +9319,8 @@ int32_t Lab_C5_app(void* p) {
     app->board_last_ping_tick = 0;
     app->board_last_rx_tick = furi_get_tick();
     app->board_missing_shown = false;
+    app->board_bootstrap_active = true;
+    app->board_bootstrap_reboot_sent = false;
     app->boot_short_enabled = false;
     app->boot_long_enabled = false;
     app->boot_short_command_index = 1; // start_sniffer_dog
@@ -9366,7 +9400,7 @@ int32_t Lab_C5_app(void* p) {
     }
 
     if(!simple_app_status_message_is_active(app)) {
-        simple_app_show_status_message(app, "Board detection", 1500, true);
+        simple_app_show_status_message(app, "Board discovery\nSending ping...", 0, true);
     }
     simple_app_send_ping(app);
     simple_app_flush_viewport(app);
