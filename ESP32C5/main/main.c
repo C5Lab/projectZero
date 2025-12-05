@@ -87,7 +87,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "0.7.6"
+#define JANOS_VERSION "1.0.0"
 
 
 #define NEOPIXEL_GPIO      27
@@ -306,6 +306,9 @@ typedef enum {
 
 static radio_mode_t current_radio_mode = RADIO_MODE_NONE;
 static bool wifi_initialized = false;
+static bool netif_initialized = false;
+static bool event_loop_initialized = false;
+static esp_netif_t *sta_netif_handle = NULL;
 
 // ============================================================================
 // Memory logging helper
@@ -1242,11 +1245,22 @@ static void verify_password(const char* password) {
 // --- Wi-Fi initialization (STA only - uses less memory) ---
 // AP mode will be enabled dynamically when needed (Evil Twin, Portal)
 static esp_err_t wifi_init_ap_sta(void) {
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    // Initialize netif only once (shared between WiFi and BLE modes)
+    if (!netif_initialized) {
+        ESP_ERROR_CHECK(esp_netif_init());
+        netif_initialized = true;
+    }
+    
+    // Create event loop only once (shared between WiFi and BLE modes)
+    if (!event_loop_initialized) {
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        event_loop_initialized = true;
+    }
 
-    // Only create STA interface by default (AP created when needed)
-    esp_netif_create_default_wifi_sta();
+    // Only create STA interface once (reused on WiFi re-init)
+    if (sta_netif_handle == NULL) {
+        sta_netif_handle = esp_netif_create_default_wifi_sta();
+    }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -1353,15 +1367,12 @@ static bool ensure_ble_mode(void)
             MY_LOG_INFO(TAG, "Switching from WiFi to BLE mode...");
             esp_wifi_stop();
             esp_wifi_deinit();
-            // Destroy netifs
+            // Only destroy AP netif, keep STA netif for reuse on WiFi re-init
             esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
             if (ap_netif) {
                 esp_netif_destroy(ap_netif);
             }
-            esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-            if (sta_netif) {
-                esp_netif_destroy(sta_netif);
-            }
+            // Note: sta_netif_handle is preserved for WiFi re-initialization
             wifi_initialized = false;
             current_radio_mode = RADIO_MODE_NONE;
             // Now initialize BLE (recursive call with RADIO_MODE_NONE)
