@@ -45,6 +45,7 @@ typedef enum {
     ScreenChannelView,
     ScreenConfirmBlackout,
     ScreenConfirmSnifferDos,
+    ScreenConfirmExit,
     ScreenKarmaMenu,
     ScreenEvilTwinMenu,
     ScreenPortalMenu,
@@ -55,7 +56,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.28"
+#define LAB_C5_VERSION_TEXT "0.31"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -76,17 +77,22 @@ typedef enum {
 #define MENU_VISIBLE_COUNT_SNIFFERS 4
 #define MENU_VISIBLE_COUNT_ATTACKS 4
 #define MENU_VISIBLE_COUNT_SETUP 4
+#define MENU_SECTION_VISIBLE_COUNT 6
+#define MENU_SECTION_BASE_Y 14
+#define MENU_SECTION_SPACING 9
 #define PACKAGE_MONITOR_MAX_HISTORY 96
 #define MENU_TITLE_Y 12
 #define MENU_ITEM_BASE_Y 24
 #define MENU_ITEM_SPACING 12
 #define MENU_SCROLL_TRACK_Y 14
 #define SERIAL_VISIBLE_LINES 6
-#define SERIAL_LINE_CHAR_LIMIT 22
+#define SERIAL_LINE_CHAR_LIMIT 26
 #define SERIAL_TEXT_LINE_HEIGHT 10
 #define DISPLAY_WIDTH 128
 #define DISPLAY_HEIGHT 64
 #define WARD_DRIVE_CONSOLE_LINES 3
+#define BT_SCAN_CONSOLE_LINES 4
+#define AIRTAG_REFRESH_INTERVAL_MS 30000
 #define RESULT_DEFAULT_MAX_LINES 4
 #define RESULT_DEFAULT_LINE_HEIGHT 12
 #define RESULT_DEFAULT_CHAR_LIMIT (SERIAL_LINE_CHAR_LIMIT - 3)
@@ -104,7 +110,8 @@ typedef enum {
 #define MENU_SECTION_TARGETS 2
 #define MENU_SECTION_ATTACKS 3
 #define MENU_SECTION_MONITORING 4
-#define MENU_SECTION_SETUP 5
+#define MENU_SECTION_BLUETOOTH 5
+#define MENU_SECTION_SETUP 6
 #define SCANNER_FILTER_VISIBLE_COUNT 3
 #define SCANNER_SCAN_COMMAND "scan_networks"
 #define TARGETS_RESULTS_COMMAND "show_scan_results"
@@ -278,6 +285,7 @@ typedef struct {
     bool exit_app;
     MenuState menu_state;
     uint32_t section_index;
+    uint32_t section_offset;
     uint32_t item_index;
     uint32_t item_offset;
     AppScreen screen;
@@ -299,11 +307,24 @@ typedef struct {
     size_t wardrive_line_length;
     bool wardrive_otg_forced;
     bool wardrive_otg_previous_state;
+    bool bt_scan_view_active;
+    bool bt_scan_summary_seen;
+    bool airtag_scan_mode;
+    uint32_t airtag_next_refresh_tick;
+    int bt_scan_airtags;
+    int bt_scan_smarttags;
+    int bt_scan_total;
+    char bt_scan_line_buffer[96];
+    size_t bt_scan_line_length;
     bool last_command_sent;
     bool sniffer_show_results_on_back;
     bool confirm_blackout_yes;
     bool confirm_sniffer_dos_yes;
+    bool confirm_exit_yes;
     uint32_t last_attack_index;
+    bool board_reboot_sent;
+    bool exit_confirm_active;
+    uint32_t exit_confirm_tick;
     size_t evil_twin_menu_index;
     EvilTwinHtmlEntry evil_twin_html_entries[EVIL_TWIN_MAX_HTML_FILES];
     size_t evil_twin_html_count;
@@ -462,6 +483,8 @@ typedef struct {
     uint32_t board_last_ping_tick;
     uint32_t board_last_rx_tick;
     bool board_missing_shown;
+    bool board_bootstrap_active;
+    bool board_bootstrap_reboot_sent;
     uint32_t last_input_tick;
     bool help_hint_visible;
     bool package_monitor_active;
@@ -530,7 +553,7 @@ static void simple_app_draw_download_bridge(SimpleApp* app, Canvas* canvas);
 static bool simple_app_download_bridge_start(SimpleApp* app);
 static void simple_app_download_bridge_stop(SimpleApp* app);
 static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long);
-static void simple_app_handle_board_ready(SimpleApp* app);
+static void simple_app_on_board_online(SimpleApp* app, const char* source);
 static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas);
 static void simple_app_send_vendor_command(SimpleApp* app, bool enable);
 static void simple_app_request_vendor_status(SimpleApp* app);
@@ -684,6 +707,9 @@ static void simple_app_clear_status_message(SimpleApp* app);
 static bool simple_app_status_message_is_active(SimpleApp* app);
 static void simple_app_send_command_with_targets(SimpleApp* app, const char* base_command);
 static size_t simple_app_menu_visible_count(const SimpleApp* app, uint32_t section_index);
+static size_t simple_app_section_visible_count(void);
+static void simple_app_adjust_section_offset(SimpleApp* app);
+static void simple_app_prepare_exit(SimpleApp* app);
 static void simple_app_update_scroll(SimpleApp* app);
 static size_t simple_app_render_display_lines(
     SimpleApp* app,
@@ -725,6 +751,8 @@ static const char hint_section_attacks[] =
     "Test features here\nUse only on own lab\nTargets come from\nSelected networks\nFollow local laws.";
 static const char hint_section_monitoring[] =
     "Monitoring tools\nPacket rates +\nChannel analyzer\nSwitch views with\nUp/Down buttons.";
+static const char hint_section_bluetooth[] =
+    "BLE utilities\nTrackers and tags\nCounts Air/SmartTags\nScroll log on top\nStop with Back.";
 static const char hint_section_setup[] =
     "General settings\nBacklight, 5V, LED\nAdjust scanner view\nConsole with logs\nUseful for debug.";
 
@@ -755,6 +783,10 @@ static const char hint_attack_sniffer_dog[] =
     "Listens to traffic \nbetween AP and STA \nand sends deauth packet \ndirectly to this STA";
 static const char hint_attack_wardrive[] =
     "Logs networks around you \nwith GPS coordinates.";
+static const char hint_bluetooth_airtag[] =
+    "Continuous tag scan\nOutputs counts only\n30s cycles\nStop/back to exit\nFor Air/SmartTags.";
+static const char hint_bluetooth_scan[] =
+    "One-off 10s BLE scan\nLists seen devices\nHighlights trackers\nSummary shown below\nStop/back to reset.";
 
 static const char hint_setup_backlight[] =
     "Toggle screen light\nKeep brightness high\nOr allow auto dim\nGreat for console\nLong sessions.";
@@ -813,6 +845,11 @@ static const MenuEntry menu_entries_monitoring[] = {
     {"Channel View", NULL, MenuActionOpenChannelView, hint_monitor_channel},
 };
 
+static const MenuEntry menu_entries_bluetooth[] = {
+    {"AirTag Scan", "scan_airtag", MenuActionCommand, hint_bluetooth_airtag},
+    {"BT Scan", "scan_bt", MenuActionCommand, hint_bluetooth_scan},
+};
+
 static char menu_label_backlight[24] = "Backlight: On";
 static char menu_label_otg_power[24] = "5V Power: On";
 static char menu_label_led[24] = "LED: On (10)";
@@ -833,12 +870,13 @@ static const MenuEntry menu_entries_setup[] = {
 };
 
 static const MenuSection menu_sections[] = {
-    {"Scanner", hint_section_scanner, NULL, 0, 12, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 22, MENU_VISIBLE_COUNT_SNIFFERS * MENU_ITEM_SPACING},
-    {"Targets", hint_section_targets, NULL, 0, 32, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 42, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
-    {"Monitoring", hint_section_monitoring, menu_entries_monitoring, sizeof(menu_entries_monitoring) / sizeof(menu_entries_monitoring[0]), 52, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 62, MENU_VISIBLE_COUNT_SETUP * MENU_ITEM_SPACING},
+    {"Scanner", hint_section_scanner, NULL, 0, 10, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 18, MENU_VISIBLE_COUNT_SNIFFERS * MENU_ITEM_SPACING},
+    {"Targets", hint_section_targets, NULL, 0, 26, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 34, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
+    {"Monitoring", hint_section_monitoring, menu_entries_monitoring, sizeof(menu_entries_monitoring) / sizeof(menu_entries_monitoring[0]), 42, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Bluetooth", hint_section_bluetooth, menu_entries_bluetooth, sizeof(menu_entries_bluetooth) / sizeof(menu_entries_bluetooth[0]), 50, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 58, MENU_VISIBLE_COUNT_SETUP * MENU_ITEM_SPACING},
 };
 
 static const size_t menu_section_count = sizeof(menu_sections) / sizeof(menu_sections[0]);
@@ -855,6 +893,34 @@ static size_t simple_app_menu_visible_count(const SimpleApp* app, uint32_t secti
         return MENU_VISIBLE_COUNT_SETUP;
     }
     return MENU_VISIBLE_COUNT;
+}
+
+static size_t simple_app_section_visible_count(void) {
+    return (menu_section_count < MENU_SECTION_VISIBLE_COUNT) ? menu_section_count : MENU_SECTION_VISIBLE_COUNT;
+}
+
+static void simple_app_adjust_section_offset(SimpleApp* app) {
+    if(!app) return;
+    size_t visible = simple_app_section_visible_count();
+    if(visible == 0) {
+        app->section_offset = 0;
+        return;
+    }
+
+    if(app->section_index >= menu_section_count) {
+        app->section_index = (menu_section_count > 0) ? (menu_section_count - 1) : 0;
+    }
+
+    size_t max_offset = (menu_section_count > visible) ? (menu_section_count - visible) : 0;
+    if(app->section_offset > max_offset) {
+        app->section_offset = max_offset;
+    }
+
+    if(app->section_index < app->section_offset) {
+        app->section_offset = app->section_index;
+    } else if(app->section_index >= app->section_offset + visible) {
+        app->section_offset = app->section_index - visible + 1;
+    }
 }
 
 static void simple_app_focus_attacks_menu(SimpleApp* app) {
@@ -1273,7 +1339,7 @@ static void simple_app_boot_feed(SimpleApp* app, char ch) {
             } else if(strcmp(line_ptr, "Boot Long Pressed") == 0) {
                 simple_app_handle_boot_trigger(app, true);
             } else if(strcmp(line_ptr, "BOARD READY") == 0) {
-                simple_app_handle_board_ready(app);
+                simple_app_on_board_online(app, "boot");
             }
         }
         line_len = 0;
@@ -1325,8 +1391,9 @@ static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long) {
     }
 }
 
-static void simple_app_handle_board_ready(SimpleApp* app) {
+static void simple_app_on_board_online(SimpleApp* app, const char* source) {
     if(!app) return;
+    (void)source;
 
     bool was_ready = app->board_ready_seen;
     app->board_ready_seen = true;
@@ -1334,6 +1401,26 @@ static void simple_app_handle_board_ready(SimpleApp* app) {
     app->board_ping_outstanding = false;
     app->board_last_rx_tick = furi_get_tick();
     app->board_missing_shown = false;
+
+    if(app->board_bootstrap_active) {
+        if(app->board_bootstrap_reboot_sent) {
+            app->board_bootstrap_active = false;
+            app->board_bootstrap_reboot_sent = false;
+            simple_app_show_status_message(app, "Board ready", 1200, true);
+        } else {
+            simple_app_show_status_message(
+                app, "Board discovery\nBoard Found\nRebooting\nfor stability", 0, true);
+            app->board_bootstrap_reboot_sent = true;
+            simple_app_send_command_quiet(app, "reboot");
+            app->board_ready_seen = false;
+            app->board_ping_outstanding = false;
+            app->board_last_ping_tick = furi_get_tick() - BOARD_PING_INTERVAL_MS;
+        }
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
 
     if(!was_ready) {
         simple_app_show_status_message(app, "Board found", 1000, true);
@@ -1362,19 +1449,7 @@ static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas) {
 }
 
 static void simple_app_handle_pong(SimpleApp* app) {
-    if(!app) return;
-    bool was_ready = app->board_ready_seen;
-    app->board_ready_seen = true;
-    app->board_sync_pending = false;
-    app->board_ping_outstanding = false;
-    app->board_last_rx_tick = furi_get_tick();
-    app->board_missing_shown = false;
-    if(!was_ready) {
-        simple_app_show_status_message(app, "Board found", 1000, true);
-        if(app->viewport) {
-            view_port_update(app->viewport);
-        }
-    }
+    simple_app_on_board_online(app, "pong");
 }
 
 static void simple_app_send_ping(SimpleApp* app) {
@@ -1390,11 +1465,12 @@ static void simple_app_ping_watchdog(SimpleApp* app) {
     if(!app) return;
     uint32_t now = furi_get_tick();
 
-    // Only ping when idle on main menu (section list) and no modal status
-    bool idle_menu = (app->screen == ScreenMenu) && (app->menu_state == MenuStateSections) &&
-                     !simple_app_status_message_is_active(app);
+    bool status_active = simple_app_status_message_is_active(app);
+    // Ping on idle menu (no modal) or whenever we are running the bootstrap discovery
+    bool idle_menu = (app->screen == ScreenMenu) && (app->menu_state == MenuStateSections);
+    bool allow_ping = ((idle_menu && !status_active) || app->board_bootstrap_active);
 
-    if(idle_menu && !app->board_ping_outstanding &&
+    if(allow_ping && !app->board_ping_outstanding &&
        (now - app->board_last_ping_tick) >= BOARD_PING_INTERVAL_MS) {
         simple_app_send_ping(app);
     }
@@ -1403,9 +1479,25 @@ static void simple_app_ping_watchdog(SimpleApp* app) {
        (now - app->board_last_ping_tick) >= BOARD_PING_TIMEOUT_MS) {
         app->board_ping_outstanding = false;
         app->board_ready_seen = false;
+
+        if(app->board_bootstrap_active) {
+            const char* waiting_msg = app->board_bootstrap_reboot_sent
+                                          ? "Rebooting\nfor stability\nWaiting for board..."
+                                          : "Board discovery\nWaiting for board...";
+            simple_app_show_status_message(app, waiting_msg, 0, true);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
+
         if(!app->board_missing_shown) {
             app->board_missing_shown = true;
             simple_app_show_status_message(app, "No board", 1500, true);
+        }
+        if(!app->board_reboot_sent) {
+            simple_app_send_command_quiet(app, "reboot");
+            app->board_reboot_sent = true;
         }
     }
 }
@@ -1841,6 +1933,73 @@ static void simple_app_wardrive_feed(SimpleApp* app, char ch) {
         return;
     }
     app->wardrive_line_buffer[app->wardrive_line_length++] = ch;
+}
+
+static void simple_app_reset_bt_scan_summary(SimpleApp* app) {
+    if(!app) return;
+    app->bt_scan_airtags = 0;
+    app->bt_scan_smarttags = 0;
+    app->bt_scan_total = 0;
+    app->bt_scan_line_length = 0;
+    app->bt_scan_summary_seen = false;
+    app->airtag_scan_mode = false;
+    app->airtag_next_refresh_tick = 0;
+}
+
+static void simple_app_process_bt_scan_line(SimpleApp* app, const char* line) {
+    if(!app || !line || !app->bt_scan_view_active) return;
+
+    int airtags = 0;
+    int smarttags = 0;
+    int total = 0;
+
+    if(app->airtag_scan_mode) {
+        if(sscanf(line, " %d , %d", &airtags, &smarttags) == 2 ||
+           sscanf(line, " %d,%d", &airtags, &smarttags) == 2) {
+            app->bt_scan_airtags = airtags;
+            app->bt_scan_smarttags = smarttags;
+            app->bt_scan_total = airtags + smarttags;
+            uint32_t interval_ticks = furi_ms_to_ticks(AIRTAG_REFRESH_INTERVAL_MS);
+            if(interval_ticks == 0) interval_ticks = 1;
+            app->airtag_next_refresh_tick = furi_get_tick() + interval_ticks;
+        }
+        return;
+    }
+
+    if(sscanf(
+           line, "Summary: %d AirTags, %d SmartTags, %d total devices", &airtags, &smarttags, &total) == 3) {
+        app->bt_scan_airtags = airtags;
+        app->bt_scan_smarttags = smarttags;
+        app->bt_scan_total = total;
+        app->bt_scan_summary_seen = true;
+        return;
+    }
+
+    if(sscanf(line, "Found %d devices", &total) == 1) {
+        app->bt_scan_total = total;
+    }
+}
+
+static void simple_app_bt_scan_feed(SimpleApp* app, char ch) {
+    if(!app) return;
+    if(!app->bt_scan_view_active) {
+        app->bt_scan_line_length = 0;
+        return;
+    }
+    if(ch == '\r') return;
+    if(ch == '\n') {
+        if(app->bt_scan_line_length > 0) {
+            app->bt_scan_line_buffer[app->bt_scan_line_length] = '\0';
+            simple_app_process_bt_scan_line(app, app->bt_scan_line_buffer);
+        }
+        app->bt_scan_line_length = 0;
+        return;
+    }
+    if(app->bt_scan_line_length + 1 >= sizeof(app->bt_scan_line_buffer)) {
+        app->bt_scan_line_length = 0;
+        return;
+    }
+    app->bt_scan_line_buffer[app->bt_scan_line_length++] = ch;
 }
 
 static void simple_app_force_otg_for_wardrive(SimpleApp* app) {
@@ -3075,8 +3234,13 @@ static size_t simple_app_visible_serial_lines(const SimpleApp* app) {
     if(app->screen == ScreenConsole) {
         return CONSOLE_VISIBLE_LINES;
     }
-    if(app->screen == ScreenSerial && app->wardrive_view_active) {
-        return WARD_DRIVE_CONSOLE_LINES;
+    if(app->screen == ScreenSerial) {
+        if(app->bt_scan_view_active) {
+            return BT_SCAN_CONSOLE_LINES;
+        }
+        if(app->wardrive_view_active) {
+            return WARD_DRIVE_CONSOLE_LINES;
+        }
     }
     return SERIAL_VISIBLE_LINES;
 }
@@ -3168,6 +3332,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_boot_feed(app, ch);
         simple_app_vendor_feed(app, ch);
         simple_app_scanner_timing_feed(app, ch);
+        simple_app_bt_scan_feed(app, ch);
         simple_app_wardrive_feed(app, ch);
     }
 
@@ -3243,6 +3408,8 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     bool is_wardrive_command = strstr(command, "start_wardrive") != NULL;
     bool is_stop_command = strcmp(command, "stop") == 0;
     bool is_start_sniffer = simple_app_is_start_sniffer_command(command);
+    bool is_airtag_scan_command = strstr(command, "scan_airtag") != NULL;
+    bool is_bt_scan_command = is_airtag_scan_command || strstr(command, "scan_bt") != NULL;
     if(is_wardrive_command) {
         app->wardrive_view_active = true;
         simple_app_reset_wardrive_status(app);
@@ -3250,6 +3417,19 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     } else if(app->wardrive_view_active) {
         app->wardrive_view_active = false;
         simple_app_reset_wardrive_status(app);
+    }
+    if(is_bt_scan_command) {
+        app->bt_scan_view_active = true;
+        simple_app_reset_bt_scan_summary(app);
+        app->airtag_scan_mode = is_airtag_scan_command;
+        if(is_airtag_scan_command) {
+            uint32_t refresh_ticks = furi_ms_to_ticks(AIRTAG_REFRESH_INTERVAL_MS);
+            if(refresh_ticks == 0) refresh_ticks = 1;
+            app->airtag_next_refresh_tick = furi_get_tick() + refresh_ticks;
+        }
+    } else if(app->bt_scan_view_active) {
+        app->bt_scan_view_active = false;
+        simple_app_reset_bt_scan_summary(app);
     }
     if(is_stop_command) {
         simple_app_restore_otg_after_wardrive(app);
@@ -3378,6 +3558,37 @@ static void simple_app_send_stop_if_needed(SimpleApp* app) {
     app->blackout_view_active = false;
 }
 
+static void simple_app_prepare_exit(SimpleApp* app) {
+    if(!app) return;
+
+    simple_app_send_stop_if_needed(app);
+    simple_app_close_evil_twin_popup(app);
+    simple_app_reset_evil_twin_listing(app);
+    simple_app_reset_portal_ssid_listing(app);
+    simple_app_reset_sd_listing(app);
+    simple_app_reset_karma_probe_listing(app);
+    simple_app_reset_karma_html_listing(app);
+    simple_app_reset_scan_results(app);
+    simple_app_clear_status_message(app);
+
+    app->sniffer_show_results_on_back = false;
+    app->portal_input_requested = false;
+    app->portal_input_active = false;
+    app->portal_ssid_popup_active = false;
+    app->karma_probe_popup_active = false;
+    app->karma_html_popup_active = false;
+    app->sd_folder_popup_active = false;
+    app->sd_file_popup_active = false;
+    app->sd_delete_confirm_active = false;
+    app->hint_active = false;
+    app->help_hint_visible = false;
+    app->evil_twin_popup_active = false;
+
+    if(app->rx_stream) {
+        furi_stream_buffer_reset(app->rx_stream);
+    }
+}
+
 static void simple_app_request_scan_results(SimpleApp* app, const char* command) {
     if(!app) return;
     simple_app_reset_scan_results(app);
@@ -3503,6 +3714,21 @@ static void simple_app_draw_confirm_sniffer_dos(SimpleApp* app, Canvas* canvas) 
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 50, AlignCenter, AlignCenter, option_line);
 }
 
+static void simple_app_draw_confirm_exit(SimpleApp* app, Canvas* canvas) {
+    if(!app) return;
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(
+        canvas, DISPLAY_WIDTH / 2, 14, AlignCenter, AlignCenter, "Exit and clean up?");
+    canvas_draw_str_aligned(
+        canvas, DISPLAY_WIDTH / 2, 26, AlignCenter, AlignCenter, "Current tasks will stop");
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 42, AlignCenter, AlignCenter, "Confirm?");
+    canvas_set_font(canvas, FontSecondary);
+    const char* option_line = app->confirm_exit_yes ? "No        > Yes" : "> No        Yes";
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 54, AlignCenter, AlignCenter, option_line);
+}
+
 static void simple_app_handle_console_input(SimpleApp* app, InputKey key) {
     if(!app) return;
     if(key == InputKeyBack) {
@@ -3561,6 +3787,35 @@ static void simple_app_handle_console_input(SimpleApp* app, InputKey key) {
         app->serial_follow_tail = true;
         simple_app_update_scroll(app);
         view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_handle_confirm_exit_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+    if(key == InputKeyBack) {
+        app->confirm_exit_yes = false;
+        app->screen = ScreenMenu;
+        app->menu_state = MenuStateSections;
+        view_port_update(app->viewport);
+        return;
+    }
+
+    if(key == InputKeyLeft || key == InputKeyRight) {
+        app->confirm_exit_yes = !app->confirm_exit_yes;
+        view_port_update(app->viewport);
+        return;
+    }
+
+    if(key == InputKeyOk) {
+        if(app->confirm_exit_yes) {
+            simple_app_prepare_exit(app);
+            app->exit_app = true;
+        } else {
+            app->confirm_exit_yes = false;
+            app->screen = ScreenMenu;
+            app->menu_state = MenuStateSections;
+            view_port_update(app->viewport);
+        }
     }
 }
 
@@ -5374,14 +5629,34 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     }
 
     if(app->menu_state == MenuStateSections) {
+        size_t visible_sections = simple_app_section_visible_count();
+        if(visible_sections == 0) visible_sections = 1;
+        simple_app_adjust_section_offset(app);
+
         canvas_set_font(canvas, FontPrimary);
-        for(size_t i = 0; i < menu_section_count; i++) {
-            uint8_t y = menu_sections[i].display_y;
-            if(app->section_index == i) {
+        for(size_t i = 0; i < visible_sections; i++) {
+            size_t idx = app->section_offset + i;
+            if(idx >= menu_section_count) break;
+            uint8_t y = MENU_SECTION_BASE_Y + (uint8_t)(i * MENU_SECTION_SPACING);
+            const char* title = menu_sections[idx].title;
+            if(app->section_index == idx) {
                 canvas_draw_str(canvas, 0, y, ">");
-                canvas_draw_str(canvas, 12, y, menu_sections[i].title);
+                canvas_draw_str(canvas, 12, y, title);
             } else {
-                canvas_draw_str(canvas, 6, y, menu_sections[i].title);
+                canvas_draw_str(canvas, 6, y, title);
+            }
+        }
+
+        if(menu_section_count > visible_sections) {
+            bool show_up = (app->section_offset > 0);
+            bool show_down = (app->section_offset + visible_sections < menu_section_count);
+            if(show_up || show_down) {
+                uint8_t arrow_x = DISPLAY_WIDTH - 6;
+                int16_t content_top = MENU_SECTION_BASE_Y;
+                int16_t content_bottom =
+                    MENU_SECTION_BASE_Y + (int16_t)((visible_sections - 1) * MENU_SECTION_SPACING);
+                simple_app_draw_scroll_hints_clamped(
+                    canvas, arrow_x, content_top, content_bottom, show_up, show_down, 12, 44);
             }
         }
         return;
@@ -5624,7 +5899,132 @@ static void simple_app_draw_wardrive_serial(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, bottom_center, AlignCenter, AlignCenter, status);
 }
 
+static void simple_app_draw_airtag_scan(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 8, 14, "AirTags");
+    canvas_draw_str(canvas, (DISPLAY_WIDTH / 2) + 8, 14, "SmartTags");
+    canvas_draw_line(canvas, DISPLAY_WIDTH / 2, 6, DISPLAY_WIDTH / 2, 46);
+
+    canvas_set_font(canvas, FontPrimary);
+    char count_line[16];
+    snprintf(count_line, sizeof(count_line), "%d", app->bt_scan_airtags);
+    canvas_draw_str_aligned(
+        canvas, DISPLAY_WIDTH / 4, 32, AlignCenter, AlignCenter, count_line);
+    snprintf(count_line, sizeof(count_line), "%d", app->bt_scan_smarttags);
+    canvas_draw_str_aligned(
+        canvas, (DISPLAY_WIDTH * 3) / 4, 32, AlignCenter, AlignCenter, count_line);
+
+    canvas_set_font(canvas, FontSecondary);
+    char total_line[32];
+    snprintf(total_line, sizeof(total_line), "Total: %d", app->bt_scan_total);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 50, AlignCenter, AlignCenter, total_line);
+
+    char timer_line[48];
+    if(app->airtag_next_refresh_tick > 0) {
+        uint32_t now = furi_get_tick();
+        uint32_t ticks_per_second = furi_ms_to_ticks(1000);
+        if(ticks_per_second == 0) ticks_per_second = 1;
+        if(app->airtag_next_refresh_tick > now) {
+            uint32_t remaining_ticks = app->airtag_next_refresh_tick - now;
+            uint32_t remaining_seconds = (remaining_ticks + ticks_per_second - 1) / ticks_per_second;
+            snprintf(timer_line, sizeof(timer_line), "Next refresh: %lus", (unsigned long)remaining_seconds);
+        } else {
+            snprintf(timer_line, sizeof(timer_line), "Awaiting next packet");
+        }
+    } else {
+        snprintf(timer_line, sizeof(timer_line), "Waiting for scan start");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 62, AlignCenter, AlignBottom, timer_line);
+}
+
+static void simple_app_draw_bt_scan_serial(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+    char display_lines[BT_SCAN_CONSOLE_LINES][64];
+    size_t lines_filled = simple_app_render_display_lines(
+        app, app->serial_scroll, display_lines, BT_SCAN_CONSOLE_LINES);
+
+    uint8_t y = 8;
+    if(lines_filled == 0) {
+        canvas_draw_str(canvas, 2, y, "No UART data");
+    } else {
+        for(size_t i = 0; i < lines_filled; i++) {
+            canvas_draw_str(canvas, 2, y, display_lines[i][0] ? display_lines[i] : " ");
+            y += SERIAL_TEXT_LINE_HEIGHT;
+        }
+    }
+
+    size_t total_lines = simple_app_total_display_lines(app);
+    if(total_lines > BT_SCAN_CONSOLE_LINES) {
+        size_t max_scroll = simple_app_max_scroll(app);
+        bool show_up = (app->serial_scroll > 0);
+        bool show_down = (app->serial_scroll < max_scroll);
+        if(show_up || show_down) {
+            uint8_t arrow_x = DISPLAY_WIDTH - 6;
+            int16_t visible_rows =
+                (BT_SCAN_CONSOLE_LINES > 0) ? (BT_SCAN_CONSOLE_LINES - 1) : 0;
+            int16_t content_bottom = 8 + (int16_t)(visible_rows * SERIAL_TEXT_LINE_HEIGHT);
+            /* Custom arrow placement: top hugs screen edge, bottom lifted off divider */
+            if(show_up) {
+                int16_t up_base = 2; // apex ends at y=0
+                if(up_base < 0) up_base = 0;
+                simple_app_draw_scroll_arrow(canvas, arrow_x, up_base, true);
+            }
+            if(show_down) {
+                int16_t down_base = content_bottom - 2; // raise 4px higher than before
+                if(down_base > 63) down_base = 63;
+                simple_app_draw_scroll_arrow(canvas, arrow_x, down_base, false);
+            }
+        }
+    }
+
+    int16_t divider_y = 8 + (int16_t)(BT_SCAN_CONSOLE_LINES * SERIAL_TEXT_LINE_HEIGHT) + 2 - 2;
+    divider_y -= SERIAL_TEXT_LINE_HEIGHT;
+    divider_y += 3; // nudge down slightly
+    if(divider_y >= DISPLAY_HEIGHT) {
+        divider_y = DISPLAY_HEIGHT - 2;
+    } else if(divider_y < 10) {
+        divider_y = 10;
+    }
+    canvas_draw_line(canvas, 0, divider_y, DISPLAY_WIDTH - 1, divider_y);
+
+    char line1[32];
+    char line2[32];
+    char total_line[32];
+    snprintf(line1, sizeof(line1), "AirTags: %d", app->bt_scan_airtags);
+    snprintf(line2, sizeof(line2), "SmartTags: %d", app->bt_scan_smarttags);
+    snprintf(total_line, sizeof(total_line), "Total: %d", app->bt_scan_total);
+
+    canvas_set_font(canvas, FontPrimary);
+    int16_t bottom_y = DISPLAY_HEIGHT - 2;
+    int16_t top_y = bottom_y - SERIAL_TEXT_LINE_HEIGHT;
+    if(top_y <= divider_y + 2) {
+        top_y = divider_y + 2;
+        bottom_y = top_y + SERIAL_TEXT_LINE_HEIGHT;
+    }
+    canvas_draw_str_aligned(canvas, 2, top_y, AlignLeft, AlignBottom, line1);
+    canvas_draw_str_aligned(canvas, 2, bottom_y, AlignLeft, AlignBottom, line2);
+
+    // Place total in bottom-right corner to avoid overlapping the counts
+    canvas_draw_str_aligned(
+        canvas, DISPLAY_WIDTH - 2, DISPLAY_HEIGHT - 2, AlignRight, AlignBottom, total_line);
+}
+
 static void simple_app_draw_serial(SimpleApp* app, Canvas* canvas) {
+    if(app && app->bt_scan_view_active) {
+        if(app->airtag_scan_mode) {
+            simple_app_draw_airtag_scan(app, canvas);
+            return;
+        }
+        simple_app_draw_bt_scan_serial(app, canvas);
+        return;
+    }
+
     if(app && app->wardrive_view_active) {
         simple_app_draw_wardrive_serial(app, canvas);
         return;
@@ -6857,6 +7257,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenConfirmSnifferDos:
         simple_app_draw_confirm_sniffer_dos(app, canvas);
         break;
+    case ScreenConfirmExit:
+        simple_app_draw_confirm_exit(app, canvas);
+        break;
     case ScreenKarmaMenu:
         simple_app_draw_karma_menu(app, canvas);
         break;
@@ -6903,6 +7306,8 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             } else {
                 app->section_index = section_count - 1;
             }
+            simple_app_adjust_section_offset(app);
+            app->exit_confirm_active = false;
             view_port_update(app->viewport);
         } else {
             const MenuSection* section = &menu_sections[app->section_index];
@@ -6937,6 +7342,8 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             } else {
                 app->section_index = 0;
             }
+            simple_app_adjust_section_offset(app);
+            app->exit_confirm_active = false;
             view_port_update(app->viewport);
         } else {
             const MenuSection* section = &menu_sections[app->section_index];
@@ -6968,6 +7375,7 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
                 simple_app_request_scan_results(app, TARGETS_RESULTS_COMMAND);
                 return;
             }
+            app->exit_confirm_active = false;
             app->menu_state = MenuStateItems;
             if(app->section_index == MENU_SECTION_ATTACKS) {
                 simple_app_focus_attacks_menu(app);
@@ -7081,10 +7489,12 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
         simple_app_send_stop_if_needed(app);
         if(app->menu_state == MenuStateItems) {
             app->menu_state = MenuStateSections;
+            simple_app_adjust_section_offset(app);
             view_port_update(app->viewport);
         } else {
-            simple_app_save_config_if_dirty(app, NULL, false);
-            app->exit_app = true;
+            app->confirm_exit_yes = false;
+            app->screen = ScreenConfirmExit;
+            view_port_update(app->viewport);
         }
     }
 }
@@ -8995,6 +9405,10 @@ static void simple_app_input(InputEvent* event, void* context) {
 
     if(!allow_event) return;
 
+    if(event->key != InputKeyBack && app->exit_confirm_active) {
+        app->exit_confirm_active = false;
+    }
+
     switch(app->screen) {
     case ScreenMenu:
         simple_app_handle_menu_input(app, event->key);
@@ -9031,6 +9445,9 @@ static void simple_app_input(InputEvent* event, void* context) {
         break;
     case ScreenChannelView:
         simple_app_handle_channel_view_input(app, event->key);
+        break;
+    case ScreenConfirmExit:
+        simple_app_handle_confirm_exit_input(app, event->key);
         break;
     case ScreenConfirmBlackout:
         simple_app_handle_confirm_blackout_input(app, event->key);
@@ -9177,6 +9594,11 @@ int32_t Lab_C5_app(void* p) {
     app->board_last_ping_tick = 0;
     app->board_last_rx_tick = furi_get_tick();
     app->board_missing_shown = false;
+    app->board_bootstrap_active = true;
+    app->board_bootstrap_reboot_sent = false;
+    app->board_reboot_sent = false;
+    app->exit_confirm_active = false;
+    app->exit_confirm_tick = 0;
     app->boot_short_enabled = false;
     app->boot_long_enabled = false;
     app->boot_short_command_index = 1; // start_sniffer_dog
@@ -9256,17 +9678,20 @@ int32_t Lab_C5_app(void* p) {
     }
 
     if(!simple_app_status_message_is_active(app)) {
-        simple_app_show_status_message(app, "Board detection", 1500, true);
+        simple_app_show_status_message(app, "Board discovery\nSending ping...", 0, true);
     }
     simple_app_send_ping(app);
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
 
     while(!app->exit_app) {
         if(!app->download_bridge_active) {
-            simple_app_process_stream(app);
-            simple_app_update_karma_sniffer(app);
-            simple_app_update_result_scroll(app);
-            simple_app_update_sd_scroll(app);
-            simple_app_ping_watchdog(app);
+        simple_app_process_stream(app);
+        simple_app_update_karma_sniffer(app);
+        simple_app_update_result_scroll(app);
+        simple_app_update_sd_scroll(app);
+        simple_app_ping_watchdog(app);
         }
 
         if(!app->download_bridge_active && app->portal_input_requested && !app->portal_input_active) {
@@ -9303,6 +9728,13 @@ int32_t Lab_C5_app(void* p) {
                                   !app->sd_file_popup_active && !app->sd_delete_confirm_active &&
                                   !simple_app_status_message_is_active(app);
 
+        if(app->exit_confirm_active) {
+            uint32_t now = furi_get_tick();
+            if(now - app->exit_confirm_tick >= furi_ms_to_ticks(2000)) {
+                app->exit_confirm_active = false;
+            }
+        }
+
         if(can_show_help_hint) {
             uint32_t now = furi_get_tick();
             if(!app->help_hint_visible &&
@@ -9319,6 +9751,8 @@ int32_t Lab_C5_app(void* p) {
 
         furi_delay_ms(app->download_bridge_active ? 1 : 20);
     }
+
+    simple_app_prepare_exit(app);
 
     if(app->download_bridge_active) {
         simple_app_download_bridge_stop(app);
