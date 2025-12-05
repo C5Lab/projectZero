@@ -3525,6 +3525,12 @@ static int cmd_stop(int argc, char **argv) {
         esp_wifi_stop();
         MY_LOG_INFO(TAG, "Portal stopped.");
         
+        // Restart WiFi in STA mode so it's ready for next command
+        wifi_config_t wifi_config = { 0 };
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+        esp_wifi_start();
+        
         // Clean up portal SSID
         if (portalSSID != NULL) {
             free(portalSSID);
@@ -6361,9 +6367,12 @@ static void bt_nimble_deinit(void)
         }
     }
     
-    // Stop NimBLE - just stop, don't deinit (causes linker issues with GATT)
+    // Stop NimBLE host task
     nimble_port_stop();
     vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // Deinitialize NimBLE port and controller (required for reinit)
+    nimble_port_deinit();
     
     nimble_initialized = false;
     MY_LOG_INFO(TAG, "NimBLE stopped");
