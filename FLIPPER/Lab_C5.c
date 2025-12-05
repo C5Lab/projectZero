@@ -308,11 +308,15 @@ typedef struct {
     bool wardrive_otg_previous_state;
     bool bt_scan_view_active;
     bool bt_scan_summary_seen;
+    bool airtag_scan_mode;
+    uint32_t airtag_next_refresh_tick;
     int bt_scan_airtags;
     int bt_scan_smarttags;
     int bt_scan_total;
     char bt_scan_line_buffer[96];
     size_t bt_scan_line_length;
+    bool airtag_scan_mode;
+    uint32_t airtag_next_refresh_tick;
     bool last_command_sent;
     bool sniffer_show_results_on_back;
     bool confirm_blackout_yes;
@@ -547,8 +551,10 @@ static void simple_app_boot_feed(SimpleApp* app, char ch);
 static void simple_app_serial_irq(
     FuriHalSerialHandle* handle, FuriHalSerialRxEvent event, void* context);
 static void simple_app_draw_download_bridge(SimpleApp* app, Canvas* canvas);
+static void simple_app_draw_airtag_scan(SimpleApp* app, Canvas* canvas);
 static bool simple_app_download_bridge_start(SimpleApp* app);
 static void simple_app_download_bridge_stop(SimpleApp* app);
+static void simple_app_draw_airtag_scan(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long);
 static void simple_app_on_board_online(SimpleApp* app, const char* source);
 static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas);
@@ -576,6 +582,7 @@ static void simple_app_update_otg_label(SimpleApp* app);
 static void simple_app_apply_otg_power(SimpleApp* app);
 static void simple_app_toggle_otg_power(SimpleApp* app);
 static void simple_app_mark_config_dirty(SimpleApp* app);
+static void simple_app_draw_airtag_scan(SimpleApp* app, Canvas* canvas);
 static void simple_app_show_hint(SimpleApp* app, const char* title, const char* text);
 static void simple_app_hide_hint(SimpleApp* app);
 static void simple_app_handle_hint_event(SimpleApp* app, const InputEvent* event);
@@ -592,6 +599,7 @@ static void simple_app_package_monitor_feed(SimpleApp* app, char ch);
 static void simple_app_draw_package_monitor(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_package_monitor_input(SimpleApp* app, InputKey key);
 static void simple_app_channel_view_enter(SimpleApp* app);
+static void simple_app_draw_airtag_scan(SimpleApp* app, Canvas* canvas);
 static void simple_app_channel_view_start(SimpleApp* app);
 static void simple_app_channel_view_stop(SimpleApp* app);
 static void simple_app_channel_view_reset(SimpleApp* app);
@@ -644,6 +652,7 @@ static void simple_app_reset_sd_scroll(SimpleApp* app);
 static void simple_app_sd_scroll_buffer(
     SimpleApp* app, const char* text, size_t char_limit, char* out, size_t out_size);
 static void simple_app_update_sd_scroll(SimpleApp* app);
+static void simple_app_draw_airtag_scan(SimpleApp* app, Canvas* canvas);
 static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key);
 static void simple_app_draw_scroll_arrow(Canvas* canvas, uint8_t base_left_x, int16_t base_y, bool upwards);
@@ -695,6 +704,7 @@ static void simple_app_draw_setup_karma(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_setup_karma_input(SimpleApp* app, InputKey key);
 static void simple_app_draw_setup_led(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_setup_led_input(SimpleApp* app, InputKey key);
+static void simple_app_draw_airtag_scan(SimpleApp* app, Canvas* canvas);
 static void simple_app_modify_karma_duration(SimpleApp* app, int32_t delta);
 static void simple_app_save_config_if_dirty(SimpleApp* app, const char* message, bool fullscreen);
 static bool simple_app_save_config(SimpleApp* app, const char* success_message, bool fullscreen);
@@ -713,6 +723,7 @@ static size_t simple_app_render_display_lines(
     size_t skip_lines,
     char dest[][64],
     size_t max_lines);
+static void simple_app_draw_airtag_scan(SimpleApp* app, Canvas* canvas);
 static void simple_app_send_ping(SimpleApp* app);
 static void simple_app_handle_pong(SimpleApp* app);
 static void simple_app_ping_watchdog(SimpleApp* app);
@@ -1939,6 +1950,8 @@ static void simple_app_reset_bt_scan_summary(SimpleApp* app) {
     app->bt_scan_total = 0;
     app->bt_scan_line_length = 0;
     app->bt_scan_summary_seen = false;
+    app->airtag_scan_mode = false;
+    app->airtag_next_refresh_tick = 0;
 }
 
 static void simple_app_process_bt_scan_line(SimpleApp* app, const char* line) {
