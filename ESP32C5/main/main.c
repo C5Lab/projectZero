@@ -309,6 +309,7 @@ static bool wifi_initialized = false;
 static bool netif_initialized = false;
 static bool event_loop_initialized = false;
 static esp_netif_t *sta_netif_handle = NULL;
+static bool wifi_event_handler_registered = false;
 
 // ============================================================================
 // Memory logging helper
@@ -1265,11 +1266,15 @@ static esp_err_t wifi_init_ap_sta(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
+    // Register event handler only once (survives WiFi reinit after mode switch)
+    if (!wifi_event_handler_registered) {
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                            ESP_EVENT_ANY_ID,
+                                                            &wifi_event_handler,
+                                                            NULL,
+                                                            NULL));
+        wifi_event_handler_registered = true;
+    }
 
     wifi_config_t wifi_config = { 0 };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
