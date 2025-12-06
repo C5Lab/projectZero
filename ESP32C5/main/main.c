@@ -6479,7 +6479,7 @@ static void bt_scan_task(void *pvParameters)
  */
 static void bt_airtag_scan_task(void *pvParameters)
 {
-    MY_LOG_INFO(TAG, "AirTag scanner starting (30s intervals)...");
+    MY_LOG_INFO(TAG, "AirTag scanner starting (continuous)...");
     MY_LOG_INFO(TAG, "Output format: <airtag_count>,<smarttag_count>");
     MY_LOG_INFO(TAG, "Use 'stop' command to stop scanning.");
     MY_LOG_INFO(TAG, "");
@@ -6493,7 +6493,7 @@ static void bt_airtag_scan_task(void *pvParameters)
             break;
         }
         
-        // Scan for 10 seconds within each 30s cycle
+        // Scan for 10 seconds
         for (int i = 0; i < 100 && bt_airtag_scan_active && !operation_stop_requested; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
@@ -6507,10 +6507,7 @@ static void bt_airtag_scan_task(void *pvParameters)
         // Output in requested format: airtag_count,smarttag_count
         printf("%d,%d\n", bt_airtag_count, bt_smarttag_count);
         
-        // Wait remaining 20 seconds (total 30s cycle)
-        for (int i = 0; i < 200 && bt_airtag_scan_active && !operation_stop_requested; i++) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
+        // Immediately start next scan cycle (no wait)
     }
     
     bt_airtag_scan_active = false;
