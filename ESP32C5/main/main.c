@@ -312,11 +312,15 @@ static esp_netif_t *sta_netif_handle = NULL;
 static bool wifi_event_handler_registered = false;
 
 // ============================================================================
-// Memory logging helper
+// Memory logging helper (set LOG_MEMORY_INFO to 1 to enable prints)
 // ============================================================================
+#ifndef LOG_MEMORY_INFO
+#define LOG_MEMORY_INFO 0
+#endif
 
 static void log_memory_info(const char *context)
 {
+#if LOG_MEMORY_INFO
     size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     size_t internal_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
     size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
@@ -324,11 +328,14 @@ static void log_memory_info(const char *context)
     size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     
-    /*MY_LOG_INFO(TAG, "[MEM] %s: Internal=%u/%uKB, DMA=%u/%uKB, PSRAM=%u/%uKB",
+    MY_LOG_INFO(TAG, "[MEM] %s: Internal=%u/%uKB, DMA=%u/%uKB, PSRAM=%u/%uKB",
            context,
            (unsigned)(internal_free / 1024), (unsigned)(internal_total / 1024),
            (unsigned)(dma_free / 1024), (unsigned)(dma_total / 1024),
-           (unsigned)(psram_free / 1024), (unsigned)(psram_total / 1024));*/
+           (unsigned)(psram_free / 1024), (unsigned)(psram_total / 1024));
+#else
+    (void)context;
+#endif
 }
 
 // ============================================================================
@@ -7131,6 +7138,7 @@ void app_main(void) {
     esp_err_t ret1 = esp_psram_init();
     if (ret1 == ESP_OK) {
         size_t psram_size = esp_psram_get_size();
+        (void)psram_size;
         //printf("PSRAM initialized successfully, size: %zu bytes\n", psram_size);
         
         //printf("Step 2: Test PSRAM malloc\n");

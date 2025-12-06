@@ -323,6 +323,8 @@ typedef struct {
     bool bt_locator_has_rssi;
     int bt_locator_rssi;
     char bt_locator_mac[18];
+    char bt_locator_saved_mac[18];
+    bool bt_locator_preserve_mac;
     bool bt_locator_list_loading;
     bool bt_locator_list_ready;
     size_t bt_locator_count;
@@ -340,6 +342,7 @@ typedef struct {
         char mac[18];
         int rssi;
         bool has_rssi;
+        char name[32];
     } bt_locator_devices[BT_LOCATOR_MAX_DEVICES];
     char bt_scan_line_buffer[96];
     size_t bt_scan_line_length;
@@ -1979,6 +1982,13 @@ static void simple_app_reset_bt_scan_summary(SimpleApp* app) {
     app->bt_locator_has_rssi = false;
     app->bt_locator_rssi = 0;
     app->bt_locator_mac[0] = '\0';
+    if(app->bt_locator_preserve_mac && app->bt_locator_saved_mac[0] != '\0') {
+        strncpy(app->bt_locator_mac, app->bt_locator_saved_mac, sizeof(app->bt_locator_mac) - 1);
+        app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
+    } else {
+        app->bt_locator_saved_mac[0] = '\0';
+        app->bt_locator_preserve_mac = false;
+    }
     app->bt_locator_list_loading = false;
     app->bt_locator_list_ready = false;
     app->bt_locator_count = 0;
@@ -2000,14 +2010,10 @@ static void simple_app_process_bt_scan_line(SimpleApp* app, const char* line) {
         char mac[18] = {0};
         int rssi = 0;
         if(sscanf(line, " %17s RSSI: %d", mac, &rssi) == 2) {
-            strncpy(app->bt_locator_mac, mac, sizeof(app->bt_locator_mac));
-            app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
             app->bt_locator_rssi = rssi;
             app->bt_locator_has_rssi = true;
             app->bt_scan_last_update_tick = furi_get_tick();
         } else if(sscanf(line, " %17s RSSI: N/A", mac) == 1) {
-            strncpy(app->bt_locator_mac, mac, sizeof(app->bt_locator_mac));
-            app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
             app->bt_locator_has_rssi = false;
             app->bt_scan_last_update_tick = furi_get_tick();
         }
@@ -2080,15 +2086,21 @@ static void simple_app_bt_locator_reset_list(SimpleApp* app) {
     app->bt_locator_scan_len = 0;
     memset(app->bt_locator_scan_line, 0, sizeof(app->bt_locator_scan_line));
     memset(app->bt_locator_devices, 0, sizeof(app->bt_locator_devices));
+    app->bt_locator_saved_mac[0] = '\0';
+    app->bt_locator_preserve_mac = false;
 }
 
-static void simple_app_bt_locator_add(SimpleApp* app, const char* mac, int rssi) {
+static void simple_app_bt_locator_add(SimpleApp* app, const char* mac, int rssi, const char* name) {
     if(!app || !mac || mac[0] == '\0') return;
     // Update if exists
     for(size_t i = 0; i < app->bt_locator_count; i++) {
         if(strncmp(app->bt_locator_devices[i].mac, mac, sizeof(app->bt_locator_devices[i].mac)) == 0) {
             app->bt_locator_devices[i].rssi = rssi;
             app->bt_locator_devices[i].has_rssi = true;
+            if(name && name[0] != '\0') {
+                strncpy(app->bt_locator_devices[i].name, name, sizeof(app->bt_locator_devices[i].name) - 1);
+                app->bt_locator_devices[i].name[sizeof(app->bt_locator_devices[i].name) - 1] = '\0';
+            }
             return;
         }
     }
@@ -2097,6 +2109,10 @@ static void simple_app_bt_locator_add(SimpleApp* app, const char* mac, int rssi)
     app->bt_locator_devices[app->bt_locator_count].mac[sizeof(app->bt_locator_devices[app->bt_locator_count].mac) - 1] = '\0';
     app->bt_locator_devices[app->bt_locator_count].rssi = rssi;
     app->bt_locator_devices[app->bt_locator_count].has_rssi = true;
+    if(name && name[0] != '\0') {
+        strncpy(app->bt_locator_devices[app->bt_locator_count].name, name, sizeof(app->bt_locator_devices[app->bt_locator_count].name) - 1);
+        app->bt_locator_devices[app->bt_locator_count].name[sizeof(app->bt_locator_devices[app->bt_locator_count].name) - 1] = '\0';
+    }
     app->bt_locator_count++;
 
     // Keep list sorted by RSSI desc (strongest first)
@@ -2114,21 +2130,30 @@ static void simple_app_bt_locator_add(SimpleApp* app, const char* mac, int rssi)
                 char mac[18];
                 int rssi;
                 bool has_rssi;
+                char name[32];
             } tmp = {0};
             memcpy(tmp.mac, app->bt_locator_devices[i].mac, sizeof(tmp.mac));
             tmp.rssi = app->bt_locator_devices[i].rssi;
             tmp.has_rssi = app->bt_locator_devices[i].has_rssi;
+            memcpy(tmp.name, app->bt_locator_devices[i].name, sizeof(tmp.name));
 
             memcpy(app->bt_locator_devices[i].mac, app->bt_locator_devices[prev].mac, sizeof(tmp.mac));
             app->bt_locator_devices[i].rssi = app->bt_locator_devices[prev].rssi;
             app->bt_locator_devices[i].has_rssi = app->bt_locator_devices[prev].has_rssi;
+            memcpy(app->bt_locator_devices[i].name, app->bt_locator_devices[prev].name, sizeof(tmp.name));
 
             memcpy(app->bt_locator_devices[prev].mac, tmp.mac, sizeof(tmp.mac));
             app->bt_locator_devices[prev].rssi = tmp.rssi;
             app->bt_locator_devices[prev].has_rssi = tmp.has_rssi;
+            memcpy(app->bt_locator_devices[prev].name, tmp.name, sizeof(tmp.name));
         } else {
             break;
         }
+    }
+    // Restore selection mac if it matches newly inserted entry
+    if(app->bt_locator_preserve_mac && app->bt_locator_mac[0] == '\0' && app->bt_locator_saved_mac[0] != '\0') {
+        strncpy(app->bt_locator_mac, app->bt_locator_saved_mac, sizeof(app->bt_locator_mac) - 1);
+        app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
     }
 }
 
@@ -2239,7 +2264,20 @@ static void simple_app_bt_locator_feed(SimpleApp* app, char ch) {
                 int rssi = 0;
                 if(sscanf(line, " %d . %17s  RSSI: %d", &idx, mac, &rssi) == 3 ||
                    sscanf(line, " %d. %17s  RSSI: %d", &idx, mac, &rssi) == 3) {
-                    simple_app_bt_locator_add(app, mac, rssi);
+                    const char* name_ptr = strstr(line, "Name:");
+                    char name_buf[32] = {0};
+                    if(name_ptr) {
+                        name_ptr += strlen("Name:");
+                        while(*name_ptr == ' ') name_ptr++;
+                        strncpy(name_buf, name_ptr, sizeof(name_buf) - 1);
+                        // trim trailing spaces
+                        size_t nb_len = strlen(name_buf);
+                        while(nb_len > 0 && isspace((unsigned char)name_buf[nb_len - 1])) {
+                            name_buf[nb_len - 1] = '\0';
+                            nb_len--;
+                        }
+                    }
+                    simple_app_bt_locator_add(app, mac, rssi, name_buf[0] ? name_buf : NULL);
                     if(app->viewport && app->screen == ScreenBtLocatorList) {
                         view_port_update(app->viewport);
                     }
@@ -6227,7 +6265,17 @@ static void simple_app_draw_bt_locator(SimpleApp* app, Canvas* canvas) {
     canvas_set_color(canvas, ColorBlack);
     canvas_set_font(canvas, FontSecondary);
 
-    const char* mac = (app->bt_locator_mac[0] != '\0') ? app->bt_locator_mac : "No MAC";
+    const char* mac = NULL;
+    if(app->bt_locator_mac[0] != '\0') {
+        mac = app->bt_locator_mac;
+    } else if(app->bt_locator_saved_mac[0] != '\0') {
+        mac = app->bt_locator_saved_mac;
+    } else if(app->bt_locator_selected >= 0 && app->bt_locator_selected < (int32_t)app->bt_locator_count) {
+        mac = app->bt_locator_devices[app->bt_locator_selected].mac;
+    }
+    if(!mac || mac[0] == '\0' || mac[0] == '>' || (mac[0] == 'U' && mac[1] == 's')) {
+        mac = (app->bt_locator_saved_mac[0] != '\0') ? app->bt_locator_saved_mac : "No MAC";
+    }
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 14, AlignCenter, AlignCenter, mac);
 
     canvas_set_font(canvas, FontPrimary);
@@ -6304,6 +6352,7 @@ static void simple_app_draw_bt_locator_list(SimpleApp* app, Canvas* canvas) {
         const char* mac = app->bt_locator_devices[i].mac;
         int rssi = app->bt_locator_devices[i].rssi;
         bool has_rssi = app->bt_locator_devices[i].has_rssi;
+        const char* name = app->bt_locator_devices[i].name;
         char line[48];
         if(has_rssi) {
             snprintf(line, sizeof(line), "%s %d", mac, rssi);
@@ -6337,6 +6386,18 @@ static void simple_app_draw_bt_locator_list(SimpleApp* app, Canvas* canvas) {
         }
         canvas_draw_str(canvas, picked ? 18 : 12, y, to_draw);
         y += SERIAL_TEXT_LINE_HEIGHT;
+
+        if(name && name[0] != '\0' && y <= list_bottom - SERIAL_TEXT_LINE_HEIGHT) {
+            char name_buf[48];
+            strncpy(name_buf, name, sizeof(name_buf) - 1);
+            name_buf[sizeof(name_buf) - 1] = '\0';
+            simple_app_truncate_text(name_buf, char_limit);
+            canvas_draw_str(canvas, picked ? 18 : 12, y, name_buf);
+            y += SERIAL_TEXT_LINE_HEIGHT;
+        }
+        if(y >= list_bottom) {
+            break;
+        }
     }
 
     if(app->bt_locator_selected >= 0 && app->bt_locator_selected < (int32_t)app->bt_locator_count) {
@@ -9837,6 +9898,11 @@ static void simple_app_handle_bt_locator_input(SimpleApp* app, InputKey key) {
             app->bt_locator_console_mode = false;
             app->bt_locator_mode = true;
             app->bt_locator_has_rssi = false;
+            strncpy(app->bt_locator_mac, mac, sizeof(app->bt_locator_mac) - 1);
+            app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
+            strncpy(app->bt_locator_saved_mac, mac, sizeof(app->bt_locator_saved_mac) - 1);
+            app->bt_locator_saved_mac[sizeof(app->bt_locator_saved_mac) - 1] = '\0';
+            app->bt_locator_preserve_mac = true;
             simple_app_send_command(app, command, true);
         }
     } else if(key == InputKeyOk) {
@@ -9844,6 +9910,14 @@ static void simple_app_handle_bt_locator_input(SimpleApp* app, InputKey key) {
             app->bt_locator_selected = -1;
         } else {
             app->bt_locator_selected = (int32_t)app->bt_locator_index;
+            const char* mac_pick = app->bt_locator_devices[app->bt_locator_index].mac;
+            if(mac_pick && mac_pick[0] != '\0') {
+                strncpy(app->bt_locator_saved_mac, mac_pick, sizeof(app->bt_locator_saved_mac) - 1);
+                app->bt_locator_saved_mac[sizeof(app->bt_locator_saved_mac) - 1] = '\0';
+                strncpy(app->bt_locator_mac, mac_pick, sizeof(app->bt_locator_mac) - 1);
+                app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
+                app->bt_locator_preserve_mac = true;
+            }
         }
         simple_app_bt_locator_reset_scroll(app);
         if(app->viewport) view_port_update(app->viewport);
@@ -9920,6 +9994,15 @@ static void simple_app_input(InputEvent* event, void* context) {
 
     if(event->type == InputTypeLong && event->key == InputKeyOk) {
         if(app->bt_scan_view_active) {
+            app->bt_scan_full_console = !app->bt_scan_full_console;
+            app->serial_follow_tail = true;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
+        // Debug helper: when in BT locator monitor, long OK shows raw console
+        if(app->bt_locator_mode && app->screen == ScreenSerial) {
             app->bt_scan_full_console = !app->bt_scan_full_console;
             app->serial_follow_tail = true;
             if(app->viewport) {
