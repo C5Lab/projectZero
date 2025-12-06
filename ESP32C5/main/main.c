@@ -6172,8 +6172,10 @@ static void bt_format_addr(const uint8_t *addr, char *str)
 
 /**
  * Check if manufacturer data indicates Apple AirTag/Find My device
+ * AirTag has specific length (25-29 bytes) and doesn't broadcast device name
+ * This avoids false positives from iPhone/iPad with Find My enabled
  */
-static bool bt_is_apple_airtag(const uint8_t *data, uint8_t len)
+static bool bt_is_apple_airtag(const uint8_t *data, uint8_t len, bool has_name)
 {
     if (len < 4) return false;
     
@@ -6182,7 +6184,11 @@ static bool bt_is_apple_airtag(const uint8_t *data, uint8_t len)
     if (company_id != APPLE_COMPANY_ID) return false;
     
     // Check Find My device type (0x12)
-    if (data[2] == APPLE_FIND_MY_TYPE) {
+    if (data[2] != APPLE_FIND_MY_TYPE) return false;
+    
+    // AirTags typically have 25-29 bytes of manufacturer data
+    // and don't broadcast a device name (unlike iPhone/iPad)
+    if (len >= 25 && len <= 29 && !has_name) {
         return true;
     }
     
@@ -6191,16 +6197,28 @@ static bool bt_is_apple_airtag(const uint8_t *data, uint8_t len)
 
 /**
  * Check if manufacturer data indicates Samsung SmartTag
+ * SmartTag uses specific device type bytes (0x02/0x03) in SmartThings Find protocol
+ * This avoids false positives from Samsung phones
  */
 static bool bt_is_samsung_smarttag(const uint8_t *data, uint8_t len)
 {
-    if (len < 3) return false;
+    if (len < 4) return false;
     
     // Check Company ID (Little Endian: 0x75 0x00)
     uint16_t company_id = data[0] | (data[1] << 8);
     if (company_id != SAMSUNG_COMPANY_ID) return false;
     
-    return true;
+    // SmartTag uses SmartThings Find protocol
+    // Device type byte (byte 2) should be 0x02 or 0x03 for SmartTag/SmartTag+
+    // Samsung phones use different type values
+    uint8_t device_type = data[2];
+    
+    // SmartTag typical payload length is 22-28 bytes
+    if ((device_type == 0x02 || device_type == 0x03) && len >= 20 && len <= 30) {
+        return true;
+    }
+    
+    return false;
 }
 
 /**
@@ -6240,7 +6258,8 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         dev->is_smarttag = false;
         
         // Extract device name if available
-        if (fields.name != NULL && fields.name_len > 0) {
+        bool has_name = (fields.name != NULL && fields.name_len > 0);
+        if (has_name) {
             int name_len = fields.name_len < 31 ? fields.name_len : 31;
             memcpy(dev->name, fields.name, name_len);
             dev->name[name_len] = '\0';
@@ -6250,7 +6269,8 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         if (fields.mfg_data != NULL && fields.mfg_data_len >= 2) {
             dev->company_id = fields.mfg_data[0] | (fields.mfg_data[1] << 8);
             
-            if (bt_is_apple_airtag(fields.mfg_data, fields.mfg_data_len)) {
+            // Pass has_name to avoid false positives from iPhone/iPad
+            if (bt_is_apple_airtag(fields.mfg_data, fields.mfg_data_len, has_name)) {
                 dev->is_airtag = true;
                 bt_airtag_count++;
             }
