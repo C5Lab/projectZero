@@ -2745,6 +2745,12 @@ static int cmd_start_handshake(int argc, char **argv) {
         return 1;
     }
     
+    // Enable AP mode for raw frame injection (deauth packets)
+    if (!ensure_ap_mode()) {
+        MY_LOG_INFO(TAG, "Failed to enable AP mode for deauth injection");
+        return 1;
+    }
+    
     // Check if handshake attack is already running
     if (handshake_attack_active || handshake_attack_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Handshake attack already running. Use 'stop' to stop it first.");
