@@ -50,6 +50,7 @@ typedef enum {
     ScreenEvilTwinMenu,
     ScreenPortalMenu,
     ScreenDownloadBridge,
+    ScreenBtLocatorList,
 } AppScreen;
 
 typedef enum {
@@ -91,7 +92,9 @@ typedef enum {
 #define DISPLAY_WIDTH 128
 #define DISPLAY_HEIGHT 64
 #define WARD_DRIVE_CONSOLE_LINES 3
-#define BT_SCAN_CONSOLE_LINES 4
+#define BT_SCAN_CONSOLE_LINES 6
+#define BT_LOCATOR_MAX_DEVICES 64
+#define BT_LOCATOR_VISIBLE_COUNT 6
 #define RESULT_DEFAULT_MAX_LINES 4
 #define RESULT_DEFAULT_LINE_HEIGHT 12
 #define RESULT_DEFAULT_CHAR_LIMIT (SERIAL_LINE_CHAR_LIMIT - 3)
@@ -212,6 +215,7 @@ typedef enum {
     MenuActionOpenEvilTwinMenu,
     MenuActionOpenKarmaMenu,
     MenuActionOpenPortalMenu,
+    MenuActionOpenBtLocator,
 } MenuAction;
 
 typedef enum {
@@ -314,6 +318,29 @@ typedef struct {
     int bt_scan_airtags;
     int bt_scan_smarttags;
     int bt_scan_total;
+    bool bt_locator_console_mode;
+    bool bt_locator_mode;
+    bool bt_locator_has_rssi;
+    int bt_locator_rssi;
+    char bt_locator_mac[18];
+    bool bt_locator_list_loading;
+    bool bt_locator_list_ready;
+    size_t bt_locator_count;
+    size_t bt_locator_index;
+    size_t bt_locator_offset;
+    int32_t bt_locator_selected; // -1 none, otherwise index
+    char bt_locator_scroll_text[64];
+    size_t bt_locator_scroll_offset;
+    int bt_locator_scroll_dir;
+    uint8_t bt_locator_scroll_hold;
+    uint32_t bt_locator_scroll_last_tick;
+    char bt_locator_scan_line[128];
+    size_t bt_locator_scan_len;
+    struct {
+        char mac[18];
+        int rssi;
+        bool has_rssi;
+    } bt_locator_devices[BT_LOCATOR_MAX_DEVICES];
     char bt_scan_line_buffer[96];
     size_t bt_scan_line_length;
     bool last_command_sent;
@@ -604,6 +631,14 @@ static void simple_app_channel_view_process_line(SimpleApp* app, const char* lin
 static void simple_app_channel_view_feed(SimpleApp* app, char ch);
 static void simple_app_draw_channel_view(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_channel_view_input(SimpleApp* app, InputKey key);
+static void simple_app_bt_locator_reset_list(SimpleApp* app);
+static void simple_app_bt_locator_begin_scan(SimpleApp* app);
+static void simple_app_bt_locator_feed(SimpleApp* app, char ch);
+static void simple_app_draw_bt_locator_list(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_bt_locator_input(SimpleApp* app, InputKey key);
+static void simple_app_bt_locator_reset_scroll(SimpleApp* app);
+static void simple_app_bt_locator_set_scroll_text(SimpleApp* app, const char* text);
+static void simple_app_bt_locator_tick_scroll(SimpleApp* app, size_t char_limit);
 static void simple_app_channel_view_show_status(SimpleApp* app, const char* status);
 static int simple_app_channel_view_find_channel_index(const uint8_t* list, size_t count, uint8_t channel);
 static size_t simple_app_channel_view_visible_columns(ChannelViewBand band);
@@ -787,6 +822,8 @@ static const char hint_bluetooth_airtag[] =
     "Continuous tag scan\nOutputs counts only\nUpdates as data arrives\nStop/back to exit\nFor Air/SmartTags.";
 static const char hint_bluetooth_scan[] =
     "One-off 10s BLE scan\nLists seen devices\nHighlights trackers\nSummary shown below\nStop/back to reset.";
+static const char hint_bluetooth_locator[] =
+    "Tracker mode\nScan first to pick MAC\nRight starts tracing\nUpdates RSSI live\nStop/back to exit.";
 
 static const char hint_setup_backlight[] =
     "Toggle screen light\nKeep brightness high\nOr allow auto dim\nGreat for console\nLong sessions.";
@@ -848,6 +885,7 @@ static const MenuEntry menu_entries_monitoring[] = {
 static const MenuEntry menu_entries_bluetooth[] = {
     {"AirTag Scan", "scan_airtag", MenuActionCommand, hint_bluetooth_airtag},
     {"BT Scan", "scan_bt", MenuActionCommand, hint_bluetooth_scan},
+    {"BT Locator", NULL, MenuActionOpenBtLocator, hint_bluetooth_locator},
 };
 
 static char menu_label_backlight[24] = "Backlight: On";
@@ -1936,6 +1974,20 @@ static void simple_app_reset_bt_scan_summary(SimpleApp* app) {
     app->airtag_scan_mode = false;
     app->bt_scan_full_console = false;
     app->bt_scan_last_update_tick = 0;
+    app->bt_locator_console_mode = false;
+    app->bt_locator_mode = false;
+    app->bt_locator_has_rssi = false;
+    app->bt_locator_rssi = 0;
+    app->bt_locator_mac[0] = '\0';
+    app->bt_locator_list_loading = false;
+    app->bt_locator_list_ready = false;
+    app->bt_locator_count = 0;
+    app->bt_locator_index = 0;
+    app->bt_locator_offset = 0;
+    app->bt_locator_selected = -1;
+    app->bt_locator_scan_len = 0;
+    memset(app->bt_locator_scan_line, 0, sizeof(app->bt_locator_scan_line));
+    memset(app->bt_locator_devices, 0, sizeof(app->bt_locator_devices));
 }
 
 static void simple_app_process_bt_scan_line(SimpleApp* app, const char* line) {
@@ -1944,6 +1996,23 @@ static void simple_app_process_bt_scan_line(SimpleApp* app, const char* line) {
     int airtags = 0;
     int smarttags = 0;
     int total = 0;
+    if(app->bt_locator_mode) {
+        char mac[18] = {0};
+        int rssi = 0;
+        if(sscanf(line, " %17s RSSI: %d", mac, &rssi) == 2) {
+            strncpy(app->bt_locator_mac, mac, sizeof(app->bt_locator_mac));
+            app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
+            app->bt_locator_rssi = rssi;
+            app->bt_locator_has_rssi = true;
+            app->bt_scan_last_update_tick = furi_get_tick();
+        } else if(sscanf(line, " %17s RSSI: N/A", mac) == 1) {
+            strncpy(app->bt_locator_mac, mac, sizeof(app->bt_locator_mac));
+            app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
+            app->bt_locator_has_rssi = false;
+            app->bt_scan_last_update_tick = furi_get_tick();
+        }
+        return;
+    }
 
     if(app->airtag_scan_mode) {
         if(sscanf(line, " %d , %d", &airtags, &smarttags) == 2 ||
@@ -1992,6 +2061,220 @@ static void simple_app_bt_scan_feed(SimpleApp* app, char ch) {
         return;
     }
     app->bt_scan_line_buffer[app->bt_scan_line_length++] = ch;
+}
+
+static void simple_app_bt_locator_reset_list(SimpleApp* app) {
+    if(!app) return;
+    app->bt_locator_list_loading = false;
+    app->bt_locator_list_ready = false;
+    app->bt_locator_console_mode = false;
+    app->bt_locator_count = 0;
+    app->bt_locator_index = 0;
+    app->bt_locator_offset = 0;
+    app->bt_locator_selected = -1;
+    app->bt_locator_scroll_text[0] = '\0';
+    app->bt_locator_scroll_offset = 0;
+    app->bt_locator_scroll_dir = 1;
+    app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+    app->bt_locator_scroll_last_tick = furi_get_tick();
+    app->bt_locator_scan_len = 0;
+    memset(app->bt_locator_scan_line, 0, sizeof(app->bt_locator_scan_line));
+    memset(app->bt_locator_devices, 0, sizeof(app->bt_locator_devices));
+}
+
+static void simple_app_bt_locator_add(SimpleApp* app, const char* mac, int rssi) {
+    if(!app || !mac || mac[0] == '\0') return;
+    // Update if exists
+    for(size_t i = 0; i < app->bt_locator_count; i++) {
+        if(strncmp(app->bt_locator_devices[i].mac, mac, sizeof(app->bt_locator_devices[i].mac)) == 0) {
+            app->bt_locator_devices[i].rssi = rssi;
+            app->bt_locator_devices[i].has_rssi = true;
+            return;
+        }
+    }
+    if(app->bt_locator_count >= BT_LOCATOR_MAX_DEVICES) return;
+    strncpy(app->bt_locator_devices[app->bt_locator_count].mac, mac, sizeof(app->bt_locator_devices[app->bt_locator_count].mac));
+    app->bt_locator_devices[app->bt_locator_count].mac[sizeof(app->bt_locator_devices[app->bt_locator_count].mac) - 1] = '\0';
+    app->bt_locator_devices[app->bt_locator_count].rssi = rssi;
+    app->bt_locator_devices[app->bt_locator_count].has_rssi = true;
+    app->bt_locator_count++;
+
+    // Keep list sorted by RSSI desc (strongest first)
+    for(size_t pos = app->bt_locator_count; pos > 1; pos--) {
+        size_t i = pos - 1;
+        size_t prev = i - 1;
+        bool swap = false;
+        if(app->bt_locator_devices[i].has_rssi && app->bt_locator_devices[prev].has_rssi) {
+            swap = app->bt_locator_devices[i].rssi > app->bt_locator_devices[prev].rssi;
+        } else if(app->bt_locator_devices[i].has_rssi && !app->bt_locator_devices[prev].has_rssi) {
+            swap = true;
+        }
+        if(swap) {
+            struct {
+                char mac[18];
+                int rssi;
+                bool has_rssi;
+            } tmp = {0};
+            memcpy(tmp.mac, app->bt_locator_devices[i].mac, sizeof(tmp.mac));
+            tmp.rssi = app->bt_locator_devices[i].rssi;
+            tmp.has_rssi = app->bt_locator_devices[i].has_rssi;
+
+            memcpy(app->bt_locator_devices[i].mac, app->bt_locator_devices[prev].mac, sizeof(tmp.mac));
+            app->bt_locator_devices[i].rssi = app->bt_locator_devices[prev].rssi;
+            app->bt_locator_devices[i].has_rssi = app->bt_locator_devices[prev].has_rssi;
+
+            memcpy(app->bt_locator_devices[prev].mac, tmp.mac, sizeof(tmp.mac));
+            app->bt_locator_devices[prev].rssi = tmp.rssi;
+            app->bt_locator_devices[prev].has_rssi = tmp.has_rssi;
+        } else {
+            break;
+        }
+    }
+}
+
+static void simple_app_bt_locator_finish(SimpleApp* app) {
+    if(!app) return;
+    app->bt_locator_list_loading = false;
+    app->bt_locator_list_ready = true;
+    app->bt_locator_console_mode = true;
+    if(app->bt_locator_count == 0) {
+        app->bt_locator_index = 0;
+        app->bt_locator_offset = 0;
+    } else if(app->bt_locator_index >= app->bt_locator_count) {
+        app->bt_locator_index = app->bt_locator_count - 1;
+    }
+    if(app->bt_locator_offset > app->bt_locator_index) {
+        app->bt_locator_offset = app->bt_locator_index;
+    }
+    if(app->viewport && app->screen == ScreenBtLocatorList) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_bt_locator_reset_scroll(SimpleApp* app) {
+    if(!app) return;
+    app->bt_locator_scroll_text[0] = '\0';
+    app->bt_locator_scroll_offset = 0;
+    app->bt_locator_scroll_dir = 1;
+    app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+    app->bt_locator_scroll_last_tick = furi_get_tick();
+}
+
+static void simple_app_bt_locator_set_scroll_text(SimpleApp* app, const char* text) {
+    if(!app || !text) return;
+    strncpy(app->bt_locator_scroll_text, text, sizeof(app->bt_locator_scroll_text) - 1);
+    app->bt_locator_scroll_text[sizeof(app->bt_locator_scroll_text) - 1] = '\0';
+    app->bt_locator_scroll_offset = 0;
+    app->bt_locator_scroll_dir = 1;
+    app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+    app->bt_locator_scroll_last_tick = furi_get_tick();
+}
+
+static void simple_app_bt_locator_tick_scroll(SimpleApp* app, size_t char_limit) {
+    if(!app) return;
+    size_t len = strlen(app->bt_locator_scroll_text);
+    if(len <= char_limit || char_limit == 0) {
+        app->bt_locator_scroll_offset = 0;
+        return;
+    }
+
+    uint32_t interval_ticks = furi_ms_to_ticks(RESULT_SCROLL_INTERVAL_MS);
+    if(interval_ticks == 0) interval_ticks = 1;
+    uint32_t now = furi_get_tick();
+    if((now - app->bt_locator_scroll_last_tick) < interval_ticks) {
+        return;
+    }
+    app->bt_locator_scroll_last_tick = now;
+
+    if(app->bt_locator_scroll_hold > 0) {
+        app->bt_locator_scroll_hold--;
+        return;
+    }
+
+    size_t max_offset = len - char_limit;
+    bool changed = false;
+    if(app->bt_locator_scroll_dir > 0) {
+        if(app->bt_locator_scroll_offset < max_offset) {
+            app->bt_locator_scroll_offset++;
+            changed = true;
+            if(app->bt_locator_scroll_offset >= max_offset) {
+                app->bt_locator_scroll_dir = -1;
+                app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+            }
+        } else {
+            app->bt_locator_scroll_dir = -1;
+            app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        }
+    } else {
+        if(app->bt_locator_scroll_offset > 0) {
+            app->bt_locator_scroll_offset--;
+            changed = true;
+            if(app->bt_locator_scroll_offset == 0) {
+                app->bt_locator_scroll_dir = 1;
+                app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+            }
+        } else {
+            app->bt_locator_scroll_dir = 1;
+            app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        }
+    }
+
+    if(changed && app->viewport && app->screen == ScreenBtLocatorList) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_bt_locator_feed(SimpleApp* app, char ch) {
+    if(!app || !app->bt_locator_list_loading) return;
+    if(ch == '\r') return;
+    if(ch == '\n') {
+        if(app->bt_locator_scan_len > 0) {
+            app->bt_locator_scan_line[app->bt_locator_scan_len] = '\0';
+            const char* line = app->bt_locator_scan_line;
+            if(strstr(line, "Summary:") != NULL) {
+                simple_app_bt_locator_finish(app);
+            } else {
+                int idx = 0;
+                char mac[18] = {0};
+                int rssi = 0;
+                if(sscanf(line, " %d . %17s  RSSI: %d", &idx, mac, &rssi) == 3 ||
+                   sscanf(line, " %d. %17s  RSSI: %d", &idx, mac, &rssi) == 3) {
+                    simple_app_bt_locator_add(app, mac, rssi);
+                    if(app->viewport && app->screen == ScreenBtLocatorList) {
+                        view_port_update(app->viewport);
+                    }
+                }
+            }
+        }
+        app->bt_locator_scan_len = 0;
+        return;
+    }
+    if(app->bt_locator_scan_len + 1 >= sizeof(app->bt_locator_scan_line)) {
+        app->bt_locator_scan_len = 0;
+        return;
+    }
+    app->bt_locator_scan_line[app->bt_locator_scan_len++] = ch;
+}
+
+static void simple_app_bt_locator_begin_scan(SimpleApp* app) {
+    if(!app) return;
+    simple_app_reset_bt_scan_summary(app);
+    simple_app_bt_locator_reset_list(app);
+    app->bt_locator_console_mode = true;
+    app->bt_locator_list_loading = true;
+    app->bt_locator_list_ready = false;
+    app->bt_locator_mode = false;
+    simple_app_bt_locator_reset_scroll(app);
+    app->screen = ScreenSerial;
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+    simple_app_send_command(app, "scan_bt", false);
+    // send_command resets scan state; reassert locator flags so UI stays in "scanning" console mode
+    app->bt_locator_console_mode = true;
+    app->bt_locator_list_loading = true;
+    app->bt_locator_list_ready = false;
+    app->bt_locator_mode = false;
 }
 
 static void simple_app_force_otg_for_wardrive(SimpleApp* app) {
@@ -3325,6 +3608,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_vendor_feed(app, ch);
         simple_app_scanner_timing_feed(app, ch);
         simple_app_bt_scan_feed(app, ch);
+        simple_app_bt_locator_feed(app, ch);
         simple_app_wardrive_feed(app, ch);
     }
 
@@ -3414,6 +3698,19 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
         app->bt_scan_view_active = true;
         simple_app_reset_bt_scan_summary(app);
         app->airtag_scan_mode = is_airtag_scan_command;
+        if(!is_airtag_scan_command) {
+            const char* mac_ptr = strstr(command, "scan_bt");
+            if(mac_ptr) {
+                mac_ptr += strlen("scan_bt");
+                while(*mac_ptr == ' ') mac_ptr++;
+                if(strchr(mac_ptr, ':')) {
+                    strncpy(app->bt_locator_mac, mac_ptr, sizeof(app->bt_locator_mac));
+                    app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
+                    app->bt_locator_mode = true;
+                    app->bt_locator_has_rssi = false;
+                }
+            }
+        }
     } else if(app->bt_scan_view_active) {
         app->bt_scan_view_active = false;
         simple_app_reset_bt_scan_summary(app);
@@ -5924,9 +6221,179 @@ static void simple_app_draw_airtag_scan(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 62, AlignCenter, AlignBottom, status_line);
 }
 
+static void simple_app_draw_bt_locator(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+
+    const char* mac = (app->bt_locator_mac[0] != '\0') ? app->bt_locator_mac : "No MAC";
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 14, AlignCenter, AlignCenter, mac);
+
+    canvas_set_font(canvas, FontPrimary);
+    char rssi_line[32];
+    if(app->bt_locator_has_rssi) {
+        snprintf(rssi_line, sizeof(rssi_line), "RSSI: %d dBm", app->bt_locator_rssi);
+    } else {
+        snprintf(rssi_line, sizeof(rssi_line), "RSSI: N/A");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 34, AlignCenter, AlignCenter, rssi_line);
+
+    canvas_set_font(canvas, FontSecondary);
+    const char* quality = "No signal";
+    if(app->bt_locator_has_rssi) {
+        if(app->bt_locator_rssi >= -60) {
+            quality = "Great";
+        } else if(app->bt_locator_rssi >= -75) {
+            quality = "Good";
+        } else if(app->bt_locator_rssi >= -90) {
+            quality = "Poor";
+        } else {
+            quality = "Very weak";
+        }
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 50, AlignCenter, AlignCenter, quality);
+
+    char status_line[48];
+    if(app->bt_scan_last_update_tick > 0) {
+        uint32_t ticks_per_second = furi_ms_to_ticks(1000);
+        if(ticks_per_second == 0) ticks_per_second = 1;
+        uint32_t elapsed = (furi_get_tick() - app->bt_scan_last_update_tick) / ticks_per_second;
+        snprintf(status_line, sizeof(status_line), "Updated: %lus ago", (unsigned long)elapsed);
+    } else {
+        snprintf(status_line, sizeof(status_line), "Waiting for data...");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 62, AlignCenter, AlignBottom, status_line);
+}
+
+static void simple_app_draw_bt_locator_list(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+
+    uint8_t list_top = 8;
+    uint8_t list_bottom = DISPLAY_HEIGHT - 2;
+
+    if(app->bt_locator_list_loading) {
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, (list_top + list_bottom) / 2 - 6, AlignCenter, AlignCenter, "Scanning...");
+        char count_line[32];
+        snprintf(count_line, sizeof(count_line), "Found: %u", (unsigned)app->bt_locator_count);
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, (list_top + list_bottom) / 2 + 6, AlignCenter, AlignCenter, count_line);
+        return;
+    }
+
+    if(app->bt_locator_count == 0) {
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, (list_top + list_bottom) / 2 - 6, AlignCenter, AlignCenter, "No devices");
+        return;
+    }
+
+    canvas_set_font(canvas, FontSecondary);
+    size_t visible = 6;
+    size_t start = app->bt_locator_offset;
+    size_t end = start + visible;
+    if(end > app->bt_locator_count) end = app->bt_locator_count;
+
+    const size_t char_limit = 21;
+    uint8_t y = list_top;
+    for(size_t i = start; i < end; i++) {
+        const bool selected = (i == app->bt_locator_index);
+        const bool picked = ((int32_t)i == app->bt_locator_selected);
+        const char* mac = app->bt_locator_devices[i].mac;
+        int rssi = app->bt_locator_devices[i].rssi;
+        bool has_rssi = app->bt_locator_devices[i].has_rssi;
+        char line[48];
+        if(has_rssi) {
+            snprintf(line, sizeof(line), "%s %d", mac, rssi);
+        } else {
+            snprintf(line, sizeof(line), "%s ?", mac);
+        }
+        const char* to_draw = line;
+        char scroll_buf[48];
+        size_t len = strlen(line);
+        if(selected && len > char_limit) {
+            if(strncmp(app->bt_locator_scroll_text, line, sizeof(app->bt_locator_scroll_text)) != 0) {
+                simple_app_bt_locator_set_scroll_text(app, line);
+            }
+            simple_app_bt_locator_tick_scroll(app, char_limit);
+            size_t offset = app->bt_locator_scroll_offset;
+            if(offset >= len) offset = 0;
+            size_t copy_len = (len - offset > char_limit) ? char_limit : (len - offset);
+            memcpy(scroll_buf, line + offset, copy_len);
+            scroll_buf[copy_len] = '\0';
+            to_draw = scroll_buf;
+        } else {
+            simple_app_bt_locator_reset_scroll(app);
+            simple_app_truncate_text(line, char_limit);
+            to_draw = line;
+        }
+        if(selected) {
+            canvas_draw_str(canvas, 2, y, ">");
+        }
+        if(picked) {
+            canvas_draw_str(canvas, 10, y, "*");
+        }
+        canvas_draw_str(canvas, picked ? 18 : 12, y, to_draw);
+        y += SERIAL_TEXT_LINE_HEIGHT;
+    }
+
+    if(app->bt_locator_selected >= 0 && app->bt_locator_selected < (int32_t)app->bt_locator_count) {
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 2, DISPLAY_HEIGHT - 2, AlignRight, AlignBottom, "->");
+    }
+}
+
 static void simple_app_draw_bt_scan_serial(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas) return;
     canvas_set_color(canvas, ColorBlack);
+    if(app->bt_locator_mode) {
+        simple_app_draw_bt_locator(app, canvas);
+        return;
+    }
+    if(app->bt_locator_console_mode) {
+        canvas_set_font(canvas, FontSecondary);
+        char display_lines[BT_SCAN_CONSOLE_LINES][64];
+        size_t lines_filled =
+            simple_app_render_display_lines(app, app->serial_scroll, display_lines, BT_SCAN_CONSOLE_LINES);
+
+        uint8_t y = 8;
+        if(lines_filled == 0) {
+            canvas_draw_str(canvas, 2, y, "Scanning...");
+            y += SERIAL_TEXT_LINE_HEIGHT;
+        } else {
+            for(size_t i = 0; i < lines_filled; i++) {
+                canvas_draw_str(canvas, 2, y, display_lines[i][0] ? display_lines[i] : " ");
+                y += SERIAL_TEXT_LINE_HEIGHT;
+            }
+        }
+
+        size_t total_lines = simple_app_total_display_lines(app);
+        if(total_lines > BT_SCAN_CONSOLE_LINES) {
+            size_t max_scroll = simple_app_max_scroll(app);
+            bool show_up = (app->serial_scroll > 0);
+            bool show_down = (app->serial_scroll < max_scroll);
+            if(show_up || show_down) {
+                uint8_t arrow_x = DISPLAY_WIDTH - 6;
+                int16_t content_top = 0; // top edge
+                int16_t visible_rows = (BT_SCAN_CONSOLE_LINES > 0) ? (BT_SCAN_CONSOLE_LINES - 1) : 0;
+                int16_t content_bottom = -4 + (int16_t)(visible_rows * SERIAL_TEXT_LINE_HEIGHT);
+                simple_app_draw_scroll_hints(canvas, arrow_x, content_top, content_bottom, show_up, show_down);
+            }
+        }
+
+        if(app->bt_locator_list_ready) {
+            canvas_set_font(canvas, FontPrimary);
+            canvas_draw_str_aligned(canvas,
+                                    DISPLAY_WIDTH - 2,
+                                    DISPLAY_HEIGHT - 2,
+                                    AlignRight,
+                                    AlignBottom,
+                                    "->");
+        }
+        return;
+    }
     canvas_set_font(canvas, FontSecondary);
     char display_lines[BT_SCAN_CONSOLE_LINES][64];
     size_t lines_filled = simple_app_render_display_lines(
@@ -5979,6 +6446,10 @@ static void simple_app_draw_bt_scan_serial(SimpleApp* app, Canvas* canvas) {
     char line1[32];
     char line2[32];
     char total_line[32];
+    if(app->bt_locator_mode) {
+        // Locator view is drawn separately
+        return;
+    }
     snprintf(line1, sizeof(line1), "AirTags: %d", app->bt_scan_airtags);
     snprintf(line2, sizeof(line2), "SmartTags: %d", app->bt_scan_smarttags);
     snprintf(total_line, sizeof(total_line), "Total: %d", app->bt_scan_total);
@@ -6002,6 +6473,10 @@ static void simple_app_draw_serial(SimpleApp* app, Canvas* canvas) {
     if(app && app->bt_scan_view_active && !app->bt_scan_full_console) {
         if(app->airtag_scan_mode) {
             simple_app_draw_airtag_scan(app, canvas);
+            return;
+        }
+        if(app->bt_locator_mode) {
+            simple_app_draw_bt_locator(app, canvas);
             return;
         }
         simple_app_draw_bt_scan_serial(app, canvas);
@@ -7255,6 +7730,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenDownloadBridge:
         simple_app_draw_download_bridge(app, canvas);
         break;
+    case ScreenBtLocatorList:
+        simple_app_draw_bt_locator_list(app, canvas);
+        break;
     default:
         simple_app_draw_results(app, canvas);
         break;
@@ -7459,6 +7937,8 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             return;
         } else if(entry->action == MenuActionOpenConsole) {
             simple_app_console_enter(app);
+        } else if(entry->action == MenuActionOpenBtLocator) {
+            simple_app_bt_locator_begin_scan(app);
         } else if(entry->action == MenuActionConfirmBlackout) {
             app->confirm_blackout_yes = false;
             app->screen = ScreenConfirmBlackout;
@@ -9239,6 +9719,13 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
             return;
         }
 
+        if(app->bt_locator_console_mode && app->bt_locator_list_ready) {
+            app->bt_locator_console_mode = false;
+            app->screen = ScreenBtLocatorList;
+            view_port_update(app->viewport);
+            return;
+        }
+
         size_t step = SERIAL_VISIBLE_LINES;
         size_t max_scroll = simple_app_max_scroll(app);
         if(app->serial_scroll < max_scroll) {
@@ -9301,6 +9788,65 @@ static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
             app->last_attack_index = 0;
             view_port_update(app->viewport);
         }
+    }
+}
+
+static void simple_app_handle_bt_locator_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+    if(key == InputKeyBack || key == InputKeyLeft) {
+        simple_app_send_stop_if_needed(app);
+        app->screen = ScreenMenu;
+        view_port_update(app->viewport);
+        return;
+    }
+
+    if(app->bt_locator_list_loading || app->bt_locator_count == 0) {
+        return;
+    }
+
+    size_t visible = 6;
+
+    if(key == InputKeyUp) {
+        if(app->bt_locator_index > 0) {
+            app->bt_locator_index--;
+            if(app->bt_locator_index < app->bt_locator_offset) {
+                app->bt_locator_offset = app->bt_locator_index;
+            }
+            simple_app_bt_locator_reset_scroll(app);
+            if(app->viewport) view_port_update(app->viewport);
+        }
+    } else if(key == InputKeyDown) {
+        if(app->bt_locator_index + 1 < app->bt_locator_count) {
+            app->bt_locator_index++;
+            if(app->bt_locator_index >= app->bt_locator_offset + visible) {
+                app->bt_locator_offset = app->bt_locator_index - visible + 1;
+            }
+            simple_app_bt_locator_reset_scroll(app);
+            if(app->viewport) view_port_update(app->viewport);
+        }
+    } else if(key == InputKeyRight) {
+        if(app->bt_locator_selected < 0) {
+            return; // require explicit selection
+        }
+        size_t target_idx = (size_t)app->bt_locator_selected;
+        if(target_idx >= app->bt_locator_count) return;
+        const char* mac = app->bt_locator_devices[target_idx].mac;
+        if(mac[0] != '\0') {
+            char command[64];
+            snprintf(command, sizeof(command), "scan_bt %s", mac);
+            app->bt_locator_console_mode = false;
+            app->bt_locator_mode = true;
+            app->bt_locator_has_rssi = false;
+            simple_app_send_command(app, command, true);
+        }
+    } else if(key == InputKeyOk) {
+        if((int32_t)app->bt_locator_index == app->bt_locator_selected) {
+            app->bt_locator_selected = -1;
+        } else {
+            app->bt_locator_selected = (int32_t)app->bt_locator_index;
+        }
+        simple_app_bt_locator_reset_scroll(app);
+        if(app->viewport) view_port_update(app->viewport);
     }
 }
 
@@ -9459,6 +10005,9 @@ static void simple_app_input(InputEvent* event, void* context) {
         if(event->key == InputKeyBack) {
             simple_app_download_bridge_stop(app);
         }
+        break;
+    case ScreenBtLocatorList:
+        simple_app_handle_bt_locator_input(app, event->key);
         break;
     default:
         simple_app_handle_results_input(app, event->key);
