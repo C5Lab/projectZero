@@ -370,6 +370,12 @@ typedef struct {
 static bt_device_info_t *bt_devices = NULL;                 // ~5.5 KB in PSRAM
 static int bt_device_count = 0;
 
+// MAC tracking mode for scan_bt with argument
+static bool bt_tracking_mode = false;
+static uint8_t bt_tracking_mac[6];
+static int8_t bt_tracking_rssi = 0;
+static bool bt_tracking_found = false;
+
 // ============================================================================
 
 // Promiscuous filter (like Marauder)
@@ -6171,6 +6177,32 @@ static void bt_format_addr(const uint8_t *addr, char *str)
 }
 
 /**
+ * Parse MAC address string to bytes (format: XX:XX:XX:XX:XX:XX)
+ * Returns true if parsing successful
+ */
+static bool bt_parse_mac(const char *str, uint8_t *mac)
+{
+    unsigned int values[6];
+    if (sscanf(str, "%02X:%02X:%02X:%02X:%02X:%02X",
+               &values[0], &values[1], &values[2],
+               &values[3], &values[4], &values[5]) != 6) {
+        // Try lowercase
+        if (sscanf(str, "%02x:%02x:%02x:%02x:%02x:%02x",
+                   &values[0], &values[1], &values[2],
+                   &values[3], &values[4], &values[5]) != 6) {
+            return false;
+        }
+    }
+    
+    // Store in reverse order (BLE format)
+    for (int i = 0; i < 6; i++) {
+        mac[5 - i] = (uint8_t)values[i];
+    }
+    
+    return true;
+}
+
+/**
  * Check if manufacturer data indicates Apple AirTag/Find My device
  * AirTag has specific length (25-29 bytes) and doesn't broadcast device name
  * This avoids false positives from iPhone/iPad with Find My enabled
@@ -6231,6 +6263,15 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     }
     
     struct ble_gap_disc_desc *desc = &event->disc;
+    
+    // MAC tracking mode - just update RSSI for tracked device
+    if (bt_tracking_mode) {
+        if (memcmp(desc->addr.val, bt_tracking_mac, 6) == 0) {
+            bt_tracking_rssi = desc->rssi;
+            bt_tracking_found = true;
+        }
+        return 0;
+    }
     
     // Skip if already seen
     if (bt_is_device_found(desc->addr.val)) {
@@ -6564,11 +6605,78 @@ static void bt_airtag_scan_task(void *pvParameters)
 }
 
 /**
+ * Task for MAC tracking mode (scan_bt with MAC argument)
+ * Scans every 10 seconds and outputs RSSI for the tracked MAC
+ */
+static void bt_tracking_task(void *pvParameters)
+{
+    char mac_str[18];
+    bt_format_addr(bt_tracking_mac, mac_str);
+    
+    MY_LOG_INFO(TAG, "Tracking %s (10s intervals)...", mac_str);
+    MY_LOG_INFO(TAG, "Use 'stop' command to stop tracking.");
+    MY_LOG_INFO(TAG, "");
+    
+    while (bt_scan_active && !operation_stop_requested) {
+        // Reset tracking state
+        bt_tracking_found = false;
+        bt_tracking_rssi = 0;
+        
+        int rc = bt_start_scan();
+        if (rc != 0) {
+            MY_LOG_INFO(TAG, "BLE scan start failed: %d", rc);
+            break;
+        }
+        
+        // Scan for 10 seconds with light blue LED blinking
+        bool led_on = false;
+        for (int i = 0; i < 100 && bt_scan_active && !operation_stop_requested; i++) {
+            // Toggle LED every 500ms (every 5 iterations)
+            if (i % 5 == 0) {
+                led_on = !led_on;
+                if (led_on) {
+                    led_set_color(100, 200, 255); // Light blue
+                } else {
+                    led_clear();
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        
+        bt_stop_scan();
+        
+        if (!bt_scan_active || operation_stop_requested) {
+            break;
+        }
+        
+        // Output result
+        if (bt_tracking_found) {
+            printf("%s  RSSI: %d dBm\n", mac_str, bt_tracking_rssi);
+        } else {
+            printf("%s  not found\n", mac_str);
+        }
+    }
+    
+    // Restore idle LED
+    led_set_idle();
+    
+    bt_tracking_mode = false;
+    bt_scan_active = false;
+    bt_scan_task_handle = NULL;
+    MY_LOG_INFO(TAG, "MAC tracking stopped.");
+    vTaskDelete(NULL);
+}
+
+/**
  * Command: scan_bt - One-time BLE device scan
+ * With MAC argument: continuous tracking of specific device
+ * 
+ * Usage:
+ *   scan_bt              - One-time 10s scan, show all devices
+ *   scan_bt XX:XX:XX:XX:XX:XX - Continuous tracking of specific MAC (2s intervals)
  */
 static int cmd_scan_bt(int argc, char **argv)
 {
-    (void)argc; (void)argv;
     log_memory_info("scan_bt");
     
     // Ensure BLE is initialized (may reboot if WiFi was active)
@@ -6584,19 +6692,52 @@ static int cmd_scan_bt(int argc, char **argv)
     bt_scan_active = true;
     operation_stop_requested = false;
     
-    BaseType_t task_ret = xTaskCreate(
-        bt_scan_task,
-        "bt_scan_task",
-        4096,
-        NULL,
-        5,
-        &bt_scan_task_handle
-    );
-    
-    if (task_ret != pdPASS) {
-        bt_scan_active = false;
-        MY_LOG_INFO(TAG, "Failed to create BLE scan task");
-        return 1;
+    // Check if MAC argument provided
+    if (argc > 1) {
+        // Tracking mode - parse MAC address
+        if (!bt_parse_mac(argv[1], bt_tracking_mac)) {
+            MY_LOG_INFO(TAG, "Invalid MAC address format. Use XX:XX:XX:XX:XX:XX");
+            bt_scan_active = false;
+            return 1;
+        }
+        
+        bt_tracking_mode = true;
+        bt_tracking_found = false;
+        bt_tracking_rssi = 0;
+        
+        BaseType_t task_ret = xTaskCreate(
+            bt_tracking_task,
+            "bt_tracking_task",
+            4096,
+            NULL,
+            5,
+            &bt_scan_task_handle
+        );
+        
+        if (task_ret != pdPASS) {
+            bt_scan_active = false;
+            bt_tracking_mode = false;
+            MY_LOG_INFO(TAG, "Failed to create MAC tracking task");
+            return 1;
+        }
+    } else {
+        // Normal scan mode
+        bt_tracking_mode = false;
+        
+        BaseType_t task_ret = xTaskCreate(
+            bt_scan_task,
+            "bt_scan_task",
+            4096,
+            NULL,
+            5,
+            &bt_scan_task_handle
+        );
+        
+        if (task_ret != pdPASS) {
+            bt_scan_active = false;
+            MY_LOG_INFO(TAG, "Failed to create BLE scan task");
+            return 1;
+        }
     }
     
     return 0;
