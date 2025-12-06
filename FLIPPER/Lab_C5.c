@@ -92,7 +92,6 @@ typedef enum {
 #define DISPLAY_HEIGHT 64
 #define WARD_DRIVE_CONSOLE_LINES 3
 #define BT_SCAN_CONSOLE_LINES 4
-#define AIRTAG_REFRESH_INTERVAL_MS 30000
 #define RESULT_DEFAULT_MAX_LINES 4
 #define RESULT_DEFAULT_LINE_HEIGHT 12
 #define RESULT_DEFAULT_CHAR_LIMIT (SERIAL_LINE_CHAR_LIMIT - 3)
@@ -310,7 +309,8 @@ typedef struct {
     bool bt_scan_view_active;
     bool bt_scan_summary_seen;
     bool airtag_scan_mode;
-    uint32_t airtag_next_refresh_tick;
+    bool bt_scan_full_console;
+    uint32_t bt_scan_last_update_tick;
     int bt_scan_airtags;
     int bt_scan_smarttags;
     int bt_scan_total;
@@ -784,7 +784,7 @@ static const char hint_attack_sniffer_dog[] =
 static const char hint_attack_wardrive[] =
     "Logs networks around you \nwith GPS coordinates.";
 static const char hint_bluetooth_airtag[] =
-    "Continuous tag scan\nOutputs counts only\n30s cycles\nStop/back to exit\nFor Air/SmartTags.";
+    "Continuous tag scan\nOutputs counts only\nUpdates as data arrives\nStop/back to exit\nFor Air/SmartTags.";
 static const char hint_bluetooth_scan[] =
     "One-off 10s BLE scan\nLists seen devices\nHighlights trackers\nSummary shown below\nStop/back to reset.";
 
@@ -1403,19 +1403,10 @@ static void simple_app_on_board_online(SimpleApp* app, const char* source) {
     app->board_missing_shown = false;
 
     if(app->board_bootstrap_active) {
-        if(app->board_bootstrap_reboot_sent) {
-            app->board_bootstrap_active = false;
-            app->board_bootstrap_reboot_sent = false;
-            simple_app_show_status_message(app, "Board ready", 1200, true);
-        } else {
-            simple_app_show_status_message(
-                app, "Board discovery\nBoard Found\nRebooting\nfor stability", 0, true);
-            app->board_bootstrap_reboot_sent = true;
-            simple_app_send_command_quiet(app, "reboot");
-            app->board_ready_seen = false;
-            app->board_ping_outstanding = false;
-            app->board_last_ping_tick = furi_get_tick() - BOARD_PING_INTERVAL_MS;
-        }
+        // End bootstrap discovery without forcing a reboot
+        app->board_bootstrap_active = false;
+        app->board_bootstrap_reboot_sent = false;
+        simple_app_show_status_message(app, "Board ready", 1200, true);
         if(app->viewport) {
             view_port_update(app->viewport);
         }
@@ -1943,7 +1934,8 @@ static void simple_app_reset_bt_scan_summary(SimpleApp* app) {
     app->bt_scan_line_length = 0;
     app->bt_scan_summary_seen = false;
     app->airtag_scan_mode = false;
-    app->airtag_next_refresh_tick = 0;
+    app->bt_scan_full_console = false;
+    app->bt_scan_last_update_tick = 0;
 }
 
 static void simple_app_process_bt_scan_line(SimpleApp* app, const char* line) {
@@ -1959,9 +1951,7 @@ static void simple_app_process_bt_scan_line(SimpleApp* app, const char* line) {
             app->bt_scan_airtags = airtags;
             app->bt_scan_smarttags = smarttags;
             app->bt_scan_total = airtags + smarttags;
-            uint32_t interval_ticks = furi_ms_to_ticks(AIRTAG_REFRESH_INTERVAL_MS);
-            if(interval_ticks == 0) interval_ticks = 1;
-            app->airtag_next_refresh_tick = furi_get_tick() + interval_ticks;
+            app->bt_scan_last_update_tick = furi_get_tick();
         }
         return;
     }
@@ -1972,11 +1962,13 @@ static void simple_app_process_bt_scan_line(SimpleApp* app, const char* line) {
         app->bt_scan_smarttags = smarttags;
         app->bt_scan_total = total;
         app->bt_scan_summary_seen = true;
+        app->bt_scan_last_update_tick = furi_get_tick();
         return;
     }
 
     if(sscanf(line, "Found %d devices", &total) == 1) {
         app->bt_scan_total = total;
+        app->bt_scan_last_update_tick = furi_get_tick();
     }
 }
 
@@ -3235,7 +3227,7 @@ static size_t simple_app_visible_serial_lines(const SimpleApp* app) {
         return CONSOLE_VISIBLE_LINES;
     }
     if(app->screen == ScreenSerial) {
-        if(app->bt_scan_view_active) {
+        if(app->bt_scan_view_active && !app->bt_scan_full_console) {
             return BT_SCAN_CONSOLE_LINES;
         }
         if(app->wardrive_view_active) {
@@ -3422,11 +3414,6 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
         app->bt_scan_view_active = true;
         simple_app_reset_bt_scan_summary(app);
         app->airtag_scan_mode = is_airtag_scan_command;
-        if(is_airtag_scan_command) {
-            uint32_t refresh_ticks = furi_ms_to_ticks(AIRTAG_REFRESH_INTERVAL_MS);
-            if(refresh_ticks == 0) refresh_ticks = 1;
-            app->airtag_next_refresh_tick = furi_get_tick() + refresh_ticks;
-        }
     } else if(app->bt_scan_view_active) {
         app->bt_scan_view_active = false;
         simple_app_reset_bt_scan_summary(app);
@@ -5923,22 +5910,18 @@ static void simple_app_draw_airtag_scan(SimpleApp* app, Canvas* canvas) {
     snprintf(total_line, sizeof(total_line), "Total: %d", app->bt_scan_total);
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 50, AlignCenter, AlignCenter, total_line);
 
-    char timer_line[48];
-    if(app->airtag_next_refresh_tick > 0) {
-        uint32_t now = furi_get_tick();
+    char status_line[48];
+    if(app->bt_scan_last_update_tick > 0) {
         uint32_t ticks_per_second = furi_ms_to_ticks(1000);
         if(ticks_per_second == 0) ticks_per_second = 1;
-        if(app->airtag_next_refresh_tick > now) {
-            uint32_t remaining_ticks = app->airtag_next_refresh_tick - now;
-            uint32_t remaining_seconds = (remaining_ticks + ticks_per_second - 1) / ticks_per_second;
-            snprintf(timer_line, sizeof(timer_line), "Next refresh: %lus", (unsigned long)remaining_seconds);
-        } else {
-            snprintf(timer_line, sizeof(timer_line), "Awaiting next packet");
-        }
+        uint32_t now = furi_get_tick();
+        uint32_t elapsed_ticks = now - app->bt_scan_last_update_tick;
+        uint32_t elapsed_seconds = elapsed_ticks / ticks_per_second;
+        snprintf(status_line, sizeof(status_line), "Last update: %lus ago", (unsigned long)elapsed_seconds);
     } else {
-        snprintf(timer_line, sizeof(timer_line), "Waiting for scan start");
+        snprintf(status_line, sizeof(status_line), "Waiting for scan data");
     }
-    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 62, AlignCenter, AlignBottom, timer_line);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 62, AlignCenter, AlignBottom, status_line);
 }
 
 static void simple_app_draw_bt_scan_serial(SimpleApp* app, Canvas* canvas) {
@@ -6016,7 +5999,7 @@ static void simple_app_draw_bt_scan_serial(SimpleApp* app, Canvas* canvas) {
 }
 
 static void simple_app_draw_serial(SimpleApp* app, Canvas* canvas) {
-    if(app && app->bt_scan_view_active) {
+    if(app && app->bt_scan_view_active && !app->bt_scan_full_console) {
         if(app->airtag_scan_mode) {
             simple_app_draw_airtag_scan(app, canvas);
             return;
@@ -9390,6 +9373,14 @@ static void simple_app_input(InputEvent* event, void* context) {
     }
 
     if(event->type == InputTypeLong && event->key == InputKeyOk) {
+        if(app->bt_scan_view_active) {
+            app->bt_scan_full_console = !app->bt_scan_full_console;
+            app->serial_follow_tail = true;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
         if(simple_app_try_show_hint(app)) {
             return;
         }
