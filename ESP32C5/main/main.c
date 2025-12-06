@@ -324,11 +324,11 @@ static void log_memory_info(const char *context)
     size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     
-    MY_LOG_INFO(TAG, "[MEM] %s: Internal=%u/%uKB, DMA=%u/%uKB, PSRAM=%u/%uKB",
+    /*MY_LOG_INFO(TAG, "[MEM] %s: Internal=%u/%uKB, DMA=%u/%uKB, PSRAM=%u/%uKB",
            context,
            (unsigned)(internal_free / 1024), (unsigned)(internal_total / 1024),
            (unsigned)(dma_free / 1024), (unsigned)(dma_total / 1024),
-           (unsigned)(psram_free / 1024), (unsigned)(psram_total / 1024));
+           (unsigned)(psram_free / 1024), (unsigned)(psram_total / 1024));*/
 }
 
 // ============================================================================
@@ -1285,8 +1285,7 @@ static esp_err_t wifi_init_ap_sta(void) {
     esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
 
     if (ret == ESP_OK) {
-        MY_LOG_INFO(TAG,"JanOS version: " JANOS_VERSION);
-        MY_LOG_INFO("MAC", "MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
+         MY_LOG_INFO("MAC", "MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     } else {
         ESP_LOGE("MAC", "Failed to get MAC address");
@@ -6433,8 +6432,23 @@ static void bt_scan_task(void *pvParameters)
         return;
     }
     
-    // Scan for 10 seconds
-    vTaskDelay(pdMS_TO_TICKS(10000));
+    // Scan for 10 seconds with light blue LED blinking
+    bool led_on = false;
+    for (int i = 0; i < 100 && bt_scan_active; i++) {
+        // Toggle LED every 500ms (every 5 iterations)
+        if (i % 5 == 0) {
+            led_on = !led_on;
+            if (led_on) {
+                led_set_color(100, 200, 255); // Light blue
+            } else {
+                led_clear();
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    // Restore idle LED
+    led_set_idle();
     
     bt_stop_scan();
     bt_scan_active = false;
@@ -6493,8 +6507,18 @@ static void bt_airtag_scan_task(void *pvParameters)
             break;
         }
         
-        // Scan for 10 seconds
+        // Scan for 10 seconds with light blue LED blinking
+        bool led_on = false;
         for (int i = 0; i < 100 && bt_airtag_scan_active && !operation_stop_requested; i++) {
+            // Toggle LED every 500ms (every 5 iterations)
+            if (i % 5 == 0) {
+                led_on = !led_on;
+                if (led_on) {
+                    led_set_color(100, 200, 255); // Light blue
+                } else {
+                    led_clear();
+                }
+            }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         
@@ -6509,6 +6533,9 @@ static void bt_airtag_scan_task(void *pvParameters)
         
         // Immediately start next scan cycle (no wait)
     }
+    
+    // Restore idle LED
+    led_set_idle();
     
     bt_airtag_scan_active = false;
     bt_scan_task_handle = NULL;
@@ -6921,10 +6948,10 @@ static void register_commands(void)
 void app_main(void) {
 
 
-    printf("Heap regions:\n");
-    printf("  DRAM total: %u KB\n", (unsigned)(heap_caps_get_total_size(MALLOC_CAP_8BIT) / 1024));
-    printf("  IRAM total: %u KB\n", (unsigned)(heap_caps_get_total_size(MALLOC_CAP_EXEC) / 1024));
-    heap_caps_print_heap_info(MALLOC_CAP_DEFAULT);
+    // printf("Heap regions:\n");
+    // printf("  DRAM total: %u KB\n", (unsigned)(heap_caps_get_total_size(MALLOC_CAP_8BIT) / 1024));
+    // printf("  IRAM total: %u KB\n", (unsigned)(heap_caps_get_total_size(MALLOC_CAP_EXEC) / 1024));
+    // heap_caps_print_heap_info(MALLOC_CAP_DEFAULT);
 
     printf("\n\n=== APP_MAIN START (v" JANOS_VERSION ") ===\n");
     
@@ -6936,30 +6963,30 @@ void app_main(void) {
     // esp_log_level_set(TAG, ESP_LOG_DEBUG);
     // esp_log_level_set("espnow", ESP_LOG_DEBUG);
 
-#ifdef CONFIG_SPIRAM
-    printf("Step 1: Manual PSRAM init\n");
+ #ifdef CONFIG_SPIRAM
+//     printf("Step 1: Manual PSRAM init\n");
     
     // Manual PSRAM initialization (CONFIG_SPIRAM_BOOT_INIT=n)
     esp_err_t ret1 = esp_psram_init();
     if (ret1 == ESP_OK) {
         size_t psram_size = esp_psram_get_size();
-        printf("PSRAM initialized successfully, size: %zu bytes\n", psram_size);
+        //printf("PSRAM initialized successfully, size: %zu bytes\n", psram_size);
         
-        printf("Step 2: Test PSRAM malloc\n");
+        //printf("Step 2: Test PSRAM malloc\n");
         void* ptr = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
         if (ptr != NULL) {
-            printf("Malloc from PSRAM succeeded\n");
+            //printf("Malloc from PSRAM succeeded\n");
             heap_caps_free(ptr);
         } else {
             printf("Malloc from PSRAM failed\n");
         }
         
-        printf("Step 2b: Allocate buffers in PSRAM\n");
+        //printf("Step 2b: Allocate buffers in PSRAM\n");
         if (!init_psram_buffers()) {
             printf("FATAL: PSRAM buffer allocation failed!\n");
             return;
         }
-        printf("PSRAM buffers allocated (~110 KB)\n");
+        //printf("PSRAM buffers allocated (~110 KB)\n");
     } else {
         printf("PSRAM init failed: %s (continuing without PSRAM)\n", esp_err_to_name(ret1));
     }
@@ -6967,13 +6994,13 @@ void app_main(void) {
     printf("PSRAM support disabled in config\n");
 #endif
 
-    printf("Step 3: Init NVS\n");
+//     printf("Step 3: Init NVS\n");
     ESP_ERROR_CHECK(nvs_flash_init());
-    printf("NVS initialized OK\n");
+    //printf("NVS initialized OK\n");
 
     channel_time_load_state_from_nvs();
 
-    printf("Step 4: Init LED strip\n");
+    //printf("Step 4: Init LED strip\n");
     // 1. LED strip configuration
     led_strip_config_t strip_cfg = {
         .strip_gpio_num            = NEOPIXEL_GPIO,
@@ -6992,12 +7019,12 @@ void app_main(void) {
 
     // 3. strip instance
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &strip));
-    printf("LED strip initialized OK\n");
+    //printf("LED strip initialized OK\n");
 
     led_initialized = true;
-    printf("Step 5: LED boot sequence\n");
+    //printf("Step 5: LED boot sequence\n");
     led_boot_sequence();
-    printf("Step 6: Vendor load state\n");
+    //printf("Step 6: Vendor load state\n");
     MY_LOG_INFO(TAG, "Status LED ready (brightness %u%%, %s)", led_brightness_percent, led_user_enabled ? "on" : "off");
     vendor_load_state_from_nvs();
     vendor_last_valid = false;
@@ -7006,15 +7033,18 @@ void app_main(void) {
     vendor_file_checked = false;
     vendor_file_present = false;
     vendor_record_count = 0;
-    printf("Step 7: Boot config load\n");
+    //printf("Step 7: Boot config load\n");
     boot_config_load_from_nvs();
 
     // Note: WiFi and BLE are initialized lazily on first command that needs them
     // This saves memory and allows SD card to work properly
-    printf("Radio init: deferred (lazy initialization)\n");
+    //printf("Radio init: deferred (lazy initialization)\n");
     
     // Show memory status at boot
     log_memory_info("BOOT");
+
+    MY_LOG_INFO(TAG,"JanOS version: " JANOS_VERSION);
+
 
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
