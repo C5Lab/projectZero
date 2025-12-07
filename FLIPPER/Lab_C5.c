@@ -18,6 +18,7 @@
 #include <gui/modules/text_input.h>
 #include <furi_hal_usb.h>
 #include <furi_hal_usb_cdc.h>
+#include <furi_hal_vibro.h>
 #include <usb_cdc.h>
 
 #define TAG "Lab_C5"
@@ -106,6 +107,11 @@ typedef enum {
 #define RESULT_SCROLL_GAP 0
 #define RESULT_SCROLL_INTERVAL_MS 200
 #define RESULT_SCROLL_EDGE_PAUSE_STEPS 3
+#define DEAUTH_GUARD_BLINK_MS 500
+#define DEAUTH_GUARD_VIBRO_MS 400
+#define DEAUTH_GUARD_LED_LEVEL 255
+#define DEAUTH_GUARD_BLINK_TOGGLES 6
+#define DEAUTH_GUARD_IDLE_MONITOR_MS 60000
 #define CONSOLE_VISIBLE_LINES 4
 #define MENU_SECTION_SCANNER 0
 #define MENU_SECTION_SNIFFERS 1
@@ -346,6 +352,27 @@ typedef struct {
     } bt_locator_devices[BT_LOCATOR_MAX_DEVICES];
     char bt_scan_line_buffer[96];
     size_t bt_scan_line_length;
+    bool deauth_guard_view_active;
+    bool deauth_guard_full_console;
+    bool deauth_guard_has_detection;
+    bool deauth_guard_has_rssi;
+    int deauth_guard_last_channel;
+    int deauth_guard_last_rssi;
+    uint32_t deauth_guard_started_tick;
+    uint32_t deauth_guard_last_detection_tick;
+    uint32_t deauth_guard_blink_until;
+    uint32_t deauth_guard_last_blink_tick;
+    bool deauth_guard_blink_state;
+    uint8_t deauth_guard_blink_count;
+    uint32_t deauth_guard_led_until;
+    bool deauth_guard_led_state;
+    uint32_t deauth_guard_vibro_until;
+    bool deauth_guard_vibro_on;
+    char deauth_guard_last_ssid[SCAN_SSID_MAX_LEN];
+    char deauth_guard_line_buffer[SCAN_LINE_BUFFER_SIZE];
+    size_t deauth_guard_line_length;
+    bool deauth_guard_monitoring;
+    uint32_t deauth_guard_detection_count;
     bool last_command_sent;
     bool sniffer_show_results_on_back;
     bool confirm_blackout_yes;
@@ -643,6 +670,12 @@ static void simple_app_bt_locator_reset_scroll(SimpleApp* app);
 static void simple_app_bt_locator_set_scroll_text(SimpleApp* app, const char* text);
 static void simple_app_bt_locator_tick_scroll(SimpleApp* app, size_t char_limit);
 static void simple_app_channel_view_show_status(SimpleApp* app, const char* status);
+static void simple_app_reset_deauth_guard(SimpleApp* app);
+static void simple_app_start_deauth_guard(SimpleApp* app);
+static void simple_app_process_deauth_guard_line(SimpleApp* app, const char* line);
+static void simple_app_deauth_guard_feed(SimpleApp* app, char ch);
+static void simple_app_update_deauth_guard(SimpleApp* app);
+static void simple_app_draw_deauth_guard(SimpleApp* app, Canvas* canvas);
 static int simple_app_channel_view_find_channel_index(const uint8_t* list, size_t count, uint8_t channel);
 static size_t simple_app_channel_view_visible_columns(ChannelViewBand band);
 static uint8_t simple_app_channel_view_max_offset(ChannelViewBand band);
@@ -2070,6 +2103,247 @@ static void simple_app_bt_scan_feed(SimpleApp* app, char ch) {
         return;
     }
     app->bt_scan_line_buffer[app->bt_scan_line_length++] = ch;
+}
+
+static void simple_app_reset_deauth_guard(SimpleApp* app) {
+    if(!app) return;
+    bool was_blinking = app->deauth_guard_blink_until > 0;
+    app->deauth_guard_view_active = false;
+    app->deauth_guard_full_console = false;
+    app->deauth_guard_has_detection = false;
+    app->deauth_guard_has_rssi = false;
+    app->deauth_guard_last_channel = -1;
+    app->deauth_guard_last_rssi = 0;
+    app->deauth_guard_started_tick = 0;
+    app->deauth_guard_last_detection_tick = 0;
+    app->deauth_guard_monitoring = false;
+    app->deauth_guard_blink_until = 0;
+    app->deauth_guard_last_blink_tick = 0;
+    app->deauth_guard_blink_state = false;
+    app->deauth_guard_blink_count = 0;
+    app->deauth_guard_led_until = 0;
+    app->deauth_guard_led_state = false;
+    if(app->deauth_guard_vibro_on) {
+        furi_hal_vibro_on(false);
+    }
+    app->deauth_guard_vibro_on = false;
+    app->deauth_guard_detection_count = 0;
+    app->deauth_guard_line_length = 0;
+    memset(app->deauth_guard_last_ssid, 0, sizeof(app->deauth_guard_last_ssid));
+    memset(app->deauth_guard_line_buffer, 0, sizeof(app->deauth_guard_line_buffer));
+    furi_hal_light_set(LightRed, 0);
+    furi_hal_light_set(LightGreen, 0);
+    furi_hal_light_set(LightBlue, 0);
+    if(was_blinking) {
+        simple_app_apply_backlight(app);
+    }
+}
+
+static void simple_app_start_deauth_guard(SimpleApp* app) {
+    if(!app) return;
+    simple_app_reset_deauth_guard(app);
+    app->deauth_guard_view_active = true;
+    app->deauth_guard_started_tick = furi_get_tick();
+    app->deauth_guard_last_detection_tick = app->deauth_guard_started_tick;
+    app->serial_targets_hint = false;
+}
+
+static void simple_app_process_deauth_guard_line(SimpleApp* app, const char* line) {
+    if(!app || !line || !app->deauth_guard_view_active) return;
+    // Ignore startup and prompt noise
+    if(strncmp(line, "[MEM]", 5) == 0) return;
+    if(strncmp(line, "Deauth Detector started", 24) == 0) return;
+    if(strncmp(line, "Output: [DEAUTH]", 16) == 0) return;
+    if(strncmp(line, "Use 'stop' to stop.", 19) == 0) return;
+    if(strncmp(line, "->", 2) == 0) return;
+
+    if(strstr(line, "[DEAUTH]") == NULL) return;
+    if(strstr(line, "RSSI:") == NULL || strstr(line, "CH:") == NULL) return;
+
+    int channel = -1;
+    int rssi = 0;
+    bool has_rssi = false;
+
+    const char* ch_ptr = strstr(line, "CH:");
+    if(ch_ptr) {
+        channel = atoi(ch_ptr + 3);
+    }
+
+    const char* rssi_ptr = strstr(line, "RSSI:");
+    if(rssi_ptr) {
+        rssi = atoi(rssi_ptr + 5);
+        has_rssi = true;
+    }
+
+    char ssid[SCAN_SSID_MAX_LEN];
+    ssid[0] = '\0';
+    const char* ap_ptr = strstr(line, "AP:");
+    if(ap_ptr) {
+        ap_ptr += 3;
+        while(*ap_ptr == ' ' || *ap_ptr == '|') {
+            ap_ptr++;
+        }
+        const char* end = ap_ptr;
+        while(*end && *end != '(' && *end != '|' && *end != '\r' && *end != '\n') {
+            end++;
+        }
+        size_t len = (size_t)(end - ap_ptr);
+        while(len > 0 && isspace((unsigned char)ap_ptr[len - 1])) {
+            len--;
+        }
+        if(len >= sizeof(ssid)) {
+            len = sizeof(ssid) - 1;
+        }
+        memcpy(ssid, ap_ptr, len);
+        ssid[len] = '\0';
+    }
+    if(ssid[0] == '\0') {
+        snprintf(ssid, sizeof(ssid), "Unknown");
+    }
+
+    strncpy(app->deauth_guard_last_ssid, ssid, sizeof(app->deauth_guard_last_ssid) - 1);
+    app->deauth_guard_last_ssid[sizeof(app->deauth_guard_last_ssid) - 1] = '\0';
+    app->deauth_guard_last_channel = channel;
+    app->deauth_guard_has_rssi = has_rssi;
+    app->deauth_guard_last_rssi = rssi;
+    app->deauth_guard_has_detection = true;
+    app->deauth_guard_detection_count++;
+
+    uint32_t now = furi_get_tick();
+    app->deauth_guard_last_detection_tick = now;
+    app->deauth_guard_blink_count = 0;
+    app->deauth_guard_blink_until =
+        now + furi_ms_to_ticks(DEAUTH_GUARD_BLINK_MS * DEAUTH_GUARD_BLINK_TOGGLES);
+    app->deauth_guard_last_blink_tick = now;
+    app->deauth_guard_blink_state = true;
+    app->deauth_guard_led_until = app->deauth_guard_blink_until;
+    app->deauth_guard_led_state = true;
+    furi_hal_light_set(LightRed, DEAUTH_GUARD_LED_LEVEL);
+    furi_hal_light_set(LightGreen, 0);
+    furi_hal_light_set(LightBlue, 0);
+
+    if(!app->deauth_guard_vibro_on) {
+        app->deauth_guard_vibro_on = true;
+        app->deauth_guard_vibro_until = now + furi_ms_to_ticks(DEAUTH_GUARD_VIBRO_MS);
+        furi_hal_vibro_on(true);
+    } else {
+        app->deauth_guard_vibro_until = now + furi_ms_to_ticks(DEAUTH_GUARD_VIBRO_MS);
+    }
+
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_deauth_guard_feed(SimpleApp* app, char ch) {
+    if(!app) return;
+    if(!app->deauth_guard_view_active) {
+        app->deauth_guard_line_length = 0;
+        return;
+    }
+    if(ch == '\r') return;
+    if(ch == '\n') {
+        if(app->deauth_guard_line_length > 0) {
+            app->deauth_guard_line_buffer[app->deauth_guard_line_length] = '\0';
+            simple_app_process_deauth_guard_line(app, app->deauth_guard_line_buffer);
+        }
+        app->deauth_guard_line_length = 0;
+        return;
+    }
+    if(app->deauth_guard_line_length + 1 >= sizeof(app->deauth_guard_line_buffer)) {
+        app->deauth_guard_line_length = 0;
+        return;
+    }
+    app->deauth_guard_line_buffer[app->deauth_guard_line_length++] = ch;
+}
+
+static void simple_app_update_deauth_guard(SimpleApp* app) {
+    if(!app) return;
+    if(!app->deauth_guard_view_active) {
+        if(app->deauth_guard_blink_until > 0) {
+            app->deauth_guard_blink_until = 0;
+            app->deauth_guard_blink_state = false;
+            simple_app_apply_backlight(app);
+        }
+        return;
+    }
+
+    if(!app->backlight_enabled || app->backlight_notification_enforced) {
+        // Still allow LED/vibro even if backlight is enforced off/on.
+        app->deauth_guard_blink_state = true;
+    }
+
+    uint32_t now = furi_get_tick();
+    if(app->deauth_guard_blink_until == 0) {
+        // Track idle monitoring state once per loop.
+        if(!app->deauth_guard_has_detection) {
+            uint32_t since_start = now - app->deauth_guard_started_tick;
+            app->deauth_guard_monitoring =
+                (since_start >= furi_ms_to_ticks(DEAUTH_GUARD_IDLE_MONITOR_MS));
+        } else {
+            app->deauth_guard_monitoring = false;
+        }
+        return;
+    }
+    if(now >= app->deauth_guard_blink_until) {
+        app->deauth_guard_blink_until = 0;
+        app->deauth_guard_blink_state = false;
+        simple_app_apply_backlight(app);
+        if(app->deauth_guard_led_state) {
+            furi_hal_light_set(LightRed, 0);
+            furi_hal_light_set(LightGreen, 0);
+            furi_hal_light_set(LightBlue, 0);
+            app->deauth_guard_led_state = false;
+            app->deauth_guard_led_until = 0;
+        }
+        if(app->deauth_guard_vibro_on) {
+            furi_hal_vibro_on(false);
+            app->deauth_guard_vibro_on = false;
+            app->deauth_guard_vibro_until = 0;
+        }
+        return;
+    }
+
+    uint32_t interval = furi_ms_to_ticks(DEAUTH_GUARD_BLINK_MS);
+    if(interval == 0) interval = 1;
+    if(now - app->deauth_guard_last_blink_tick >= interval) {
+        app->deauth_guard_last_blink_tick = now;
+        app->deauth_guard_blink_state = !app->deauth_guard_blink_state;
+        if(app->deauth_guard_blink_count < DEAUTH_GUARD_BLINK_TOGGLES) {
+            app->deauth_guard_blink_count++;
+        }
+        uint8_t level =
+            app->deauth_guard_blink_state ? BACKLIGHT_ON_LEVEL : BACKLIGHT_OFF_LEVEL;
+        furi_hal_light_set(LightBacklight, level);
+        if(now < app->deauth_guard_led_until) {
+            if(app->deauth_guard_blink_state) {
+                furi_hal_light_set(LightRed, DEAUTH_GUARD_LED_LEVEL);
+                furi_hal_light_set(LightGreen, 0);
+                furi_hal_light_set(LightBlue, 0);
+                app->deauth_guard_led_state = true;
+            } else {
+                furi_hal_light_set(LightRed, 0);
+                furi_hal_light_set(LightGreen, 0);
+                furi_hal_light_set(LightBlue, 0);
+                app->deauth_guard_led_state = false;
+            }
+        }
+    }
+
+    if(app->deauth_guard_vibro_on && now >= app->deauth_guard_vibro_until) {
+        furi_hal_vibro_on(false);
+        app->deauth_guard_vibro_on = false;
+        app->deauth_guard_vibro_until = 0;
+    }
+
+    // Update idle monitoring flag after blink handling to avoid extra reads.
+    if(!app->deauth_guard_has_detection) {
+        uint32_t since_start = now - app->deauth_guard_started_tick;
+        app->deauth_guard_monitoring =
+            (since_start >= furi_ms_to_ticks(DEAUTH_GUARD_IDLE_MONITOR_MS));
+    } else {
+        app->deauth_guard_monitoring = false;
+    }
 }
 
 static void simple_app_bt_locator_reset_list(SimpleApp* app) {
@@ -3617,7 +3891,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
     }
     app->serial_buffer[app->serial_len] = '\0';
 
-    if(!app->serial_targets_hint && !app->blackout_view_active) {
+    if(!app->serial_targets_hint && !app->blackout_view_active && !app->deauth_guard_view_active) {
         static const char hint_phrase[] = "Scan results printed.";
         size_t phrase_len = strlen(hint_phrase);
         if(app->serial_len >= phrase_len) {
@@ -3648,6 +3922,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_boot_feed(app, ch);
         simple_app_vendor_feed(app, ch);
         simple_app_scanner_timing_feed(app, ch);
+        simple_app_deauth_guard_feed(app, ch);
         simple_app_bt_scan_feed(app, ch);
         simple_app_bt_locator_feed(app, ch);
         simple_app_wardrive_feed(app, ch);
@@ -3727,6 +4002,7 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     bool is_start_sniffer = simple_app_is_start_sniffer_command(command);
     bool is_airtag_scan_command = strstr(command, "scan_airtag") != NULL;
     bool is_bt_scan_command = is_airtag_scan_command || strstr(command, "scan_bt") != NULL;
+    bool is_deauth_guard_command = strstr(command, "deauth_detector") != NULL;
     if(is_wardrive_command) {
         app->wardrive_view_active = true;
         simple_app_reset_wardrive_status(app);
@@ -3755,6 +4031,11 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     } else if(app->bt_scan_view_active) {
         app->bt_scan_view_active = false;
         simple_app_reset_bt_scan_summary(app);
+    }
+    if(is_deauth_guard_command) {
+        simple_app_start_deauth_guard(app);
+    } else if(is_stop_command || app->deauth_guard_view_active) {
+        simple_app_reset_deauth_guard(app);
     }
     if(is_stop_command) {
         simple_app_restore_otg_after_wardrive(app);
@@ -3894,6 +4175,7 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     simple_app_reset_karma_probe_listing(app);
     simple_app_reset_karma_html_listing(app);
     simple_app_reset_scan_results(app);
+    simple_app_reset_deauth_guard(app);
     simple_app_clear_status_message(app);
 
     app->sniffer_show_results_on_back = false;
@@ -6224,6 +6506,56 @@ static void simple_app_draw_wardrive_serial(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, bottom_center, AlignCenter, AlignCenter, status);
 }
 
+static void simple_app_draw_deauth_guard(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+    app->serial_targets_hint = false;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 14, AlignCenter, AlignCenter, "Deauth Guard");
+
+    canvas_set_font(canvas, FontSecondary);
+    if(!app->deauth_guard_has_detection) {
+        if(app->deauth_guard_monitoring) {
+            canvas_draw_str_aligned(
+                canvas, DISPLAY_WIDTH / 2, 32, AlignCenter, AlignCenter, "Monitoring...");
+            canvas_draw_str_aligned(
+                canvas, DISPLAY_WIDTH / 2, 48, AlignCenter, AlignCenter, "No deauths detected");
+        } else {
+            canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 32, AlignCenter, AlignCenter, "Warm up...");
+            canvas_draw_str_aligned(
+                canvas, DISPLAY_WIDTH / 2, 48, AlignCenter, AlignCenter, "Listening for deauths");
+        }
+        return;
+    }
+
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 30, AlignCenter, AlignCenter, "Attack ongoing!");
+    char status_line[48];
+    if(app->deauth_guard_last_channel > 0) {
+        if(app->deauth_guard_has_rssi) {
+            snprintf(
+                status_line,
+                sizeof(status_line),
+                "CH %d | RSSI %d",
+                app->deauth_guard_last_channel,
+                app->deauth_guard_last_rssi);
+        } else {
+            snprintf(status_line, sizeof(status_line), "CH %d", app->deauth_guard_last_channel);
+        }
+    } else {
+        snprintf(status_line, sizeof(status_line), "Channel: ?");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 44, AlignCenter, AlignCenter, status_line);
+
+    char ssid_line[SCAN_SSID_MAX_LEN + 8];
+    snprintf(
+        ssid_line,
+        sizeof(ssid_line),
+        "%s",
+        (app->deauth_guard_last_ssid[0] != '\0') ? app->deauth_guard_last_ssid : "Unknown SSID");
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 58, AlignCenter, AlignCenter, ssid_line);
+}
+
 static void simple_app_draw_airtag_scan(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas) return;
 
@@ -6534,6 +6866,11 @@ static void simple_app_draw_bt_scan_serial(SimpleApp* app, Canvas* canvas) {
 }
 
 static void simple_app_draw_serial(SimpleApp* app, Canvas* canvas) {
+    if(app && app->deauth_guard_view_active && !app->deauth_guard_full_console) {
+        simple_app_draw_deauth_guard(app, canvas);
+        return;
+    }
+
     if(app && app->bt_scan_view_active && !app->bt_scan_full_console) {
         if(app->airtag_scan_mode) {
             simple_app_draw_airtag_scan(app, canvas);
@@ -9731,6 +10068,24 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
     if(app->blackout_view_active && key != InputKeyBack && key != InputKeyUp && key != InputKeyDown) {
         return;
     }
+    if(app->deauth_guard_view_active && !app->deauth_guard_full_console) {
+        // In Deauth Guard compact mode ignore navigation; only Back stops and exits.
+        if(key == InputKeyBack) {
+            bool focus_sniffer_results = app->sniffer_show_results_on_back;
+            simple_app_send_stop_if_needed(app);
+            app->serial_targets_hint = false;
+            if(focus_sniffer_results) {
+                simple_app_focus_sniffer_results(app);
+                app->sniffer_show_results_on_back = false;
+            } else {
+                app->screen = ScreenMenu;
+            }
+            app->serial_follow_tail = true;
+            simple_app_update_scroll(app);
+            view_port_update(app->viewport);
+        }
+        return;
+    }
 
     if(key == InputKeyBack) {
         bool focus_sniffer_results = app->sniffer_show_results_on_back;
@@ -9995,6 +10350,17 @@ static void simple_app_input(InputEvent* event, void* context) {
         return;
     }
 
+    if((event->type == InputTypeLong || event->type == InputTypeShort) &&
+       event->key == InputKeyOk && app->deauth_guard_view_active) {
+        app->deauth_guard_full_console = !app->deauth_guard_full_console;
+        app->serial_follow_tail = true;
+        app->serial_targets_hint = false;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
     if(event->type == InputTypeLong && event->key == InputKeyOk) {
         if(app->bt_scan_view_active) {
             app->bt_scan_full_console = !app->bt_scan_full_console;
@@ -10184,6 +10550,7 @@ int32_t Lab_C5_app(void* p) {
         return 0;
     }
     memset(app, 0, sizeof(SimpleApp));
+    app->deauth_guard_last_channel = -1;
     app->package_monitor_channel = PACKAGE_MONITOR_DEFAULT_CHANNEL;
     app->channel_view_band = ChannelViewBand24;
     simple_app_channel_view_reset(app);
@@ -10313,11 +10680,12 @@ int32_t Lab_C5_app(void* p) {
 
     while(!app->exit_app) {
         if(!app->download_bridge_active) {
-        simple_app_process_stream(app);
-        simple_app_update_karma_sniffer(app);
-        simple_app_update_result_scroll(app);
-        simple_app_update_sd_scroll(app);
-        simple_app_ping_watchdog(app);
+            simple_app_process_stream(app);
+            simple_app_update_karma_sniffer(app);
+            simple_app_update_result_scroll(app);
+            simple_app_update_sd_scroll(app);
+            simple_app_update_deauth_guard(app);
+            simple_app_ping_watchdog(app);
         }
 
         if(!app->download_bridge_active && app->portal_input_requested && !app->portal_input_active) {
