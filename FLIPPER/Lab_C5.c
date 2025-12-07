@@ -57,7 +57,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.31"
+#define LAB_C5_VERSION_TEXT "0.32"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -807,6 +807,8 @@ static const char hint_attack_blackout[] =
     "Sends broadcast deauth \npackets to all networks \naround you.";
 static const char hint_attack_deauth[] =
     "Disconnects clients \nof all selected networks.";
+static const char hint_attack_deauth_guard[] =
+    "Monitors for deauths\nOptional target list\nUse scan selection\n1 or many networks\nStop with Back.";
 static const char hint_attack_handshaker[] =
     "Collect WPA handshakes\nWorks with or without\nselected networks.\nNo selection grabs\nall in the air.";
 static const char hint_attack_evil_twin[] =
@@ -865,6 +867,7 @@ static const MenuEntry menu_entries_sniffers[] = {
 static const MenuEntry menu_entries_attacks[] = {
     {"Blackout", NULL, MenuActionConfirmBlackout, hint_attack_blackout},
     {"Deauth", "start_deauth", MenuActionCommandWithTargets, hint_attack_deauth},
+    {"Deauth Guard", "deauth_detector", MenuActionCommandWithTargets, hint_attack_deauth_guard},
     {"Handshaker", "start_handshake", MenuActionCommandWithTargets, hint_attack_handshaker},
     {"Evil Twin", NULL, MenuActionOpenEvilTwinMenu, hint_attack_evil_twin},
     {"Portal", NULL, MenuActionOpenPortalMenu, hint_attack_portal},
