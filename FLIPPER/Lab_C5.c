@@ -92,7 +92,7 @@ typedef enum {
 #define DISPLAY_WIDTH 128
 #define DISPLAY_HEIGHT 64
 #define WARD_DRIVE_CONSOLE_LINES 3
-#define BT_SCAN_CONSOLE_LINES 6
+#define BT_SCAN_CONSOLE_LINES 3
 #define BT_LOCATOR_MAX_DEVICES 64
 #define BT_LOCATOR_VISIBLE_COUNT 6
 #define RESULT_DEFAULT_MAX_LINES 4
@@ -6409,6 +6409,8 @@ static void simple_app_draw_bt_locator_list(SimpleApp* app, Canvas* canvas) {
 static void simple_app_draw_bt_scan_serial(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas) return;
     canvas_set_color(canvas, ColorBlack);
+    const int16_t console_top = 8;
+    const int16_t line_height = SERIAL_TEXT_LINE_HEIGHT;
     if(app->bt_locator_mode) {
         simple_app_draw_bt_locator(app, canvas);
         return;
@@ -6419,7 +6421,7 @@ static void simple_app_draw_bt_scan_serial(SimpleApp* app, Canvas* canvas) {
         size_t lines_filled =
             simple_app_render_display_lines(app, app->serial_scroll, display_lines, BT_SCAN_CONSOLE_LINES);
 
-        uint8_t y = 8;
+        int16_t y = console_top;
         if(lines_filled == 0) {
             canvas_draw_str(canvas, 2, y, "Scanning...");
             y += SERIAL_TEXT_LINE_HEIGHT;
@@ -6437,9 +6439,9 @@ static void simple_app_draw_bt_scan_serial(SimpleApp* app, Canvas* canvas) {
             bool show_down = (app->serial_scroll < max_scroll);
             if(show_up || show_down) {
                 uint8_t arrow_x = DISPLAY_WIDTH - 6;
-                int16_t content_top = 0; // top edge
+                int16_t content_top = console_top;
                 int16_t visible_rows = (BT_SCAN_CONSOLE_LINES > 0) ? (BT_SCAN_CONSOLE_LINES - 1) : 0;
-                int16_t content_bottom = -4 + (int16_t)(visible_rows * SERIAL_TEXT_LINE_HEIGHT);
+                int16_t content_bottom = console_top + (int16_t)(visible_rows * line_height);
                 simple_app_draw_scroll_hints(canvas, arrow_x, content_top, content_bottom, show_up, show_down);
             }
         }
@@ -6460,7 +6462,7 @@ static void simple_app_draw_bt_scan_serial(SimpleApp* app, Canvas* canvas) {
     size_t lines_filled = simple_app_render_display_lines(
         app, app->serial_scroll, display_lines, BT_SCAN_CONSOLE_LINES);
 
-    uint8_t y = 8;
+    int16_t y = console_top;
     if(lines_filled == 0) {
         canvas_draw_str(canvas, 2, y, "No UART data");
     } else {
@@ -6479,7 +6481,7 @@ static void simple_app_draw_bt_scan_serial(SimpleApp* app, Canvas* canvas) {
             uint8_t arrow_x = DISPLAY_WIDTH - 6;
             int16_t visible_rows =
                 (BT_SCAN_CONSOLE_LINES > 0) ? (BT_SCAN_CONSOLE_LINES - 1) : 0;
-            int16_t content_bottom = 8 + (int16_t)(visible_rows * SERIAL_TEXT_LINE_HEIGHT);
+            int16_t content_bottom = console_top + (int16_t)(visible_rows * line_height);
             /* Custom arrow placement: top hugs screen edge, bottom lifted off divider */
             if(show_up) {
                 int16_t up_base = 2; // apex ends at y=0
@@ -6494,13 +6496,12 @@ static void simple_app_draw_bt_scan_serial(SimpleApp* app, Canvas* canvas) {
         }
     }
 
-    int16_t divider_y = 8 + (int16_t)(BT_SCAN_CONSOLE_LINES * SERIAL_TEXT_LINE_HEIGHT) + 2 - 2;
-    divider_y -= SERIAL_TEXT_LINE_HEIGHT;
-    divider_y += 3; // nudge down slightly
-    if(divider_y >= DISPLAY_HEIGHT) {
-        divider_y = DISPLAY_HEIGHT - 2;
-    } else if(divider_y < 10) {
-        divider_y = 10;
+    size_t used_lines = (lines_filled > 0) ? lines_filled : 1;
+    if(used_lines > BT_SCAN_CONSOLE_LINES) used_lines = BT_SCAN_CONSOLE_LINES;
+    int16_t divider_y = (int16_t)(console_top + (int16_t)(used_lines * line_height) - 2);
+    if(divider_y < console_top) divider_y = console_top;
+    if(divider_y > DISPLAY_HEIGHT - 6) {
+        divider_y = DISPLAY_HEIGHT - 6;
     }
     canvas_draw_line(canvas, 0, divider_y, DISPLAY_WIDTH - 1, divider_y);
 
@@ -6521,6 +6522,10 @@ static void simple_app_draw_bt_scan_serial(SimpleApp* app, Canvas* canvas) {
     if(top_y <= divider_y + 2) {
         top_y = divider_y + 2;
         bottom_y = top_y + SERIAL_TEXT_LINE_HEIGHT;
+        if(bottom_y > DISPLAY_HEIGHT - 2) {
+            bottom_y = DISPLAY_HEIGHT - 2;
+            top_y = bottom_y - SERIAL_TEXT_LINE_HEIGHT;
+        }
     }
     canvas_draw_str_aligned(canvas, 2, top_y, AlignLeft, AlignBottom, line1);
     canvas_draw_str_aligned(canvas, 2, bottom_y, AlignLeft, AlignBottom, line2);
