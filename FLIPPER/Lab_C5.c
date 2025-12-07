@@ -50,13 +50,14 @@ typedef enum {
     ScreenEvilTwinMenu,
     ScreenPortalMenu,
     ScreenDownloadBridge,
+    ScreenBtLocatorList,
 } AppScreen;
 
 typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.30"
+#define LAB_C5_VERSION_TEXT "0.31"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -77,17 +78,23 @@ typedef enum {
 #define MENU_VISIBLE_COUNT_SNIFFERS 4
 #define MENU_VISIBLE_COUNT_ATTACKS 4
 #define MENU_VISIBLE_COUNT_SETUP 4
+#define MENU_SECTION_VISIBLE_COUNT 6
+#define MENU_SECTION_BASE_Y 14
+#define MENU_SECTION_SPACING 9
 #define PACKAGE_MONITOR_MAX_HISTORY 96
 #define MENU_TITLE_Y 12
 #define MENU_ITEM_BASE_Y 24
 #define MENU_ITEM_SPACING 12
 #define MENU_SCROLL_TRACK_Y 14
 #define SERIAL_VISIBLE_LINES 6
-#define SERIAL_LINE_CHAR_LIMIT 22
+#define SERIAL_LINE_CHAR_LIMIT 26
 #define SERIAL_TEXT_LINE_HEIGHT 10
 #define DISPLAY_WIDTH 128
 #define DISPLAY_HEIGHT 64
 #define WARD_DRIVE_CONSOLE_LINES 3
+#define BT_SCAN_CONSOLE_LINES 6
+#define BT_LOCATOR_MAX_DEVICES 64
+#define BT_LOCATOR_VISIBLE_COUNT 6
 #define RESULT_DEFAULT_MAX_LINES 4
 #define RESULT_DEFAULT_LINE_HEIGHT 12
 #define RESULT_DEFAULT_CHAR_LIMIT (SERIAL_LINE_CHAR_LIMIT - 3)
@@ -105,7 +112,8 @@ typedef enum {
 #define MENU_SECTION_TARGETS 2
 #define MENU_SECTION_ATTACKS 3
 #define MENU_SECTION_MONITORING 4
-#define MENU_SECTION_SETUP 5
+#define MENU_SECTION_BLUETOOTH 5
+#define MENU_SECTION_SETUP 6
 #define SCANNER_FILTER_VISIBLE_COUNT 3
 #define SCANNER_SCAN_COMMAND "scan_networks"
 #define TARGETS_RESULTS_COMMAND "show_scan_results"
@@ -207,6 +215,7 @@ typedef enum {
     MenuActionOpenEvilTwinMenu,
     MenuActionOpenKarmaMenu,
     MenuActionOpenPortalMenu,
+    MenuActionOpenBtLocator,
 } MenuAction;
 
 typedef enum {
@@ -279,6 +288,7 @@ typedef struct {
     bool exit_app;
     MenuState menu_state;
     uint32_t section_index;
+    uint32_t section_offset;
     uint32_t item_index;
     uint32_t item_offset;
     AppScreen screen;
@@ -287,8 +297,6 @@ typedef struct {
     FuriStreamBuffer* rx_stream;
     ViewPort* viewport;
     Gui* gui;
-    bool viewport_dirty;
-    uint32_t viewport_last_update_tick;
     char serial_buffer[SERIAL_BUFFER_SIZE];
     size_t serial_len;
     size_t serial_scroll;
@@ -302,12 +310,51 @@ typedef struct {
     size_t wardrive_line_length;
     bool wardrive_otg_forced;
     bool wardrive_otg_previous_state;
+    bool bt_scan_view_active;
+    bool bt_scan_summary_seen;
+    bool airtag_scan_mode;
+    bool bt_scan_full_console;
+    uint32_t bt_scan_last_update_tick;
+    int bt_scan_airtags;
+    int bt_scan_smarttags;
+    int bt_scan_total;
+    bool bt_locator_console_mode;
+    bool bt_locator_mode;
+    bool bt_locator_has_rssi;
+    int bt_locator_rssi;
+    char bt_locator_mac[18];
+    char bt_locator_saved_mac[18];
+    bool bt_locator_preserve_mac;
+    bool bt_locator_list_loading;
+    bool bt_locator_list_ready;
+    size_t bt_locator_count;
+    size_t bt_locator_index;
+    size_t bt_locator_offset;
+    int32_t bt_locator_selected; // -1 none, otherwise index
+    char bt_locator_scroll_text[64];
+    size_t bt_locator_scroll_offset;
+    int bt_locator_scroll_dir;
+    uint8_t bt_locator_scroll_hold;
+    uint32_t bt_locator_scroll_last_tick;
+    char bt_locator_scan_line[128];
+    size_t bt_locator_scan_len;
+    struct {
+        char mac[18];
+        int rssi;
+        bool has_rssi;
+        char name[32];
+    } bt_locator_devices[BT_LOCATOR_MAX_DEVICES];
+    char bt_scan_line_buffer[96];
+    size_t bt_scan_line_length;
     bool last_command_sent;
     bool sniffer_show_results_on_back;
     bool confirm_blackout_yes;
     bool confirm_sniffer_dos_yes;
     bool confirm_exit_yes;
     uint32_t last_attack_index;
+    bool board_reboot_sent;
+    bool exit_confirm_active;
+    uint32_t exit_confirm_tick;
     size_t evil_twin_menu_index;
     EvilTwinHtmlEntry evil_twin_html_entries[EVIL_TWIN_MAX_HTML_FILES];
     size_t evil_twin_html_count;
@@ -535,12 +582,8 @@ static void simple_app_serial_irq(
 static void simple_app_draw_download_bridge(SimpleApp* app, Canvas* canvas);
 static bool simple_app_download_bridge_start(SimpleApp* app);
 static void simple_app_download_bridge_stop(SimpleApp* app);
-static void simple_app_prepare_exit(SimpleApp* app);
-static void simple_app_request_viewport_update(SimpleApp* app);
-static void simple_app_flush_viewport(SimpleApp* app);
 static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long);
 static void simple_app_on_board_online(SimpleApp* app, const char* source);
-static void simple_app_handle_board_ready(SimpleApp* app);
 static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas);
 static void simple_app_send_vendor_command(SimpleApp* app, bool enable);
 static void simple_app_request_vendor_status(SimpleApp* app);
@@ -591,6 +634,14 @@ static void simple_app_channel_view_process_line(SimpleApp* app, const char* lin
 static void simple_app_channel_view_feed(SimpleApp* app, char ch);
 static void simple_app_draw_channel_view(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_channel_view_input(SimpleApp* app, InputKey key);
+static void simple_app_bt_locator_reset_list(SimpleApp* app);
+static void simple_app_bt_locator_begin_scan(SimpleApp* app);
+static void simple_app_bt_locator_feed(SimpleApp* app, char ch);
+static void simple_app_draw_bt_locator_list(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_bt_locator_input(SimpleApp* app, InputKey key);
+static void simple_app_bt_locator_reset_scroll(SimpleApp* app);
+static void simple_app_bt_locator_set_scroll_text(SimpleApp* app, const char* text);
+static void simple_app_bt_locator_tick_scroll(SimpleApp* app, size_t char_limit);
 static void simple_app_channel_view_show_status(SimpleApp* app, const char* status);
 static int simple_app_channel_view_find_channel_index(const uint8_t* list, size_t count, uint8_t channel);
 static size_t simple_app_channel_view_visible_columns(ChannelViewBand band);
@@ -694,6 +745,9 @@ static void simple_app_clear_status_message(SimpleApp* app);
 static bool simple_app_status_message_is_active(SimpleApp* app);
 static void simple_app_send_command_with_targets(SimpleApp* app, const char* base_command);
 static size_t simple_app_menu_visible_count(const SimpleApp* app, uint32_t section_index);
+static size_t simple_app_section_visible_count(void);
+static void simple_app_adjust_section_offset(SimpleApp* app);
+static void simple_app_prepare_exit(SimpleApp* app);
 static void simple_app_update_scroll(SimpleApp* app);
 static size_t simple_app_render_display_lines(
     SimpleApp* app,
@@ -735,6 +789,8 @@ static const char hint_section_attacks[] =
     "Test features here\nUse only on own lab\nTargets come from\nSelected networks\nFollow local laws.";
 static const char hint_section_monitoring[] =
     "Monitoring tools\nPacket rates +\nChannel analyzer\nSwitch views with\nUp/Down buttons.";
+static const char hint_section_bluetooth[] =
+    "BLE utilities\nTrackers and tags\nCounts Air/SmartTags\nScroll log on top\nStop with Back.";
 static const char hint_section_setup[] =
     "General settings\nBacklight, 5V, LED\nAdjust scanner view\nConsole with logs\nUseful for debug.";
 
@@ -765,6 +821,12 @@ static const char hint_attack_sniffer_dog[] =
     "Listens to traffic \nbetween AP and STA \nand sends deauth packet \ndirectly to this STA";
 static const char hint_attack_wardrive[] =
     "Logs networks around you \nwith GPS coordinates.";
+static const char hint_bluetooth_airtag[] =
+    "Continuous tag scan\nOutputs counts only\nUpdates as data arrives\nStop/back to exit\nFor Air/SmartTags.";
+static const char hint_bluetooth_scan[] =
+    "One-off 10s BLE scan\nLists seen devices\nHighlights trackers\nSummary shown below\nStop/back to reset.";
+static const char hint_bluetooth_locator[] =
+    "Tracker mode\nScan first to pick MAC\nRight starts tracing\nUpdates RSSI live\nStop/back to exit.";
 
 static const char hint_setup_backlight[] =
     "Toggle screen light\nKeep brightness high\nOr allow auto dim\nGreat for console\nLong sessions.";
@@ -823,6 +885,12 @@ static const MenuEntry menu_entries_monitoring[] = {
     {"Channel View", NULL, MenuActionOpenChannelView, hint_monitor_channel},
 };
 
+static const MenuEntry menu_entries_bluetooth[] = {
+    {"AirTag Scan", "scan_airtag", MenuActionCommand, hint_bluetooth_airtag},
+    {"BT Scan", "scan_bt", MenuActionCommand, hint_bluetooth_scan},
+    {"BT Locator", NULL, MenuActionOpenBtLocator, hint_bluetooth_locator},
+};
+
 static char menu_label_backlight[24] = "Backlight: On";
 static char menu_label_otg_power[24] = "5V Power: On";
 static char menu_label_led[24] = "LED: On (10)";
@@ -843,12 +911,13 @@ static const MenuEntry menu_entries_setup[] = {
 };
 
 static const MenuSection menu_sections[] = {
-    {"Scanner", hint_section_scanner, NULL, 0, 12, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 22, MENU_VISIBLE_COUNT_SNIFFERS * MENU_ITEM_SPACING},
-    {"Targets", hint_section_targets, NULL, 0, 32, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 42, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
-    {"Monitoring", hint_section_monitoring, menu_entries_monitoring, sizeof(menu_entries_monitoring) / sizeof(menu_entries_monitoring[0]), 52, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 62, MENU_VISIBLE_COUNT_SETUP * MENU_ITEM_SPACING},
+    {"Scanner", hint_section_scanner, NULL, 0, 10, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 18, MENU_VISIBLE_COUNT_SNIFFERS * MENU_ITEM_SPACING},
+    {"Targets", hint_section_targets, NULL, 0, 26, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 34, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
+    {"Monitoring", hint_section_monitoring, menu_entries_monitoring, sizeof(menu_entries_monitoring) / sizeof(menu_entries_monitoring[0]), 42, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Bluetooth", hint_section_bluetooth, menu_entries_bluetooth, sizeof(menu_entries_bluetooth) / sizeof(menu_entries_bluetooth[0]), 50, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 58, MENU_VISIBLE_COUNT_SETUP * MENU_ITEM_SPACING},
 };
 
 static const size_t menu_section_count = sizeof(menu_sections) / sizeof(menu_sections[0]);
@@ -865,6 +934,34 @@ static size_t simple_app_menu_visible_count(const SimpleApp* app, uint32_t secti
         return MENU_VISIBLE_COUNT_SETUP;
     }
     return MENU_VISIBLE_COUNT;
+}
+
+static size_t simple_app_section_visible_count(void) {
+    return (menu_section_count < MENU_SECTION_VISIBLE_COUNT) ? menu_section_count : MENU_SECTION_VISIBLE_COUNT;
+}
+
+static void simple_app_adjust_section_offset(SimpleApp* app) {
+    if(!app) return;
+    size_t visible = simple_app_section_visible_count();
+    if(visible == 0) {
+        app->section_offset = 0;
+        return;
+    }
+
+    if(app->section_index >= menu_section_count) {
+        app->section_index = (menu_section_count > 0) ? (menu_section_count - 1) : 0;
+    }
+
+    size_t max_offset = (menu_section_count > visible) ? (menu_section_count - visible) : 0;
+    if(app->section_offset > max_offset) {
+        app->section_offset = max_offset;
+    }
+
+    if(app->section_index < app->section_offset) {
+        app->section_offset = app->section_index;
+    } else if(app->section_index >= app->section_offset + visible) {
+        app->section_offset = app->section_index - visible + 1;
+    }
 }
 
 static void simple_app_focus_attacks_menu(SimpleApp* app) {
@@ -1276,14 +1373,14 @@ static void simple_app_boot_feed(SimpleApp* app, char ch) {
 
             if(simple_app_handle_boot_status_line(app, line_ptr)) {
                 if(app->viewport) {
-                    simple_app_request_viewport_update(app);
+                    view_port_update(app->viewport);
                 }
             } else if(strcmp(line_ptr, "Boot Pressed") == 0) {
                 simple_app_handle_boot_trigger(app, false);
             } else if(strcmp(line_ptr, "Boot Long Pressed") == 0) {
                 simple_app_handle_boot_trigger(app, true);
             } else if(strcmp(line_ptr, "BOARD READY") == 0) {
-                simple_app_handle_board_ready(app);
+                simple_app_on_board_online(app, "boot");
             }
         }
         line_len = 0;
@@ -1330,13 +1427,9 @@ static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long) {
         app->last_command_sent = true; // allow Back to send stop for boot-triggered actions
         simple_app_update_scroll(app);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     }
-}
-
-static void simple_app_handle_board_ready(SimpleApp* app) {
-    simple_app_on_board_online(app, "ready");
 }
 
 static void simple_app_on_board_online(SimpleApp* app, const char* source) {
@@ -1351,32 +1444,20 @@ static void simple_app_on_board_online(SimpleApp* app, const char* source) {
     app->board_missing_shown = false;
 
     if(app->board_bootstrap_active) {
-        if(app->board_bootstrap_reboot_sent) {
-            app->board_bootstrap_active = false;
-            app->board_bootstrap_reboot_sent = false;
-            simple_app_show_status_message(app, "Board ready", 1200, true);
-        } else {
-            simple_app_show_status_message(
-                app,
-                "Board discovery\nBoard Found\nRebooting\nfor stability",
-                0,
-                true);
-            app->board_bootstrap_reboot_sent = true;
-            simple_app_send_command_quiet(app, "reboot");
-            app->board_ready_seen = false;
-            app->board_ping_outstanding = false;
-            app->board_last_ping_tick = furi_get_tick() - BOARD_PING_INTERVAL_MS;
-        }
+        // End bootstrap discovery without forcing a reboot
+        app->board_bootstrap_active = false;
+        app->board_bootstrap_reboot_sent = false;
+        simple_app_show_status_message(app, "Board ready", 1200, true);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
 
     if(!was_ready) {
-        simple_app_show_status_message(app, "Board Found", 1000, true);
+        simple_app_show_status_message(app, "Board found", 1000, true);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     }
 }
@@ -1437,7 +1518,7 @@ static void simple_app_ping_watchdog(SimpleApp* app) {
                                           : "Board discovery\nWaiting for board...";
             simple_app_show_status_message(app, waiting_msg, 0, true);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
             return;
         }
@@ -1445,6 +1526,10 @@ static void simple_app_ping_watchdog(SimpleApp* app) {
         if(!app->board_missing_shown) {
             app->board_missing_shown = true;
             simple_app_show_status_message(app, "No board", 1500, true);
+        }
+        if(!app->board_reboot_sent) {
+            simple_app_send_command_quiet(app, "reboot");
+            app->board_reboot_sent = true;
         }
     }
 }
@@ -1542,9 +1627,9 @@ static bool simple_app_handle_led_status_line(SimpleApp* app, const char* line) 
 
     if(app->screen == ScreenMenu && app->menu_state == MenuStateItems &&
        app->section_index == MENU_SECTION_SETUP && app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     } else if(app->screen == ScreenSetupLed && app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
     return true;
 }
@@ -1619,7 +1704,7 @@ static bool simple_app_handle_vendor_status_line(SimpleApp* app, const char* lin
         simple_app_rebuild_visible_results(app);
         simple_app_adjust_result_offset(app);
         if(app->viewport && app->screen == ScreenSetupScanner) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     }
     return true;
@@ -1694,7 +1779,7 @@ static bool simple_app_set_channel_time(SimpleApp* app, bool is_min, uint16_t va
     }
 
     if(changed && app->viewport && app->screen == ScreenSetupScannerTiming) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 
     return changed;
@@ -1880,6 +1965,354 @@ static void simple_app_wardrive_feed(SimpleApp* app, char ch) {
         return;
     }
     app->wardrive_line_buffer[app->wardrive_line_length++] = ch;
+}
+
+static void simple_app_reset_bt_scan_summary(SimpleApp* app) {
+    if(!app) return;
+    app->bt_scan_airtags = 0;
+    app->bt_scan_smarttags = 0;
+    app->bt_scan_total = 0;
+    app->bt_scan_line_length = 0;
+    app->bt_scan_summary_seen = false;
+    app->airtag_scan_mode = false;
+    app->bt_scan_full_console = false;
+    app->bt_scan_last_update_tick = 0;
+    app->bt_locator_console_mode = false;
+    app->bt_locator_mode = false;
+    app->bt_locator_has_rssi = false;
+    app->bt_locator_rssi = 0;
+    app->bt_locator_mac[0] = '\0';
+    if(app->bt_locator_preserve_mac && app->bt_locator_saved_mac[0] != '\0') {
+        strncpy(app->bt_locator_mac, app->bt_locator_saved_mac, sizeof(app->bt_locator_mac) - 1);
+        app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
+    } else {
+        app->bt_locator_saved_mac[0] = '\0';
+        app->bt_locator_preserve_mac = false;
+    }
+    app->bt_locator_list_loading = false;
+    app->bt_locator_list_ready = false;
+    app->bt_locator_count = 0;
+    app->bt_locator_index = 0;
+    app->bt_locator_offset = 0;
+    app->bt_locator_selected = -1;
+    app->bt_locator_scan_len = 0;
+    memset(app->bt_locator_scan_line, 0, sizeof(app->bt_locator_scan_line));
+    memset(app->bt_locator_devices, 0, sizeof(app->bt_locator_devices));
+}
+
+static void simple_app_process_bt_scan_line(SimpleApp* app, const char* line) {
+    if(!app || !line || !app->bt_scan_view_active) return;
+
+    int airtags = 0;
+    int smarttags = 0;
+    int total = 0;
+    if(app->bt_locator_mode) {
+        char mac[18] = {0};
+        int rssi = 0;
+        if(sscanf(line, " %17s RSSI: %d", mac, &rssi) == 2) {
+            app->bt_locator_rssi = rssi;
+            app->bt_locator_has_rssi = true;
+            app->bt_scan_last_update_tick = furi_get_tick();
+        } else if(sscanf(line, " %17s RSSI: N/A", mac) == 1) {
+            app->bt_locator_has_rssi = false;
+            app->bt_scan_last_update_tick = furi_get_tick();
+        }
+        return;
+    }
+
+    if(app->airtag_scan_mode) {
+        if(sscanf(line, " %d , %d", &airtags, &smarttags) == 2 ||
+           sscanf(line, " %d,%d", &airtags, &smarttags) == 2) {
+            app->bt_scan_airtags = airtags;
+            app->bt_scan_smarttags = smarttags;
+            app->bt_scan_total = airtags + smarttags;
+            app->bt_scan_last_update_tick = furi_get_tick();
+        }
+        return;
+    }
+
+    if(sscanf(
+           line, "Summary: %d AirTags, %d SmartTags, %d total devices", &airtags, &smarttags, &total) == 3) {
+        app->bt_scan_airtags = airtags;
+        app->bt_scan_smarttags = smarttags;
+        app->bt_scan_total = total;
+        app->bt_scan_summary_seen = true;
+        app->bt_scan_last_update_tick = furi_get_tick();
+        return;
+    }
+
+    if(sscanf(line, "Found %d devices", &total) == 1) {
+        app->bt_scan_total = total;
+        app->bt_scan_last_update_tick = furi_get_tick();
+    }
+}
+
+static void simple_app_bt_scan_feed(SimpleApp* app, char ch) {
+    if(!app) return;
+    if(!app->bt_scan_view_active) {
+        app->bt_scan_line_length = 0;
+        return;
+    }
+    if(ch == '\r') return;
+    if(ch == '\n') {
+        if(app->bt_scan_line_length > 0) {
+            app->bt_scan_line_buffer[app->bt_scan_line_length] = '\0';
+            simple_app_process_bt_scan_line(app, app->bt_scan_line_buffer);
+        }
+        app->bt_scan_line_length = 0;
+        return;
+    }
+    if(app->bt_scan_line_length + 1 >= sizeof(app->bt_scan_line_buffer)) {
+        app->bt_scan_line_length = 0;
+        return;
+    }
+    app->bt_scan_line_buffer[app->bt_scan_line_length++] = ch;
+}
+
+static void simple_app_bt_locator_reset_list(SimpleApp* app) {
+    if(!app) return;
+    app->bt_locator_list_loading = false;
+    app->bt_locator_list_ready = false;
+    app->bt_locator_console_mode = false;
+    app->bt_locator_count = 0;
+    app->bt_locator_index = 0;
+    app->bt_locator_offset = 0;
+    app->bt_locator_selected = -1;
+    app->bt_locator_scroll_text[0] = '\0';
+    app->bt_locator_scroll_offset = 0;
+    app->bt_locator_scroll_dir = 1;
+    app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+    app->bt_locator_scroll_last_tick = furi_get_tick();
+    app->bt_locator_scan_len = 0;
+    memset(app->bt_locator_scan_line, 0, sizeof(app->bt_locator_scan_line));
+    memset(app->bt_locator_devices, 0, sizeof(app->bt_locator_devices));
+    app->bt_locator_saved_mac[0] = '\0';
+    app->bt_locator_preserve_mac = false;
+}
+
+static void simple_app_bt_locator_add(SimpleApp* app, const char* mac, int rssi, const char* name) {
+    if(!app || !mac || mac[0] == '\0') return;
+    // Update if exists
+    for(size_t i = 0; i < app->bt_locator_count; i++) {
+        if(strncmp(app->bt_locator_devices[i].mac, mac, sizeof(app->bt_locator_devices[i].mac)) == 0) {
+            app->bt_locator_devices[i].rssi = rssi;
+            app->bt_locator_devices[i].has_rssi = true;
+            if(name && name[0] != '\0') {
+                strncpy(app->bt_locator_devices[i].name, name, sizeof(app->bt_locator_devices[i].name) - 1);
+                app->bt_locator_devices[i].name[sizeof(app->bt_locator_devices[i].name) - 1] = '\0';
+            }
+            return;
+        }
+    }
+    if(app->bt_locator_count >= BT_LOCATOR_MAX_DEVICES) return;
+    strncpy(app->bt_locator_devices[app->bt_locator_count].mac, mac, sizeof(app->bt_locator_devices[app->bt_locator_count].mac));
+    app->bt_locator_devices[app->bt_locator_count].mac[sizeof(app->bt_locator_devices[app->bt_locator_count].mac) - 1] = '\0';
+    app->bt_locator_devices[app->bt_locator_count].rssi = rssi;
+    app->bt_locator_devices[app->bt_locator_count].has_rssi = true;
+    if(name && name[0] != '\0') {
+        strncpy(app->bt_locator_devices[app->bt_locator_count].name, name, sizeof(app->bt_locator_devices[app->bt_locator_count].name) - 1);
+        app->bt_locator_devices[app->bt_locator_count].name[sizeof(app->bt_locator_devices[app->bt_locator_count].name) - 1] = '\0';
+    }
+    app->bt_locator_count++;
+
+    // Keep list sorted by RSSI desc (strongest first)
+    for(size_t pos = app->bt_locator_count; pos > 1; pos--) {
+        size_t i = pos - 1;
+        size_t prev = i - 1;
+        bool swap = false;
+        if(app->bt_locator_devices[i].has_rssi && app->bt_locator_devices[prev].has_rssi) {
+            swap = app->bt_locator_devices[i].rssi > app->bt_locator_devices[prev].rssi;
+        } else if(app->bt_locator_devices[i].has_rssi && !app->bt_locator_devices[prev].has_rssi) {
+            swap = true;
+        }
+        if(swap) {
+            struct {
+                char mac[18];
+                int rssi;
+                bool has_rssi;
+                char name[32];
+            } tmp = {0};
+            memcpy(tmp.mac, app->bt_locator_devices[i].mac, sizeof(tmp.mac));
+            tmp.rssi = app->bt_locator_devices[i].rssi;
+            tmp.has_rssi = app->bt_locator_devices[i].has_rssi;
+            memcpy(tmp.name, app->bt_locator_devices[i].name, sizeof(tmp.name));
+
+            memcpy(app->bt_locator_devices[i].mac, app->bt_locator_devices[prev].mac, sizeof(tmp.mac));
+            app->bt_locator_devices[i].rssi = app->bt_locator_devices[prev].rssi;
+            app->bt_locator_devices[i].has_rssi = app->bt_locator_devices[prev].has_rssi;
+            memcpy(app->bt_locator_devices[i].name, app->bt_locator_devices[prev].name, sizeof(tmp.name));
+
+            memcpy(app->bt_locator_devices[prev].mac, tmp.mac, sizeof(tmp.mac));
+            app->bt_locator_devices[prev].rssi = tmp.rssi;
+            app->bt_locator_devices[prev].has_rssi = tmp.has_rssi;
+            memcpy(app->bt_locator_devices[prev].name, tmp.name, sizeof(tmp.name));
+        } else {
+            break;
+        }
+    }
+    // Restore selection mac if it matches newly inserted entry
+    if(app->bt_locator_preserve_mac && app->bt_locator_mac[0] == '\0' && app->bt_locator_saved_mac[0] != '\0') {
+        strncpy(app->bt_locator_mac, app->bt_locator_saved_mac, sizeof(app->bt_locator_mac) - 1);
+        app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
+    }
+}
+
+static void simple_app_bt_locator_finish(SimpleApp* app) {
+    if(!app) return;
+    app->bt_locator_list_loading = false;
+    app->bt_locator_list_ready = true;
+    app->bt_locator_console_mode = true;
+    if(app->bt_locator_count == 0) {
+        app->bt_locator_index = 0;
+        app->bt_locator_offset = 0;
+    } else if(app->bt_locator_index >= app->bt_locator_count) {
+        app->bt_locator_index = app->bt_locator_count - 1;
+    }
+    if(app->bt_locator_offset > app->bt_locator_index) {
+        app->bt_locator_offset = app->bt_locator_index;
+    }
+    if(app->viewport && app->screen == ScreenBtLocatorList) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_bt_locator_reset_scroll(SimpleApp* app) {
+    if(!app) return;
+    app->bt_locator_scroll_text[0] = '\0';
+    app->bt_locator_scroll_offset = 0;
+    app->bt_locator_scroll_dir = 1;
+    app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+    app->bt_locator_scroll_last_tick = furi_get_tick();
+}
+
+static void simple_app_bt_locator_set_scroll_text(SimpleApp* app, const char* text) {
+    if(!app || !text) return;
+    strncpy(app->bt_locator_scroll_text, text, sizeof(app->bt_locator_scroll_text) - 1);
+    app->bt_locator_scroll_text[sizeof(app->bt_locator_scroll_text) - 1] = '\0';
+    app->bt_locator_scroll_offset = 0;
+    app->bt_locator_scroll_dir = 1;
+    app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+    app->bt_locator_scroll_last_tick = furi_get_tick();
+}
+
+static void simple_app_bt_locator_tick_scroll(SimpleApp* app, size_t char_limit) {
+    if(!app) return;
+    size_t len = strlen(app->bt_locator_scroll_text);
+    if(len <= char_limit || char_limit == 0) {
+        app->bt_locator_scroll_offset = 0;
+        return;
+    }
+
+    uint32_t interval_ticks = furi_ms_to_ticks(RESULT_SCROLL_INTERVAL_MS);
+    if(interval_ticks == 0) interval_ticks = 1;
+    uint32_t now = furi_get_tick();
+    if((now - app->bt_locator_scroll_last_tick) < interval_ticks) {
+        return;
+    }
+    app->bt_locator_scroll_last_tick = now;
+
+    if(app->bt_locator_scroll_hold > 0) {
+        app->bt_locator_scroll_hold--;
+        return;
+    }
+
+    size_t max_offset = len - char_limit;
+    bool changed = false;
+    if(app->bt_locator_scroll_dir > 0) {
+        if(app->bt_locator_scroll_offset < max_offset) {
+            app->bt_locator_scroll_offset++;
+            changed = true;
+            if(app->bt_locator_scroll_offset >= max_offset) {
+                app->bt_locator_scroll_dir = -1;
+                app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+            }
+        } else {
+            app->bt_locator_scroll_dir = -1;
+            app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        }
+    } else {
+        if(app->bt_locator_scroll_offset > 0) {
+            app->bt_locator_scroll_offset--;
+            changed = true;
+            if(app->bt_locator_scroll_offset == 0) {
+                app->bt_locator_scroll_dir = 1;
+                app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+            }
+        } else {
+            app->bt_locator_scroll_dir = 1;
+            app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        }
+    }
+
+    if(changed && app->viewport && app->screen == ScreenBtLocatorList) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_bt_locator_feed(SimpleApp* app, char ch) {
+    if(!app || !app->bt_locator_list_loading) return;
+    if(ch == '\r') return;
+    if(ch == '\n') {
+        if(app->bt_locator_scan_len > 0) {
+            app->bt_locator_scan_line[app->bt_locator_scan_len] = '\0';
+            const char* line = app->bt_locator_scan_line;
+            if(strstr(line, "Summary:") != NULL) {
+                simple_app_bt_locator_finish(app);
+            } else {
+                int idx = 0;
+                char mac[18] = {0};
+                int rssi = 0;
+                if(sscanf(line, " %d . %17s  RSSI: %d", &idx, mac, &rssi) == 3 ||
+                   sscanf(line, " %d. %17s  RSSI: %d", &idx, mac, &rssi) == 3) {
+                    const char* name_ptr = strstr(line, "Name:");
+                    char name_buf[32] = {0};
+                    if(name_ptr) {
+                        name_ptr += strlen("Name:");
+                        while(*name_ptr == ' ') name_ptr++;
+                        strncpy(name_buf, name_ptr, sizeof(name_buf) - 1);
+                        // trim trailing spaces
+                        size_t nb_len = strlen(name_buf);
+                        while(nb_len > 0 && isspace((unsigned char)name_buf[nb_len - 1])) {
+                            name_buf[nb_len - 1] = '\0';
+                            nb_len--;
+                        }
+                    }
+                    simple_app_bt_locator_add(app, mac, rssi, name_buf[0] ? name_buf : NULL);
+                    if(app->viewport && app->screen == ScreenBtLocatorList) {
+                        view_port_update(app->viewport);
+                    }
+                }
+            }
+        }
+        app->bt_locator_scan_len = 0;
+        return;
+    }
+    if(app->bt_locator_scan_len + 1 >= sizeof(app->bt_locator_scan_line)) {
+        app->bt_locator_scan_len = 0;
+        return;
+    }
+    app->bt_locator_scan_line[app->bt_locator_scan_len++] = ch;
+}
+
+static void simple_app_bt_locator_begin_scan(SimpleApp* app) {
+    if(!app) return;
+    simple_app_reset_bt_scan_summary(app);
+    simple_app_bt_locator_reset_list(app);
+    app->bt_locator_console_mode = true;
+    app->bt_locator_list_loading = true;
+    app->bt_locator_list_ready = false;
+    app->bt_locator_mode = false;
+    simple_app_bt_locator_reset_scroll(app);
+    app->screen = ScreenSerial;
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+    simple_app_send_command(app, "scan_bt", false);
+    // send_command resets scan state; reassert locator flags so UI stays in "scanning" console mode
+    app->bt_locator_console_mode = true;
+    app->bt_locator_list_loading = true;
+    app->bt_locator_list_ready = false;
+    app->bt_locator_mode = false;
 }
 
 static void simple_app_force_otg_for_wardrive(SimpleApp* app) {
@@ -2257,7 +2690,7 @@ static void simple_app_show_status_message(
         app->status_message_fullscreen = false;
     }
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -2268,7 +2701,7 @@ static void simple_app_clear_status_message(SimpleApp* app) {
     app->status_message_fullscreen = false;
     app->karma_status_active = false;
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -2646,7 +3079,7 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
     if(strncmp(cursor, "Scan results", 12) == 0) {
         app->scan_results_loading = false;
         if(app->screen == ScreenResults) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -2695,7 +3128,7 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
 
     if(app->screen == ScreenResults) {
         simple_app_adjust_result_offset(app);
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -2766,7 +3199,7 @@ static void simple_app_update_result_scroll(SimpleApp* app) {
         if(app->result_scroll_text[0] != '\0' || app->result_scroll_offset != 0) {
             simple_app_reset_result_scroll(app);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -2777,7 +3210,7 @@ static void simple_app_update_result_scroll(SimpleApp* app) {
         if(app->result_scroll_text[0] != '\0' || app->result_scroll_offset != 0) {
             simple_app_reset_result_scroll(app);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -2790,7 +3223,7 @@ static void simple_app_update_result_scroll(SimpleApp* app) {
         if(app->result_scroll_text[0] != '\0' || app->result_scroll_offset != 0) {
             simple_app_reset_result_scroll(app);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -2805,7 +3238,7 @@ static void simple_app_update_result_scroll(SimpleApp* app) {
         app->result_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
         app->result_scroll_last_tick = furi_get_tick();
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -2822,7 +3255,7 @@ static void simple_app_update_result_scroll(SimpleApp* app) {
         if(app->result_scroll_offset != 0) {
             app->result_scroll_offset = 0;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -2870,7 +3303,7 @@ static void simple_app_update_result_scroll(SimpleApp* app) {
     }
 
     if(changed && app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -2894,7 +3327,7 @@ static void simple_app_update_sd_scroll(SimpleApp* app) {
         if(app->sd_scroll_offset != 0) {
             simple_app_reset_sd_scroll(app);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -2942,7 +3375,7 @@ static void simple_app_update_sd_scroll(SimpleApp* app) {
     }
 
     if(changed && app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -3114,8 +3547,13 @@ static size_t simple_app_visible_serial_lines(const SimpleApp* app) {
     if(app->screen == ScreenConsole) {
         return CONSOLE_VISIBLE_LINES;
     }
-    if(app->screen == ScreenSerial && app->wardrive_view_active) {
-        return WARD_DRIVE_CONSOLE_LINES;
+    if(app->screen == ScreenSerial) {
+        if(app->bt_scan_view_active && !app->bt_scan_full_console) {
+            return BT_SCAN_CONSOLE_LINES;
+        }
+        if(app->wardrive_view_active) {
+            return WARD_DRIVE_CONSOLE_LINES;
+        }
     }
     return SERIAL_VISIBLE_LINES;
 }
@@ -3207,6 +3645,8 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_boot_feed(app, ch);
         simple_app_vendor_feed(app, ch);
         simple_app_scanner_timing_feed(app, ch);
+        simple_app_bt_scan_feed(app, ch);
+        simple_app_bt_locator_feed(app, ch);
         simple_app_wardrive_feed(app, ch);
     }
 
@@ -3282,6 +3722,8 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     bool is_wardrive_command = strstr(command, "start_wardrive") != NULL;
     bool is_stop_command = strcmp(command, "stop") == 0;
     bool is_start_sniffer = simple_app_is_start_sniffer_command(command);
+    bool is_airtag_scan_command = strstr(command, "scan_airtag") != NULL;
+    bool is_bt_scan_command = is_airtag_scan_command || strstr(command, "scan_bt") != NULL;
     if(is_wardrive_command) {
         app->wardrive_view_active = true;
         simple_app_reset_wardrive_status(app);
@@ -3289,6 +3731,27 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     } else if(app->wardrive_view_active) {
         app->wardrive_view_active = false;
         simple_app_reset_wardrive_status(app);
+    }
+    if(is_bt_scan_command) {
+        app->bt_scan_view_active = true;
+        simple_app_reset_bt_scan_summary(app);
+        app->airtag_scan_mode = is_airtag_scan_command;
+        if(!is_airtag_scan_command) {
+            const char* mac_ptr = strstr(command, "scan_bt");
+            if(mac_ptr) {
+                mac_ptr += strlen("scan_bt");
+                while(*mac_ptr == ' ') mac_ptr++;
+                if(strchr(mac_ptr, ':')) {
+                    strncpy(app->bt_locator_mac, mac_ptr, sizeof(app->bt_locator_mac));
+                    app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
+                    app->bt_locator_mode = true;
+                    app->bt_locator_has_rssi = false;
+                }
+            }
+        }
+    } else if(app->bt_scan_view_active) {
+        app->bt_scan_view_active = false;
+        simple_app_reset_bt_scan_summary(app);
     }
     if(is_stop_command) {
         simple_app_restore_otg_after_wardrive(app);
@@ -3339,7 +3802,7 @@ static void simple_app_send_command_with_targets(SimpleApp* app, const char* bas
     if(app->scan_selected_count == 0 && requires_select_networks) {
         simple_app_show_status_message(app, "Please select\nnetwork first", 1500, true);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -3448,27 +3911,6 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     }
 }
 
-static void simple_app_request_viewport_update(SimpleApp* app) {
-    if(!app) return;
-    app->viewport_dirty = true;
-}
-
-static void simple_app_flush_viewport(SimpleApp* app) {
-    if(!app || !app->viewport) return;
-    if(!app->viewport_dirty) return;
-
-    uint32_t now = furi_get_tick();
-    if(app->viewport_last_update_tick != 0 &&
-       (now - app->viewport_last_update_tick) < furi_ms_to_ticks(10)) {
-        // Throttle to avoid GUI lock warnings when updates are spammed
-        return;
-    }
-
-    app->viewport_last_update_tick = now;
-    app->viewport_dirty = false;
-    view_port_update(app->viewport);
-}
-
 static void simple_app_request_scan_results(SimpleApp* app, const char* command) {
     if(!app) return;
     simple_app_reset_scan_results(app);
@@ -3478,7 +3920,7 @@ static void simple_app_request_scan_results(SimpleApp* app, const char* command)
         simple_app_send_command(app, command, false);
     }
     app->screen = ScreenResults;
-    simple_app_request_viewport_update(app);
+    view_port_update(app->viewport);
 }
 
 static void simple_app_console_enter(SimpleApp* app) {
@@ -3486,7 +3928,7 @@ static void simple_app_console_enter(SimpleApp* app) {
     app->screen = ScreenConsole;
     app->serial_follow_tail = true;
     simple_app_update_scroll(app);
-    simple_app_request_viewport_update(app);
+    view_port_update(app->viewport);
 }
 
 static void simple_app_console_leave(SimpleApp* app) {
@@ -3505,7 +3947,7 @@ static void simple_app_console_leave(SimpleApp* app) {
     }
     app->serial_follow_tail = true;
     simple_app_update_scroll(app);
-    simple_app_request_viewport_update(app);
+    view_port_update(app->viewport);
 }
 
 static void simple_app_draw_console(SimpleApp* app, Canvas* canvas) {
@@ -3621,7 +4063,7 @@ static void simple_app_handle_console_input(SimpleApp* app, InputKey key) {
         if(app->serial_scroll > 0) {
             app->serial_scroll--;
             app->serial_follow_tail = false;
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -3636,7 +4078,7 @@ static void simple_app_handle_console_input(SimpleApp* app, InputKey key) {
             }
             app->serial_follow_tail = false;
         }
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
         return;
     } else if(key == InputKeyRight) {
         size_t step = CONSOLE_VISIBLE_LINES;
@@ -3649,80 +4091,24 @@ static void simple_app_handle_console_input(SimpleApp* app, InputKey key) {
             app->serial_follow_tail = true;
             simple_app_update_scroll(app);
         }
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
         return;
     } else if(key == InputKeyDown) {
         size_t max_scroll = simple_app_max_scroll(app);
         if(app->serial_scroll < max_scroll) {
             app->serial_scroll++;
             app->serial_follow_tail = (app->serial_scroll == max_scroll);
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         } else {
             app->serial_follow_tail = true;
             simple_app_update_scroll(app);
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     } else if(key == InputKeyOk) {
         app->serial_follow_tail = true;
         simple_app_update_scroll(app);
-        simple_app_request_viewport_update(app);
-    }
-}
-
-static void simple_app_handle_confirm_blackout_input(SimpleApp* app, InputKey key) {
-    if(!app) return;
-    if(key == InputKeyBack) {
-        simple_app_send_stop_if_needed(app);
-        app->confirm_blackout_yes = false;
-        simple_app_focus_attacks_menu(app);
-        simple_app_request_viewport_update(app);
-        return;
-    }
-
-    if(key == InputKeyLeft || key == InputKeyRight) {
-        app->confirm_blackout_yes = !app->confirm_blackout_yes;
-        simple_app_request_viewport_update(app);
-        return;
-    }
-
-    if(key == InputKeyOk) {
-        if(app->confirm_blackout_yes) {
-            app->confirm_blackout_yes = false;
-            app->blackout_view_active = true;
-            app->serial_targets_hint = false;
-            simple_app_send_command(app, "start_blackout", true);
-        } else {
-            simple_app_focus_attacks_menu(app);
-            simple_app_request_viewport_update(app);
-        }
-    }
-}
-
-static void simple_app_handle_confirm_sniffer_dos_input(SimpleApp* app, InputKey key) {
-    if(!app) return;
-    if(key == InputKeyBack) {
-        simple_app_send_stop_if_needed(app);
-        app->confirm_sniffer_dos_yes = false;
-        simple_app_focus_attacks_menu(app);
-        simple_app_request_viewport_update(app);
-        return;
-    }
-
-    if(key == InputKeyLeft || key == InputKeyRight) {
-        app->confirm_sniffer_dos_yes = !app->confirm_sniffer_dos_yes;
-        simple_app_request_viewport_update(app);
-        return;
-    }
-
-    if(key == InputKeyOk) {
-        if(app->confirm_sniffer_dos_yes) {
-            app->confirm_sniffer_dos_yes = false;
-            simple_app_send_command(app, "start_sniffer_dog", true);
-        } else {
-            simple_app_focus_attacks_menu(app);
-            simple_app_request_viewport_update(app);
-        }
+        view_port_update(app->viewport);
     }
 }
 
@@ -3732,13 +4118,13 @@ static void simple_app_handle_confirm_exit_input(SimpleApp* app, InputKey key) {
         app->confirm_exit_yes = false;
         app->screen = ScreenMenu;
         app->menu_state = MenuStateSections;
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
         return;
     }
 
     if(key == InputKeyLeft || key == InputKeyRight) {
         app->confirm_exit_yes = !app->confirm_exit_yes;
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
         return;
     }
 
@@ -3750,7 +4136,63 @@ static void simple_app_handle_confirm_exit_input(SimpleApp* app, InputKey key) {
             app->confirm_exit_yes = false;
             app->screen = ScreenMenu;
             app->menu_state = MenuStateSections;
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
+        }
+    }
+}
+
+static void simple_app_handle_confirm_blackout_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+    if(key == InputKeyBack) {
+        simple_app_send_stop_if_needed(app);
+        app->confirm_blackout_yes = false;
+        simple_app_focus_attacks_menu(app);
+        view_port_update(app->viewport);
+        return;
+    }
+
+    if(key == InputKeyLeft || key == InputKeyRight) {
+        app->confirm_blackout_yes = !app->confirm_blackout_yes;
+        view_port_update(app->viewport);
+        return;
+    }
+
+    if(key == InputKeyOk) {
+        if(app->confirm_blackout_yes) {
+            app->confirm_blackout_yes = false;
+            app->blackout_view_active = true;
+            app->serial_targets_hint = false;
+            simple_app_send_command(app, "start_blackout", true);
+        } else {
+            simple_app_focus_attacks_menu(app);
+            view_port_update(app->viewport);
+        }
+    }
+}
+
+static void simple_app_handle_confirm_sniffer_dos_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+    if(key == InputKeyBack) {
+        simple_app_send_stop_if_needed(app);
+        app->confirm_sniffer_dos_yes = false;
+        simple_app_focus_attacks_menu(app);
+        view_port_update(app->viewport);
+        return;
+    }
+
+    if(key == InputKeyLeft || key == InputKeyRight) {
+        app->confirm_sniffer_dos_yes = !app->confirm_sniffer_dos_yes;
+        view_port_update(app->viewport);
+        return;
+    }
+
+    if(key == InputKeyOk) {
+        if(app->confirm_sniffer_dos_yes) {
+            app->confirm_sniffer_dos_yes = false;
+            simple_app_send_command(app, "start_sniffer_dog", true);
+        } else {
+            simple_app_focus_attacks_menu(app);
+            view_port_update(app->viewport);
         }
     }
 }
@@ -3897,7 +4339,7 @@ static void simple_app_package_monitor_enter(SimpleApp* app) {
     app->screen = ScreenPackageMonitor;
     simple_app_package_monitor_start(app, app->package_monitor_channel, true);
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -4020,7 +4462,7 @@ static void simple_app_handle_package_monitor_input(SimpleApp* app, InputKey key
         app->screen = ScreenMenu;
         app->package_monitor_dirty = false;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -4040,7 +4482,7 @@ static void simple_app_handle_package_monitor_input(SimpleApp* app, InputKey key
             simple_app_package_monitor_reset(app);
             simple_app_package_monitor_start(app, next_channel, false);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyDown) {
@@ -4052,13 +4494,13 @@ static void simple_app_handle_package_monitor_input(SimpleApp* app, InputKey key
             simple_app_package_monitor_reset(app);
             simple_app_package_monitor_start(app, prev_channel, false);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyOk) {
         simple_app_package_monitor_start(app, app->package_monitor_channel, true);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     }
 }
@@ -4185,7 +4627,7 @@ static void simple_app_channel_view_enter(SimpleApp* app) {
     app->screen = ScreenChannelView;
     simple_app_channel_view_start(app);
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -4409,7 +4851,7 @@ static void simple_app_handle_channel_view_input(SimpleApp* app, InputKey key) {
         app->item_offset = 0;
         app->screen = ScreenMenu;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -4425,7 +4867,7 @@ static void simple_app_handle_channel_view_input(SimpleApp* app, InputKey key) {
         }
         app->channel_view_dirty = true;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -4434,21 +4876,21 @@ static void simple_app_handle_channel_view_input(SimpleApp* app, InputKey key) {
         simple_app_channel_view_stop(app);
         simple_app_channel_view_start(app);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
 
     if(key == InputKeyLeft) {
         if(simple_app_channel_view_adjust_offset(app, app->channel_view_band, -1) && app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
 
     if(key == InputKeyRight) {
         if(simple_app_channel_view_adjust_offset(app, app->channel_view_band, 1) && app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -4547,7 +4989,7 @@ static void simple_app_show_hint(SimpleApp* app, const char* title, const char* 
     app->hint_scroll = 0;
     app->hint_active = true;
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -4557,7 +4999,7 @@ static void simple_app_hide_hint(SimpleApp* app) {
     app->hint_line_count = 0;
     app->hint_scroll = 0;
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -4574,7 +5016,7 @@ static void simple_app_hint_scroll(SimpleApp* app, int delta) {
     if((size_t)new_value != app->hint_scroll) {
         app->hint_scroll = (size_t)new_value;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     }
 }
@@ -4796,7 +5238,7 @@ static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key) {
         app->portal_menu_offset = 0;
         simple_app_focus_attacks_menu(app);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -4806,7 +5248,7 @@ static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key) {
             app->portal_menu_index--;
             simple_app_portal_sync_offset(app);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyDown) {
@@ -4814,7 +5256,7 @@ static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key) {
             app->portal_menu_index++;
             simple_app_portal_sync_offset(app);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyOk) {
@@ -4822,7 +5264,7 @@ static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key) {
             if(app->portal_ssid_listing_active) {
                 simple_app_show_status_message(app, "Listing already\nin progress", 1200, true);
                 if(app->viewport) {
-                    simple_app_request_viewport_update(app);
+                    view_port_update(app->viewport);
                 }
                 return;
             }
@@ -4847,7 +5289,7 @@ static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key) {
                 }
                 app->karma_html_popup_active = true;
                 if(app->viewport) {
-                    simple_app_request_viewport_update(app);
+                    view_port_update(app->viewport);
                 }
             }
         } else {
@@ -4902,7 +5344,7 @@ static void simple_app_open_portal_ssid_popup(SimpleApp* app) {
     app->portal_ssid_popup_active = true;
     simple_app_clear_status_message(app);
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -4920,7 +5362,7 @@ static void simple_app_finish_portal_ssid_listing(SimpleApp* app) {
             simple_app_show_status_message(app, "SSID presets\nnot available", 1500, true);
             simple_app_portal_prompt_ssid(app);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -5039,7 +5481,7 @@ static void simple_app_request_portal_ssid_list(SimpleApp* app) {
     simple_app_show_status_message(app, "Listing SSID...", 0, false);
     simple_app_send_command(app, "list_ssid", false);
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -5173,7 +5615,7 @@ static bool simple_app_portal_run_text_input(SimpleApp* app) {
 
     if(viewport_detached) {
         gui_add_view_port(app->gui, app->viewport, GuiLayerFullscreen);
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
     app->portal_input_active = false;
 
@@ -5274,7 +5716,7 @@ static void simple_app_handle_portal_ssid_popup_event(SimpleApp* app, const Inpu
     if(is_short && key == InputKeyBack) {
         app->portal_ssid_popup_active = false;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -5290,7 +5732,7 @@ static void simple_app_handle_portal_ssid_popup_event(SimpleApp* app, const Inpu
                 app->portal_ssid_popup_offset = app->portal_ssid_popup_index;
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyDown) {
@@ -5306,7 +5748,7 @@ static void simple_app_handle_portal_ssid_popup_event(SimpleApp* app, const Inpu
                 app->portal_ssid_popup_offset = max_offset;
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(is_short && key == InputKeyOk) {
@@ -5325,7 +5767,7 @@ static void simple_app_handle_portal_ssid_popup_event(SimpleApp* app, const Inpu
             app->portal_ssid_popup_active = false;
         }
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     }
 }
@@ -5336,7 +5778,7 @@ static void simple_app_start_portal(SimpleApp* app) {
     if(app->portal_ssid_listing_active) {
         simple_app_show_status_message(app, "Wait for list\ncompletion", 1500, true);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -5344,7 +5786,7 @@ static void simple_app_start_portal(SimpleApp* app) {
     if(app->karma_html_listing_active) {
         simple_app_show_status_message(app, "Wait for list\ncompletion", 1500, true);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -5352,7 +5794,7 @@ static void simple_app_start_portal(SimpleApp* app) {
     if(app->portal_ssid[0] == '\0') {
         simple_app_show_status_message(app, "Set SSID first", 1200, true);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -5360,7 +5802,7 @@ static void simple_app_start_portal(SimpleApp* app) {
     if(app->karma_selected_html_id == 0) {
         simple_app_show_status_message(app, "Select HTML file\nbefore starting", 1500, true);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -5509,14 +5951,34 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     }
 
     if(app->menu_state == MenuStateSections) {
+        size_t visible_sections = simple_app_section_visible_count();
+        if(visible_sections == 0) visible_sections = 1;
+        simple_app_adjust_section_offset(app);
+
         canvas_set_font(canvas, FontPrimary);
-        for(size_t i = 0; i < menu_section_count; i++) {
-            uint8_t y = menu_sections[i].display_y;
-            if(app->section_index == i) {
+        for(size_t i = 0; i < visible_sections; i++) {
+            size_t idx = app->section_offset + i;
+            if(idx >= menu_section_count) break;
+            uint8_t y = MENU_SECTION_BASE_Y + (uint8_t)(i * MENU_SECTION_SPACING);
+            const char* title = menu_sections[idx].title;
+            if(app->section_index == idx) {
                 canvas_draw_str(canvas, 0, y, ">");
-                canvas_draw_str(canvas, 12, y, menu_sections[i].title);
+                canvas_draw_str(canvas, 12, y, title);
             } else {
-                canvas_draw_str(canvas, 6, y, menu_sections[i].title);
+                canvas_draw_str(canvas, 6, y, title);
+            }
+        }
+
+        if(menu_section_count > visible_sections) {
+            bool show_up = (app->section_offset > 0);
+            bool show_down = (app->section_offset + visible_sections < menu_section_count);
+            if(show_up || show_down) {
+                uint8_t arrow_x = DISPLAY_WIDTH - 6;
+                int16_t content_top = MENU_SECTION_BASE_Y;
+                int16_t content_bottom =
+                    MENU_SECTION_BASE_Y + (int16_t)((visible_sections - 1) * MENU_SECTION_SPACING);
+                simple_app_draw_scroll_hints_clamped(
+                    canvas, arrow_x, content_top, content_bottom, show_up, show_down, 12, 44);
             }
         }
         return;
@@ -5759,7 +6221,329 @@ static void simple_app_draw_wardrive_serial(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, bottom_center, AlignCenter, AlignCenter, status);
 }
 
+static void simple_app_draw_airtag_scan(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 8, 14, "AirTags");
+    canvas_draw_str(canvas, (DISPLAY_WIDTH / 2) + 8, 14, "SmartTags");
+    canvas_draw_line(canvas, DISPLAY_WIDTH / 2, 6, DISPLAY_WIDTH / 2, 46);
+
+    canvas_set_font(canvas, FontPrimary);
+    char count_line[16];
+    snprintf(count_line, sizeof(count_line), "%d", app->bt_scan_airtags);
+    canvas_draw_str_aligned(
+        canvas, DISPLAY_WIDTH / 4, 32, AlignCenter, AlignCenter, count_line);
+    snprintf(count_line, sizeof(count_line), "%d", app->bt_scan_smarttags);
+    canvas_draw_str_aligned(
+        canvas, (DISPLAY_WIDTH * 3) / 4, 32, AlignCenter, AlignCenter, count_line);
+
+    canvas_set_font(canvas, FontSecondary);
+    char total_line[32];
+    snprintf(total_line, sizeof(total_line), "Total: %d", app->bt_scan_total);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 50, AlignCenter, AlignCenter, total_line);
+
+    char status_line[48];
+    if(app->bt_scan_last_update_tick > 0) {
+        uint32_t ticks_per_second = furi_ms_to_ticks(1000);
+        if(ticks_per_second == 0) ticks_per_second = 1;
+        uint32_t now = furi_get_tick();
+        uint32_t elapsed_ticks = now - app->bt_scan_last_update_tick;
+        uint32_t elapsed_seconds = elapsed_ticks / ticks_per_second;
+        snprintf(status_line, sizeof(status_line), "Last update: %lus ago", (unsigned long)elapsed_seconds);
+    } else {
+        snprintf(status_line, sizeof(status_line), "Waiting for scan data");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 62, AlignCenter, AlignBottom, status_line);
+}
+
+static void simple_app_draw_bt_locator(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+
+    const char* mac = NULL;
+    if(app->bt_locator_mac[0] != '\0') {
+        mac = app->bt_locator_mac;
+    } else if(app->bt_locator_saved_mac[0] != '\0') {
+        mac = app->bt_locator_saved_mac;
+    } else if(app->bt_locator_selected >= 0 && app->bt_locator_selected < (int32_t)app->bt_locator_count) {
+        mac = app->bt_locator_devices[app->bt_locator_selected].mac;
+    }
+    if(!mac || mac[0] == '\0' || mac[0] == '>' || (mac[0] == 'U' && mac[1] == 's')) {
+        mac = (app->bt_locator_saved_mac[0] != '\0') ? app->bt_locator_saved_mac : "No MAC";
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 14, AlignCenter, AlignCenter, mac);
+
+    canvas_set_font(canvas, FontPrimary);
+    char rssi_line[32];
+    if(app->bt_locator_has_rssi) {
+        snprintf(rssi_line, sizeof(rssi_line), "RSSI: %d dBm", app->bt_locator_rssi);
+    } else {
+        snprintf(rssi_line, sizeof(rssi_line), "RSSI: N/A");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 34, AlignCenter, AlignCenter, rssi_line);
+
+    canvas_set_font(canvas, FontSecondary);
+    const char* quality = "No signal";
+    if(app->bt_locator_has_rssi) {
+        if(app->bt_locator_rssi >= -60) {
+            quality = "Great";
+        } else if(app->bt_locator_rssi >= -75) {
+            quality = "Good";
+        } else if(app->bt_locator_rssi >= -90) {
+            quality = "Poor";
+        } else {
+            quality = "Very weak";
+        }
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 50, AlignCenter, AlignCenter, quality);
+
+    char status_line[48];
+    if(app->bt_scan_last_update_tick > 0) {
+        uint32_t ticks_per_second = furi_ms_to_ticks(1000);
+        if(ticks_per_second == 0) ticks_per_second = 1;
+        uint32_t elapsed = (furi_get_tick() - app->bt_scan_last_update_tick) / ticks_per_second;
+        snprintf(status_line, sizeof(status_line), "Updated: %lus ago", (unsigned long)elapsed);
+    } else {
+        snprintf(status_line, sizeof(status_line), "Waiting for data...");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 62, AlignCenter, AlignBottom, status_line);
+}
+
+static void simple_app_draw_bt_locator_list(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+
+    uint8_t list_top = 8;
+    uint8_t list_bottom = DISPLAY_HEIGHT - 2;
+
+    if(app->bt_locator_list_loading) {
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, (list_top + list_bottom) / 2 - 6, AlignCenter, AlignCenter, "Scanning...");
+        char count_line[32];
+        snprintf(count_line, sizeof(count_line), "Found: %u", (unsigned)app->bt_locator_count);
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, (list_top + list_bottom) / 2 + 6, AlignCenter, AlignCenter, count_line);
+        return;
+    }
+
+    if(app->bt_locator_count == 0) {
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, (list_top + list_bottom) / 2 - 6, AlignCenter, AlignCenter, "No devices");
+        return;
+    }
+
+    canvas_set_font(canvas, FontSecondary);
+    size_t visible = 6;
+    size_t start = app->bt_locator_offset;
+    size_t end = start + visible;
+    if(end > app->bt_locator_count) end = app->bt_locator_count;
+
+    const size_t char_limit = 21;
+    uint8_t y = list_top;
+    for(size_t i = start; i < end; i++) {
+        const bool selected = (i == app->bt_locator_index);
+        const bool picked = ((int32_t)i == app->bt_locator_selected);
+        const char* mac = app->bt_locator_devices[i].mac;
+        int rssi = app->bt_locator_devices[i].rssi;
+        bool has_rssi = app->bt_locator_devices[i].has_rssi;
+        const char* name = app->bt_locator_devices[i].name;
+        char line[48];
+        if(has_rssi) {
+            snprintf(line, sizeof(line), "%s %d", mac, rssi);
+        } else {
+            snprintf(line, sizeof(line), "%s ?", mac);
+        }
+        const char* to_draw = line;
+        char scroll_buf[48];
+        size_t len = strlen(line);
+        if(selected && len > char_limit) {
+            if(strncmp(app->bt_locator_scroll_text, line, sizeof(app->bt_locator_scroll_text)) != 0) {
+                simple_app_bt_locator_set_scroll_text(app, line);
+            }
+            simple_app_bt_locator_tick_scroll(app, char_limit);
+            size_t offset = app->bt_locator_scroll_offset;
+            if(offset >= len) offset = 0;
+            size_t copy_len = (len - offset > char_limit) ? char_limit : (len - offset);
+            memcpy(scroll_buf, line + offset, copy_len);
+            scroll_buf[copy_len] = '\0';
+            to_draw = scroll_buf;
+        } else {
+            simple_app_bt_locator_reset_scroll(app);
+            simple_app_truncate_text(line, char_limit);
+            to_draw = line;
+        }
+        if(selected) {
+            canvas_draw_str(canvas, 2, y, ">");
+        }
+        if(picked) {
+            canvas_draw_str(canvas, 10, y, "*");
+        }
+        canvas_draw_str(canvas, picked ? 18 : 12, y, to_draw);
+        y += SERIAL_TEXT_LINE_HEIGHT;
+
+        if(name && name[0] != '\0' && y <= list_bottom - SERIAL_TEXT_LINE_HEIGHT) {
+            char name_buf[48];
+            strncpy(name_buf, name, sizeof(name_buf) - 1);
+            name_buf[sizeof(name_buf) - 1] = '\0';
+            simple_app_truncate_text(name_buf, char_limit);
+            canvas_draw_str(canvas, picked ? 18 : 12, y, name_buf);
+            y += SERIAL_TEXT_LINE_HEIGHT;
+        }
+        if(y >= list_bottom) {
+            break;
+        }
+    }
+
+    if(app->bt_locator_selected >= 0 && app->bt_locator_selected < (int32_t)app->bt_locator_count) {
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 2, DISPLAY_HEIGHT - 2, AlignRight, AlignBottom, "->");
+    }
+}
+
+static void simple_app_draw_bt_scan_serial(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+    canvas_set_color(canvas, ColorBlack);
+    if(app->bt_locator_mode) {
+        simple_app_draw_bt_locator(app, canvas);
+        return;
+    }
+    if(app->bt_locator_console_mode) {
+        canvas_set_font(canvas, FontSecondary);
+        char display_lines[BT_SCAN_CONSOLE_LINES][64];
+        size_t lines_filled =
+            simple_app_render_display_lines(app, app->serial_scroll, display_lines, BT_SCAN_CONSOLE_LINES);
+
+        uint8_t y = 8;
+        if(lines_filled == 0) {
+            canvas_draw_str(canvas, 2, y, "Scanning...");
+            y += SERIAL_TEXT_LINE_HEIGHT;
+        } else {
+            for(size_t i = 0; i < lines_filled; i++) {
+                canvas_draw_str(canvas, 2, y, display_lines[i][0] ? display_lines[i] : " ");
+                y += SERIAL_TEXT_LINE_HEIGHT;
+            }
+        }
+
+        size_t total_lines = simple_app_total_display_lines(app);
+        if(total_lines > BT_SCAN_CONSOLE_LINES) {
+            size_t max_scroll = simple_app_max_scroll(app);
+            bool show_up = (app->serial_scroll > 0);
+            bool show_down = (app->serial_scroll < max_scroll);
+            if(show_up || show_down) {
+                uint8_t arrow_x = DISPLAY_WIDTH - 6;
+                int16_t content_top = 0; // top edge
+                int16_t visible_rows = (BT_SCAN_CONSOLE_LINES > 0) ? (BT_SCAN_CONSOLE_LINES - 1) : 0;
+                int16_t content_bottom = -4 + (int16_t)(visible_rows * SERIAL_TEXT_LINE_HEIGHT);
+                simple_app_draw_scroll_hints(canvas, arrow_x, content_top, content_bottom, show_up, show_down);
+            }
+        }
+
+        if(app->bt_locator_list_ready) {
+            canvas_set_font(canvas, FontPrimary);
+            canvas_draw_str_aligned(canvas,
+                                    DISPLAY_WIDTH - 2,
+                                    DISPLAY_HEIGHT - 2,
+                                    AlignRight,
+                                    AlignBottom,
+                                    "->");
+        }
+        return;
+    }
+    canvas_set_font(canvas, FontSecondary);
+    char display_lines[BT_SCAN_CONSOLE_LINES][64];
+    size_t lines_filled = simple_app_render_display_lines(
+        app, app->serial_scroll, display_lines, BT_SCAN_CONSOLE_LINES);
+
+    uint8_t y = 8;
+    if(lines_filled == 0) {
+        canvas_draw_str(canvas, 2, y, "No UART data");
+    } else {
+        for(size_t i = 0; i < lines_filled; i++) {
+            canvas_draw_str(canvas, 2, y, display_lines[i][0] ? display_lines[i] : " ");
+            y += SERIAL_TEXT_LINE_HEIGHT;
+        }
+    }
+
+    size_t total_lines = simple_app_total_display_lines(app);
+    if(total_lines > BT_SCAN_CONSOLE_LINES) {
+        size_t max_scroll = simple_app_max_scroll(app);
+        bool show_up = (app->serial_scroll > 0);
+        bool show_down = (app->serial_scroll < max_scroll);
+        if(show_up || show_down) {
+            uint8_t arrow_x = DISPLAY_WIDTH - 6;
+            int16_t visible_rows =
+                (BT_SCAN_CONSOLE_LINES > 0) ? (BT_SCAN_CONSOLE_LINES - 1) : 0;
+            int16_t content_bottom = 8 + (int16_t)(visible_rows * SERIAL_TEXT_LINE_HEIGHT);
+            /* Custom arrow placement: top hugs screen edge, bottom lifted off divider */
+            if(show_up) {
+                int16_t up_base = 2; // apex ends at y=0
+                if(up_base < 0) up_base = 0;
+                simple_app_draw_scroll_arrow(canvas, arrow_x, up_base, true);
+            }
+            if(show_down) {
+                int16_t down_base = content_bottom - 2; // raise 4px higher than before
+                if(down_base > 63) down_base = 63;
+                simple_app_draw_scroll_arrow(canvas, arrow_x, down_base, false);
+            }
+        }
+    }
+
+    int16_t divider_y = 8 + (int16_t)(BT_SCAN_CONSOLE_LINES * SERIAL_TEXT_LINE_HEIGHT) + 2 - 2;
+    divider_y -= SERIAL_TEXT_LINE_HEIGHT;
+    divider_y += 3; // nudge down slightly
+    if(divider_y >= DISPLAY_HEIGHT) {
+        divider_y = DISPLAY_HEIGHT - 2;
+    } else if(divider_y < 10) {
+        divider_y = 10;
+    }
+    canvas_draw_line(canvas, 0, divider_y, DISPLAY_WIDTH - 1, divider_y);
+
+    char line1[32];
+    char line2[32];
+    char total_line[32];
+    if(app->bt_locator_mode) {
+        // Locator view is drawn separately
+        return;
+    }
+    snprintf(line1, sizeof(line1), "AirTags: %d", app->bt_scan_airtags);
+    snprintf(line2, sizeof(line2), "SmartTags: %d", app->bt_scan_smarttags);
+    snprintf(total_line, sizeof(total_line), "Total: %d", app->bt_scan_total);
+
+    canvas_set_font(canvas, FontPrimary);
+    int16_t bottom_y = DISPLAY_HEIGHT - 2;
+    int16_t top_y = bottom_y - SERIAL_TEXT_LINE_HEIGHT;
+    if(top_y <= divider_y + 2) {
+        top_y = divider_y + 2;
+        bottom_y = top_y + SERIAL_TEXT_LINE_HEIGHT;
+    }
+    canvas_draw_str_aligned(canvas, 2, top_y, AlignLeft, AlignBottom, line1);
+    canvas_draw_str_aligned(canvas, 2, bottom_y, AlignLeft, AlignBottom, line2);
+
+    // Place total in bottom-right corner to avoid overlapping the counts
+    canvas_draw_str_aligned(
+        canvas, DISPLAY_WIDTH - 2, DISPLAY_HEIGHT - 2, AlignRight, AlignBottom, total_line);
+}
+
 static void simple_app_draw_serial(SimpleApp* app, Canvas* canvas) {
+    if(app && app->bt_scan_view_active && !app->bt_scan_full_console) {
+        if(app->airtag_scan_mode) {
+            simple_app_draw_airtag_scan(app, canvas);
+            return;
+        }
+        if(app->bt_locator_mode) {
+            simple_app_draw_bt_locator(app, canvas);
+            return;
+        }
+        simple_app_draw_bt_scan_serial(app, canvas);
+        return;
+    }
+
     if(app && app->wardrive_view_active) {
         simple_app_draw_wardrive_serial(app, canvas);
         return;
@@ -6081,7 +6865,7 @@ static void simple_app_open_sd_manager(SimpleApp* app) {
 
     app->sd_folder_popup_active = (sd_folder_option_count > 0);
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -6104,7 +6888,7 @@ static void simple_app_request_sd_listing(SimpleApp* app, const SdFolderOption* 
     }
     simple_app_send_command(app, command, false);
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -6120,7 +6904,7 @@ static void simple_app_finish_sd_listing(SimpleApp* app) {
     if(app->sd_file_count == 0) {
         simple_app_show_status_message(app, "No files in\nselected folder", 1500, true);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -6138,7 +6922,7 @@ static void simple_app_finish_sd_listing(SimpleApp* app) {
         app->sd_file_popup_active = true;
         simple_app_reset_sd_scroll(app);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     }
 
@@ -6209,7 +6993,7 @@ static void simple_app_process_sd_line(SimpleApp* app, const char* line) {
         app->last_command_sent = false;
         simple_app_show_status_message(app, "SD listing failed", 1500, true);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -6527,7 +7311,7 @@ static void simple_app_handle_sd_folder_popup_event(SimpleApp* app, const InputE
         app->sd_folder_popup_active = false;
         simple_app_reset_sd_scroll(app);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -6536,7 +7320,7 @@ static void simple_app_handle_sd_folder_popup_event(SimpleApp* app, const InputE
         if(event->type == InputTypeShort && key == InputKeyOk) {
             app->sd_folder_popup_active = false;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -6555,7 +7339,7 @@ static void simple_app_handle_sd_folder_popup_event(SimpleApp* app, const InputE
                 app->sd_folder_offset = app->sd_folder_index;
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyDown) {
@@ -6572,7 +7356,7 @@ static void simple_app_handle_sd_folder_popup_event(SimpleApp* app, const InputE
                 app->sd_folder_offset = max_offset;
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(event->type == InputTypeShort && key == InputKeyOk) {
@@ -6592,7 +7376,7 @@ static void simple_app_handle_sd_file_popup_event(SimpleApp* app, const InputEve
         app->sd_file_popup_active = false;
         simple_app_reset_sd_scroll(app);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -6601,7 +7385,7 @@ static void simple_app_handle_sd_file_popup_event(SimpleApp* app, const InputEve
         if(event->type == InputTypeShort && key == InputKeyOk) {
             app->sd_file_popup_active = false;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -6620,7 +7404,7 @@ static void simple_app_handle_sd_file_popup_event(SimpleApp* app, const InputEve
                 app->sd_file_popup_offset = app->sd_file_popup_index;
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyDown) {
@@ -6637,7 +7421,7 @@ static void simple_app_handle_sd_file_popup_event(SimpleApp* app, const InputEve
                 app->sd_file_popup_offset = max_offset;
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(event->type == InputTypeShort && key == InputKeyOk) {
@@ -6672,7 +7456,7 @@ static void simple_app_handle_sd_file_popup_event(SimpleApp* app, const InputEve
             app->sd_delete_confirm_active = true;
             app->sd_file_popup_active = false;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     }
@@ -6689,7 +7473,7 @@ static void simple_app_handle_sd_delete_confirm_event(SimpleApp* app, const Inpu
         app->sd_file_popup_active = true;
         simple_app_reset_sd_scroll(app);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -6697,7 +7481,7 @@ static void simple_app_handle_sd_delete_confirm_event(SimpleApp* app, const Inpu
     if(key == InputKeyLeft || key == InputKeyRight) {
         app->sd_delete_confirm_yes = !app->sd_delete_confirm_yes;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -6718,7 +7502,7 @@ static void simple_app_handle_sd_delete_confirm_event(SimpleApp* app, const Inpu
         app->sd_delete_confirm_yes = false;
         simple_app_reset_sd_scroll(app);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     }
 }
@@ -6737,7 +7521,7 @@ static void simple_app_handle_setup_sd_manager_input(SimpleApp* app, InputKey ke
         app->menu_state = MenuStateItems;
         app->section_index = MENU_SECTION_SETUP;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -6747,7 +7531,7 @@ static void simple_app_handle_setup_sd_manager_input(SimpleApp* app, InputKey ke
         app->sd_file_popup_active = false;
         app->sd_delete_confirm_active = false;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -6758,7 +7542,7 @@ static void simple_app_handle_setup_sd_manager_input(SimpleApp* app, InputKey ke
             app->sd_file_popup_index = 0;
             app->sd_file_popup_offset = 0;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -7007,6 +7791,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenDownloadBridge:
         simple_app_draw_download_bridge(app, canvas);
         break;
+    case ScreenBtLocatorList:
+        simple_app_draw_bt_locator_list(app, canvas);
+        break;
     default:
         simple_app_draw_results(app, canvas);
         break;
@@ -7041,7 +7828,9 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             } else {
                 app->section_index = section_count - 1;
             }
-            simple_app_request_viewport_update(app);
+            simple_app_adjust_section_offset(app);
+            app->exit_confirm_active = false;
+            view_port_update(app->viewport);
         } else {
             const MenuSection* section = &menu_sections[app->section_index];
             size_t entry_count = section->entry_count;
@@ -7064,7 +7853,7 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             if(app->section_index == MENU_SECTION_ATTACKS) {
                 app->last_attack_index = app->item_index;
             }
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyDown) {
         if(app->menu_state == MenuStateSections) {
@@ -7075,7 +7864,9 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             } else {
                 app->section_index = 0;
             }
-            simple_app_request_viewport_update(app);
+            simple_app_adjust_section_offset(app);
+            app->exit_confirm_active = false;
+            view_port_update(app->viewport);
         } else {
             const MenuSection* section = &menu_sections[app->section_index];
             size_t entry_count = section->entry_count;
@@ -7094,23 +7885,24 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             if(app->section_index == MENU_SECTION_ATTACKS) {
                 app->last_attack_index = app->item_index;
             }
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyOk) {
         if(app->menu_state == MenuStateSections) {
             if(app->section_index == MENU_SECTION_SCANNER) {
                 simple_app_send_command(app, SCANNER_SCAN_COMMAND, true);
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
                 return;
             } else if(app->section_index == MENU_SECTION_TARGETS) {
                 simple_app_request_scan_results(app, TARGETS_RESULTS_COMMAND);
                 return;
             }
+            app->exit_confirm_active = false;
             app->menu_state = MenuStateItems;
             if(app->section_index == MENU_SECTION_ATTACKS) {
                 simple_app_focus_attacks_menu(app);
                 app->last_attack_index = app->item_index;
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
                 return;
             }
             app->item_index = 0;
@@ -7129,7 +7921,7 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
                 simple_app_request_vendor_status(app);
                 simple_app_request_scanner_timing(app);
             }
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
             return;
         }
 
@@ -7159,17 +7951,17 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             app->screen = ScreenKarmaMenu;
             app->karma_menu_index = 0;
             app->karma_menu_offset = 0;
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         } else if(entry->action == MenuActionOpenEvilTwinMenu) {
             app->screen = ScreenEvilTwinMenu;
             app->evil_twin_menu_index = 0;
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         } else if(entry->action == MenuActionOpenPortalMenu) {
             app->screen = ScreenPortalMenu;
             app->portal_menu_index = 0;
             app->portal_menu_offset = 0;
             simple_app_portal_sync_offset(app);
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         } else if(entry->action == MenuActionToggleBacklight) {
             simple_app_toggle_backlight(app);
         } else if(entry->action == MenuActionToggleOtgPower) {
@@ -7206,6 +7998,8 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             return;
         } else if(entry->action == MenuActionOpenConsole) {
             simple_app_console_enter(app);
+        } else if(entry->action == MenuActionOpenBtLocator) {
+            simple_app_bt_locator_begin_scan(app);
         } else if(entry->action == MenuActionConfirmBlackout) {
             app->confirm_blackout_yes = false;
             app->screen = ScreenConfirmBlackout;
@@ -7214,16 +8008,17 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             app->screen = ScreenConfirmSnifferDos;
         }
 
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     } else if(key == InputKeyBack) {
         simple_app_send_stop_if_needed(app);
         if(app->menu_state == MenuStateItems) {
             app->menu_state = MenuStateSections;
-            simple_app_request_viewport_update(app);
+            simple_app_adjust_section_offset(app);
+            view_port_update(app->viewport);
         } else {
             app->confirm_exit_yes = false;
             app->screen = ScreenConfirmExit;
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     }
 }
@@ -7240,7 +8035,7 @@ static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key)
         simple_app_close_evil_twin_popup(app);
         simple_app_focus_attacks_menu(app);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -7249,14 +8044,14 @@ static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key)
         if(app->evil_twin_menu_index > 0) {
             app->evil_twin_menu_index--;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyDown) {
         if(app->evil_twin_menu_index + 1 < EVIL_TWIN_MENU_OPTION_COUNT) {
             app->evil_twin_menu_index++;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyOk) {
@@ -7301,7 +8096,7 @@ static void simple_app_start_evil_portal(SimpleApp* app) {
     app->last_command_sent = false;
     simple_app_send_command_with_targets(app, "start_evil_twin");
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -7368,7 +8163,7 @@ static void simple_app_finish_evil_twin_listing(SimpleApp* app) {
 
     app->evil_twin_popup_active = true;
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -7478,7 +8273,7 @@ static void simple_app_handle_evil_twin_popup_event(SimpleApp* app, const InputE
     if(event->type == InputTypeShort && key == InputKeyBack) {
         simple_app_close_evil_twin_popup(app);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -7487,7 +8282,7 @@ static void simple_app_handle_evil_twin_popup_event(SimpleApp* app, const InputE
         if(event->type == InputTypeShort && key == InputKeyOk) {
             simple_app_close_evil_twin_popup(app);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -7505,7 +8300,7 @@ static void simple_app_handle_evil_twin_popup_event(SimpleApp* app, const InputE
                 app->evil_twin_html_popup_offset = app->evil_twin_html_popup_index;
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyDown) {
@@ -7523,7 +8318,7 @@ static void simple_app_handle_evil_twin_popup_event(SimpleApp* app, const InputE
                 app->evil_twin_html_popup_offset = max_offset;
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(event->type == InputTypeShort && key == InputKeyOk) {
@@ -7555,7 +8350,7 @@ static void simple_app_handle_evil_twin_popup_event(SimpleApp* app, const InputE
 
             simple_app_close_evil_twin_popup(app);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     }
@@ -7614,7 +8409,7 @@ static void simple_app_finish_karma_probe_listing(SimpleApp* app) {
             simple_app_show_status_message(app, "No probes found", 1500, true);
             app->karma_probe_popup_active = false;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -7658,7 +8453,7 @@ static void simple_app_finish_karma_probe_listing(SimpleApp* app) {
 
     app->karma_probe_popup_active = true;
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -7836,7 +8631,7 @@ static void simple_app_handle_karma_probe_popup_event(SimpleApp* app, const Inpu
     if(event->type == InputTypeShort && key == InputKeyBack) {
         app->karma_probe_popup_active = false;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -7845,7 +8640,7 @@ static void simple_app_handle_karma_probe_popup_event(SimpleApp* app, const Inpu
         if(event->type == InputTypeShort && key == InputKeyOk) {
             app->karma_probe_popup_active = false;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -7863,7 +8658,7 @@ static void simple_app_handle_karma_probe_popup_event(SimpleApp* app, const Inpu
                 app->karma_probe_popup_offset = app->karma_probe_popup_index;
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyDown) {
@@ -7880,7 +8675,7 @@ static void simple_app_handle_karma_probe_popup_event(SimpleApp* app, const Inpu
                 app->karma_probe_popup_offset = max_offset;
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(event->type == InputTypeShort && key == InputKeyOk) {
@@ -7899,7 +8694,7 @@ static void simple_app_handle_karma_probe_popup_event(SimpleApp* app, const Inpu
 
             app->karma_probe_popup_active = false;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     }
@@ -7919,7 +8714,7 @@ static void simple_app_request_karma_probe_list(SimpleApp* app) {
     }
     simple_app_send_command(app, "list_probes", false);
     if(show_status && app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -7951,7 +8746,7 @@ static void simple_app_finish_karma_html_listing(SimpleApp* app) {
             simple_app_show_status_message(app, "No HTML files\nfound on SD", 1500, true);
             app->karma_html_popup_active = false;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -7995,7 +8790,7 @@ static void simple_app_finish_karma_html_listing(SimpleApp* app) {
 
     app->karma_html_popup_active = true;
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -8174,7 +8969,7 @@ static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const Input
     if(is_short && key == InputKeyBack) {
         app->karma_html_popup_active = false;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -8183,7 +8978,7 @@ static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const Input
         if(is_short && key == InputKeyOk) {
             app->karma_html_popup_active = false;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -8201,7 +8996,7 @@ static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const Input
                 app->karma_html_popup_offset = app->karma_html_popup_index;
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyDown) {
@@ -8218,7 +9013,7 @@ static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const Input
                 app->karma_html_popup_offset = max_offset;
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(is_short && key == InputKeyOk) {
@@ -8254,7 +9049,7 @@ static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const Input
 
             app->karma_html_popup_active = false;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     }
@@ -8273,7 +9068,7 @@ static void simple_app_request_karma_html_list(SimpleApp* app) {
     }
     simple_app_send_command(app, "list_sd", false);
     if(show_status && app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -8302,7 +9097,7 @@ static void simple_app_start_karma_sniffer(SimpleApp* app) {
     app->karma_status_active = true;
     simple_app_send_command(app, "start_sniffer", false);
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -8471,7 +9266,7 @@ static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key) {
         app->karma_menu_offset = 0;
         simple_app_focus_attacks_menu(app);
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -8483,7 +9278,7 @@ static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key) {
                 app->karma_menu_offset = app->karma_menu_index;
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyDown) {
@@ -8494,7 +9289,7 @@ static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key) {
                 app->karma_menu_offset = app->karma_menu_index - visible + 1;
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyOk) {
@@ -8507,7 +9302,7 @@ static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key) {
             app->karma_status_active = false;
             app->screen = ScreenSetupKarma;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
             break;
         case 2:
@@ -8524,7 +9319,7 @@ static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key) {
                 }
                 app->karma_probe_popup_active = true;
                 if(app->viewport) {
-                    simple_app_request_viewport_update(app);
+                    view_port_update(app->viewport);
                 }
             }
             break;
@@ -8542,7 +9337,7 @@ static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key) {
                 }
                 app->karma_html_popup_active = true;
                 if(app->viewport) {
-                    simple_app_request_viewport_update(app);
+                    view_port_update(app->viewport);
                 }
             }
             break;
@@ -8571,7 +9366,7 @@ static void simple_app_update_karma_sniffer(SimpleApp* app) {
         app->karma_pending_probe_refresh = true;
         app->karma_pending_probe_tick = now + furi_ms_to_ticks(KARMA_AUTO_LIST_DELAY_MS);
         if(app->screen == ScreenKarmaMenu && app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     }
 
@@ -8582,7 +9377,7 @@ static void simple_app_update_karma_sniffer(SimpleApp* app) {
             app->karma_pending_probe_refresh = false;
             simple_app_request_karma_probe_list(app);
             if(app->screen == ScreenKarmaMenu && app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     }
@@ -8610,7 +9405,7 @@ static void simple_app_handle_setup_karma_input(SimpleApp* app, InputKey key) {
         simple_app_save_config_if_dirty(app, "Config saved", true);
         app->screen = ScreenKarmaMenu;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -8628,7 +9423,7 @@ static void simple_app_handle_setup_karma_input(SimpleApp* app, InputKey key) {
     }
 
     if(before != app->karma_sniffer_duration_sec && app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -8639,11 +9434,11 @@ static void simple_app_handle_setup_scanner_input(SimpleApp* app, InputKey key) 
         simple_app_send_stop_if_needed(app);
         if(app->scanner_adjusting_power) {
             app->scanner_adjusting_power = false;
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         } else {
             simple_app_save_config_if_dirty(app, "Config saved", true);
             app->screen = ScreenMenu;
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -8651,11 +9446,11 @@ static void simple_app_handle_setup_scanner_input(SimpleApp* app, InputKey key) 
     if(app->scanner_adjusting_power && app->scanner_setup_index == ScannerOptionMinPower) {
         if(key == InputKeyUp || key == InputKeyRight) {
             simple_app_modify_min_power(app, SCAN_POWER_STEP);
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
             return;
         } else if(key == InputKeyDown || key == InputKeyLeft) {
             simple_app_modify_min_power(app, -SCAN_POWER_STEP);
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
             return;
         }
     }
@@ -8669,7 +9464,7 @@ static void simple_app_handle_setup_scanner_input(SimpleApp* app, InputKey key) 
             if(app->scanner_setup_index < app->scanner_view_offset) {
                 app->scanner_view_offset = app->scanner_setup_index;
             }
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyDown) {
         if(app->scanner_setup_index + 1 < ScannerOptionCount) {
@@ -8682,17 +9477,17 @@ static void simple_app_handle_setup_scanner_input(SimpleApp* app, InputKey key) 
                 app->scanner_view_offset =
                     app->scanner_setup_index - SCANNER_FILTER_VISIBLE_COUNT + 1;
             }
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyOk) {
         if(app->scanner_setup_index == ScannerOptionMinPower) {
             app->scanner_adjusting_power = !app->scanner_adjusting_power;
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         } else {
             if(app->scanner_setup_index == ScannerOptionShowVendor) {
                 if(app->scanner_show_vendor && simple_app_enabled_field_count(app) <= 1) {
                     if(app->viewport) {
-                        simple_app_request_viewport_update(app);
+                        view_port_update(app->viewport);
                     }
                 } else {
                     bool new_state = !app->scanner_show_vendor;
@@ -8704,7 +9499,7 @@ static void simple_app_handle_setup_scanner_input(SimpleApp* app, InputKey key) 
                     simple_app_adjust_result_offset(app);
                     simple_app_send_vendor_command(app, new_state);
                     if(app->viewport) {
-                        simple_app_request_viewport_update(app);
+                        view_port_update(app->viewport);
                     }
                 }
                 return;
@@ -8713,14 +9508,14 @@ static void simple_app_handle_setup_scanner_input(SimpleApp* app, InputKey key) 
                 simple_app_scanner_option_flag(app, (ScannerOption)app->scanner_setup_index);
             if(flag) {
                 if(*flag && simple_app_enabled_field_count(app) <= 1) {
-                    simple_app_request_viewport_update(app);
+                    view_port_update(app->viewport);
                 } else {
                     *flag = !(*flag);
                     simple_app_mark_config_dirty(app);
                     simple_app_update_result_layout(app);
                     simple_app_rebuild_visible_results(app);
                     simple_app_adjust_result_offset(app);
-                    simple_app_request_viewport_update(app);
+                    view_port_update(app->viewport);
                 }
             }
         }
@@ -8734,7 +9529,7 @@ static void simple_app_handle_setup_scanner_timing_input(SimpleApp* app, InputKe
         simple_app_save_config_if_dirty(app, "Config saved", true);
         app->screen = ScreenMenu;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -8743,7 +9538,7 @@ static void simple_app_handle_setup_scanner_timing_input(SimpleApp* app, InputKe
         if(app->scanner_timing_index > 0) {
             app->scanner_timing_index = 0;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -8753,7 +9548,7 @@ static void simple_app_handle_setup_scanner_timing_input(SimpleApp* app, InputKe
         if(app->scanner_timing_index < 1) {
             app->scanner_timing_index = 1;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -8775,7 +9570,7 @@ static void simple_app_handle_setup_led_input(SimpleApp* app, InputKey key) {
         simple_app_save_config_if_dirty(app, "Config saved", true);
         app->screen = ScreenMenu;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -8784,7 +9579,7 @@ static void simple_app_handle_setup_led_input(SimpleApp* app, InputKey key) {
         if(app->led_setup_index > 0) {
             app->led_setup_index = 0;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -8794,7 +9589,7 @@ static void simple_app_handle_setup_led_input(SimpleApp* app, InputKey key) {
         if(app->led_setup_index < 1) {
             app->led_setup_index = 1;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -8815,7 +9610,7 @@ static void simple_app_handle_setup_led_input(SimpleApp* app, InputKey key) {
             simple_app_update_led_label(app);
             simple_app_send_led_power_command(app);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -8840,7 +9635,7 @@ static void simple_app_handle_setup_led_input(SimpleApp* app, InputKey key) {
             simple_app_update_led_label(app);
             simple_app_send_led_level_command(app);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     }
@@ -8853,7 +9648,7 @@ static void simple_app_handle_setup_boot_input(SimpleApp* app, InputKey key) {
         simple_app_save_config_if_dirty(app, "Config saved", true);
         app->screen = ScreenMenu;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
         return;
     }
@@ -8862,7 +9657,7 @@ static void simple_app_handle_setup_boot_input(SimpleApp* app, InputKey key) {
         if(app->boot_setup_index > 0) {
             app->boot_setup_index = 0;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -8872,7 +9667,7 @@ static void simple_app_handle_setup_boot_input(SimpleApp* app, InputKey key) {
         if(app->boot_setup_index < 1) {
             app->boot_setup_index = 1;
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -8898,7 +9693,7 @@ static void simple_app_handle_setup_boot_input(SimpleApp* app, InputKey key) {
             simple_app_update_boot_labels(app);
             simple_app_send_boot_status(app, !is_long, *enabled_ptr);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
         return;
@@ -8922,7 +9717,7 @@ static void simple_app_handle_setup_boot_input(SimpleApp* app, InputKey key) {
             simple_app_update_boot_labels(app);
             simple_app_send_boot_command(app, !is_long, *cmd_index_ptr);
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     }
@@ -8949,23 +9744,23 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
         }
         app->serial_follow_tail = true;
         simple_app_update_scroll(app);
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     } else if(key == InputKeyUp) {
         if(app->serial_scroll > 0) {
             app->serial_scroll--;
             app->serial_follow_tail = false;
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyDown) {
         size_t max_scroll = simple_app_max_scroll(app);
         if(app->serial_scroll < max_scroll) {
             app->serial_scroll++;
             app->serial_follow_tail = (app->serial_scroll == max_scroll);
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         } else {
             app->serial_follow_tail = true;
             simple_app_update_scroll(app);
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyLeft) {
         size_t step = SERIAL_VISIBLE_LINES;
@@ -8976,12 +9771,19 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
                 app->serial_scroll = 0;
             }
             app->serial_follow_tail = false;
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyRight) {
         if(app->serial_targets_hint) {
             app->serial_targets_hint = false;
             simple_app_request_scan_results(app, TARGETS_RESULTS_COMMAND);
+            return;
+        }
+
+        if(app->bt_locator_console_mode && app->bt_locator_list_ready) {
+            app->bt_locator_console_mode = false;
+            app->screen = ScreenBtLocatorList;
+            view_port_update(app->viewport);
             return;
         }
 
@@ -8991,16 +9793,16 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
             app->serial_scroll =
                 (app->serial_scroll + step < max_scroll) ? app->serial_scroll + step : max_scroll;
             app->serial_follow_tail = (app->serial_scroll == max_scroll);
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         } else {
             app->serial_follow_tail = true;
             simple_app_update_scroll(app);
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyOk) {
         app->serial_follow_tail = true;
         simple_app_update_scroll(app);
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -9008,7 +9810,7 @@ static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
     if(key == InputKeyBack || key == InputKeyLeft) {
         simple_app_send_stop_if_needed(app);
         app->screen = ScreenMenu;
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
         return;
     }
 
@@ -9019,14 +9821,14 @@ static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
             app->scan_result_index--;
             simple_app_reset_result_scroll(app);
             simple_app_adjust_result_offset(app);
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyDown) {
         if(app->scan_result_index + 1 < app->visible_result_count) {
             app->scan_result_index++;
             simple_app_reset_result_scroll(app);
             simple_app_adjust_result_offset(app);
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyOk) {
         if(app->scan_result_index < app->visible_result_count) {
@@ -9034,7 +9836,7 @@ static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
             if(result) {
                 simple_app_toggle_scan_selection(app, result);
                 simple_app_adjust_result_offset(app);
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyRight) {
@@ -9045,8 +9847,80 @@ static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
             app->item_index = 0;
             app->item_offset = 0;
             app->last_attack_index = 0;
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
+    }
+}
+
+static void simple_app_handle_bt_locator_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+    if(key == InputKeyBack || key == InputKeyLeft) {
+        simple_app_send_stop_if_needed(app);
+        app->screen = ScreenMenu;
+        view_port_update(app->viewport);
+        return;
+    }
+
+    if(app->bt_locator_list_loading || app->bt_locator_count == 0) {
+        return;
+    }
+
+    size_t visible = 6;
+
+    if(key == InputKeyUp) {
+        if(app->bt_locator_index > 0) {
+            app->bt_locator_index--;
+            if(app->bt_locator_index < app->bt_locator_offset) {
+                app->bt_locator_offset = app->bt_locator_index;
+            }
+            simple_app_bt_locator_reset_scroll(app);
+            if(app->viewport) view_port_update(app->viewport);
+        }
+    } else if(key == InputKeyDown) {
+        if(app->bt_locator_index + 1 < app->bt_locator_count) {
+            app->bt_locator_index++;
+            if(app->bt_locator_index >= app->bt_locator_offset + visible) {
+                app->bt_locator_offset = app->bt_locator_index - visible + 1;
+            }
+            simple_app_bt_locator_reset_scroll(app);
+            if(app->viewport) view_port_update(app->viewport);
+        }
+    } else if(key == InputKeyRight) {
+        if(app->bt_locator_selected < 0) {
+            return; // require explicit selection
+        }
+        size_t target_idx = (size_t)app->bt_locator_selected;
+        if(target_idx >= app->bt_locator_count) return;
+        const char* mac = app->bt_locator_devices[target_idx].mac;
+        if(mac[0] != '\0') {
+            char command[64];
+            snprintf(command, sizeof(command), "scan_bt %s", mac);
+            app->bt_locator_console_mode = false;
+            app->bt_locator_mode = true;
+            app->bt_locator_has_rssi = false;
+            strncpy(app->bt_locator_mac, mac, sizeof(app->bt_locator_mac) - 1);
+            app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
+            strncpy(app->bt_locator_saved_mac, mac, sizeof(app->bt_locator_saved_mac) - 1);
+            app->bt_locator_saved_mac[sizeof(app->bt_locator_saved_mac) - 1] = '\0';
+            app->bt_locator_preserve_mac = true;
+            simple_app_send_command(app, command, true);
+        }
+    } else if(key == InputKeyOk) {
+        if((int32_t)app->bt_locator_index == app->bt_locator_selected) {
+            app->bt_locator_selected = -1;
+        } else {
+            app->bt_locator_selected = (int32_t)app->bt_locator_index;
+            const char* mac_pick = app->bt_locator_devices[app->bt_locator_index].mac;
+            if(mac_pick && mac_pick[0] != '\0') {
+                strncpy(app->bt_locator_saved_mac, mac_pick, sizeof(app->bt_locator_saved_mac) - 1);
+                app->bt_locator_saved_mac[sizeof(app->bt_locator_saved_mac) - 1] = '\0';
+                strncpy(app->bt_locator_mac, mac_pick, sizeof(app->bt_locator_mac) - 1);
+                app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
+                app->bt_locator_preserve_mac = true;
+            }
+        }
+        simple_app_bt_locator_reset_scroll(app);
+        if(app->viewport) view_port_update(app->viewport);
     }
 }
 
@@ -9063,7 +9937,7 @@ static void simple_app_input(InputEvent* event, void* context) {
     if(app->help_hint_visible) {
         app->help_hint_visible = false;
         if(app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
     }
 
@@ -9119,6 +9993,23 @@ static void simple_app_input(InputEvent* event, void* context) {
     }
 
     if(event->type == InputTypeLong && event->key == InputKeyOk) {
+        if(app->bt_scan_view_active) {
+            app->bt_scan_full_console = !app->bt_scan_full_console;
+            app->serial_follow_tail = true;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
+        // Debug helper: when in BT locator monitor, long OK shows raw console
+        if(app->bt_locator_mode && app->screen == ScreenSerial) {
+            app->bt_scan_full_console = !app->bt_scan_full_console;
+            app->serial_follow_tail = true;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
         if(simple_app_try_show_hint(app)) {
             return;
         }
@@ -9133,6 +10024,10 @@ static void simple_app_input(InputEvent* event, void* context) {
     }
 
     if(!allow_event) return;
+
+    if(event->key != InputKeyBack && app->exit_confirm_active) {
+        app->exit_confirm_active = false;
+    }
 
     switch(app->screen) {
     case ScreenMenu:
@@ -9171,14 +10066,14 @@ static void simple_app_input(InputEvent* event, void* context) {
     case ScreenChannelView:
         simple_app_handle_channel_view_input(app, event->key);
         break;
+    case ScreenConfirmExit:
+        simple_app_handle_confirm_exit_input(app, event->key);
+        break;
     case ScreenConfirmBlackout:
         simple_app_handle_confirm_blackout_input(app, event->key);
         break;
     case ScreenConfirmSnifferDos:
         simple_app_handle_confirm_sniffer_dos_input(app, event->key);
-        break;
-    case ScreenConfirmExit:
-        simple_app_handle_confirm_exit_input(app, event->key);
         break;
     case ScreenEvilTwinMenu:
         simple_app_handle_evil_twin_menu_input(app, event->key);
@@ -9193,6 +10088,9 @@ static void simple_app_input(InputEvent* event, void* context) {
         if(event->key == InputKeyBack) {
             simple_app_download_bridge_stop(app);
         }
+        break;
+    case ScreenBtLocatorList:
+        simple_app_handle_bt_locator_input(app, event->key);
         break;
     default:
         simple_app_handle_results_input(app, event->key);
@@ -9223,13 +10121,13 @@ static void simple_app_process_stream(SimpleApp* app) {
     }
 
     if(updated && (app->screen == ScreenSerial || app->screen == ScreenConsole)) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
     if(app->package_monitor_dirty && app->screen == ScreenPackageMonitor && app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
     if(app->channel_view_dirty && app->screen == ScreenChannelView && app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 }
 
@@ -9321,6 +10219,9 @@ int32_t Lab_C5_app(void* p) {
     app->board_missing_shown = false;
     app->board_bootstrap_active = true;
     app->board_bootstrap_reboot_sent = false;
+    app->board_reboot_sent = false;
+    app->exit_confirm_active = false;
+    app->exit_confirm_tick = 0;
     app->boot_short_enabled = false;
     app->boot_long_enabled = false;
     app->boot_short_command_index = 1; // start_sniffer_dog
@@ -9396,22 +10297,24 @@ int32_t Lab_C5_app(void* p) {
     simple_app_update_otg_label(app);
     simple_app_apply_otg_power(app);
     if(app->viewport) {
-        simple_app_request_viewport_update(app);
+        view_port_update(app->viewport);
     }
 
     if(!simple_app_status_message_is_active(app)) {
         simple_app_show_status_message(app, "Board discovery\nSending ping...", 0, true);
     }
     simple_app_send_ping(app);
-    simple_app_flush_viewport(app);
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
 
     while(!app->exit_app) {
         if(!app->download_bridge_active) {
-            simple_app_process_stream(app);
-            simple_app_update_karma_sniffer(app);
-            simple_app_update_result_scroll(app);
-            simple_app_update_sd_scroll(app);
-            simple_app_ping_watchdog(app);
+        simple_app_process_stream(app);
+        simple_app_update_karma_sniffer(app);
+        simple_app_update_result_scroll(app);
+        simple_app_update_sd_scroll(app);
+        simple_app_ping_watchdog(app);
         }
 
         if(!app->download_bridge_active && app->portal_input_requested && !app->portal_input_active) {
@@ -9428,7 +10331,7 @@ int32_t Lab_C5_app(void* p) {
                 simple_app_portal_sync_offset(app);
             }
             if(app->viewport) {
-                simple_app_request_viewport_update(app);
+                view_port_update(app->viewport);
             }
         }
 
@@ -9448,6 +10351,13 @@ int32_t Lab_C5_app(void* p) {
                                   !app->sd_file_popup_active && !app->sd_delete_confirm_active &&
                                   !simple_app_status_message_is_active(app);
 
+        if(app->exit_confirm_active) {
+            uint32_t now = furi_get_tick();
+            if(now - app->exit_confirm_tick >= furi_ms_to_ticks(2000)) {
+                app->exit_confirm_active = false;
+            }
+        }
+
         if(can_show_help_hint) {
             uint32_t now = furi_get_tick();
             if(!app->help_hint_visible &&
@@ -9459,10 +10369,9 @@ int32_t Lab_C5_app(void* p) {
         }
 
         if(app->help_hint_visible != previous_help_hint && app->viewport) {
-            simple_app_request_viewport_update(app);
+            view_port_update(app->viewport);
         }
 
-        simple_app_flush_viewport(app);
         furi_delay_ms(app->download_bridge_active ? 1 : 20);
     }
 
