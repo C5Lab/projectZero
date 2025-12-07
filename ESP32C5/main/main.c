@@ -4401,11 +4401,12 @@ static int cmd_deauth_detector(int argc, char **argv) {
         
         // Parse indices and extract unique channels
         for (int i = 1; i < argc; i++) {
-            int idx = atoi(argv[i]);
+            int user_idx = atoi(argv[i]);
+            int idx = user_idx - 1; // Convert from 1-based (user) to 0-based (internal)
             
-            // Validate index (0-based internally, user provides 0-based)
+            // Validate index
             if (idx < 0 || idx >= (int)g_scan_count) {
-                MY_LOG_INFO(TAG, "Invalid index %d (valid: 0-%d), skipping", idx, g_scan_count - 1);
+                MY_LOG_INFO(TAG, "Invalid index %d (valid: 1-%d), skipping", user_idx, g_scan_count);
                 continue;
             }
             
@@ -8826,6 +8827,8 @@ static void deauth_detector_task(void *pvParameters) {
         
         if (time_expired) {
             deauth_detector_channel_hop();
+            // Reset LED to yellow after channel hop (in case it was red from deauth detection)
+            (void)led_set_color(255, 255, 0);
         }
     }
     
@@ -8873,8 +8876,15 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
     const char *ssid = deauth_detector_find_ssid_by_bssid(bssid_mac);
     const char *ap_name = (ssid && ssid[0] != '\0') ? ssid : "<Unknown>";
     
-    // Red LED flash to indicate deauth detected (visible flash)
-    (void)led_set_color(255, 0, 0); // Red
+    // Throttle LED flash - only flash red if 100ms passed since last flash
+    // This prevents RMT channel conflicts when deauth frames come rapidly
+    static int64_t last_led_flash_time = 0;
+    int64_t now = esp_timer_get_time() / 1000; // ms
+    
+    if (now - last_led_flash_time >= 100) {
+        (void)led_set_color(255, 0, 0); // Red flash
+        last_led_flash_time = now;
+    }
     
     // Print detection: CHANNEL | AP NAME (MAC) | RSSI
     MY_LOG_INFO(TAG, "[DEAUTH] CH: %d | AP: %s (%02X:%02X:%02X:%02X:%02X:%02X) | RSSI: %d",
@@ -8883,11 +8893,7 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
                bssid_mac[0], bssid_mac[1], bssid_mac[2], bssid_mac[3], bssid_mac[4], bssid_mac[5],
                rssi);
     
-    // Small delay to make LED flash visible (50ms)
-    vTaskDelay(pdMS_TO_TICKS(50));
-    
-    // Back to yellow (monitoring mode)
-    (void)led_set_color(255, 255, 0);
+    // Note: LED reset to yellow is handled by the task after channel hop
 }
 
 // === WARDRIVE HELPER FUNCTIONS ===
