@@ -95,6 +95,7 @@ typedef enum {
 #define BT_SCAN_CONSOLE_LINES 3
 #define BT_LOCATOR_MAX_DEVICES 64
 #define BT_LOCATOR_VISIBLE_COUNT 6
+#define BT_LOCATOR_WARMUP_MS 10000
 #define RESULT_DEFAULT_MAX_LINES 4
 #define RESULT_DEFAULT_LINE_HEIGHT 12
 #define RESULT_DEFAULT_CHAR_LIMIT (SERIAL_LINE_CHAR_LIMIT - 3)
@@ -322,6 +323,8 @@ typedef struct {
     bool bt_locator_mode;
     bool bt_locator_has_rssi;
     int bt_locator_rssi;
+    uint32_t bt_locator_start_tick;
+    uint32_t bt_locator_last_console_tick;
     char bt_locator_mac[18];
     char bt_locator_saved_mac[18];
     bool bt_locator_preserve_mac;
@@ -1981,6 +1984,8 @@ static void simple_app_reset_bt_scan_summary(SimpleApp* app) {
     app->bt_locator_mode = false;
     app->bt_locator_has_rssi = false;
     app->bt_locator_rssi = 0;
+    app->bt_locator_start_tick = 0;
+    app->bt_locator_last_console_tick = 0;
     app->bt_locator_mac[0] = '\0';
     if(app->bt_locator_preserve_mac && app->bt_locator_saved_mac[0] != '\0') {
         strncpy(app->bt_locator_mac, app->bt_locator_saved_mac, sizeof(app->bt_locator_mac) - 1);
@@ -2053,6 +2058,9 @@ static void simple_app_bt_scan_feed(SimpleApp* app, char ch) {
         app->bt_scan_line_length = 0;
         return;
     }
+    if(app->bt_locator_mode) {
+        app->bt_locator_last_console_tick = furi_get_tick();
+    }
     if(ch == '\r') return;
     if(ch == '\n') {
         if(app->bt_scan_line_length > 0) {
@@ -2083,6 +2091,8 @@ static void simple_app_bt_locator_reset_list(SimpleApp* app) {
     app->bt_locator_scroll_dir = 1;
     app->bt_locator_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
     app->bt_locator_scroll_last_tick = furi_get_tick();
+    app->bt_locator_start_tick = 0;
+    app->bt_locator_last_console_tick = 0;
     app->bt_locator_scan_len = 0;
     memset(app->bt_locator_scan_line, 0, sizeof(app->bt_locator_scan_line));
     memset(app->bt_locator_devices, 0, sizeof(app->bt_locator_devices));
@@ -3746,6 +3756,8 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
                     app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
                     app->bt_locator_mode = true;
                     app->bt_locator_has_rssi = false;
+                    app->bt_locator_start_tick = furi_get_tick();
+                    app->bt_locator_last_console_tick = app->bt_locator_start_tick;
                 }
             }
         }
@@ -6264,6 +6276,18 @@ static void simple_app_draw_bt_locator(SimpleApp* app, Canvas* canvas) {
 
     canvas_set_color(canvas, ColorBlack);
     canvas_set_font(canvas, FontSecondary);
+    uint32_t now_ticks = furi_get_tick();
+    uint32_t ticks_per_second = furi_ms_to_ticks(1000);
+    if(ticks_per_second == 0) ticks_per_second = 1;
+    uint32_t warmup_ticks = furi_ms_to_ticks(BT_LOCATOR_WARMUP_MS);
+    if(warmup_ticks == 0) warmup_ticks = 1;
+    uint32_t warmup_elapsed =
+        (app->bt_locator_start_tick > 0) ? (now_ticks - app->bt_locator_start_tick) : 0;
+    uint32_t console_elapsed =
+        (app->bt_locator_last_console_tick > 0) ? (now_ticks - app->bt_locator_last_console_tick) : warmup_elapsed;
+    bool warmup_active = !app->bt_locator_has_rssi &&
+                         ((app->bt_locator_start_tick > 0 && warmup_elapsed < warmup_ticks) ||
+                          (app->bt_locator_last_console_tick > 0 && console_elapsed < warmup_ticks));
 
     const char* mac = NULL;
     if(app->bt_locator_mac[0] != '\0') {
@@ -6288,7 +6312,7 @@ static void simple_app_draw_bt_locator(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 34, AlignCenter, AlignCenter, rssi_line);
 
     canvas_set_font(canvas, FontSecondary);
-    const char* quality = "No signal";
+    const char* quality = warmup_active ? "Warm up" : "No signal";
     if(app->bt_locator_has_rssi) {
         if(app->bt_locator_rssi >= -60) {
             quality = "Great";
@@ -6304,12 +6328,23 @@ static void simple_app_draw_bt_locator(SimpleApp* app, Canvas* canvas) {
 
     char status_line[48];
     if(app->bt_scan_last_update_tick > 0) {
-        uint32_t ticks_per_second = furi_ms_to_ticks(1000);
-        if(ticks_per_second == 0) ticks_per_second = 1;
-        uint32_t elapsed = (furi_get_tick() - app->bt_scan_last_update_tick) / ticks_per_second;
+        uint32_t elapsed = (now_ticks - app->bt_scan_last_update_tick) / ticks_per_second;
         snprintf(status_line, sizeof(status_line), "Updated: %lus ago", (unsigned long)elapsed);
+    } else if(warmup_active) {
+        uint32_t basis = warmup_elapsed;
+        if(app->bt_locator_last_console_tick > 0) {
+            uint32_t console_elapsed_local = (app->bt_locator_last_console_tick <= now_ticks)
+                                                 ? (now_ticks - app->bt_locator_last_console_tick)
+                                                 : 0;
+            if(console_elapsed_local < basis || app->bt_locator_start_tick == 0) {
+                basis = console_elapsed_local;
+            }
+        }
+        uint32_t remaining_ticks = (basis < warmup_ticks) ? (warmup_ticks - basis) : 0;
+        uint32_t remaining_seconds = (remaining_ticks + ticks_per_second - 1) / ticks_per_second;
+        snprintf(status_line, sizeof(status_line), "Warm up... %lus", (unsigned long)remaining_seconds);
     } else {
-        snprintf(status_line, sizeof(status_line), "Waiting for data...");
+        snprintf(status_line, sizeof(status_line), "No data");
     }
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 62, AlignCenter, AlignBottom, status_line);
 }
@@ -9903,6 +9938,8 @@ static void simple_app_handle_bt_locator_input(SimpleApp* app, InputKey key) {
             app->bt_locator_console_mode = false;
             app->bt_locator_mode = true;
             app->bt_locator_has_rssi = false;
+            app->bt_locator_start_tick = furi_get_tick();
+            app->bt_locator_last_console_tick = app->bt_locator_start_tick;
             strncpy(app->bt_locator_mac, mac, sizeof(app->bt_locator_mac) - 1);
             app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
             strncpy(app->bt_locator_saved_mac, mac, sizeof(app->bt_locator_saved_mac) - 1);
@@ -9922,6 +9959,8 @@ static void simple_app_handle_bt_locator_input(SimpleApp* app, InputKey key) {
                 strncpy(app->bt_locator_mac, mac_pick, sizeof(app->bt_locator_mac) - 1);
                 app->bt_locator_mac[sizeof(app->bt_locator_mac) - 1] = '\0';
                 app->bt_locator_preserve_mac = true;
+                app->bt_locator_start_tick = furi_get_tick();
+                app->bt_locator_last_console_tick = app->bt_locator_start_tick;
             }
         }
         simple_app_bt_locator_reset_scroll(app);

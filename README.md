@@ -103,6 +103,7 @@ We're regular tinkerers who got bored and decided to design the full stack ourse
 - Join the LAB Discord server to discuss ESP32-C5 builds and projectZero workflows: https://discord.gg/57wmJzzR8C
 
 ## Last Changes
+- 2025-12-07 JanOS 1.0.0 BT scan / Airtag scan / BT Locator / FAP 031 support for JanOS 1.0.0 new Bluetooth menu
 - 2025-12-04 FAP 0.30 - Improve board discovery bootstrap with stabilization reboot
 - 2025-12-04 FAP 0.29 - fix evil twin exit and reopen FAP crash flipper
 - 2025-12-03 JanOS 0.7.6 / FAP 0.28 - Setup / Scan timing: add configurable min/max durations for scanning.
