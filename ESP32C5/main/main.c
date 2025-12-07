@@ -255,6 +255,17 @@ static int sniffer_dog_current_channel = 1;
 static int sniffer_dog_channel_index = 0;
 static int64_t sniffer_dog_last_channel_hop = 0;
 
+// Deauth detector task
+static TaskHandle_t deauth_detector_task_handle = NULL;
+static volatile bool deauth_detector_active = false;
+static int deauth_detector_current_channel = 1;
+static int deauth_detector_channel_index = 0;
+static int64_t deauth_detector_last_channel_hop = 0;
+// Deauth detector selected mode
+static bool deauth_detector_selected_mode = false;
+static int deauth_detector_selected_channels[MAX_AP_CNT];
+static int deauth_detector_selected_channels_count = 0;
+
 // Wardrive task
 static TaskHandle_t wardrive_task_handle = NULL;
 
@@ -315,7 +326,7 @@ static bool wifi_event_handler_registered = false;
 // Memory logging helper (set LOG_MEMORY_INFO to 1 to enable prints)
 // ============================================================================
 #ifndef LOG_MEMORY_INFO
-#define LOG_MEMORY_INFO 0
+#define LOG_MEMORY_INFO 1
 #endif
 
 static void log_memory_info(const char *context)
@@ -745,7 +756,8 @@ static const char* boot_allowed_commands[] = {
     "packet_monitor",
     "start_sniffer",
     "scan_networks",
-    "start_wardrive"
+    "start_wardrive",
+    "deauth_detector"
 };
 static const size_t boot_allowed_command_count = sizeof(boot_allowed_commands) / sizeof(boot_allowed_commands[0]);
 
@@ -850,6 +862,11 @@ static void sniffer_dog_task(void *pvParameters);
 static void sniffer_dog_channel_hop(void);
 static void sniffer_channel_task(void *pvParameters);
 static bool is_multicast_mac(const uint8_t *mac);
+// Deauth detector functions
+static int cmd_deauth_detector(int argc, char **argv);
+static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
+static void deauth_detector_task(void *pvParameters);
+static void deauth_detector_channel_hop(void);
 // BLE scanner functions (NimBLE)
 static int cmd_scan_bt(int argc, char **argv);
 static int cmd_scan_airtag(int argc, char **argv);
@@ -1913,6 +1930,8 @@ static void boot_execute_command(const char* command) {
         (void)cmd_scan_networks(0, NULL);
     } else if (strcasecmp(command, "start_wardrive") == 0) {
         (void)cmd_start_wardrive(0, NULL);
+    } else if (strcasecmp(command, "deauth_detector") == 0) {
+        (void)cmd_deauth_detector(0, NULL);
     } else {
         MY_LOG_INFO(TAG, "Boot cmd '%s' not recognized", command);
     }
@@ -3490,6 +3509,45 @@ static int cmd_stop(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Sniffer Dog stopped.");
     }
     
+    // Stop deauth_detector if active
+    if (deauth_detector_active || deauth_detector_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping Deauth Detector task...");
+        deauth_detector_active = false;
+        
+        // Wait a bit for task to finish
+        for (int i = 0; i < 20 && deauth_detector_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (deauth_detector_task_handle != NULL) {
+            vTaskDelete(deauth_detector_task_handle);
+            deauth_detector_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Deauth Detector task forcefully stopped.");
+        }
+        
+        // Disable promiscuous mode
+        esp_wifi_set_promiscuous(false);
+        
+        // Reset channel state
+        deauth_detector_channel_index = 0;
+        deauth_detector_current_channel = dual_band_channels[0];
+        deauth_detector_last_channel_hop = 0;
+        
+        // Reset selected mode state
+        deauth_detector_selected_mode = false;
+        deauth_detector_selected_channels_count = 0;
+        memset(deauth_detector_selected_channels, 0, sizeof(deauth_detector_selected_channels));
+        
+        // Return LED to idle
+        esp_err_t led_err = led_set_idle();
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to restore idle LED after Deauth Detector stop: %s", esp_err_to_name(led_err));
+        }
+        
+        MY_LOG_INFO(TAG, "Deauth Detector stopped.");
+    }
+    
     // Stop wardrive task if running
     if (wardrive_active || wardrive_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Stopping wardrive task...");
@@ -4295,6 +4353,201 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
     
     MY_LOG_INFO(TAG, "Sniffer Dog started - hunting for AP-STA pairs...");
     MY_LOG_INFO(TAG, "Deauth packets will be sent to detected stations.");
+    MY_LOG_INFO(TAG, "Use 'stop' to stop.");
+    
+    return 0;
+}
+
+static int cmd_deauth_detector(int argc, char **argv) {
+    log_memory_info("deauth_detector");
+    
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+    
+    // Reset stop flag at the beginning of operation
+    operation_stop_requested = false;
+    
+    if (deauth_detector_active) {
+        MY_LOG_INFO(TAG, "Deauth detector already active. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    if (sniffer_active) {
+        MY_LOG_INFO(TAG, "Regular sniffer is active. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    if (sniffer_dog_active) {
+        MY_LOG_INFO(TAG, "Sniffer Dog is active. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    // Reset selected mode state
+    deauth_detector_selected_mode = false;
+    deauth_detector_selected_channels_count = 0;
+    memset(deauth_detector_selected_channels, 0, sizeof(deauth_detector_selected_channels));
+    
+    // MODE B: With network indices (e.g., deauth_detector 1 3)
+    if (argc > 1) {
+        // Check if scan was performed
+        if (!g_scan_done || g_scan_count == 0) {
+            MY_LOG_INFO(TAG, "No scan results available. Run 'scan_networks' first.");
+            return 1;
+        }
+        
+        MY_LOG_INFO(TAG, "Starting Deauth Detector in SELECTED mode...");
+        
+        // Parse indices and extract unique channels
+        for (int i = 1; i < argc; i++) {
+            int idx = atoi(argv[i]);
+            
+            // Validate index (0-based internally, user provides 0-based)
+            if (idx < 0 || idx >= (int)g_scan_count) {
+                MY_LOG_INFO(TAG, "Invalid index %d (valid: 0-%d), skipping", idx, g_scan_count - 1);
+                continue;
+            }
+            
+            wifi_ap_record_t *ap = &g_scan_results[idx];
+            int channel = ap->primary;
+            
+            // Check if channel already in list
+            bool channel_exists = false;
+            for (int j = 0; j < deauth_detector_selected_channels_count; j++) {
+                if (deauth_detector_selected_channels[j] == channel) {
+                    channel_exists = true;
+                    break;
+                }
+            }
+            
+            if (!channel_exists && deauth_detector_selected_channels_count < MAX_AP_CNT) {
+                deauth_detector_selected_channels[deauth_detector_selected_channels_count++] = channel;
+                MY_LOG_INFO(TAG, "  Added: %s (ch %d)", ap->ssid, channel);
+            }
+        }
+        
+        if (deauth_detector_selected_channels_count == 0) {
+            MY_LOG_INFO(TAG, "No valid channels selected. Aborting.");
+            return 1;
+        }
+        
+        deauth_detector_selected_mode = true;
+        
+        // Build channel list string for display
+        char channel_list[128] = {0};
+        int offset = 0;
+        for (int i = 0; i < deauth_detector_selected_channels_count && offset < 120; i++) {
+            offset += snprintf(channel_list + offset, sizeof(channel_list) - offset,
+                             "%d%s", deauth_detector_selected_channels[i],
+                             (i < deauth_detector_selected_channels_count - 1) ? ", " : "");
+        }
+        MY_LOG_INFO(TAG, "Monitoring %d channel(s): [%s]", deauth_detector_selected_channels_count, channel_list);
+        
+    } else {
+        // MODE A: No arguments - scan first, then monitor all channels
+        MY_LOG_INFO(TAG, "Starting Deauth Detector in SCAN mode...");
+        MY_LOG_INFO(TAG, "Scanning networks first...");
+        
+        // Start WiFi scan
+        esp_err_t err = start_background_scan();
+        if (err != ESP_OK) {
+            if (err == ESP_ERR_INVALID_STATE) {
+                MY_LOG_INFO(TAG, "Scan already in progress. Please wait or use 'stop'.");
+            } else {
+                MY_LOG_INFO(TAG, "Failed to start scan: %s", esp_err_to_name(err));
+            }
+            return 1;
+        }
+        
+        // Wait for scan to complete (with timeout)
+        int timeout_iterations = 0;
+        while (g_scan_in_progress && timeout_iterations < 200) { // 20 seconds max (200 * 100ms)
+            vTaskDelay(pdMS_TO_TICKS(100));
+            timeout_iterations++;
+            
+            // Check for stop request
+            if (operation_stop_requested) {
+                MY_LOG_INFO(TAG, "Scan cancelled by user.");
+                return 1;
+            }
+        }
+        
+        if (g_scan_in_progress) {
+            MY_LOG_INFO(TAG, "Scan timed out. Try again later.");
+            esp_wifi_scan_stop(); // Force stop the scan
+            return 1;
+        }
+        
+        // Verify scan actually completed with results
+        if (!g_scan_done || g_scan_count == 0) {
+            MY_LOG_INFO(TAG, "No scan results available. Try 'scan_networks' first.");
+            return 1;
+        }
+        
+        MY_LOG_INFO(TAG, "Found %d networks.", g_scan_count);
+        deauth_detector_selected_mode = false;
+    }
+    
+    // Activate deauth_detector
+    deauth_detector_active = true;
+    
+    // Set LED to yellow (monitoring mode)
+    esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for Deauth Detector: %s", esp_err_to_name(led_err));
+    }
+    
+    // Set promiscuous filter for MGMT frames only (deauth is a management frame)
+    wifi_promiscuous_filter_t mgmt_filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
+    };
+    esp_wifi_set_promiscuous_filter(&mgmt_filter);
+    
+    // Enable promiscuous mode with deauth_detector callback
+    esp_wifi_set_promiscuous_rx_cb(deauth_detector_promiscuous_callback);
+    esp_wifi_set_promiscuous(true);
+    
+    // Initialize channel hopping
+    deauth_detector_channel_index = 0;
+    if (deauth_detector_selected_mode && deauth_detector_selected_channels_count > 0) {
+        deauth_detector_current_channel = deauth_detector_selected_channels[0];
+    } else {
+        deauth_detector_current_channel = dual_band_channels[0];
+    }
+    esp_wifi_set_channel(deauth_detector_current_channel, WIFI_SECOND_CHAN_NONE);
+    deauth_detector_last_channel_hop = esp_timer_get_time() / 1000;
+    
+    // Create channel hopping task (stack must be in internal RAM on ESP32-C5)
+    BaseType_t task_created = xTaskCreate(
+        deauth_detector_task,
+        "deauth_det",
+        4096,
+        NULL,
+        5,
+        &deauth_detector_task_handle
+    );
+    
+    if (task_created != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create Deauth Detector channel hopping task");
+        deauth_detector_active = false;
+        esp_wifi_set_promiscuous(false);
+        
+        // Return LED to idle
+        led_err = led_set_idle();
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to restore idle LED after Deauth Detector failure: %s", esp_err_to_name(led_err));
+        }
+        
+        return 1;
+    }
+    
+    if (deauth_detector_selected_mode) {
+        MY_LOG_INFO(TAG, "Deauth Detector started - monitoring selected channels for deauth frames...");
+    } else {
+        MY_LOG_INFO(TAG, "Deauth Detector started - scanning all channels for deauth frames...");
+    }
+    MY_LOG_INFO(TAG, "Output: [DEAUTH] CH: <ch> | AP: <name> (<bssid>) | RSSI: <rssi>");
     MY_LOG_INFO(TAG, "Use 'stop' to stop.");
     
     return 0;
@@ -6886,6 +7139,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_dog_cmd));
 
+    const esp_console_cmd_t deauth_detector_cmd = {
+        .command = "deauth_detector",
+        .help = "Detect deauth frames. No args: scan+all channels. With indices: selected channels only",
+        .hint = "[index1 index2 ...]",
+        .func = &cmd_deauth_detector,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&deauth_detector_cmd));
+
     const esp_console_cmd_t select_cmd = {
         .command = "select_networks",
         .help = "Selects networks by indexes: select_networks 0 2 5",
@@ -8503,6 +8765,129 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
                ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
                sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5],
                sniffer_dog_current_channel, pkt->rx_ctrl.rssi);
+}
+
+// === DEAUTH DETECTOR FUNCTIONS ===
+
+// Helper function to find SSID by BSSID from scan results
+static const char* deauth_detector_find_ssid_by_bssid(const uint8_t *bssid) {
+    for (int i = 0; i < g_scan_count; i++) {
+        if (memcmp(g_scan_results[i].bssid, bssid, 6) == 0) {
+            return (const char*)g_scan_results[i].ssid;
+        }
+    }
+    return NULL; // Unknown AP
+}
+
+static void deauth_detector_channel_hop(void) {
+    if (!deauth_detector_active) {
+        return;
+    }
+    
+    // Check if we're in selected channels mode
+    if (deauth_detector_selected_mode && deauth_detector_selected_channels_count > 0) {
+        // Use selected channels only
+        deauth_detector_current_channel = deauth_detector_selected_channels[deauth_detector_channel_index];
+        
+        deauth_detector_channel_index++;
+        if (deauth_detector_channel_index >= deauth_detector_selected_channels_count) {
+            deauth_detector_channel_index = 0;
+        }
+    } else {
+        // Use dual-band channel hopping (all channels)
+        deauth_detector_current_channel = dual_band_channels[deauth_detector_channel_index];
+        
+        deauth_detector_channel_index++;
+        if (deauth_detector_channel_index >= dual_band_channels_count) {
+            deauth_detector_channel_index = 0;
+        }
+    }
+    
+    esp_wifi_set_channel(deauth_detector_current_channel, WIFI_SECOND_CHAN_NONE);
+    deauth_detector_last_channel_hop = esp_timer_get_time() / 1000;
+}
+
+// Task that handles channel hopping for deauth_detector
+static void deauth_detector_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    log_memory_info("deauth_detector_task");
+    
+    while (deauth_detector_active) {
+        vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
+        
+        if (!deauth_detector_active) {
+            continue;
+        }
+        
+        // Force channel hop if 250ms passed
+        int64_t current_time = esp_timer_get_time() / 1000;
+        bool time_expired = (current_time - deauth_detector_last_channel_hop >= sniffer_channel_hop_delay_ms);
+        
+        if (time_expired) {
+            deauth_detector_channel_hop();
+        }
+    }
+    
+    MY_LOG_INFO(TAG, "Deauth detector channel task ending");
+    deauth_detector_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Promiscuous callback for deauth_detector - detects deauthentication frames
+static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!deauth_detector_active) {
+        return;
+    }
+    
+    // Filter only MGMT packets (deauth is a management frame)
+    if (type != WIFI_PKT_MGMT) {
+        return;
+    }
+    
+    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+    
+    if (len < 24) { // Minimum 802.11 header size
+        return;
+    }
+    
+    // Check if this is a deauthentication frame
+    // Frame Control: Type=0 (Management), Subtype=12 (Deauthentication)
+    // Frame Control byte 0: 0xC0 = (subtype << 4) | (type << 2) = (12 << 4) | (0 << 2) = 0xC0
+    uint8_t frame_type = frame[0] & 0xFC;
+    if (frame_type != 0xC0) {
+        return; // Not a deauthentication frame
+    }
+    
+    // Extract BSSID (Address 3 in management frames)
+    // 802.11 header: FC(2) + Duration(2) + Addr1(6) + Addr2(6) + Addr3(6) + SeqCtl(2)
+    // Addr3 is at offset 16
+    const uint8_t *bssid_mac = &frame[16];
+    
+    // Get RSSI from rx_ctrl
+    int rssi = pkt->rx_ctrl.rssi;
+    
+    // Lookup SSID by BSSID from scan results
+    const char *ssid = deauth_detector_find_ssid_by_bssid(bssid_mac);
+    const char *ap_name = (ssid && ssid[0] != '\0') ? ssid : "<Unknown>";
+    
+    // Red LED flash to indicate deauth detected (visible flash)
+    (void)led_set_color(255, 0, 0); // Red
+    
+    // Print detection: CHANNEL | AP NAME (MAC) | RSSI
+    MY_LOG_INFO(TAG, "[DEAUTH] CH: %d | AP: %s (%02X:%02X:%02X:%02X:%02X:%02X) | RSSI: %d",
+               deauth_detector_current_channel,
+               ap_name,
+               bssid_mac[0], bssid_mac[1], bssid_mac[2], bssid_mac[3], bssid_mac[4], bssid_mac[5],
+               rssi);
+    
+    // Small delay to make LED flash visible (50ms)
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
+    // Back to yellow (monitoring mode)
+    (void)led_set_color(255, 255, 0);
 }
 
 // === WARDRIVE HELPER FUNCTIONS ===
