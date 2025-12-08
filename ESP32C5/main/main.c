@@ -393,6 +393,7 @@ static bool bt_tracking_mode = false;
 static uint8_t bt_tracking_mac[6];
 static int8_t bt_tracking_rssi = 0;
 static bool bt_tracking_found = false;
+static char bt_tracking_name[32] = "";
 
 // ============================================================================
 
@@ -6539,11 +6540,23 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     
     struct ble_gap_disc_desc *desc = &event->disc;
     
-    // MAC tracking mode - just update RSSI for tracked device
+    // MAC tracking mode - update RSSI and name for tracked device
     if (bt_tracking_mode) {
         if (memcmp(desc->addr.val, bt_tracking_mac, 6) == 0) {
             bt_tracking_rssi = desc->rssi;
             bt_tracking_found = true;
+            
+            // Try to extract name if we don't have one yet
+            if (bt_tracking_name[0] == '\0') {
+                struct ble_hs_adv_fields fields;
+                if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) == 0) {
+                    if (fields.name != NULL && fields.name_len > 0) {
+                        int name_len = fields.name_len < 31 ? fields.name_len : 31;
+                        memcpy(bt_tracking_name, fields.name, name_len);
+                        bt_tracking_name[name_len] = '\0';
+                    }
+                }
+            }
         }
         return 0;
     }
@@ -6941,7 +6954,11 @@ static void bt_tracking_task(void *pvParameters)
         
         // Output result
         if (bt_tracking_found) {
-            printf("%s  RSSI: %d dBm\n", mac_str, bt_tracking_rssi);
+            if (bt_tracking_name[0] != '\0') {
+                printf("%s  RSSI: %d dBm  Name: %s\n", mac_str, bt_tracking_rssi, bt_tracking_name);
+            } else {
+                printf("%s  RSSI: %d dBm\n", mac_str, bt_tracking_rssi);
+            }
         } else {
             printf("%s  not found\n", mac_str);
         }
@@ -6994,6 +7011,7 @@ static int cmd_scan_bt(int argc, char **argv)
         bt_tracking_mode = true;
         bt_tracking_found = false;
         bt_tracking_rssi = 0;
+        bt_tracking_name[0] = '\0';
         
         BaseType_t task_ret = xTaskCreate(
             bt_tracking_task,
