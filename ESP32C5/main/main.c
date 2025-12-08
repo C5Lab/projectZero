@@ -6405,6 +6405,20 @@ static bool bt_is_device_found(const uint8_t *addr)
 }
 
 /**
+ * Find device index by MAC address in bt_devices array
+ * Returns -1 if not found
+ */
+static int bt_find_device_index(const uint8_t *addr)
+{
+    for (int i = 0; i < bt_device_count; i++) {
+        if (memcmp(bt_devices[i].addr, addr, 6) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/**
  * Add BLE device to found list
  */
 static void bt_add_found_device(const uint8_t *addr)
@@ -6534,15 +6548,30 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         return 0;
     }
     
-    // Skip if already seen
-    if (bt_is_device_found(desc->addr.val)) {
-        return 0;
-    }
-    
     // Parse advertising data
     struct ble_hs_adv_fields fields;
     int rc = ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data);
     if (rc != 0) {
+        return 0;
+    }
+    
+    // Check if this is a Scan Response packet (contains names more often)
+    bool is_scan_response = (desc->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
+    
+    // Check if device already seen
+    bool already_seen = bt_is_device_found(desc->addr.val);
+    
+    // If already seen, only process scan responses to update names
+    if (already_seen) {
+        // Try to update name from scan response if we don't have one
+        if (is_scan_response && fields.name != NULL && fields.name_len > 0) {
+            int dev_idx = bt_find_device_index(desc->addr.val);
+            if (dev_idx >= 0 && bt_devices[dev_idx].name[0] == '\0') {
+                int name_len = fields.name_len < 31 ? fields.name_len : 31;
+                memcpy(bt_devices[dev_idx].name, fields.name, name_len);
+                bt_devices[dev_idx].name[name_len] = '\0';
+            }
+        }
         return 0;
     }
     
@@ -6559,7 +6588,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         dev->is_airtag = false;
         dev->is_smarttag = false;
         
-        // Extract device name if available
+        // Extract device name if available (standard AD field)
         bool has_name = (fields.name != NULL && fields.name_len > 0);
         if (has_name) {
             int name_len = fields.name_len < 31 ? fields.name_len : 31;
@@ -6594,11 +6623,11 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
 static int bt_start_scan(void)
 {
     struct ble_gap_disc_params scan_params = {
-        .itvl = 160,              // 100ms interval (160 * 0.625ms)
-        .window = 80,             // 50ms window (80 * 0.625ms)
+        .itvl = 0x60,             // 60ms interval (0x60 * 0.625ms)
+        .window = 0x60,           // 60ms window = continuous listening
         .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
         .limited = 0,
-        .passive = 1,             // Passive scan
+        .passive = 0,             // ACTIVE scan - critical for Scan Response names
         .filter_duplicates = 0,   // We handle duplicates ourselves
     };
     
