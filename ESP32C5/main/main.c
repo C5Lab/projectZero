@@ -6479,27 +6479,27 @@ static bool bt_parse_mac(const char *str, uint8_t *mac)
 }
 
 /**
- * Check if manufacturer data indicates Apple AirTag/Find My device
- * AirTag has specific length (25-29 bytes) and doesn't broadcast device name
- * This avoids false positives from iPhone/iPad with Find My enabled
+ * Check if raw BLE payload contains Apple AirTag/Find My patterns
+ * Uses Marauder's method: scan raw payload for specific byte sequences
+ * Detects both original AirTags and clones (Mi-Tag, etc.)
  */
-static bool bt_is_apple_airtag(const uint8_t *data, uint8_t len, bool has_name)
+static bool bt_is_airtag_payload(const uint8_t *payload, size_t len)
 {
     if (len < 4) return false;
     
-    // Check Company ID (Little Endian: 0x4C 0x00)
-    uint16_t company_id = data[0] | (data[1] << 8);
-    if (company_id != APPLE_COMPANY_ID) return false;
-    
-    // Check Find My device type (0x12)
-    if (data[2] != APPLE_FIND_MY_TYPE) return false;
-    
-    // AirTags typically have 25-29 bytes of manufacturer data
-    // and don't broadcast a device name (unlike iPhone/iPad)
-    if (len >= 25 && len <= 29 && !has_name) {
-        return true;
+    // Scan payload for Marauder patterns
+    for (size_t i = 0; i + 4 <= len; i++) {
+        // Pattern 1: 0x1E 0xFF 0x4C 0x00 (len=30, mfg type, Apple ID)
+        if (payload[i] == 0x1E && payload[i+1] == 0xFF && 
+            payload[i+2] == 0x4C && payload[i+3] == 0x00) {
+            return true;
+        }
+        // Pattern 2: 0x4C 0x00 0x12 0x19 (Apple ID, Find My type, len=25)
+        if (payload[i] == 0x4C && payload[i+1] == 0x00 && 
+            payload[i+2] == 0x12 && payload[i+3] == 0x19) {
+            return true;
+        }
     }
-    
     return false;
 }
 
@@ -6609,16 +6609,17 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
             dev->name[name_len] = '\0';
         }
         
-        // Check manufacturer data
+        // Check for AirTag using raw payload (Marauder method)
+        if (bt_is_airtag_payload(desc->data, desc->length_data)) {
+            dev->is_airtag = true;
+            bt_airtag_count++;
+        }
+        
+        // Check manufacturer data for SmartTag and company ID
         if (fields.mfg_data != NULL && fields.mfg_data_len >= 2) {
             dev->company_id = fields.mfg_data[0] | (fields.mfg_data[1] << 8);
             
-            // Pass has_name to avoid false positives from iPhone/iPad
-            if (bt_is_apple_airtag(fields.mfg_data, fields.mfg_data_len, has_name)) {
-                dev->is_airtag = true;
-                bt_airtag_count++;
-            }
-            else if (bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
+            if (!dev->is_airtag && bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
                 dev->is_smarttag = true;
                 bt_smarttag_count++;
             }
