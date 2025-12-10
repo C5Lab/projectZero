@@ -58,7 +58,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.33"
+#define LAB_C5_VERSION_TEXT "0.34"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -94,6 +94,11 @@ typedef enum {
 #define DISPLAY_HEIGHT 64
 #define WARD_DRIVE_CONSOLE_LINES 3
 #define BT_SCAN_CONSOLE_LINES 3
+#define SNIFFER_CONSOLE_LINES 3
+#define SNIFFER_MAX_APS 32
+#define SNIFFER_MAX_CLIENTS 96
+#define PROBE_MAX_SSIDS 32
+#define PROBE_MAX_CLIENTS 96
 #define BT_LOCATOR_MAX_DEVICES 64
 #define BT_LOCATOR_VISIBLE_COUNT 6
 #define BT_LOCATOR_WARMUP_MS 10000
@@ -291,6 +296,25 @@ typedef struct {
 } PortalSsidEntry;
 
 typedef struct {
+    char ssid[SCAN_SSID_MAX_LEN];
+    uint8_t channel;
+    uint16_t client_start;
+    uint16_t client_count;
+    uint16_t expected_count;
+} SnifferApEntry;
+
+typedef struct {
+    char mac[18];
+} SnifferClientEntry;
+
+typedef struct {
+    char ssid[SCAN_SSID_MAX_LEN];
+    uint16_t client_start;
+    uint16_t client_count;
+    uint16_t expected_count;
+} ProbeSsidEntry;
+
+typedef struct {
     const char* label;
     const char* path;
 } SdFolderOption;
@@ -393,6 +417,35 @@ typedef struct {
     uint32_t deauth_guard_detection_count;
     bool last_command_sent;
     bool sniffer_show_results_on_back;
+    bool sniffer_view_active;
+    bool sniffer_full_console;
+    bool sniffer_running;
+    bool sniffer_has_data;
+    bool sniffer_scan_done;
+    bool sniffer_results_active;
+    bool sniffer_results_loading;
+    uint32_t sniffer_packet_count;
+    uint32_t sniffer_networks;
+    uint32_t sniffer_last_update_tick;
+    char sniffer_mode[12];
+    char sniffer_line_buffer[96];
+    size_t sniffer_line_length;
+    SnifferApEntry sniffer_aps[SNIFFER_MAX_APS];
+    SnifferClientEntry sniffer_clients[SNIFFER_MAX_CLIENTS];
+    size_t sniffer_ap_count;
+    size_t sniffer_client_count;
+    size_t sniffer_results_ap_index;
+    size_t sniffer_results_client_offset;
+    bool probe_results_active;
+    bool probe_full_console;
+    bool probe_results_loading;
+    ProbeSsidEntry probe_ssids[PROBE_MAX_SSIDS];
+    SnifferClientEntry probe_clients[PROBE_MAX_CLIENTS];
+    size_t probe_ssid_count;
+    size_t probe_client_count;
+    size_t probe_ssid_index;
+    size_t probe_client_offset;
+    uint32_t probe_total;
     bool confirm_blackout_yes;
     bool confirm_sniffer_dos_yes;
     bool confirm_exit_yes;
@@ -2198,6 +2251,360 @@ static void simple_app_wardrive_feed(SimpleApp* app, char ch) {
         return;
     }
     app->wardrive_line_buffer[app->wardrive_line_length++] = ch;
+}
+
+static void simple_app_reset_sniffer_status(SimpleApp* app) {
+    if(!app) return;
+    app->sniffer_running = false;
+    app->sniffer_has_data = false;
+    app->sniffer_scan_done = false;
+    app->sniffer_packet_count = 0;
+    app->sniffer_networks = 0;
+    app->sniffer_last_update_tick = 0;
+    app->sniffer_mode[0] = '\0';
+    app->sniffer_line_length = 0;
+    app->sniffer_full_console = false;
+}
+
+static void simple_app_reset_sniffer_results(SimpleApp* app) {
+    if(!app) return;
+    memset(app->sniffer_aps, 0, sizeof(app->sniffer_aps));
+    memset(app->sniffer_clients, 0, sizeof(app->sniffer_clients));
+    app->sniffer_ap_count = 0;
+    app->sniffer_client_count = 0;
+    app->sniffer_results_ap_index = 0;
+    app->sniffer_results_client_offset = 0;
+    app->sniffer_results_loading = false;
+}
+
+static void simple_app_reset_probe_results(SimpleApp* app) {
+    if(!app) return;
+    memset(app->probe_ssids, 0, sizeof(app->probe_ssids));
+    memset(app->probe_clients, 0, sizeof(app->probe_clients));
+    app->probe_ssid_count = 0;
+    app->probe_client_count = 0;
+    app->probe_ssid_index = 0;
+    app->probe_client_offset = 0;
+    app->probe_total = 0;
+    app->probe_results_loading = false;
+    app->probe_full_console = false;
+}
+
+static void simple_app_sniffer_trim(char* text) {
+    if(!text) return;
+    char* start = text;
+    while(*start && isspace((unsigned char)*start)) start++;
+    char* end = start + strlen(start);
+    while(end > start && isspace((unsigned char)*(end - 1))) {
+        end--;
+    }
+    size_t len = (size_t)(end - start);
+    if(start != text) {
+        memmove(text, start, len);
+    }
+    text[len] = '\0';
+}
+
+static bool simple_app_sniffer_parse_header(
+    SimpleApp* app,
+    const char* line,
+    SnifferApEntry* out_entry) {
+    if(!app || !line || !out_entry) return false;
+    char buf[64];
+    strncpy(buf, line, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    simple_app_sniffer_trim(buf);
+    line = buf;
+    const char* ch_ptr = strstr(line, "CH");
+    const char* colon_ptr = strchr(line, ':');
+    if(!ch_ptr || !colon_ptr) return false;
+    if(ch_ptr > colon_ptr) return false;
+
+    unsigned channel = 0;
+    unsigned expected = 0;
+    if(sscanf(ch_ptr, "CH%u: %u", &channel, &expected) < 1) {
+        return false;
+    }
+    if(channel > UINT8_MAX) channel = UINT8_MAX;
+
+    const char* comma = strchr(line, ',');
+    size_t ssid_len = 0;
+    if(comma && comma < ch_ptr) {
+        ssid_len = (size_t)(comma - line);
+        if(ssid_len >= sizeof(out_entry->ssid)) {
+            ssid_len = sizeof(out_entry->ssid) - 1;
+        }
+        memcpy(out_entry->ssid, line, ssid_len);
+    } else if(line[0] != '\0' && line[0] != '>') {
+        ssid_len = strlen(line);
+        if(ssid_len >= sizeof(out_entry->ssid)) {
+            ssid_len = sizeof(out_entry->ssid) - 1;
+        }
+        memcpy(out_entry->ssid, line, ssid_len);
+    } else {
+        ssid_len = 0;
+    }
+    out_entry->ssid[ssid_len] = '\0';
+    simple_app_sniffer_trim(out_entry->ssid);
+    if(out_entry->ssid[0] == '\0') {
+        strncpy(out_entry->ssid, "<hidden>", sizeof(out_entry->ssid) - 1);
+        out_entry->ssid[sizeof(out_entry->ssid) - 1] = '\0';
+    }
+
+    out_entry->channel = (uint8_t)channel;
+    out_entry->expected_count = (uint16_t)expected;
+    out_entry->client_start = 0;
+    out_entry->client_count = 0;
+    return true;
+}
+
+static bool simple_app_sniffer_is_mac(const char* line) {
+    if(!line) return false;
+    char buf[32];
+    strncpy(buf, line, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    simple_app_sniffer_trim(buf);
+    line = buf;
+    size_t len = strlen(line);
+    if(len < 11 || len > 20) return false;
+    int octets = 0;
+    for(size_t i = 0; line[i] != '\0'; i++) {
+        char c = line[i];
+        if(c == ':') continue;
+        if(isxdigit((unsigned char)c)) {
+            if(i == 0 || line[i - 1] == ':' || isspace((unsigned char)line[i - 1])) {
+                octets++;
+            }
+        } else if(isspace((unsigned char)c)) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    return octets >= 2;
+}
+
+static void simple_app_process_sniffer_line(SimpleApp* app, const char* line) {
+    if(!app || !line || (!app->sniffer_view_active && !app->sniffer_results_active)) return;
+
+    if(app->sniffer_results_active) {
+        if(line[0] == '>') {
+            app->sniffer_results_loading = false;
+            return;
+        }
+
+        SnifferApEntry entry;
+        if(simple_app_sniffer_parse_header(app, line, &entry)) {
+            if(app->sniffer_ap_count < SNIFFER_MAX_APS) {
+                entry.client_start = (uint16_t)app->sniffer_client_count;
+                app->sniffer_aps[app->sniffer_ap_count++] = entry;
+                app->sniffer_results_loading = false;
+            }
+            return;
+        }
+
+        if(simple_app_sniffer_is_mac(line) && app->sniffer_ap_count > 0) {
+            if(app->sniffer_client_count < SNIFFER_MAX_CLIENTS) {
+                SnifferClientEntry* client = &app->sniffer_clients[app->sniffer_client_count++];
+                strncpy(client->mac, line, sizeof(client->mac) - 1);
+                client->mac[sizeof(client->mac) - 1] = '\0';
+                simple_app_sniffer_trim(client->mac);
+                SnifferApEntry* last_ap = &app->sniffer_aps[app->sniffer_ap_count - 1];
+                if(last_ap->client_count < UINT16_MAX) {
+                    last_ap->client_count++;
+                }
+                if(last_ap->expected_count < last_ap->client_count) {
+                    last_ap->expected_count = last_ap->client_count;
+                }
+                app->sniffer_results_loading = false;
+            }
+            return;
+        }
+    }
+
+    uint32_t value = 0;
+    if(sscanf(line, "Sniffer packet count: %lu", &value) == 1 ||
+       sscanf(line, "Sniffer packet count:%lu", &value) == 1) {
+        app->sniffer_packet_count = value;
+        app->sniffer_has_data = true;
+        app->sniffer_running = true;
+        app->sniffer_last_update_tick = furi_get_tick();
+        return;
+    }
+
+    if(sscanf(line, "WiFi scan completed. Found %lu networks", &value) == 1 ||
+       sscanf(line, "Processing %lu scan results", &value) == 1 ||
+       sscanf(line, "Retrieved %lu network records", &value) == 1) {
+        app->sniffer_networks = value;
+        app->sniffer_running = true;
+        return;
+    }
+
+    const char* start_prefix = "Starting sniffer in ";
+    const char* start_ptr = strstr(line, start_prefix);
+    if(start_ptr) {
+        start_ptr += strlen(start_prefix);
+        char mode_buf[sizeof(app->sniffer_mode)] = {0};
+        size_t idx = 0;
+        while(start_ptr[idx] != '\0' && !isspace((unsigned char)start_ptr[idx]) &&
+              idx < sizeof(mode_buf) - 1) {
+            mode_buf[idx] = start_ptr[idx];
+            idx++;
+        }
+        mode_buf[idx] = '\0';
+        if(mode_buf[0] != '\0') {
+            strncpy(app->sniffer_mode, mode_buf, sizeof(app->sniffer_mode) - 1);
+            app->sniffer_mode[sizeof(app->sniffer_mode) - 1] = '\0';
+        }
+        app->sniffer_running = true;
+        app->sniffer_scan_done = false;
+        app->sniffer_packet_count = 0;
+        app->sniffer_has_data = false;
+        app->sniffer_last_update_tick = furi_get_tick();
+        return;
+    }
+
+    if(strstr(line, "Sniffer started") != NULL || strstr(line, "Starting background WiFi scan") != NULL) {
+        app->sniffer_running = true;
+        app->sniffer_last_update_tick = furi_get_tick();
+        return;
+    }
+
+    if(strstr(line, "Sniffer: Scan complete") != NULL) {
+        app->sniffer_scan_done = true;
+        app->sniffer_running = true;
+        app->sniffer_last_update_tick = furi_get_tick();
+        return;
+    }
+
+    if(strstr(line, "Sniffer stopped") != NULL) {
+        app->sniffer_running = false;
+        app->sniffer_last_update_tick = furi_get_tick();
+        return;
+    }
+}
+
+static void simple_app_sniffer_feed(SimpleApp* app, char ch) {
+    if(!app) return;
+    if(!app->sniffer_view_active && !app->sniffer_results_active) {
+        app->sniffer_line_length = 0;
+        return;
+    }
+    if(ch == '\r') return;
+    if(ch == '\n') {
+        if(app->sniffer_line_length > 0) {
+            app->sniffer_line_buffer[app->sniffer_line_length] = '\0';
+            simple_app_process_sniffer_line(app, app->sniffer_line_buffer);
+        }
+        app->sniffer_line_length = 0;
+        return;
+    }
+    if(app->sniffer_line_length + 1 >= sizeof(app->sniffer_line_buffer)) {
+        app->sniffer_line_length = 0;
+        return;
+    }
+    app->sniffer_line_buffer[app->sniffer_line_length++] = ch;
+}
+
+static int simple_app_find_probe_ssid(SimpleApp* app, const char* ssid) {
+    if(!app || !ssid) return -1;
+    for(size_t i = 0; i < app->probe_ssid_count; i++) {
+        if(strncmp(app->probe_ssids[i].ssid, ssid, sizeof(app->probe_ssids[i].ssid)) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void simple_app_process_probe_line(SimpleApp* app, const char* line) {
+    if(!app || !line || !app->probe_results_active) return;
+
+    if(strncmp(line, "Probe requests:", 15) == 0) {
+        uint32_t total = 0;
+        if(sscanf(line, "Probe requests: %lu", &total) == 1) {
+            app->probe_total = total;
+        }
+        return;
+    }
+
+    if(line[0] == '>' || line[0] == '\0') {
+        app->probe_results_loading = false;
+        return;
+    }
+
+    const char* open = strchr(line, '(');
+    const char* close = strchr(line, ')');
+    if(!open || !close || close <= open) return;
+
+    char ssid[SCAN_SSID_MAX_LEN];
+    size_t ssid_len = (size_t)(open - line);
+    if(ssid_len >= sizeof(ssid)) ssid_len = sizeof(ssid) - 1;
+    memcpy(ssid, line, ssid_len);
+    ssid[ssid_len] = '\0';
+    simple_app_sniffer_trim(ssid);
+    if(ssid[0] == '\0') {
+        strncpy(ssid, "<hidden>", sizeof(ssid) - 1);
+        ssid[sizeof(ssid) - 1] = '\0';
+    }
+
+    char mac[18];
+    size_t mac_len = (size_t)(close - open - 1);
+    if(mac_len >= sizeof(mac)) mac_len = sizeof(mac) - 1;
+    memcpy(mac, open + 1, mac_len);
+    mac[mac_len] = '\0';
+    simple_app_sniffer_trim(mac);
+    if(mac[0] == '\0') return;
+
+    int existing = simple_app_find_probe_ssid(app, ssid);
+    ProbeSsidEntry* entry = NULL;
+    if(existing >= 0) {
+        entry = &app->probe_ssids[existing];
+    } else if(app->probe_ssid_count < PROBE_MAX_SSIDS) {
+        entry = &app->probe_ssids[app->probe_ssid_count++];
+        memset(entry, 0, sizeof(*entry));
+        strncpy(entry->ssid, ssid, sizeof(entry->ssid) - 1);
+        entry->ssid[sizeof(entry->ssid) - 1] = '\0';
+        entry->client_start = (uint16_t)app->probe_client_count;
+    }
+
+    if(!entry) return;
+
+    if(app->probe_client_count < PROBE_MAX_CLIENTS) {
+        SnifferClientEntry* client = &app->probe_clients[app->probe_client_count++];
+        strncpy(client->mac, mac, sizeof(client->mac) - 1);
+        client->mac[sizeof(client->mac) - 1] = '\0';
+        if(entry->client_count < UINT16_MAX) {
+            entry->client_count++;
+        }
+        if(entry->expected_count < entry->client_count) {
+            entry->expected_count = entry->client_count;
+        }
+    } else {
+        if(entry->expected_count < UINT16_MAX) entry->expected_count++;
+    }
+
+    app->probe_results_loading = false;
+}
+
+static void simple_app_probe_feed(SimpleApp* app, char ch) {
+    static char line_buf[96];
+    static size_t line_len = 0;
+    if(!app || !app->probe_results_active) {
+        line_len = 0;
+        return;
+    }
+    if(ch == '\r') return;
+    if(ch == '\n') {
+        line_buf[line_len] = '\0';
+        simple_app_process_probe_line(app, line_buf);
+        line_len = 0;
+        return;
+    }
+    if(line_len + 1 >= sizeof(line_buf)) {
+        line_len = 0;
+        return;
+    }
+    line_buf[line_len++] = ch;
 }
 
 static void simple_app_reset_bt_scan_summary(SimpleApp* app) {
@@ -4089,6 +4496,15 @@ static size_t simple_app_visible_serial_lines(const SimpleApp* app) {
         if(app->bt_scan_view_active && !app->bt_scan_full_console) {
             return BT_SCAN_CONSOLE_LINES;
         }
+        if(app->sniffer_results_active && !app->sniffer_full_console) {
+            return SNIFFER_CONSOLE_LINES;
+        }
+        if(app->sniffer_view_active && !app->sniffer_full_console) {
+            return SNIFFER_CONSOLE_LINES;
+        }
+        if(app->probe_results_active && !app->probe_full_console) {
+            return SNIFFER_CONSOLE_LINES;
+        }
         if(app->wardrive_view_active) {
             return WARD_DRIVE_CONSOLE_LINES;
         }
@@ -4187,6 +4603,8 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_bt_scan_feed(app, ch);
         simple_app_bt_locator_feed(app, ch);
         simple_app_wardrive_feed(app, ch);
+        simple_app_sniffer_feed(app, ch);
+        simple_app_probe_feed(app, ch);
     }
 
     if(trimmed_any && !app->serial_follow_tail) {
@@ -4261,6 +4679,8 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     bool is_wardrive_command = strstr(command, "start_wardrive") != NULL;
     bool is_stop_command = strcmp(command, "stop") == 0;
     bool is_start_sniffer = simple_app_is_start_sniffer_command(command);
+    bool is_sniffer_results_command = strstr(command, "show_sniffer_results") != NULL;
+    bool is_probe_results_command = strstr(command, "show_probes") != NULL;
     bool is_airtag_scan_command = strstr(command, "scan_airtag") != NULL;
     bool is_bt_scan_command = is_airtag_scan_command || strstr(command, "scan_bt") != NULL;
     bool is_wifi_scan_command = strstr(command, SCANNER_SCAN_COMMAND) != NULL;
@@ -4324,6 +4744,46 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
         app->sniffer_show_results_on_back = false;
     } else {
         app->sniffer_show_results_on_back = is_start_sniffer;
+    }
+
+    if(is_start_sniffer) {
+        simple_app_reset_sniffer_status(app);
+        app->sniffer_view_active = true;
+        app->sniffer_running = true;
+        app->sniffer_last_update_tick = furi_get_tick();
+        app->sniffer_results_active = false;
+        simple_app_reset_sniffer_results(app);
+        app->probe_results_active = false;
+        simple_app_reset_probe_results(app);
+    } else if(is_sniffer_results_command) {
+        simple_app_reset_sniffer_results(app);
+        app->sniffer_results_active = true;
+        app->sniffer_results_loading = true;
+        app->sniffer_full_console = false;
+        app->probe_results_active = false;
+        simple_app_reset_probe_results(app);
+    } else if(is_probe_results_command) {
+        simple_app_reset_probe_results(app);
+        app->probe_results_active = true;
+        app->probe_results_loading = true;
+        app->probe_full_console = false;
+        app->sniffer_results_active = false;
+    } else if(is_stop_command) {
+        app->sniffer_view_active = false;
+        app->sniffer_results_active = false;
+        app->probe_results_active = false;
+        simple_app_reset_sniffer_status(app);
+        simple_app_reset_sniffer_results(app);
+        simple_app_reset_probe_results(app);
+    } else {
+        if(!is_sniffer_results_command) {
+            app->sniffer_results_active = false;
+            simple_app_reset_sniffer_results(app);
+        }
+        if(!is_probe_results_command) {
+            app->probe_results_active = false;
+            simple_app_reset_probe_results(app);
+        }
     }
 
     app->serial_targets_hint = false;
@@ -4445,6 +4905,12 @@ static void simple_app_send_stop_if_needed(SimpleApp* app) {
     app->bt_scan_running = false;
     app->scanner_scan_running = false;
     app->bt_scan_show_list = false;
+    app->sniffer_view_active = false;
+    app->sniffer_results_active = false;
+    app->probe_results_active = false;
+    simple_app_reset_sniffer_status(app);
+    simple_app_reset_sniffer_results(app);
+    simple_app_reset_probe_results(app);
 }
 
 static void simple_app_prepare_exit(SimpleApp* app) {
@@ -4462,6 +4928,12 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     simple_app_clear_status_message(app);
 
     app->sniffer_show_results_on_back = false;
+    app->sniffer_view_active = false;
+    app->sniffer_results_active = false;
+    app->probe_results_active = false;
+    simple_app_reset_sniffer_status(app);
+    simple_app_reset_sniffer_results(app);
+    simple_app_reset_probe_results(app);
     app->portal_input_requested = false;
     app->portal_input_active = false;
     app->portal_ssid_popup_active = false;
@@ -6896,6 +7368,130 @@ static void simple_app_draw_scanner_status(SimpleApp* app, Canvas* canvas) {
     }
 }
 
+static void simple_app_draw_sniffer_overlay(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+
+    char status_line[32];
+    if(app->sniffer_running) {
+        snprintf(status_line, sizeof(status_line), app->sniffer_scan_done ? "Monitoring" : "Scanning...");
+    } else if(app->sniffer_has_data) {
+        snprintf(status_line, sizeof(status_line), "Done");
+    } else {
+        snprintf(status_line, sizeof(status_line), "Waiting...");
+    }
+
+    canvas_draw_str(canvas, 2, 12, "Sniffer");
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 2, 12, AlignRight, AlignBottom, status_line);
+
+    canvas_set_font(canvas, FontPrimary);
+    char packets_line[32];
+    snprintf(packets_line, sizeof(packets_line), "Packets: %lu", (unsigned long)app->sniffer_packet_count);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 28, AlignCenter, AlignCenter, packets_line);
+
+    canvas_set_font(canvas, FontSecondary);
+    char networks_line[32];
+    if(app->sniffer_networks > 0) {
+        snprintf(networks_line, sizeof(networks_line), "Networks: %lu", (unsigned long)app->sniffer_networks);
+    } else {
+        snprintf(networks_line, sizeof(networks_line), "Networks: --");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 42, AlignCenter, AlignCenter, networks_line);
+
+    char mode_line[32];
+    if(app->sniffer_mode[0] != '\0') {
+        snprintf(mode_line, sizeof(mode_line), "Mode: %s", app->sniffer_mode);
+    } else {
+        snprintf(mode_line, sizeof(mode_line), "Mode: ?");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 54, AlignCenter, AlignCenter, mode_line);
+}
+
+static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    size_t ap_count = app->sniffer_ap_count;
+    size_t client_count = app->sniffer_client_count;
+    if(app->sniffer_results_ap_index >= ap_count && ap_count > 0) {
+        app->sniffer_results_ap_index = ap_count - 1;
+    }
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+
+    char header[32];
+    snprintf(header, sizeof(header), "APs:%u Cli:%u", (unsigned)ap_count, (unsigned)client_count);
+    canvas_draw_str(canvas, 2, 12, "Sniffer Results");
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 2, 12, AlignRight, AlignBottom, header);
+
+    if(app->sniffer_results_loading && ap_count == 0 && client_count == 0) {
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 36, AlignCenter, AlignCenter, "Loading...");
+        return;
+    }
+
+    if(ap_count == 0) {
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 36, AlignCenter, AlignCenter, "No clients yet");
+        return;
+    }
+
+    const SnifferApEntry* ap = &app->sniffer_aps[app->sniffer_results_ap_index];
+    char title[32];
+    canvas_set_font(canvas, FontPrimary);
+    snprintf(title, sizeof(title), "%s", ap->ssid[0] ? ap->ssid : "<hidden>");
+    simple_app_truncate_text(title, 14);
+    canvas_draw_str(canvas, 2, 30, title);
+
+    canvas_set_font(canvas, FontSecondary);
+    uint16_t current_client =
+        (ap->client_count == 0) ? 0 : (uint16_t)(app->sniffer_results_client_offset + 1);
+    if(current_client > ap->client_count) current_client = ap->client_count;
+
+    char info[32];
+    snprintf(
+        info,
+        sizeof(info),
+        "CH%u  Client: %u/%u",
+        (unsigned)ap->channel,
+        (unsigned)current_client,
+        (unsigned)ap->client_count);
+    simple_app_truncate_text(info, 21);
+    canvas_draw_str(canvas, 2, 44, info);
+
+    uint8_t list_top = 54;
+    uint8_t list_bottom = DISPLAY_HEIGHT - 8;
+    uint8_t max_lines =
+        (uint8_t)((list_bottom - list_top + SERIAL_TEXT_LINE_HEIGHT) / SERIAL_TEXT_LINE_HEIGHT);
+    if(max_lines == 0) max_lines = 1;
+
+    size_t first = ap->client_start + app->sniffer_results_client_offset;
+    size_t last_possible = ap->client_start + ap->client_count;
+    if(first > last_possible) {
+        app->sniffer_results_client_offset = 0;
+        first = ap->client_start;
+    }
+
+    size_t lines_drawn = 0;
+    uint8_t y = list_top;
+    for(size_t idx = first; idx < last_possible && lines_drawn < max_lines; idx++) {
+        if(idx >= SNIFFER_MAX_CLIENTS) break;
+        const SnifferClientEntry* client = &app->sniffer_clients[idx];
+        canvas_draw_str(canvas, 6, y, client->mac);
+        y += SERIAL_TEXT_LINE_HEIGHT;
+        lines_drawn++;
+    }
+
+    bool show_up = (app->sniffer_results_client_offset > 0) || (app->sniffer_results_ap_index > 0);
+    bool show_down =
+        ((first + lines_drawn) < last_possible) || (app->sniffer_results_ap_index + 1 < ap_count);
+    if(show_up || show_down) {
+        uint8_t arrow_x = DISPLAY_WIDTH - 6;
+        simple_app_draw_scroll_hints(canvas, arrow_x, list_top, y - 2, show_up, show_down);
+    }
+
+}
+
 static void simple_app_draw_bt_scan_overlay(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas) return;
 
@@ -6931,6 +7527,87 @@ static void simple_app_draw_bt_scan_overlay(SimpleApp* app, Canvas* canvas) {
 
     if(!app->bt_scan_running && app->bt_scan_has_data && app->bt_scan_total > 0) {
         canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 4, DISPLAY_HEIGHT - 2, AlignRight, AlignBottom, "->");
+    }
+}
+
+static void simple_app_draw_probe_results_overlay(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    size_t ssid_count = app->probe_ssid_count;
+    if(app->probe_ssid_index >= ssid_count && ssid_count > 0) {
+        app->probe_ssid_index = ssid_count - 1;
+        app->probe_client_offset = 0;
+    }
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+
+    char header[32];
+    snprintf(header, sizeof(header), "SSIDs:%u Req:%u", (unsigned)ssid_count, (unsigned)app->probe_total);
+    canvas_draw_str(canvas, 2, 12, "Probe Requests");
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 2, 12, AlignRight, AlignBottom, header);
+
+    if(ssid_count == 0) {
+        const char* msg1 = "No probes found";
+        const char* msg2 = "Run a scan again";
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 32, AlignCenter, AlignCenter, msg1);
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 48, AlignCenter, AlignCenter, msg2);
+        return;
+    }
+
+    const ProbeSsidEntry* ssid = &app->probe_ssids[app->probe_ssid_index];
+    char title[32];
+    canvas_set_font(canvas, FontPrimary);
+    snprintf(title, sizeof(title), "%s", ssid->ssid[0] ? ssid->ssid : "<hidden>");
+    simple_app_truncate_text(title, 14);
+    canvas_draw_str(canvas, 2, 30, title);
+
+    canvas_set_font(canvas, FontSecondary);
+    uint16_t current_client =
+        (ssid->client_count == 0) ? 0 : (uint16_t)(app->probe_client_offset + 1);
+    if(current_client > ssid->client_count) current_client = ssid->client_count;
+
+    char info[32];
+    snprintf(
+        info,
+        sizeof(info),
+        "Client: %u/%u",
+        (unsigned)current_client,
+        (unsigned)ssid->client_count);
+    simple_app_truncate_text(info, 21);
+    canvas_draw_str(canvas, 2, 44, info);
+
+    uint8_t list_top = 54;
+    uint8_t list_bottom = DISPLAY_HEIGHT - 8;
+    uint8_t max_lines =
+        (uint8_t)((list_bottom - list_top + SERIAL_TEXT_LINE_HEIGHT) / SERIAL_TEXT_LINE_HEIGHT);
+    if(max_lines == 0) max_lines = 1;
+
+    size_t first = ssid->client_start + app->probe_client_offset;
+    size_t last_possible = ssid->client_start + ssid->client_count;
+    if(first > last_possible) {
+        app->probe_client_offset = 0;
+        first = ssid->client_start;
+    }
+
+    size_t lines_drawn = 0;
+    uint8_t y = list_top;
+    for(size_t idx = first; idx < last_possible && lines_drawn < max_lines; idx++) {
+        if(idx >= PROBE_MAX_CLIENTS) break;
+        const SnifferClientEntry* client = &app->probe_clients[idx];
+        canvas_draw_str(canvas, 6, y, client->mac);
+        y += SERIAL_TEXT_LINE_HEIGHT;
+        lines_drawn++;
+    }
+
+    bool show_up = (app->probe_client_offset > 0) || (app->probe_ssid_index > 0);
+    bool show_down =
+        ((first + lines_drawn) < last_possible) || (app->probe_ssid_index + 1 < ssid_count);
+    if(show_up || show_down) {
+        uint8_t arrow_x = DISPLAY_WIDTH - 6;
+        simple_app_draw_scroll_hints(canvas, arrow_x, list_top, y - 2, show_up, show_down);
     }
 }
 
@@ -7401,6 +8078,21 @@ static void simple_app_draw_serial(SimpleApp* app, Canvas* canvas) {
 
     if(app && app->scanner_view_active && !app->scanner_full_console) {
         simple_app_draw_scanner_status(app, canvas);
+        return;
+    }
+
+    if(app && app->probe_results_active && !app->probe_full_console) {
+        simple_app_draw_probe_results_overlay(app, canvas);
+        return;
+    }
+
+    if(app && app->sniffer_results_active && !app->sniffer_full_console) {
+        simple_app_draw_sniffer_results_overlay(app, canvas);
+        return;
+    }
+
+    if(app && app->sniffer_view_active && !app->sniffer_full_console) {
+        simple_app_draw_sniffer_overlay(app, canvas);
         return;
     }
 
@@ -10632,6 +11324,97 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
         return;
     }
 
+    if(app->probe_results_active) {
+        if(key == InputKeyBack) {
+            app->probe_results_active = false;
+            app->probe_full_console = false;
+            app->screen = ScreenMenu;
+            app->serial_follow_tail = true;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
+        if(!app->probe_full_console && app->probe_ssid_count > 0) {
+            ProbeSsidEntry* ssid = &app->probe_ssids[app->probe_ssid_index];
+            uint8_t list_top = 54;
+            uint8_t list_bottom = DISPLAY_HEIGHT - 8;
+            uint8_t max_lines = (uint8_t)(
+                (list_bottom - list_top + SERIAL_TEXT_LINE_HEIGHT) / SERIAL_TEXT_LINE_HEIGHT);
+            if(max_lines == 0) max_lines = 1;
+
+            if(key == InputKeyUp) {
+                if(app->probe_client_offset > 0) {
+                    app->probe_client_offset--;
+                } else if(app->probe_ssid_index > 0) {
+                    app->probe_ssid_index--;
+                    app->probe_client_offset = 0;
+                }
+            } else if(key == InputKeyDown) {
+                if(ssid->client_count > 0 &&
+                   app->probe_client_offset + max_lines < ssid->client_count) {
+                    app->probe_client_offset++;
+                } else if(app->probe_ssid_index + 1 < app->probe_ssid_count) {
+                    app->probe_ssid_index++;
+                    app->probe_client_offset = 0;
+                }
+            } else {
+                // ignore other keys in probe overlay
+                return;
+            }
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
+    }
+
+    if(app->sniffer_results_active && !app->sniffer_full_console) {
+        size_t ap_count = app->sniffer_ap_count;
+        if(ap_count == 0) {
+            return;
+        }
+        SnifferApEntry* ap = &app->sniffer_aps[app->sniffer_results_ap_index];
+        uint8_t list_top = 54;
+        uint8_t list_bottom = DISPLAY_HEIGHT - 8;
+        uint8_t max_lines =
+            (uint8_t)((list_bottom - list_top + SERIAL_TEXT_LINE_HEIGHT) / SERIAL_TEXT_LINE_HEIGHT);
+        if(max_lines == 0) max_lines = 1;
+
+        if(key == InputKeyBack) {
+            app->sniffer_results_active = false;
+            app->sniffer_full_console = false;
+            app->sniffer_view_active = false;
+            app->screen = ScreenMenu;
+            app->serial_follow_tail = true;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        } else if(key == InputKeyUp) {
+            if(app->sniffer_results_client_offset > 0) {
+                app->sniffer_results_client_offset--;
+            } else if(app->sniffer_results_ap_index > 0) {
+                app->sniffer_results_ap_index--;
+                app->sniffer_results_client_offset = 0;
+            }
+        } else if(key == InputKeyDown) {
+            if(ap->client_count > 0 &&
+               app->sniffer_results_client_offset + max_lines < ap->client_count) {
+                app->sniffer_results_client_offset++;
+            } else if(app->sniffer_results_ap_index + 1 < ap_count) {
+                app->sniffer_results_ap_index++;
+                app->sniffer_results_client_offset = 0;
+            }
+        } else {
+            return;
+        }
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
     if(key == InputKeyBack) {
         bool focus_sniffer_results = app->sniffer_show_results_on_back;
         simple_app_send_stop_if_needed(app);
@@ -10951,6 +11734,24 @@ static void simple_app_input(InputEvent* event, void* context) {
             }
             return;
         }
+        if(app->sniffer_view_active || app->sniffer_results_active) {
+            app->sniffer_full_console = !app->sniffer_full_console;
+            app->serial_follow_tail = true;
+            app->serial_targets_hint = false;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
+        if(app->probe_results_active) {
+            app->probe_full_console = !app->probe_full_console;
+            app->serial_follow_tail = true;
+            app->serial_targets_hint = false;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
         if(app->bt_scan_view_active) {
             app->bt_scan_full_console = !app->bt_scan_full_console;
             if(app->bt_scan_full_console) {
@@ -11214,6 +12015,9 @@ int32_t Lab_C5_app(void* p) {
     app->screen = ScreenMenu;
     app->serial_follow_tail = true;
     simple_app_reset_scan_results(app);
+    simple_app_reset_sniffer_status(app);
+    simple_app_reset_sniffer_results(app);
+    simple_app_reset_probe_results(app);
     app->last_input_tick = furi_get_tick();
     app->help_hint_visible = false;
 
