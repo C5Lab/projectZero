@@ -73,8 +73,8 @@ typedef enum {
 #define BACKLIGHT_ON_LEVEL 255
 #define BACKLIGHT_OFF_LEVEL 0
 
-#define SERIAL_BUFFER_SIZE 4096
-#define UART_STREAM_SIZE 4096
+#define SERIAL_BUFFER_SIZE 2048
+#define UART_STREAM_SIZE 2048
 #define MENU_VISIBLE_COUNT 6
 #define MENU_VISIBLE_COUNT_SNIFFERS 4
 #define MENU_VISIBLE_COUNT_ATTACKS 4
@@ -97,6 +97,7 @@ typedef enum {
 #define SNIFFER_CONSOLE_LINES 3
 #define SNIFFER_MAX_APS 32
 #define SNIFFER_MAX_CLIENTS 96
+#define SNIFFER_RESULTS_ARROW_THRESHOLD 200
 #define PROBE_MAX_SSIDS 32
 #define PROBE_MAX_CLIENTS 96
 #define BT_LOCATOR_MAX_DEVICES 64
@@ -116,7 +117,6 @@ typedef enum {
 #define RESULT_SCROLL_EDGE_PAUSE_STEPS 3
 #define DEAUTH_GUARD_BLINK_MS 500
 #define DEAUTH_GUARD_VIBRO_MS 400
-#define DEAUTH_GUARD_LED_LEVEL 255
 #define DEAUTH_GUARD_BLINK_TOGGLES 6
 #define DEAUTH_GUARD_IDLE_MONITOR_MS 60000
 #define CONSOLE_VISIBLE_LINES 4
@@ -201,6 +201,7 @@ static const char* boot_command_options[BOOT_COMMAND_OPTION_COUNT] = {
 #define KARMA_SNIFFER_DURATION_STEP 5
 #define KARMA_AUTO_LIST_DELAY_MS 500
 #define HELP_HINT_IDLE_MS 3000
+#define DOUBLE_BACK_EXIT_MS 700
 #define SD_MANAGER_MAX_FILES 64
 #define SD_MANAGER_FILE_NAME_MAX 64
 #define SD_MANAGER_POPUP_VISIBLE_LINES 3
@@ -406,8 +407,6 @@ typedef struct {
     uint32_t deauth_guard_last_blink_tick;
     bool deauth_guard_blink_state;
     uint8_t deauth_guard_blink_count;
-    uint32_t deauth_guard_led_until;
-    bool deauth_guard_led_state;
     uint32_t deauth_guard_vibro_until;
     bool deauth_guard_vibro_on;
     char deauth_guard_last_ssid[SCAN_SSID_MAX_LEN];
@@ -416,7 +415,6 @@ typedef struct {
     bool deauth_guard_monitoring;
     uint32_t deauth_guard_detection_count;
     bool last_command_sent;
-    bool sniffer_show_results_on_back;
     bool sniffer_view_active;
     bool sniffer_full_console;
     bool sniffer_running;
@@ -550,6 +548,7 @@ typedef struct {
     bool scanner_view_active;
     bool scanner_full_console;
     bool scanner_scan_running;
+    bool scanner_rescan_hint;
     uint16_t scanner_total;
     uint16_t scanner_band_24;
     uint16_t scanner_band_5;
@@ -626,6 +625,7 @@ typedef struct {
     bool board_bootstrap_active;
     bool board_bootstrap_reboot_sent;
     uint32_t last_input_tick;
+    uint32_t last_back_tick;
     bool help_hint_visible;
     bool package_monitor_active;
     uint8_t package_monitor_channel;
@@ -1119,30 +1119,6 @@ static void simple_app_focus_attacks_menu(SimpleApp* app) {
     }
 }
 
-static void simple_app_focus_sniffer_results(SimpleApp* app) {
-    if(!app) return;
-    app->screen = ScreenMenu;
-    app->menu_state = MenuStateItems;
-    app->section_index = MENU_SECTION_SNIFFERS;
-    const MenuSection* section = &menu_sections[MENU_SECTION_SNIFFERS];
-    size_t entry_count = section->entry_count;
-    size_t target_index = (entry_count > 1) ? 1 : 0;
-    app->item_index = (entry_count > 0) ? target_index : 0;
-    size_t visible_count = simple_app_menu_visible_count(app, MENU_SECTION_SNIFFERS);
-    if(visible_count == 0) visible_count = 1;
-    if(entry_count <= visible_count || app->item_index < visible_count) {
-        app->item_offset = 0;
-    } else {
-        size_t max_offset = entry_count - visible_count;
-        size_t desired_offset =
-            (app->item_index >= visible_count) ? (app->item_index - visible_count + 1) : 0;
-        if(desired_offset > max_offset) {
-            desired_offset = max_offset;
-        }
-        app->item_offset = desired_offset;
-    }
-}
-
 static void simple_app_truncate_text(char* text, size_t max_chars) {
     if(!text || max_chars == 0) return;
     size_t len = strlen(text);
@@ -1357,6 +1333,7 @@ static void simple_app_reset_scanner_stats(SimpleApp* app) {
     app->scanner_best_ssid[0] = '\0';
     app->scanner_last_update_tick = 0;
     app->scanner_scan_running = false;
+    app->scanner_rescan_hint = false;
 }
 
 static bool simple_app_security_is_open(const char* security) {
@@ -2779,8 +2756,6 @@ static void simple_app_reset_deauth_guard(SimpleApp* app) {
     app->deauth_guard_last_blink_tick = 0;
     app->deauth_guard_blink_state = false;
     app->deauth_guard_blink_count = 0;
-    app->deauth_guard_led_until = 0;
-    app->deauth_guard_led_state = false;
     if(app->deauth_guard_vibro_on) {
         furi_hal_vibro_on(false);
     }
@@ -2789,9 +2764,6 @@ static void simple_app_reset_deauth_guard(SimpleApp* app) {
     app->deauth_guard_line_length = 0;
     memset(app->deauth_guard_last_ssid, 0, sizeof(app->deauth_guard_last_ssid));
     memset(app->deauth_guard_line_buffer, 0, sizeof(app->deauth_guard_line_buffer));
-    furi_hal_light_set(LightRed, 0);
-    furi_hal_light_set(LightGreen, 0);
-    furi_hal_light_set(LightBlue, 0);
     if(was_blinking) {
         simple_app_apply_backlight(app);
     }
@@ -2874,11 +2846,6 @@ static void simple_app_process_deauth_guard_line(SimpleApp* app, const char* lin
         now + furi_ms_to_ticks(DEAUTH_GUARD_BLINK_MS * DEAUTH_GUARD_BLINK_TOGGLES);
     app->deauth_guard_last_blink_tick = now;
     app->deauth_guard_blink_state = true;
-    app->deauth_guard_led_until = app->deauth_guard_blink_until;
-    app->deauth_guard_led_state = true;
-    furi_hal_light_set(LightRed, DEAUTH_GUARD_LED_LEVEL);
-    furi_hal_light_set(LightGreen, 0);
-    furi_hal_light_set(LightBlue, 0);
 
     if(!app->deauth_guard_vibro_on) {
         app->deauth_guard_vibro_on = true;
@@ -2947,13 +2914,6 @@ static void simple_app_update_deauth_guard(SimpleApp* app) {
         app->deauth_guard_blink_until = 0;
         app->deauth_guard_blink_state = false;
         simple_app_apply_backlight(app);
-        if(app->deauth_guard_led_state) {
-            furi_hal_light_set(LightRed, 0);
-            furi_hal_light_set(LightGreen, 0);
-            furi_hal_light_set(LightBlue, 0);
-            app->deauth_guard_led_state = false;
-            app->deauth_guard_led_until = 0;
-        }
         if(app->deauth_guard_vibro_on) {
             furi_hal_vibro_on(false);
             app->deauth_guard_vibro_on = false;
@@ -2973,19 +2933,6 @@ static void simple_app_update_deauth_guard(SimpleApp* app) {
         uint8_t level =
             app->deauth_guard_blink_state ? BACKLIGHT_ON_LEVEL : BACKLIGHT_OFF_LEVEL;
         furi_hal_light_set(LightBacklight, level);
-        if(now < app->deauth_guard_led_until) {
-            if(app->deauth_guard_blink_state) {
-                furi_hal_light_set(LightRed, DEAUTH_GUARD_LED_LEVEL);
-                furi_hal_light_set(LightGreen, 0);
-                furi_hal_light_set(LightBlue, 0);
-                app->deauth_guard_led_state = true;
-            } else {
-                furi_hal_light_set(LightRed, 0);
-                furi_hal_light_set(LightGreen, 0);
-                furi_hal_light_set(LightBlue, 0);
-                app->deauth_guard_led_state = false;
-            }
-        }
     }
 
     if(app->deauth_guard_vibro_on && now >= app->deauth_guard_vibro_until) {
@@ -4016,6 +3963,7 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
     if(strncmp(cursor, "Scan results", 12) == 0) {
         app->scan_results_loading = false;
         app->scanner_scan_running = false;
+        app->scanner_rescan_hint = false;
         if(app->scanner_last_update_tick == 0) {
             app->scanner_last_update_tick = furi_get_tick();
         }
@@ -4740,12 +4688,6 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     if(is_stop_command) {
         simple_app_restore_otg_after_wardrive(app);
     }
-    if(is_stop_command) {
-        app->sniffer_show_results_on_back = false;
-    } else {
-        app->sniffer_show_results_on_back = is_start_sniffer;
-    }
-
     if(is_start_sniffer) {
         simple_app_reset_sniffer_status(app);
         app->sniffer_view_active = true;
@@ -4927,7 +4869,6 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     simple_app_reset_deauth_guard(app);
     simple_app_clear_status_message(app);
 
-    app->sniffer_show_results_on_back = false;
     app->sniffer_view_active = false;
     app->sniffer_results_active = false;
     app->probe_results_active = false;
@@ -7319,17 +7260,13 @@ static void simple_app_draw_scanner_status(SimpleApp* app, Canvas* canvas) {
 
     char status_line[48];
     if(app->scan_results_loading || app->scanner_scan_running) {
-        snprintf(status_line, sizeof(status_line), "Scanning...");
-    } else if(app->scanner_total > 0) {
-        if(app->scanner_last_update_tick > 0) {
-            uint32_t ticks_per_second = furi_ms_to_ticks(1000);
-            if(ticks_per_second == 0) ticks_per_second = 1;
-            uint32_t elapsed =
-                (furi_get_tick() - app->scanner_last_update_tick) / ticks_per_second;
-            snprintf(status_line, sizeof(status_line), "Done %lus ago", (unsigned long)elapsed);
+        if(app->scanner_rescan_hint) {
+            snprintf(status_line, sizeof(status_line), "Rescanning...");
         } else {
-            snprintf(status_line, sizeof(status_line), "Done");
+            snprintf(status_line, sizeof(status_line), "Scanning...");
         }
+    } else if(app->scanner_total > 0) {
+        snprintf(status_line, sizeof(status_line), "Finished");
     } else if(app->scanner_last_update_tick > 0) {
         snprintf(status_line, sizeof(status_line), "No networks");
     } else {
@@ -7407,6 +7344,11 @@ static void simple_app_draw_sniffer_overlay(SimpleApp* app, Canvas* canvas) {
         snprintf(mode_line, sizeof(mode_line), "Mode: ?");
     }
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 54, AlignCenter, AlignCenter, mode_line);
+
+    if(app->sniffer_has_data && app->sniffer_packet_count >= SNIFFER_RESULTS_ARROW_THRESHOLD) {
+        canvas_draw_str_aligned(
+            canvas, DISPLAY_WIDTH - 4, DISPLAY_HEIGHT - 2, AlignRight, AlignBottom, "->");
+    }
 }
 
 static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canvas) {
@@ -7490,6 +7432,9 @@ static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canv
         simple_app_draw_scroll_hints(canvas, arrow_x, list_top, y - 2, show_up, show_down);
     }
 
+    if(app->sniffer_has_data || ap_count > 0 || client_count > 0) {
+        canvas_draw_str(canvas, 2, DISPLAY_HEIGHT - 2, "->");
+    }
 }
 
 static void simple_app_draw_bt_scan_overlay(SimpleApp* app, Canvas* canvas) {
@@ -7544,7 +7489,7 @@ static void simple_app_draw_probe_results_overlay(SimpleApp* app, Canvas* canvas
 
     char header[32];
     snprintf(header, sizeof(header), "SSIDs:%u Req:%u", (unsigned)ssid_count, (unsigned)app->probe_total);
-    canvas_draw_str(canvas, 2, 12, "Probe Requests");
+    canvas_draw_str(canvas, 2, 12, "Probes");
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 2, 12, AlignRight, AlignBottom, header);
 
     if(ssid_count == 0) {
@@ -7609,6 +7554,8 @@ static void simple_app_draw_probe_results_overlay(SimpleApp* app, Canvas* canvas
         uint8_t arrow_x = DISPLAY_WIDTH - 6;
         simple_app_draw_scroll_hints(canvas, arrow_x, list_top, y - 2, show_up, show_down);
     }
+
+    canvas_draw_str(canvas, 2, DISPLAY_HEIGHT - 2, "<-");
 }
 
 static void simple_app_draw_bt_scan_list(SimpleApp* app, Canvas* canvas) {
@@ -11308,15 +11255,9 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
     if(app->deauth_guard_view_active && !app->deauth_guard_full_console) {
         // In Deauth Guard compact mode ignore navigation; only Back stops and exits.
         if(key == InputKeyBack) {
-            bool focus_sniffer_results = app->sniffer_show_results_on_back;
             simple_app_send_stop_if_needed(app);
             app->serial_targets_hint = false;
-            if(focus_sniffer_results) {
-                simple_app_focus_sniffer_results(app);
-                app->sniffer_show_results_on_back = false;
-            } else {
-                app->screen = ScreenMenu;
-            }
+            app->screen = ScreenMenu;
             app->serial_follow_tail = true;
             simple_app_update_scroll(app);
             view_port_update(app->viewport);
@@ -11330,6 +11271,23 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
             app->probe_full_console = false;
             app->screen = ScreenMenu;
             app->serial_follow_tail = true;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
+        if(key == InputKeyRight) {
+            // Boundary hint: no further screen to the right from Probes.
+            furi_hal_vibro_on(true);
+            furi_delay_ms(40);
+            furi_hal_vibro_on(false);
+            return;
+        }
+        if(key == InputKeyLeft) {
+            app->probe_results_active = false;
+            app->probe_full_console = false;
+            app->sniffer_results_active = true;
+            app->sniffer_full_console = false;
             if(app->viewport) {
                 view_port_update(app->viewport);
             }
@@ -11380,6 +11338,9 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
         uint8_t max_lines =
             (uint8_t)((list_bottom - list_top + SERIAL_TEXT_LINE_HEIGHT) / SERIAL_TEXT_LINE_HEIGHT);
         if(max_lines == 0) max_lines = 1;
+        bool can_jump_to_probes =
+            (app->sniffer_has_data && app->sniffer_packet_count >= SNIFFER_RESULTS_ARROW_THRESHOLD) ||
+            ap_count > 0 || app->sniffer_client_count > 0;
 
         if(key == InputKeyBack) {
             app->sniffer_results_active = false;
@@ -11390,6 +11351,12 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
             if(app->viewport) {
                 view_port_update(app->viewport);
             }
+            return;
+        } else if(key == InputKeyLeft) {
+            simple_app_send_start_sniffer(app);
+            return;
+        } else if(key == InputKeyRight && can_jump_to_probes) {
+            simple_app_send_command(app, "show_probes", true);
             return;
         } else if(key == InputKeyUp) {
             if(app->sniffer_results_client_offset > 0) {
@@ -11415,14 +11382,30 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
         return;
     }
 
+    if(app->sniffer_view_active && !app->sniffer_full_console && key == InputKeyRight &&
+       app->sniffer_has_data && app->sniffer_packet_count >= SNIFFER_RESULTS_ARROW_THRESHOLD) {
+        // Stop current sniffer session before requesting results to avoid it running in background.
+        simple_app_send_command(app, "stop", false);
+        simple_app_send_command(app, "show_sniffer_results", true);
+        return;
+    }
+    if(app->sniffer_view_active && !app->sniffer_full_console && key == InputKeyLeft) {
+        // Boundary hint: nothing to the left of Sniffer overlay.
+        furi_hal_vibro_on(true);
+        furi_delay_ms(40);
+        furi_hal_vibro_on(false);
+        return;
+    }
+
+    if(app->scanner_view_active && !app->scanner_full_console && key == InputKeyOk) {
+        simple_app_send_command(app, SCANNER_SCAN_COMMAND, true);
+        return;
+    }
+
     if(key == InputKeyBack) {
-        bool focus_sniffer_results = app->sniffer_show_results_on_back;
         simple_app_send_stop_if_needed(app);
         app->serial_targets_hint = false;
-        if(focus_sniffer_results) {
-            simple_app_focus_sniffer_results(app);
-            app->sniffer_show_results_on_back = false;
-        } else if(app->blackout_view_active) {
+        if(app->blackout_view_active) {
             app->blackout_view_active = false;
             simple_app_focus_attacks_menu(app);
         } else {
@@ -11516,9 +11499,9 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
 
 static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
     if(key == InputKeyBack || key == InputKeyLeft) {
-        simple_app_send_stop_if_needed(app);
-        app->screen = ScreenMenu;
-        view_port_update(app->viewport);
+        // Restart scanner when exiting targets/results to refresh data and hide navigation arrow.
+        app->scanner_rescan_hint = true;
+        simple_app_send_command(app, SCANNER_SCAN_COMMAND, true);
         return;
     }
 
@@ -11653,7 +11636,53 @@ static void simple_app_input(InputEvent* event, void* context) {
     SimpleApp* app = context;
     if(!app || !event) return;
 
+    // Global long Back: stop and return to main menu regardless of current state.
+    if(event->type == InputTypeLong && event->key == InputKeyBack) {
+        simple_app_send_stop_if_needed(app);
+        app->serial_targets_hint = false;
+        app->scanner_view_active = false;
+        app->sniffer_view_active = false;
+        app->sniffer_results_active = false;
+        app->probe_results_active = false;
+        app->bt_scan_view_active = false;
+        app->bt_locator_mode = false;
+        app->blackout_view_active = false;
+        app->deauth_guard_view_active = false;
+        app->screen = ScreenMenu;
+        app->menu_state = MenuStateSections;
+        simple_app_adjust_section_offset(app);
+        app->serial_follow_tail = true;
+        app->last_back_tick = 0;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
     uint32_t now = furi_get_tick();
+
+    // Global double short Back: show exit confirmation (after stopping tasks).
+    if(event->type == InputTypeShort && event->key == InputKeyBack) {
+        uint32_t last = app->last_back_tick;
+        app->last_back_tick = now;
+        if(last != 0 && (now - last) <= furi_ms_to_ticks(DOUBLE_BACK_EXIT_MS)) {
+            simple_app_send_stop_if_needed(app);
+            app->serial_targets_hint = false;
+            app->confirm_exit_yes = false;
+            app->exit_confirm_active = true;
+            app->exit_confirm_tick = now;
+            app->screen = ScreenConfirmExit;
+            app->menu_state = MenuStateSections;
+            app->help_hint_visible = false;
+            app->last_back_tick = 0;
+            app->last_input_tick = now;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
+    }
+
     app->last_input_tick = now;
     if(app->help_hint_visible) {
         app->help_hint_visible = false;
