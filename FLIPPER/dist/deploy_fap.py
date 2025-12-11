@@ -8,6 +8,7 @@ Upload an existing .fap from dist/ to a connected Flipper over USB CDC (serial, 
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
 from typing import List
 
@@ -53,7 +54,26 @@ def ensure_ufbt_in_path() -> None:
         sys.path.insert(0, str(ufbt_scripts))
 
 
+def ensure_pyserial_installed() -> None:
+    """Verify pyserial is available; install it if missing."""
+    try:
+        import serial  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    print("pyserial not detected. Installing with pip ...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "pyserial"])
+    except Exception as exc:
+        raise RuntimeError(
+            "pyserial is required but could not be installed automatically. "
+            "Install it manually with `python -m pip install pyserial` and retry."
+        ) from exc
+
+
 def pick_port() -> str:
+    ensure_pyserial_installed()
     from serial.tools import list_ports
 
     ports = list(list_ports.comports())
