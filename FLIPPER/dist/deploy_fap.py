@@ -54,6 +54,24 @@ def ensure_ufbt_in_path() -> None:
         sys.path.insert(0, str(ufbt_scripts))
 
 
+def ensure_ufbt_installed() -> None:
+    """Verify ufbt toolchain (flipper.storage) is available; install if missing."""
+    try:
+        import flipper.storage  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    print("ufbt (flipper.storage) not detected. Installing with pip ...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "ufbt"])
+    except Exception as exc:
+        raise RuntimeError(
+            "ufbt is required but could not be installed automatically. "
+            "Install it manually with `python -m pip install -U ufbt` and retry."
+        ) from exc
+
+
 def ensure_pyserial_installed() -> None:
     """Verify pyserial is available; install it if missing."""
     try:
@@ -141,6 +159,7 @@ def run_app(storage, flipper_path: str) -> None:
 
 
 def upload_via_serial(fap: Path, port: str, flipper_dir: str, purge: bool, run_after: bool) -> None:
+    ensure_ufbt_installed()
     ensure_ufbt_in_path()
     try:
         from flipper.storage import FlipperStorage, FlipperStorageOperations
