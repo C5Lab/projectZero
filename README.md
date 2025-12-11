@@ -126,7 +126,7 @@ We're regular tinkerers who got bored and decided to design the full stack ourse
 - Join the LAB Discord server to discuss ESP32-C5 builds and projectZero workflows: https://discord.gg/57wmJzzR8C
 
 ## Last Changes
-- 2025-12-11 FAP 0.35 - fixed qFlipper-connected crash; Sniffer flow adds 200+ pkt right-jump to Results then Probes, left/back returns; Probes label corrected for 2-digit SSID counts; haptics on Sniffer edge; hold Back to root, double Back opens Exit; Deauth Guard LED hit indicator removed; Wi-Fi Targets left re-runs Scanner and resets results.
+- 2025-12-11 FAP 0.35 - fixed qFlipper-connected crash; Sniffer flow adds 200+ pkt right-jump to Results then Probes, left/back returns; Probes label corrected for 2-digit SSID counts; haptics on Sniffer edge; hold Back to root, double Back opens Exit; Deauth Guard LED hit indicator removed; Wi-Fi Targets left re-runs Scanner and resets results; restored Scanner arrow after returning from console; build via `FLIPPER/build_fap.py`, deploy via `FLIPPER/dist/deploy_fap.py`.
 - 2025-12-10 FAP 0.34 Sniffer - new GUI for all 3 options
 - 2025-12-08 JanOS 1.0.0 fix BT name scan / FAP 0.33 Wifi Scanner new GUI / BT all GUI rework, BT scan show name of device / Exit from FAP small heptic.
 - 2025-12-07 JanOS 1.0.0 BT scan / Airtag scan / BT Locator / Deauth Guard passive deauth detection / FAP 031 support for JanOS 1.0.0 new Bluetooth menu

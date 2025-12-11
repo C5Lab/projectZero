@@ -19,6 +19,7 @@
 #include <furi_hal_usb.h>
 #include <furi_hal_usb_cdc.h>
 #include <furi_hal_vibro.h>
+#include <dialogs/dialogs.h>
 #include <usb_cdc.h>
 
 #define TAG "Lab_C5"
@@ -58,7 +59,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.34"
+#define LAB_C5_VERSION_TEXT "0.35"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -655,7 +656,6 @@ typedef struct {
     // Download/bridge state
     bool download_bridge_active;
     uint8_t download_cdc_if;
-    FuriHalUsbInterface* download_usb_prev;
     FuriThread* download_thread;
     uint32_t download_baud;
     uint32_t download_baud_new;
@@ -692,6 +692,8 @@ static void simple_app_serial_irq(
 static void simple_app_draw_download_bridge(SimpleApp* app, Canvas* canvas);
 static bool simple_app_download_bridge_start(SimpleApp* app);
 static void simple_app_download_bridge_stop(SimpleApp* app);
+static bool simple_app_usb_profile_ok(void);
+static void simple_app_show_usb_blocker(void);
 static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long);
 static void simple_app_on_board_online(SimpleApp* app, const char* source);
 static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas);
@@ -11499,9 +11501,15 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
 
 static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
     if(key == InputKeyBack || key == InputKeyLeft) {
-        // Restart scanner when exiting targets/results to refresh data and hide navigation arrow.
+        // Restart scanner when exiting targets/results: clear stale rows and redraw scan state.
+        simple_app_reset_scan_results(app);
+        app->scan_results_loading = true;
+        app->serial_targets_hint = false;
         app->scanner_rescan_hint = true;
         simple_app_send_command(app, SCANNER_SCAN_COMMAND, true);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
         return;
     }
 
@@ -11757,7 +11765,6 @@ static void simple_app_input(InputEvent* event, void* context) {
         if(app->scanner_view_active) {
             app->scanner_full_console = !app->scanner_full_console;
             app->serial_follow_tail = true;
-            app->serial_targets_hint = false;
             if(app->viewport) {
                 view_port_update(app->viewport);
             }
@@ -11936,6 +11943,32 @@ static void simple_app_download_bridge_stop(SimpleApp* app) {
     (void)app;
 }
 
+static bool simple_app_usb_profile_ok(void) {
+    const FuriHalUsbInterface* current = furi_hal_usb_get_config();
+    if(!current) return true;
+    return current == &usb_cdc_single;
+}
+
+static void simple_app_show_usb_blocker(void) {
+    DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
+    if(dialogs) {
+        DialogMessage* msg = dialog_message_alloc();
+        if(msg) {
+            dialog_message_set_header(msg, "USB in use", 64, 8, AlignCenter, AlignTop);
+            dialog_message_set_text(
+                msg,
+                "Close qFlipper/mass\nstorage.\nSet USB to CDC/Serial\nthen relaunch.",
+                64,
+                32,
+                AlignCenter,
+                AlignCenter);
+            dialog_message_show(dialogs, msg);
+            dialog_message_free(msg);
+        }
+        furi_record_close(RECORD_DIALOGS);
+    }
+}
+
 static void simple_app_serial_irq(FuriHalSerialHandle* handle, FuriHalSerialRxEvent event, void* context) {
     SimpleApp* app = context;
     if(!app || !app->rx_stream || !(event & FuriHalSerialRxEventData)) return;
@@ -11969,6 +12002,10 @@ static void simple_app_draw_download_bridge(SimpleApp* app, Canvas* canvas) {
 
 int32_t Lab_C5_app(void* p) {
     UNUSED(p);
+
+    if(!simple_app_usb_profile_ok()) {
+        simple_app_show_usb_blocker();
+    }
 
     SimpleApp* app = malloc(sizeof(SimpleApp));
     if(!app) {
