@@ -294,6 +294,7 @@
       esploader: null,
       chip: null,
       isFlashing: false,
+      monitoring: false,
     };
 
     const log = (msg) => {
@@ -347,6 +348,43 @@
         setStatus("Web Serial not available. Use Chrome/Edge over HTTPS.", "error");
         throw new Error("Web Serial unavailable");
       }
+    };
+
+
+    const startMonitor = async () => {
+      if (state.monitoring || !state.reader) return;
+      state.monitoring = true;
+      log("Serial monitor started. Disconnect to stop.");
+      try {
+        while (state.monitoring && state.connected) {
+          const { value, done } = await state.reader.read();
+          if (done) break;
+          if (value) {
+            ui.log.textContent += value;
+            ui.log.scrollTop = ui.log.scrollHeight;
+          }
+        }
+      } catch (err) {
+        log(`Monitor stopped: ${err.message || err}`);
+      } finally {
+        state.monitoring = false;
+      }
+    };
+
+    const tryReset = async () => {
+      const t = state.transport;
+      if (state.esploader && typeof state.esploader.hardReset === "function") {
+        await state.esploader.hardReset();
+        return "hardReset()";
+      }
+      if (t && typeof t.setDTR === "function" && typeof t.setRTS === "function") {
+        await t.setDTR(false);
+        await t.setRTS(true);
+        await new Promise((r) => setTimeout(r, 120));
+        await t.setRTS(false);
+        return "DTR/RTS toggle";
+      }
+      throw new Error("Reset not supported by transport");
     };
 
     const connect = async () => {
@@ -450,6 +488,7 @@ const flash = async () => {
       ui.flashBtn.disabled = true;
       ui.connectBtn.disabled = true;
       state.isFlashing = true;
+      state.monitoring = false;
       ui.progress.style.width = "0%";
       try {
         const files = await fetchFiles();
@@ -471,14 +510,15 @@ const flash = async () => {
         await state.esploader.after();
         try {
           setStatus("Flash complete. Resetting ...");
-          await state.esploader.hardReset();
-          log("Hard reset sent.");
+          const how = await tryReset();
+          log(`Reset sent (${how}).`);
         } catch (e) {
           log(`Reset failed (ignored): ${e.message || e}`);
         }
         ui.progress.style.width = "100%";
-        setStatus("Flash complete. Press RESET if the board doesn't reboot.");
+        setStatus("Flash complete. Monitoring serial; unplug/disconnect to stop.");
         log("Flash complete.");
+        startMonitor().catch((err) => log(`Monitor start failed: ${err.message || err}`));
       } catch (err) {
         console.error(err);
         setStatus(err.message || "Flash failed", "error");
@@ -491,6 +531,7 @@ const flash = async () => {
     };
 
     const disconnect = async () => {
+      state.monitoring = false;
       try {
         if (state.transport) {
           await state.transport.disconnect();
