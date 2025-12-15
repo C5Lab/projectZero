@@ -295,6 +295,8 @@
       chip: null,
       isFlashing: false,
       monitoring: false,
+      connected: false,
+      monitorReader: null,
     };
 
     const log = (msg) => {
@@ -352,22 +354,29 @@
 
 
     const startMonitor = async () => {
-      if (state.monitoring || !state.reader) return;
+      if (state.monitoring || !state.port?.readable) return;
       state.monitoring = true;
       log("Serial monitor started. Disconnect to stop.");
       try {
+        const decoder = new TextDecoderStream();
+        const pipe = state.port.readable.pipeTo(decoder.writable);
+        const reader = decoder.readable.getReader();
+        state.monitorReader = reader;
         while (state.monitoring && state.connected) {
-          const { value, done } = await state.reader.read();
+          const { value, done } = await reader.read();
           if (done) break;
           if (value) {
             ui.log.textContent += value;
             ui.log.scrollTop = ui.log.scrollHeight;
           }
         }
+        await reader.cancel().catch(() => {});
+        await pipe.catch(() => {});
       } catch (err) {
         log(`Monitor stopped: ${err.message || err}`);
       } finally {
         state.monitoring = false;
+        state.monitorReader = null;
       }
     };
 
@@ -416,6 +425,7 @@
         setStatus(`Connected to ${state.chip}. Ready to flash.`);
         log(`Connected: ${state.chip}`);
         ui.flashBtn.disabled = false;
+        state.connected = true;
       } catch (err) {
         console.error(err);
         setStatus(err.message || "Connection failed", "error");
@@ -533,6 +543,9 @@ const flash = async () => {
     const disconnect = async () => {
       state.monitoring = false;
       try {
+        if (state.monitorReader) {
+          await state.monitorReader.cancel().catch(() => {});
+        }
         if (state.transport) {
           await state.transport.disconnect();
         } else if (state.port && state.port.close) {
@@ -546,6 +559,7 @@ const flash = async () => {
       ui.chip.style.display = "none";
       ui.flashBtn.disabled = true;
       setStatus("Disconnected.");
+      state.connected = false;
     };
 
     ui.connectBtn.addEventListener("click", () => connect().catch(() => {}));
