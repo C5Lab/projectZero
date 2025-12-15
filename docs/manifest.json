@@ -4,8 +4,8 @@
   "build": "latest",
   "chipFamily": "ESP32-C5",
   "parts": [
-    { "path": "firmware/bootloader.bin", "offset": 8192 },
-    { "path": "firmware/partition-table.bin", "offset": 32768 },
-    { "path": "firmware/projectZero.bin", "offset": 65536 }
+    { "path": "https://raw.githubusercontent.com/C5Lab/projectZero/main/ESP32C5/binaries-esp32c5/bootloader.bin", "offset": 8192 },
+    { "path": "https://raw.githubusercontent.com/C5Lab/projectZero/main/ESP32C5/binaries-esp32c5/partition-table.bin", "offset": 32768 },
+    { "path": "https://raw.githubusercontent.com/C5Lab/projectZero/main/ESP32C5/binaries-esp32c5/projectZero.bin", "offset": 65536 }
   ]
 }
