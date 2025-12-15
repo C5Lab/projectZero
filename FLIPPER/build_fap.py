@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
 """
-Build lab_c5 for Momentum and Unleashed SDK bundles found in sdk/.
-- Picks the newest zip whose name contains mntm/momentum (Momentum) or unlsh/unleashed (Unleashed).
-- Runs `ufbt update --hw f7 --url <file:///path/to/sdk.zip>` and `ufbt` to build.
-- Renames dist/lab_c5.fap to lab_c5_v<version>_<variant>.fap, removing older files with that name.
+CI-friendly FAP builder for lab_c5.
+
+Ported from upstream (development branch) with tweaks:
+- Skips interactive upload when running in CI or when --no-upload is passed.
+- Allows optional --sdk-dir override; defaults to FLIPPER/sdk.
+- Renames artifacts to lab_c5_v<version>_<variant>.fap.
+
+Expected layout:
+  FLIPPER/
+    Lab_C5.c              (contains LAB_C5_VERSION_TEXT)
+    sdk/*.zip             (Momentum / Unleashed SDK zips)
+    dist/                 (build outputs)
 """
 
 from __future__ import annotations
 
+import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -16,7 +26,6 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 ROOT = Path(__file__).resolve().parent
-SDK_DIR = ROOT / "sdk"
 DIST_DIR = ROOT / "dist"
 DIST_FAP = DIST_DIR / "lab_c5.fap"
 SOURCE_FILE = ROOT / "Lab_C5.c"
@@ -27,6 +36,22 @@ VARIANTS = (
 )
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build lab_c5 FAP variants")
+    parser.add_argument(
+        "--sdk-dir",
+        type=Path,
+        default=ROOT / "sdk",
+        help="Directory containing Momentum/Unleashed SDK zips (default: FLIPPER/sdk)",
+    )
+    parser.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="Do not prompt or attempt upload after build",
+    )
+    return parser.parse_args()
+
+
 def read_version() -> str:
     text = SOURCE_FILE.read_text(encoding="utf-8", errors="ignore")
     match = re.search(r'#define\s+LAB_C5_VERSION_TEXT\s+"([^"]+)"', text)
@@ -35,10 +60,10 @@ def read_version() -> str:
     return match.group(1)
 
 
-def pick_sdk(patterns: Iterable[str]) -> Optional[Path]:
+def pick_sdk(sdk_dir: Path, patterns: Iterable[str]) -> Optional[Path]:
     candidates = [
         path
-        for path in SDK_DIR.glob("*.zip")
+        for path in sdk_dir.glob("*.zip")
         if any(token in path.name.lower() for token in patterns)
     ]
     if not candidates:
@@ -127,6 +152,7 @@ def prompt_upload_choice(built: list[tuple[str, Path]]) -> Optional[tuple[str, P
 
 
 def main() -> None:
+    args = parse_args()
     ensure_dependencies()
     version = read_version()
     print(f"Detected version: {version}")
@@ -136,9 +162,9 @@ def main() -> None:
     built_variants: list[tuple[str, Path]] = []
 
     for variant, patterns in VARIANTS:
-        sdk = pick_sdk(patterns)
+        sdk = pick_sdk(args.sdk_dir, patterns)
         if not sdk:
-            print(f"Skipping {variant}: no matching SDK zip in {SDK_DIR}")
+            print(f"Skipping {variant}: no matching SDK zip in {args.sdk_dir}")
             continue
         print(f"\n=== {variant.upper()} ===")
         print(f"Using SDK: {sdk.name}")
@@ -147,13 +173,21 @@ def main() -> None:
         rename_artifact(version, variant)
         built_variants.append((variant, sdk))
 
-    selected = prompt_upload_choice(built_variants)
-    if selected:
-        variant, sdk = selected
-        print(f"\nUploading {variant} build using SDK {sdk.name}...")
-        update_sdk(sdk)
-        upload_app()
-        print("Upload finished. Ensure your Flipper is connected over USB and unlocked.")
+    if not built_variants:
+        print("No variants built (missing SDK zips?).")
+        return
+
+    should_upload = not args.no_upload and not os.getenv("CI")
+    if should_upload:
+        selected = prompt_upload_choice(built_variants)
+        if selected:
+            variant, sdk = selected
+            print(f"\nUploading {variant} build using SDK {sdk.name}...")
+            update_sdk(sdk)
+            upload_app()
+            print("Upload finished. Ensure your Flipper is connected over USB and unlocked.")
+    else:
+        print("Upload skipped (CI or --no-upload).")
 
     print("\nDone.")
 
