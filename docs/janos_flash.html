@@ -469,6 +469,13 @@ const flash = async () => {
         };
         await state.esploader.writeFlash(flashOptions);
         await state.esploader.after();
+        try {
+          setStatus("Flash complete. Resetting ...");
+          await state.esploader.hardReset();
+          log("Hard reset sent.");
+        } catch (e) {
+          log(`Reset failed (ignored): ${e.message || e}`);
+        }
         ui.progress.style.width = "100%";
         setStatus("Flash complete. Press RESET if the board doesn't reboot.");
         log("Flash complete.");
