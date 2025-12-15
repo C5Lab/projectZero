@@ -12,8 +12,20 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 <img src="Gfx/fap_over.gif" alt="GUI overview" width="30%">
 
 - Scan once, re-use the dataset everywhere: CLI commands and the Flipper Targets list consume the same buffers from `ESP32C5/main/main.c`.
+- Bluetooth toolkit slots in alongside Wi-Fi recon: BT scan sweeps for BLE beacons, Airtag scan hunts trackers, and BT Locator uses RSSI to home in on a chosen target.
 - Attacks keep their own FreeRTOS tasks and respect the global `stop` flag, so you can stack scans, sniffing and portals without rebooting.
 - Credential harvesting writes to `/sdcard/lab/portals.txt`, and validated passwords automatically end a deauth run.
+- Deauth Guard constantly listens for deauth floods and flags nearby networks that are being kicked offline.
+
+### Features
+- Dual-band Wi-Fi recon pipeline: `scan_networks` → `select_networks` → `show_scan_results` shares one target table across the CLI and Flipper UI.
+- Packet intelligence: `start_sniffer`, `show_sniffer_results`, `show_probes`, and `list_probes` capture AP/client pairs and probe SSIDs; `sniffer_debug` unlocks verbose traces.
+- Channel telemetry: `packet_monitor` shows packets-per-second per channel, while `channel_view` continuously prints utilization so you can pick the quietest lanes.
+- Attack suite: `start_deauth`, `start_blackout`, `start_sniffer_dog`, `start_evil_twin`, `start_handshake`, `sae_overflow`, `start_karma`, `start_portal`, and `start_wardrive`.
+- Bluetooth toolkit: `scan_bt` runs a 10s BLE sweep or tracks a specific MAC for locator duty; `scan_airtag` keeps hunting AirTags/SmartTags with periodic rollups.
+- Defensive watch: `deauth_detector` (Deauth Guard) passively flags nearby deauth floods before they disrupt your targets.
+- SD and vendor helpers: `list_sd`, `list_dir`, `file_delete`, `select_html`, `list_ssid`, plus OUI lookups via `vendor set/read`.
+- Controls and safety: `boot_button`, `channel_time`, `led`, `stop`, `reboot`, `download`, `ping`, and `save_handshake` to map buttons, tune scan dwell, reboot to UART flash, or flush captured handshakes.
 
 ## Core Capabilities
 
@@ -23,7 +35,9 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 - `start_sniffer` / `show_sniffer_results` - dual-band sniffer logs AP/client pairs, RSSI and last-seen timestamps; use `sniffer_debug <0|1>` to toggle verbose logging.
 - `show_probes` / `list_probes` - reviews all captured probe requests so you can pivot into Karma or custom portals.
 - `packet_monitor <channel>` - lightweight packet-per-second telemetry for a single channel, useful before launching SAE floods.
+- `channel_view` - continuous sweep that prints channel utilization so you can pick the quietest lanes before attacking.
 - `start_wardrive` - waits for a GPS fix, then writes Wigle-style logs to `/sdcard/lab/wardrives/wXXXX.log` with auth mode, RSSI, and coordinates.
+- Bluetooth discovery pipeline: `scan_bt` does a 10s BLE sweep (or continuous RSSI tracking when you pass a MAC for locator duty) and `scan_airtag` keeps hunting AirTags/SmartTags with 30s rollups.
 
 ### Credential Capture & Portal Control
 - `start_evil_twin` - spins up the ESP-NOW link to the secondary ESP32 so that deauth + portal orchestration happens automatically; once a password is validated, ESP32-C5 stops the attack.
@@ -31,6 +45,7 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 - `list_sd` / `select_html <index>` - browse `/sdcard/lab/htmls/` for custom captive-portal templates (limited to 800 KB each) and push them into RAM.
 - `start_karma <probe_index>` - re-broadcasts one of the sniffed probe SSIDs so the portal can masquerade as whatever nearby phones expect.
 - `start_handshake` - exclusive LAB feature that spins up a dedicated WPA handshake capture task (shown as **Handshaker** inside the Flipper UI). More details: https://github.com/C5Lab/projectZero/wiki/Handshaker
+- `save_handshake` - manual flush of a completed 4-way handshake to the SD card when you want to preserve it before stopping attacks.
 
 ### Disruption & Containment
 - `start_deauth` - multi-network broadcast and targeted deauth (including DFS/high 5 GHz channels) with LED status feedback.
@@ -40,12 +55,20 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 - Deep dive into both flows: https://github.com/C5Lab/projectZero/wiki/Blackout_SnifferDog
 - `white.txt` - place MAC addresses (one per line) on `/sdcard/lab/white.txt` to exempt them from Blackout and Sniffer Dog logic.
 
+### Defensive Monitoring
+- `deauth_detector [ch ...]` - Deauth Guard CLI: passive scan of all channels (or selected indexes) to flag networks being deauthorized nearby.
+- Deauth Guard scanner keeps a passive ear on the air and raises an alert whenever it detects deauth frames hitting nearby networks, so you know if someone else is running jammers.
+
 ### System Utilities & Feedback
+- `boot_button read|list|set <short|long> <command>` and `boot_button status <short|long> <on|off>` - map hardware button presses to saved CLI actions and toggle press detection.
+- `channel_time set <min|max> <ms>` / `channel_time read <min|max>` - tune how long scans dwell on each channel for faster or deeper recon runs.
 - `vendor set <on|off>` / `vendor read` - toggles OUI lookup backed by `/lab/oui_wifi.bin` on the SD card.
 - `led set <on|off>` / `led level <1-100>` - controls the WS2812 status LED (purple for portal, other colors for attacks).
+- `download` - reboot straight into ROM download mode for UART flashing.
+- `ping` - quick CLI connectivity check (prints pong).
 - `stop` - flips the global stop flag so every running task can wind down gracefully.
 - `reboot` - clean restart without USB re-plug.
-- `list_sd` / `select_html` - also double as simple SD-card diagnostics.
+- SD helpers: `list_sd` (HTMLs), `list_dir [path]`, `file_delete <path>`, `select_html <index>`, and `list_ssid` for the SSID hint file.
 
 ## Flipper App Navigation
 
@@ -103,7 +126,12 @@ We're regular tinkerers who got bored and decided to design the full stack ourse
 - Join the LAB Discord server to discuss ESP32-C5 builds and projectZero workflows: https://discord.gg/57wmJzzR8C
 
 ## Last Changes
-- 2025-12-04 FAP o.29 - fix evil twin exit and reopen FAP crash flipper
+- 2025-12-11 FAP 0.35 - fixed qFlipper-connected crash; Sniffer flow adds 200+ pkt right-jump to Results then Probes, left/back returns; Probes label corrected for 2-digit SSID counts; haptics on Sniffer edge; hold Back to root, double Back opens Exit; Deauth Guard LED hit indicator removed; Wi-Fi Targets left re-runs Scanner and resets results; restored Scanner arrow after returning from console; build via `FLIPPER/build_fap.py`, deploy via `FLIPPER/dist/deploy_fap.py`.
+- 2025-12-10 FAP 0.34 Sniffer - new GUI for all 3 options
+- 2025-12-08 JanOS 1.0.0 fix BT name scan / FAP 0.33 Wifi Scanner new GUI / BT all GUI rework, BT scan show name of device / Exit from FAP small heptic.
+- 2025-12-07 JanOS 1.0.0 BT scan / Airtag scan / BT Locator / Deauth Guard passive deauth detection / FAP 031 support for JanOS 1.0.0 new Bluetooth menu
+- 2025-12-04 FAP 0.30 - Improve board discovery bootstrap with stabilization reboot
+- 2025-12-04 FAP 0.29 - fix evil twin exit and reopen FAP crash flipper
 - 2025-12-03 JanOS 0.7.6 / FAP 0.28 - Setup / Scan timing: add configurable min/max durations for scanning.
 - 2025-11-30 JanOS 0.7.5 / FAP 0.27 - Added Sniffer start with selected targets; Back stops and returns to Sniffers on Show Sniffer Results.
 - 2025-11-29 FAP 0.26 - Setup → SD Manager with folder picker, file listing, delete + scrolling for long names.

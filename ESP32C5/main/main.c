@@ -60,6 +60,12 @@
 #include "attack_handshake.h"
 #include "hccapx_serializer.h"
 
+// NimBLE includes for BLE scanning
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
+
 #include "esp_rom_sys.h"
 #include "soc/soc.h"
 
@@ -81,7 +87,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "0.7.6"
+#define JANOS_VERSION "1.0.0"
 
 
 #define NEOPIXEL_GPIO      27
@@ -181,8 +187,8 @@ static bool gps_uart_initialized = false;
 // Global stop flag for all operations
 static volatile bool operation_stop_requested = false;
 
-// Sniffer state
-static sniffer_ap_t sniffer_aps[MAX_SNIFFER_APS];
+// Sniffer state (allocated in PSRAM)
+static sniffer_ap_t *sniffer_aps = NULL;                    // ~75 KB in PSRAM
 static int sniffer_ap_count = 0;
 static volatile bool sniffer_active = false;
 static volatile bool sniffer_scan_phase = false;
@@ -206,8 +212,8 @@ static volatile bool channel_view_active = false;
 static volatile bool channel_view_scan_mode = false;
 static TaskHandle_t channel_view_task_handle = NULL;
 
-// Probe request storage
-static probe_request_t probe_requests[MAX_PROBE_REQUESTS];
+// Probe request storage (allocated in PSRAM)
+static probe_request_t *probe_requests = NULL;              // ~9.4 KB in PSRAM
 static int probe_request_count = 0;
 
 // Channel hopping for sniffer (like Marauder dual-band)
@@ -227,9 +233,9 @@ static volatile bool deauth_attack_active = false;
 static TaskHandle_t blackout_attack_task_handle = NULL;
 static volatile bool blackout_attack_active = false;
 
-// Target BSSID monitoring
+// Target BSSID monitoring (allocated in PSRAM)
 #define MAX_TARGET_BSSIDS 50
-static target_bssid_t target_bssids[MAX_TARGET_BSSIDS];
+static target_bssid_t *target_bssids = NULL;                // ~2.3 KB in PSRAM
 static int target_bssid_count = 0;
 static uint32_t last_channel_check_time = 0;
 static const uint32_t CHANNEL_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -249,6 +255,17 @@ static int sniffer_dog_current_channel = 1;
 static int sniffer_dog_channel_index = 0;
 static int64_t sniffer_dog_last_channel_hop = 0;
 
+// Deauth detector task
+static TaskHandle_t deauth_detector_task_handle = NULL;
+static volatile bool deauth_detector_active = false;
+static int deauth_detector_current_channel = 1;
+static int deauth_detector_channel_index = 0;
+static int64_t deauth_detector_last_channel_hop = 0;
+// Deauth detector selected mode
+static bool deauth_detector_selected_mode = false;
+static int deauth_detector_selected_channels[MAX_AP_CNT];
+static int deauth_detector_selected_channels_count = 0;
+
 // Wardrive task
 static TaskHandle_t wardrive_task_handle = NULL;
 
@@ -256,7 +273,7 @@ static TaskHandle_t wardrive_task_handle = NULL;
 static TaskHandle_t handshake_attack_task_handle = NULL;
 static volatile bool handshake_attack_active = false;
 static bool handshake_selected_mode = false; // true if networks were selected, false for scan-all mode
-static wifi_ap_record_t handshake_targets[MAX_AP_CNT]; // Copy of target networks
+static wifi_ap_record_t *handshake_targets = NULL;          // ~6.4 KB in PSRAM
 static int handshake_target_count = 0;
 static bool handshake_captured[MAX_AP_CNT]; // Track which networks have captured handshakes
 static int handshake_current_index = 0;
@@ -288,6 +305,98 @@ static const int dual_band_channels[] = {
 };
 static const int dual_band_channels_count = sizeof(dual_band_channels) / sizeof(dual_band_channels[0]);
 
+// ============================================================================
+// Radio Mode State (lazy initialization)
+// ============================================================================
+
+typedef enum {
+    RADIO_MODE_NONE,
+    RADIO_MODE_WIFI,
+    RADIO_MODE_BLE
+} radio_mode_t;
+
+static radio_mode_t current_radio_mode = RADIO_MODE_NONE;
+static bool wifi_initialized = false;
+static bool netif_initialized = false;
+static bool event_loop_initialized = false;
+static esp_netif_t *sta_netif_handle = NULL;
+static bool wifi_event_handler_registered = false;
+
+// ============================================================================
+// Memory logging helper (set LOG_MEMORY_INFO to 1 to enable prints)
+// ============================================================================
+#ifndef LOG_MEMORY_INFO
+#define LOG_MEMORY_INFO 1
+#endif
+
+static void log_memory_info(const char *context)
+{
+#if LOG_MEMORY_INFO
+    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t internal_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+    size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    size_t dma_total = heap_caps_get_total_size(MALLOC_CAP_DMA);
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    
+    MY_LOG_INFO(TAG, "[MEM] %s: Internal=%u/%uKB, DMA=%u/%uKB, PSRAM=%u/%uKB",
+           context,
+           (unsigned)(internal_free / 1024), (unsigned)(internal_total / 1024),
+           (unsigned)(dma_free / 1024), (unsigned)(dma_total / 1024),
+           (unsigned)(psram_free / 1024), (unsigned)(psram_total / 1024));
+#else
+    (void)context;
+#endif
+}
+
+// ============================================================================
+// BLE Scanner state (NimBLE)
+// ============================================================================
+
+// Apple Company ID (Little Endian)
+#define APPLE_COMPANY_ID        0x004C
+// Samsung Company ID (Little Endian)
+#define SAMSUNG_COMPANY_ID      0x0075
+// Apple Find My Network device type (AirTag, AirPods, etc.)
+#define APPLE_FIND_MY_TYPE      0x12
+
+// BLE scan state
+static volatile bool bt_scan_active = false;
+static volatile bool bt_airtag_scan_active = false;
+static TaskHandle_t bt_scan_task_handle = NULL;
+static volatile bool nimble_initialized = false;
+
+// BLE device tracking for deduplication
+#define BT_MAX_DEVICES 128
+static uint8_t bt_found_devices[BT_MAX_DEVICES][6];
+static int bt_found_device_count = 0;
+
+// AirTag/SmartTag counters
+static int bt_airtag_count = 0;
+static int bt_smarttag_count = 0;
+
+// Generic BT device storage for scan_bt command
+typedef struct {
+    uint8_t addr[6];
+    int8_t rssi;
+    char name[32];
+    uint16_t company_id;
+    bool is_airtag;
+    bool is_smarttag;
+} bt_device_info_t;
+
+static bt_device_info_t *bt_devices = NULL;                 // ~5.5 KB in PSRAM
+static int bt_device_count = 0;
+
+// MAC tracking mode for scan_bt with argument
+static bool bt_tracking_mode = false;
+static uint8_t bt_tracking_mac[6];
+static int8_t bt_tracking_rssi = 0;
+static bool bt_tracking_found = false;
+static char bt_tracking_name[32] = "";
+
+// ============================================================================
+
 // Promiscuous filter (like Marauder)
 static const wifi_promiscuous_filter_t sniffer_filter = {
     .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
@@ -295,7 +404,7 @@ static const wifi_promiscuous_filter_t sniffer_filter = {
 
 // Wardrive buffers (static to avoid stack overflow)
 static char wardrive_gps_buffer[GPS_BUF_SIZE];
-static wifi_ap_record_t wardrive_scan_results[MAX_AP_CNT];
+static wifi_ap_record_t *wardrive_scan_results = NULL;      // ~6.4 KB in PSRAM
 
 // Configurable scan channel time (in ms)
 static uint32_t g_scan_min_channel_time = 100;
@@ -583,11 +692,11 @@ static void led_boot_sequence(void) {
     vTaskDelay(pdMS_TO_TICKS(100));
 }
 
-// SD card HTML file management
+// SD card HTML file management (allocated in PSRAM)
 #define MAX_HTML_FILES 50
 #define MAX_HTML_FILENAME 64
 #define SD_PATH_MAX 192
-static char sd_html_files[MAX_HTML_FILES][MAX_HTML_FILENAME];
+static char (*sd_html_files)[MAX_HTML_FILENAME] = NULL;     // ~3.2 KB in PSRAM
 static int sd_html_count = 0;
 static char* custom_portal_html = NULL;
 static bool sd_card_mounted = false;
@@ -595,13 +704,36 @@ static bool sd_card_mounted = false;
 #define MAX_SSID_NAME_LEN 32
 #define SSID_PRESET_PATH "/sdcard/lab/ssid.txt"
 
-// Whitelist for BSSID protection
+// Whitelist for BSSID protection (allocated in PSRAM)
 #define MAX_WHITELISTED_BSSIDS 150
 typedef struct {
     uint8_t bssid[6];
 } whitelisted_bssid_t;
-static whitelisted_bssid_t whiteListedBssids[MAX_WHITELISTED_BSSIDS];
+static whitelisted_bssid_t *whiteListedBssids = NULL;       // ~0.9 KB in PSRAM
 static int whitelistedBssidsCount = 0;
+
+// ============================================================================
+// PSRAM buffer initialization (must be after all pointer declarations)
+// ============================================================================
+
+static bool init_psram_buffers(void)
+{
+    sniffer_aps = heap_caps_calloc(MAX_SNIFFER_APS, sizeof(sniffer_ap_t), MALLOC_CAP_SPIRAM);
+    probe_requests = heap_caps_calloc(MAX_PROBE_REQUESTS, sizeof(probe_request_t), MALLOC_CAP_SPIRAM);
+    bt_devices = heap_caps_calloc(BT_MAX_DEVICES, sizeof(bt_device_info_t), MALLOC_CAP_SPIRAM);
+    wardrive_scan_results = heap_caps_calloc(MAX_AP_CNT, sizeof(wifi_ap_record_t), MALLOC_CAP_SPIRAM);
+    handshake_targets = heap_caps_calloc(MAX_AP_CNT, sizeof(wifi_ap_record_t), MALLOC_CAP_SPIRAM);
+    sd_html_files = heap_caps_calloc(MAX_HTML_FILES, MAX_HTML_FILENAME, MALLOC_CAP_SPIRAM);
+    target_bssids = heap_caps_calloc(MAX_TARGET_BSSIDS, sizeof(target_bssid_t), MALLOC_CAP_SPIRAM);
+    whiteListedBssids = heap_caps_calloc(MAX_WHITELISTED_BSSIDS, sizeof(whitelisted_bssid_t), MALLOC_CAP_SPIRAM);
+    
+    if (!sniffer_aps || !probe_requests || !bt_devices || !wardrive_scan_results ||
+        !handshake_targets || !sd_html_files || !target_bssids || !whiteListedBssids) {
+        MY_LOG_INFO(TAG, "PSRAM allocation failed!");
+        return false;
+    }
+    return true;
+}
 
 #define VENDOR_RECORD_SIZE 64
 #define VENDOR_RECORD_NAME_BYTES (VENDOR_RECORD_SIZE - 4)
@@ -625,7 +757,8 @@ static const char* boot_allowed_commands[] = {
     "packet_monitor",
     "start_sniffer",
     "scan_networks",
-    "start_wardrive"
+    "start_wardrive",
+    "deauth_detector"
 };
 static const size_t boot_allowed_command_count = sizeof(boot_allowed_commands) / sizeof(boot_allowed_commands[0]);
 
@@ -730,6 +863,17 @@ static void sniffer_dog_task(void *pvParameters);
 static void sniffer_dog_channel_hop(void);
 static void sniffer_channel_task(void *pvParameters);
 static bool is_multicast_mac(const uint8_t *mac);
+// Deauth detector functions
+static int cmd_deauth_detector(int argc, char **argv);
+static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
+static void deauth_detector_task(void *pvParameters);
+static void deauth_detector_channel_hop(void);
+// BLE scanner functions (NimBLE)
+static int cmd_scan_bt(int argc, char **argv);
+static int cmd_scan_airtag(int argc, char **argv);
+static void bt_scan_stop(void);
+static void bt_scan_task(void *pvParameters);
+static void bt_airtag_scan_task(void *pvParameters);
 static bool is_broadcast_bssid(const uint8_t *bssid);
 static bool is_own_device_mac(const uint8_t *mac);
 static void add_client_to_ap(int ap_index, const uint8_t *client_mac, int rssi);
@@ -815,6 +959,8 @@ static void wifi_event_handler(void *event_handler_arg,
                                void *event_data);
 
 static esp_err_t wifi_init_ap_sta(void);
+static esp_err_t bt_nimble_init(void);
+static void bt_nimble_deinit(void);
 static void register_commands(void);
 
 // --- Wi-Fi event handler ---
@@ -1128,48 +1274,49 @@ static void verify_password(const char* password) {
     esp_wifi_connect();
 }
 
-// --- Wi-Fi initialization (STA, no connection yet) ---
+// --- Wi-Fi initialization (STA only - uses less memory) ---
+// AP mode will be enabled dynamically when needed (Evil Twin, Portal)
 static esp_err_t wifi_init_ap_sta(void) {
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-    esp_netif_create_default_wifi_ap();
-    esp_netif_create_default_wifi_sta();
+    // Initialize netif only once (shared between WiFi and BLE modes)
+    if (!netif_initialized) {
+        ESP_ERROR_CHECK(esp_netif_init());
+        netif_initialized = true;
+    }
     
+    // Create event loop only once (shared between WiFi and BLE modes)
+    if (!event_loop_initialized) {
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        event_loop_initialized = true;
+    }
+
+    // Only create STA interface once (reused on WiFi re-init)
+    if (sta_netif_handle == NULL) {
+        sta_netif_handle = esp_netif_create_default_wifi_sta();
+    }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
+    // Register event handler only once (survives WiFi reinit after mode switch)
+    if (!wifi_event_handler_registered) {
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                            ESP_EVENT_ANY_ID,
+                                                            &wifi_event_handler,
+                                                            NULL,
+                                                            NULL));
+        wifi_event_handler_registered = true;
+    }
 
     wifi_config_t wifi_config = { 0 };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-
-    wifi_config_t mgmt_wifi_config = {
-            .ap = {
-                .ssid = "",
-                .ssid_len = 0,
-                .ssid_hidden = 1,
-                .password = "nevermind",
-                .max_connection = 0,
-                .authmode = WIFI_AUTH_WPA2_PSK
-            },
-        };
-
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &mgmt_wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     uint8_t mac[6];
     esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
 
     if (ret == ESP_OK) {
-        MY_LOG_INFO(TAG,"JanOS version: " JANOS_VERSION);
-        MY_LOG_INFO("MAC", "MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
+         MY_LOG_INFO("MAC", "MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     } else {
         ESP_LOGE("MAC", "Failed to get MAC address");
@@ -1178,6 +1325,164 @@ static esp_err_t wifi_init_ap_sta(void) {
     return ESP_OK;
 }
 
+// ============================================================================
+// Radio Mode Switching (lazy initialization)
+// ============================================================================
+
+/**
+ * Ensure WiFi mode is active. If BLE is active, reboots to switch.
+ * Returns true if WiFi is ready to use, false if switching (will reboot).
+ */
+static bool ensure_wifi_mode(void)
+{
+    switch (current_radio_mode) {
+        case RADIO_MODE_WIFI:
+            // Already in WiFi mode
+            return true;
+            
+        case RADIO_MODE_NONE:
+            // Initialize WiFi
+            MY_LOG_INFO(TAG, "Initializing WiFi...");
+            esp_err_t ret = wifi_init_ap_sta();
+            if (ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "WiFi init failed: %d", ret);
+                return false;
+            }
+            
+            // Set WiFi country for extended channels
+            wifi_country_t wifi_country = {
+                .cc = "PH",
+                .schan = 1,
+                .nchan = 14,
+                .policy = WIFI_COUNTRY_POLICY_AUTO,
+            };
+            esp_wifi_set_country(&wifi_country);
+            
+            current_radio_mode = RADIO_MODE_WIFI;
+            wifi_initialized = true;
+            MY_LOG_INFO(TAG, "WiFi initialized OK");
+            return true;
+            
+        case RADIO_MODE_BLE:
+            // Deinitialize BLE and switch to WiFi
+            MY_LOG_INFO(TAG, "Switching from BLE to WiFi mode...");
+            bt_nimble_deinit();
+            current_radio_mode = RADIO_MODE_NONE;
+            // Now initialize WiFi (recursive call with RADIO_MODE_NONE)
+            return ensure_wifi_mode();
+    }
+    return false;
+}
+
+/**
+ * Ensure BLE mode is active. If WiFi is active, deinits WiFi first.
+ * Returns true if BLE is ready to use, false if switching (will reboot).
+ */
+static bool ensure_ble_mode(void)
+{
+    switch (current_radio_mode) {
+        case RADIO_MODE_BLE:
+            // Already in BLE mode
+            return true;
+            
+        case RADIO_MODE_NONE:
+            // Initialize BLE
+            MY_LOG_INFO(TAG, "Initializing BLE (NimBLE)...");
+            esp_err_t ret = bt_nimble_init();
+            if (ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "BLE init failed: %d", ret);
+                return false;
+            }
+            current_radio_mode = RADIO_MODE_BLE;
+            MY_LOG_INFO(TAG, "BLE initialized OK");
+            return true;
+            
+        case RADIO_MODE_WIFI: {
+            // Deinitialize WiFi and switch to BLE
+            MY_LOG_INFO(TAG, "Switching from WiFi to BLE mode...");
+            esp_wifi_stop();
+            esp_wifi_deinit();
+            // Only destroy AP netif, keep STA netif for reuse on WiFi re-init
+            esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+            if (ap_netif) {
+                esp_netif_destroy(ap_netif);
+            }
+            // Note: sta_netif_handle is preserved for WiFi re-initialization
+            wifi_initialized = false;
+            current_radio_mode = RADIO_MODE_NONE;
+            // Now initialize BLE (recursive call with RADIO_MODE_NONE)
+            return ensure_ble_mode();
+        }
+    }
+    return false;
+}
+
+// Track if AP netif was created
+static esp_netif_t *ap_netif_handle = NULL;
+
+/**
+ * Enable AP mode (switch to APSTA if needed) for Evil Twin, Portal, etc.
+ * Must be called after ensure_wifi_mode().
+ * Returns the AP netif handle, or NULL on failure.
+ */
+static esp_netif_t *ensure_ap_mode(void)
+{
+    if (current_radio_mode != RADIO_MODE_WIFI) {
+        MY_LOG_INFO(TAG, "WiFi must be initialized first");
+        return NULL;
+    }
+    
+    // Check if AP netif already exists
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap_netif) {
+        return ap_netif;
+    }
+    
+    // Need to stop WiFi, switch mode, and restart
+    MY_LOG_INFO(TAG, "Enabling AP mode...");
+    
+    esp_wifi_stop();
+    
+    // Create AP netif
+    ap_netif_handle = esp_netif_create_default_wifi_ap();
+    if (!ap_netif_handle) {
+        MY_LOG_INFO(TAG, "Failed to create AP netif");
+        esp_wifi_start();
+        return NULL;
+    }
+    
+    // Switch to APSTA mode
+    esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set APSTA mode: %s", esp_err_to_name(ret));
+        esp_wifi_start();
+        return NULL;
+    }
+    
+    // Configure minimal AP to start
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "",
+            .ssid_len = 0,
+            .ssid_hidden = 1,
+            .password = "nevermind",
+            .max_connection = 0,
+            .authmode = WIFI_AUTH_WPA2_PSK
+        },
+    };
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to restart WiFi: %s", esp_err_to_name(ret));
+        return NULL;
+    }
+    
+    MY_LOG_INFO(TAG, "AP mode enabled");
+    return ap_netif_handle;
+}
+
+// ============================================================================
 
 // --- Start background scan ---
 static esp_err_t start_background_scan(void) {
@@ -1626,6 +1931,8 @@ static void boot_execute_command(const char* command) {
         (void)cmd_scan_networks(0, NULL);
     } else if (strcasecmp(command, "start_wardrive") == 0) {
         (void)cmd_start_wardrive(0, NULL);
+    } else if (strcasecmp(command, "deauth_detector") == 0) {
+        (void)cmd_deauth_detector(0, NULL);
     } else {
         MY_LOG_INFO(TAG, "Boot cmd '%s' not recognized", command);
     }
@@ -1812,6 +2119,12 @@ static void print_scan_results(void) {
 // --- CLI: commands ---
 static int cmd_scan_networks(int argc, char **argv) {
     (void)argc; (void)argv;
+    log_memory_info("scan_networks");
+    
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
     
     if (wardrive_active || wardrive_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Wardrive is active. Use 'stop' to stop it first before scanning.");
@@ -2013,7 +2326,7 @@ static void deauth_attack_task(void *pvParameters) {
     
     // DO NOT clear target BSSIDs when attack ends - keep them for potential restart
     // target_bssid_count = 0;
-    // memset(target_bssids, 0, sizeof(target_bssids));
+    // memset(target_bssids, 0, MAX_TARGET_BSSIDS * sizeof(target_bssid_t));
     
     MY_LOG_INFO(TAG,"Deauth attack task finished.");
     
@@ -2138,7 +2451,7 @@ static void blackout_attack_task(void *pvParameters) {
     
     // Clear target BSSIDs
     target_bssid_count = 0;
-    memset(target_bssids, 0, sizeof(target_bssids));
+    memset(target_bssids, 0, MAX_TARGET_BSSIDS * sizeof(target_bssid_t));
     
     MY_LOG_INFO(TAG, "Blackout attack task finished.");
     
@@ -2191,7 +2504,7 @@ static void handshake_cleanup(void) {
     handshake_attack_task_handle = NULL;
     handshake_target_count = 0;
     handshake_current_index = 0;
-    memset(handshake_targets, 0, sizeof(handshake_targets));
+    memset(handshake_targets, 0, MAX_AP_CNT * sizeof(wifi_ap_record_t));
     memset(handshake_captured, 0, sizeof(handshake_captured));
     
     // Restore idle LED
@@ -2459,6 +2772,17 @@ static int cmd_start_deauth(int argc, char **argv) {
 }
 
 static int cmd_start_handshake(int argc, char **argv) {
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+    
+    // Enable AP mode for raw frame injection (deauth packets)
+    if (!ensure_ap_mode()) {
+        MY_LOG_INFO(TAG, "Failed to enable AP mode for deauth injection");
+        return 1;
+    }
+    
     // Check if handshake attack is already running
     if (handshake_attack_active || handshake_attack_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Handshake attack already running. Use 'stop' to stop it first.");
@@ -2505,7 +2829,7 @@ static int cmd_start_handshake(int argc, char **argv) {
     // Initialize state
     handshake_target_count = 0;
     handshake_current_index = 0;
-    memset(handshake_targets, 0, sizeof(handshake_targets));
+    memset(handshake_targets, 0, MAX_AP_CNT * sizeof(wifi_ap_record_t));
     memset(handshake_captured, 0, sizeof(handshake_captured));
     
     // Check if networks were selected
@@ -2591,6 +2915,11 @@ static int cmd_start_sae_overflow(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
     
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+    
     // Check if SAE attack is already running
     if (sae_attack_active || sae_attack_task_handle != NULL) {
         MY_LOG_INFO(TAG, "SAE overflow attack already running. Use 'stop' to stop it first.");
@@ -2653,6 +2982,12 @@ static int cmd_start_sae_overflow(int argc, char **argv) {
 static int cmd_start_blackout(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
+    log_memory_info("start_blackout");
+    
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
     
     // Check if blackout attack is already running
     if (blackout_attack_active || blackout_attack_task_handle != NULL) {
@@ -2733,6 +3068,12 @@ static void boot_button_task(void *arg) {
 static int cmd_start_evil_twin(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
+    log_memory_info("start_evil_twin");
+    
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
     
     // Check if attack is already running
     if (deauth_attack_active || deauth_attack_task_handle != NULL) {
@@ -2765,10 +3106,10 @@ static int cmd_start_evil_twin(int argc, char **argv) {
         if (!onlyDeauth) {
             MY_LOG_INFO(TAG,"Starting captive portal for Evil Twin attack on: %s", evilTwinSSID);
             
-            // Get AP netif and stop DHCP to configure custom IP
-            esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+            // Enable AP mode (switches to APSTA) and get AP netif
+            esp_netif_t *ap_netif = ensure_ap_mode();
             if (!ap_netif) {
-                MY_LOG_INFO(TAG, "Failed to get AP netif");
+                MY_LOG_INFO(TAG, "Failed to enable AP mode");
                 applicationState = IDLE;
                 return 1;
             }
@@ -2817,8 +3158,7 @@ static int cmd_start_evil_twin(int argc, char **argv) {
                 ap_config.ap.ssid_len = strlen(evilTwinSSID);
             }
             
-            // WiFi is already running in APSTA mode from wifi_init_ap_sta()
-            // Just update the AP configuration
+            // AP mode was enabled by ensure_ap_mode(), update the configuration
             ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
             if (ret != ESP_OK) {
                 MY_LOG_INFO(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
@@ -3024,7 +3364,7 @@ static int cmd_stop(int argc, char **argv) {
         // Clean up state
         handshake_target_count = 0;
         handshake_current_index = 0;
-        memset(handshake_targets, 0, sizeof(handshake_targets));
+        memset(handshake_targets, 0, MAX_AP_CNT * sizeof(wifi_ap_record_t));
         memset(handshake_captured, 0, sizeof(handshake_captured));
     } else {
         // Stop handshake attack if running (old non-task mode)
@@ -3053,7 +3393,7 @@ static int cmd_stop(int argc, char **argv) {
         
         // Clear target BSSIDs
         target_bssid_count = 0;
-        memset(target_bssids, 0, sizeof(target_bssids));
+        memset(target_bssids, 0, MAX_TARGET_BSSIDS * sizeof(target_bssid_t));
     }
     
     // Stop SAE overflow attack task if running
@@ -3093,7 +3433,7 @@ static int cmd_stop(int argc, char **argv) {
         
         // Clear target BSSIDs
         target_bssid_count = 0;
-        memset(target_bssids, 0, sizeof(target_bssids));
+        memset(target_bssids, 0, MAX_TARGET_BSSIDS * sizeof(target_bssid_t));
     }
     
     // Stop any active attacks
@@ -3170,6 +3510,45 @@ static int cmd_stop(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Sniffer Dog stopped.");
     }
     
+    // Stop deauth_detector if active
+    if (deauth_detector_active || deauth_detector_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping Deauth Detector task...");
+        deauth_detector_active = false;
+        
+        // Wait a bit for task to finish
+        for (int i = 0; i < 20 && deauth_detector_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (deauth_detector_task_handle != NULL) {
+            vTaskDelete(deauth_detector_task_handle);
+            deauth_detector_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Deauth Detector task forcefully stopped.");
+        }
+        
+        // Disable promiscuous mode
+        esp_wifi_set_promiscuous(false);
+        
+        // Reset channel state
+        deauth_detector_channel_index = 0;
+        deauth_detector_current_channel = dual_band_channels[0];
+        deauth_detector_last_channel_hop = 0;
+        
+        // Reset selected mode state
+        deauth_detector_selected_mode = false;
+        deauth_detector_selected_channels_count = 0;
+        memset(deauth_detector_selected_channels, 0, sizeof(deauth_detector_selected_channels));
+        
+        // Return LED to idle
+        esp_err_t led_err = led_set_idle();
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to restore idle LED after Deauth Detector stop: %s", esp_err_to_name(led_err));
+        }
+        
+        MY_LOG_INFO(TAG, "Deauth Detector stopped.");
+    }
+    
     // Stop wardrive task if running
     if (wardrive_active || wardrive_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Stopping wardrive task...");
@@ -3228,12 +3607,21 @@ static int cmd_stop(int argc, char **argv) {
         esp_wifi_stop();
         MY_LOG_INFO(TAG, "Portal stopped.");
         
+        // Restart WiFi in STA mode so it's ready for next command
+        wifi_config_t wifi_config = { 0 };
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+        esp_wifi_start();
+        
         // Clean up portal SSID
         if (portalSSID != NULL) {
             free(portalSSID);
             portalSSID = NULL;
         }
     }
+    
+    // Stop BLE scanner if running
+    bt_scan_stop();
     
     // Restore LED to idle (ignore errors if LED is in invalid state)
     esp_err_t led_err = led_set_idle();
@@ -3322,6 +3710,13 @@ static void packet_monitor_task(void *pvParameters) {
 }
 
 static int cmd_packet_monitor(int argc, char **argv) {
+    log_memory_info("packet_monitor");
+    
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+    
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: packet_monitor <channel>");
         return 1;
@@ -3550,6 +3945,12 @@ static void channel_view_stop(void) {
 static int cmd_channel_view(int argc, char **argv) {
     (void)argc;
     (void)argv;
+    log_memory_info("channel_view");
+
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
 
     if (channel_view_active || channel_view_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Channel view already running. Use 'stop' to stop it first.");
@@ -3611,6 +4012,12 @@ static int cmd_channel_view(int argc, char **argv) {
 
 static int cmd_start_sniffer(int argc, char **argv) {
     (void)argc; (void)argv;
+    log_memory_info("start_sniffer");
+    
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
     
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
@@ -3622,9 +4029,9 @@ static int cmd_start_sniffer(int argc, char **argv) {
     
     // Clear previous sniffer data when starting new session
     sniffer_ap_count = 0;
-    memset(sniffer_aps, 0, sizeof(sniffer_aps));
+    memset(sniffer_aps, 0, MAX_SNIFFER_APS * sizeof(sniffer_ap_t));
     probe_request_count = 0;
-    memset(probe_requests, 0, sizeof(probe_requests));
+    memset(probe_requests, 0, MAX_PROBE_REQUESTS * sizeof(probe_request_t));
     sniffer_selected_channels_count = 0;
     memset(sniffer_selected_channels, 0, sizeof(sniffer_selected_channels));
     sniffer_packet_counter = 0;
@@ -3877,6 +4284,12 @@ static int cmd_sniffer_debug(int argc, char **argv) {
 
 static int cmd_start_sniffer_dog(int argc, char **argv) {
     (void)argc; (void)argv;
+    log_memory_info("start_sniffer_dog");
+    
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
     
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
@@ -3941,6 +4354,202 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
     
     MY_LOG_INFO(TAG, "Sniffer Dog started - hunting for AP-STA pairs...");
     MY_LOG_INFO(TAG, "Deauth packets will be sent to detected stations.");
+    MY_LOG_INFO(TAG, "Use 'stop' to stop.");
+    
+    return 0;
+}
+
+static int cmd_deauth_detector(int argc, char **argv) {
+    log_memory_info("deauth_detector");
+    
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+    
+    // Reset stop flag at the beginning of operation
+    operation_stop_requested = false;
+    
+    if (deauth_detector_active) {
+        MY_LOG_INFO(TAG, "Deauth detector already active. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    if (sniffer_active) {
+        MY_LOG_INFO(TAG, "Regular sniffer is active. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    if (sniffer_dog_active) {
+        MY_LOG_INFO(TAG, "Sniffer Dog is active. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    // Reset selected mode state
+    deauth_detector_selected_mode = false;
+    deauth_detector_selected_channels_count = 0;
+    memset(deauth_detector_selected_channels, 0, sizeof(deauth_detector_selected_channels));
+    
+    // MODE B: With network indices (e.g., deauth_detector 1 3)
+    if (argc > 1) {
+        // Check if scan was performed
+        if (!g_scan_done || g_scan_count == 0) {
+            MY_LOG_INFO(TAG, "No scan results available. Run 'scan_networks' first.");
+            return 1;
+        }
+        
+        MY_LOG_INFO(TAG, "Starting Deauth Detector in SELECTED mode...");
+        
+        // Parse indices and extract unique channels
+        for (int i = 1; i < argc; i++) {
+            int user_idx = atoi(argv[i]);
+            int idx = user_idx - 1; // Convert from 1-based (user) to 0-based (internal)
+            
+            // Validate index
+            if (idx < 0 || idx >= (int)g_scan_count) {
+                MY_LOG_INFO(TAG, "Invalid index %d (valid: 1-%d), skipping", user_idx, g_scan_count);
+                continue;
+            }
+            
+            wifi_ap_record_t *ap = &g_scan_results[idx];
+            int channel = ap->primary;
+            
+            // Check if channel already in list
+            bool channel_exists = false;
+            for (int j = 0; j < deauth_detector_selected_channels_count; j++) {
+                if (deauth_detector_selected_channels[j] == channel) {
+                    channel_exists = true;
+                    break;
+                }
+            }
+            
+            if (!channel_exists && deauth_detector_selected_channels_count < MAX_AP_CNT) {
+                deauth_detector_selected_channels[deauth_detector_selected_channels_count++] = channel;
+                MY_LOG_INFO(TAG, "  Added: %s (ch %d)", ap->ssid, channel);
+            }
+        }
+        
+        if (deauth_detector_selected_channels_count == 0) {
+            MY_LOG_INFO(TAG, "No valid channels selected. Aborting.");
+            return 1;
+        }
+        
+        deauth_detector_selected_mode = true;
+        
+        // Build channel list string for display
+        char channel_list[128] = {0};
+        int offset = 0;
+        for (int i = 0; i < deauth_detector_selected_channels_count && offset < 120; i++) {
+            offset += snprintf(channel_list + offset, sizeof(channel_list) - offset,
+                             "%d%s", deauth_detector_selected_channels[i],
+                             (i < deauth_detector_selected_channels_count - 1) ? ", " : "");
+        }
+        MY_LOG_INFO(TAG, "Monitoring %d channel(s): [%s]", deauth_detector_selected_channels_count, channel_list);
+        
+    } else {
+        // MODE A: No arguments - scan first, then monitor all channels
+        MY_LOG_INFO(TAG, "Starting Deauth Detector in SCAN mode...");
+        MY_LOG_INFO(TAG, "Scanning networks first...");
+        
+        // Start WiFi scan
+        esp_err_t err = start_background_scan();
+        if (err != ESP_OK) {
+            if (err == ESP_ERR_INVALID_STATE) {
+                MY_LOG_INFO(TAG, "Scan already in progress. Please wait or use 'stop'.");
+            } else {
+                MY_LOG_INFO(TAG, "Failed to start scan: %s", esp_err_to_name(err));
+            }
+            return 1;
+        }
+        
+        // Wait for scan to complete (with timeout)
+        int timeout_iterations = 0;
+        while (g_scan_in_progress && timeout_iterations < 200) { // 20 seconds max (200 * 100ms)
+            vTaskDelay(pdMS_TO_TICKS(100));
+            timeout_iterations++;
+            
+            // Check for stop request
+            if (operation_stop_requested) {
+                MY_LOG_INFO(TAG, "Scan cancelled by user.");
+                return 1;
+            }
+        }
+        
+        if (g_scan_in_progress) {
+            MY_LOG_INFO(TAG, "Scan timed out. Try again later.");
+            esp_wifi_scan_stop(); // Force stop the scan
+            return 1;
+        }
+        
+        // Verify scan actually completed with results
+        if (!g_scan_done || g_scan_count == 0) {
+            MY_LOG_INFO(TAG, "No scan results available. Try 'scan_networks' first.");
+            return 1;
+        }
+        
+        MY_LOG_INFO(TAG, "Found %d networks.", g_scan_count);
+        deauth_detector_selected_mode = false;
+    }
+    
+    // Activate deauth_detector
+    deauth_detector_active = true;
+    
+    // Set LED to yellow (monitoring mode)
+    esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for Deauth Detector: %s", esp_err_to_name(led_err));
+    }
+    
+    // Set promiscuous filter for MGMT frames only (deauth is a management frame)
+    wifi_promiscuous_filter_t mgmt_filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
+    };
+    esp_wifi_set_promiscuous_filter(&mgmt_filter);
+    
+    // Enable promiscuous mode with deauth_detector callback
+    esp_wifi_set_promiscuous_rx_cb(deauth_detector_promiscuous_callback);
+    esp_wifi_set_promiscuous(true);
+    
+    // Initialize channel hopping
+    deauth_detector_channel_index = 0;
+    if (deauth_detector_selected_mode && deauth_detector_selected_channels_count > 0) {
+        deauth_detector_current_channel = deauth_detector_selected_channels[0];
+    } else {
+        deauth_detector_current_channel = dual_band_channels[0];
+    }
+    esp_wifi_set_channel(deauth_detector_current_channel, WIFI_SECOND_CHAN_NONE);
+    deauth_detector_last_channel_hop = esp_timer_get_time() / 1000;
+    
+    // Create channel hopping task (stack must be in internal RAM on ESP32-C5)
+    BaseType_t task_created = xTaskCreate(
+        deauth_detector_task,
+        "deauth_det",
+        4096,
+        NULL,
+        5,
+        &deauth_detector_task_handle
+    );
+    
+    if (task_created != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create Deauth Detector channel hopping task");
+        deauth_detector_active = false;
+        esp_wifi_set_promiscuous(false);
+        
+        // Return LED to idle
+        led_err = led_set_idle();
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to restore idle LED after Deauth Detector failure: %s", esp_err_to_name(led_err));
+        }
+        
+        return 1;
+    }
+    
+    if (deauth_detector_selected_mode) {
+        MY_LOG_INFO(TAG, "Deauth Detector started - monitoring selected channels for deauth frames...");
+    } else {
+        MY_LOG_INFO(TAG, "Deauth Detector started - scanning all channels for deauth frames...");
+    }
+    MY_LOG_INFO(TAG, "Output: [DEAUTH] CH: <ch> | AP: <name> (<bssid>) | RSSI: <rssi>");
     MY_LOG_INFO(TAG, "Use 'stop' to stop.");
     
     return 0;
@@ -4881,6 +5490,12 @@ static void wardrive_task(void *pvParameters) {
 
 static int cmd_start_wardrive(int argc, char **argv) {
     (void)argc; (void)argv;
+    log_memory_info("start_wardrive");
+    
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
     
     // Check if wardrive is already running
     if (wardrive_active || wardrive_task_handle != NULL) {
@@ -5517,6 +6132,13 @@ static void dns_server_task(void *pvParameters) {
 
 // Start portal command
 static int cmd_start_portal(int argc, char **argv) {
+    log_memory_info("start_portal");
+    
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+    
     // Check for SSID argument
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: start_portal <SSID>");
@@ -5550,10 +6172,10 @@ static int cmd_start_portal(int argc, char **argv) {
     
     MY_LOG_INFO(TAG, "Starting captive portal with SSID: %s", ssid);
     
-    // Get AP netif and stop DHCP to configure custom IP
-    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    // Enable AP mode and get AP netif
+    esp_netif_t *ap_netif = ensure_ap_mode();
     if (!ap_netif) {
-        MY_LOG_INFO(TAG, "Failed to get AP netif");
+        MY_LOG_INFO(TAG, "Failed to enable AP mode");
         return 1;
     }
     
@@ -5582,22 +6204,10 @@ static int cmd_start_portal(int argc, char **argv) {
     ap_config.ap.max_connection = 4;
     ap_config.ap.authmode = WIFI_AUTH_OPEN;
     
-    // Start AP
-    ret = esp_wifi_set_mode(WIFI_MODE_AP);
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to set AP mode: %s", esp_err_to_name(ret));
-        return 1;
-    }
-    
+    // AP mode already enabled by ensure_ap_mode(), just configure it
     ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
-        return 1;
-    }
-    
-    ret = esp_wifi_start();
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to start AP: %s", esp_err_to_name(ret));
         return 1;
     }
     
@@ -5778,6 +6388,711 @@ static int cmd_start_portal(int argc, char **argv) {
     return 0;
 }
 
+// ============================================================================
+// BLE Scanner Functions (NimBLE)
+// ============================================================================
+
+/**
+ * Check if BLE device was already found (for deduplication)
+ */
+static bool bt_is_device_found(const uint8_t *addr)
+{
+    for (int i = 0; i < bt_found_device_count; i++) {
+        if (memcmp(bt_found_devices[i], addr, 6) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Find device index by MAC address in bt_devices array
+ * Returns -1 if not found
+ */
+static int bt_find_device_index(const uint8_t *addr)
+{
+    for (int i = 0; i < bt_device_count; i++) {
+        if (memcmp(bt_devices[i].addr, addr, 6) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/**
+ * Add BLE device to found list
+ */
+static void bt_add_found_device(const uint8_t *addr)
+{
+    if (bt_found_device_count < BT_MAX_DEVICES) {
+        memcpy(bt_found_devices[bt_found_device_count], addr, 6);
+        bt_found_device_count++;
+    }
+}
+
+/**
+ * Reset BLE scan counters
+ */
+static void bt_reset_counters(void)
+{
+    bt_airtag_count = 0;
+    bt_smarttag_count = 0;
+    bt_found_device_count = 0;
+    bt_device_count = 0;
+    memset(bt_found_devices, 0, sizeof(bt_found_devices));
+    memset(bt_devices, 0, BT_MAX_DEVICES * sizeof(bt_device_info_t));
+}
+
+/**
+ * Format BLE MAC address to string
+ */
+static void bt_format_addr(const uint8_t *addr, char *str)
+{
+    sprintf(str, "%02X:%02X:%02X:%02X:%02X:%02X",
+            addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+}
+
+/**
+ * Parse MAC address string to bytes (format: XX:XX:XX:XX:XX:XX)
+ * Returns true if parsing successful
+ */
+static bool bt_parse_mac(const char *str, uint8_t *mac)
+{
+    unsigned int values[6];
+    if (sscanf(str, "%02X:%02X:%02X:%02X:%02X:%02X",
+               &values[0], &values[1], &values[2],
+               &values[3], &values[4], &values[5]) != 6) {
+        // Try lowercase
+        if (sscanf(str, "%02x:%02x:%02x:%02x:%02x:%02x",
+                   &values[0], &values[1], &values[2],
+                   &values[3], &values[4], &values[5]) != 6) {
+            return false;
+        }
+    }
+    
+    // Store in reverse order (BLE format)
+    for (int i = 0; i < 6; i++) {
+        mac[5 - i] = (uint8_t)values[i];
+    }
+    
+    return true;
+}
+
+/**
+ * Check if raw BLE payload contains Apple AirTag/Find My patterns
+ * Uses Marauder's method: scan raw payload for specific byte sequences
+ * Detects both original AirTags and clones (Mi-Tag, etc.)
+ */
+static bool bt_is_airtag_payload(const uint8_t *payload, size_t len)
+{
+    if (len < 4) return false;
+    
+    // Scan payload for Marauder patterns
+    for (size_t i = 0; i + 4 <= len; i++) {
+        // Pattern 1: 0x1E 0xFF 0x4C 0x00 (len=30, mfg type, Apple ID)
+        if (payload[i] == 0x1E && payload[i+1] == 0xFF && 
+            payload[i+2] == 0x4C && payload[i+3] == 0x00) {
+            return true;
+        }
+        // Pattern 2: 0x4C 0x00 0x12 0x19 (Apple ID, Find My type, len=25)
+        if (payload[i] == 0x4C && payload[i+1] == 0x00 && 
+            payload[i+2] == 0x12 && payload[i+3] == 0x19) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Check if manufacturer data indicates Samsung SmartTag
+ * SmartTag uses specific device type bytes (0x02/0x03) in SmartThings Find protocol
+ * This avoids false positives from Samsung phones
+ */
+static bool bt_is_samsung_smarttag(const uint8_t *data, uint8_t len)
+{
+    if (len < 4) return false;
+    
+    // Check Company ID (Little Endian: 0x75 0x00)
+    uint16_t company_id = data[0] | (data[1] << 8);
+    if (company_id != SAMSUNG_COMPANY_ID) return false;
+    
+    // SmartTag uses SmartThings Find protocol
+    // Device type byte (byte 2) should be 0x02 or 0x03 for SmartTag/SmartTag+
+    // Samsung phones use different type values
+    uint8_t device_type = data[2];
+    
+    // SmartTag typical payload length is 22-28 bytes
+    if ((device_type == 0x02 || device_type == 0x03) && len >= 20 && len <= 30) {
+        return true;
+    }
+    
+    return false;
+}
+
+/**
+ * BLE GAP event callback for scanning
+ */
+static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
+{
+    if (event->type != BLE_GAP_EVENT_DISC) {
+        return 0;
+    }
+    
+    struct ble_gap_disc_desc *desc = &event->disc;
+    
+    // MAC tracking mode - update RSSI and name for tracked device
+    if (bt_tracking_mode) {
+        if (memcmp(desc->addr.val, bt_tracking_mac, 6) == 0) {
+            bt_tracking_rssi = desc->rssi;
+            bt_tracking_found = true;
+            
+            // Try to extract name if we don't have one yet
+            if (bt_tracking_name[0] == '\0') {
+                struct ble_hs_adv_fields fields;
+                if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) == 0) {
+                    if (fields.name != NULL && fields.name_len > 0) {
+                        int name_len = fields.name_len < 31 ? fields.name_len : 31;
+                        memcpy(bt_tracking_name, fields.name, name_len);
+                        bt_tracking_name[name_len] = '\0';
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+    
+    // Parse advertising data
+    struct ble_hs_adv_fields fields;
+    int rc = ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data);
+    if (rc != 0) {
+        return 0;
+    }
+    
+    // Check if this is a Scan Response packet (contains names more often)
+    bool is_scan_response = (desc->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
+    
+    // Check if device already seen
+    bool already_seen = bt_is_device_found(desc->addr.val);
+    
+    // If already seen, only process scan responses to update names
+    if (already_seen) {
+        // Try to update name from scan response if we don't have one
+        if (is_scan_response && fields.name != NULL && fields.name_len > 0) {
+            int dev_idx = bt_find_device_index(desc->addr.val);
+            if (dev_idx >= 0 && bt_devices[dev_idx].name[0] == '\0') {
+                int name_len = fields.name_len < 31 ? fields.name_len : 31;
+                memcpy(bt_devices[dev_idx].name, fields.name, name_len);
+                bt_devices[dev_idx].name[name_len] = '\0';
+            }
+        }
+        return 0;
+    }
+    
+    // Add to found devices list
+    bt_add_found_device(desc->addr.val);
+    
+    // Store device info
+    if (bt_device_count < BT_MAX_DEVICES) {
+        bt_device_info_t *dev = &bt_devices[bt_device_count];
+        memcpy(dev->addr, desc->addr.val, 6);
+        dev->rssi = desc->rssi;
+        dev->name[0] = '\0';
+        dev->company_id = 0;
+        dev->is_airtag = false;
+        dev->is_smarttag = false;
+        
+        // Extract device name if available (standard AD field)
+        bool has_name = (fields.name != NULL && fields.name_len > 0);
+        if (has_name) {
+            int name_len = fields.name_len < 31 ? fields.name_len : 31;
+            memcpy(dev->name, fields.name, name_len);
+            dev->name[name_len] = '\0';
+        }
+        
+        // Check for AirTag using raw payload (Marauder method)
+        if (bt_is_airtag_payload(desc->data, desc->length_data)) {
+            dev->is_airtag = true;
+            bt_airtag_count++;
+        }
+        
+        // Check manufacturer data for SmartTag and company ID
+        if (fields.mfg_data != NULL && fields.mfg_data_len >= 2) {
+            dev->company_id = fields.mfg_data[0] | (fields.mfg_data[1] << 8);
+            
+            if (!dev->is_airtag && bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
+                dev->is_smarttag = true;
+                bt_smarttag_count++;
+            }
+        }
+        
+        bt_device_count++;
+    }
+    
+    return 0;
+}
+
+/**
+ * Start BLE scanning
+ */
+static int bt_start_scan(void)
+{
+    struct ble_gap_disc_params scan_params = {
+        .itvl = 0x60,             // 60ms interval (0x60 * 0.625ms)
+        .window = 0x60,           // 60ms window = continuous listening
+        .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+        .limited = 0,
+        .passive = 0,             // ACTIVE scan - critical for Scan Response names
+        .filter_duplicates = 0,   // We handle duplicates ourselves
+    };
+    
+    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &scan_params,
+                          bt_gap_event_callback, NULL);
+    return rc;
+}
+
+/**
+ * Stop BLE scanning
+ */
+static void bt_stop_scan(void)
+{
+    ble_gap_disc_cancel();
+}
+
+/**
+ * NimBLE host sync callback
+ */
+static void bt_on_sync(void)
+{
+    ESP_LOGI(TAG, "BLE Host synchronized");
+    nimble_initialized = true;
+}
+
+/**
+ * NimBLE host reset callback
+ */
+static void bt_on_reset(int reason)
+{
+    ESP_LOGE(TAG, "BLE Host reset, reason: %d", reason);
+    nimble_initialized = false;
+}
+
+/**
+ * NimBLE host task
+ */
+static void nimble_host_task(void *param)
+{
+    ESP_LOGI(TAG, "NimBLE host task started");
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+/**
+ * Initialize NimBLE stack (called once)
+ */
+static esp_err_t bt_nimble_init(void)
+{
+    if (nimble_initialized) {
+        return ESP_OK;
+    }
+    
+    esp_err_t ret = nimble_port_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "NimBLE port init failed: %d", ret);
+        return ret;
+    }
+    
+    // Configure BLE host callbacks
+    ble_hs_cfg.sync_cb = bt_on_sync;
+    ble_hs_cfg.reset_cb = bt_on_reset;
+    
+    // Start NimBLE host task
+    nimble_port_freertos_init(nimble_host_task);
+    
+    // Wait for sync (max 3 seconds)
+    for (int i = 0; i < 30 && !nimble_initialized; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    if (!nimble_initialized) {
+        ESP_LOGE(TAG, "NimBLE failed to sync");
+        return ESP_FAIL;
+    }
+    
+    return ESP_OK;
+}
+
+/**
+ * Deinitialize NimBLE stack
+ */
+static void bt_nimble_deinit(void)
+{
+    if (!nimble_initialized) {
+        return;
+    }
+    
+    // Stop any active scanning
+    bt_scan_active = false;
+    bt_airtag_scan_active = false;
+    bt_stop_scan();
+    
+    // Wait for scan task to finish
+    if (bt_scan_task_handle != NULL) {
+        for (int i = 0; i < 20 && bt_scan_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+    
+    // Stop NimBLE host task
+    nimble_port_stop();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // Deinitialize NimBLE port and controller (required for reinit)
+    nimble_port_deinit();
+    
+    nimble_initialized = false;
+    MY_LOG_INFO(TAG, "NimBLE stopped");
+}
+
+/**
+ * Stop BLE scanner (called from cmd_stop)
+ */
+static void bt_scan_stop(void)
+{
+    if (!bt_scan_active && !bt_airtag_scan_active && bt_scan_task_handle == NULL) {
+        return;
+    }
+    
+    bt_scan_active = false;
+    bt_airtag_scan_active = false;
+    bt_stop_scan();
+    
+    // Wait for task to finish
+    for (int i = 0; i < 40 && bt_scan_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    
+    if (bt_scan_task_handle != NULL) {
+        vTaskDelete(bt_scan_task_handle);
+        bt_scan_task_handle = NULL;
+    }
+    
+    MY_LOG_INFO(TAG, "BLE scanner stopped.");
+}
+
+/**
+ * Task for one-time BLE scan (scan_bt command)
+ */
+static void bt_scan_task(void *pvParameters)
+{
+    bt_reset_counters();
+    
+    MY_LOG_INFO(TAG, "BLE scan starting (10 seconds)...");
+    
+    int rc = bt_start_scan();
+    if (rc != 0) {
+        MY_LOG_INFO(TAG, "BLE scan start failed: %d", rc);
+        bt_scan_active = false;
+        bt_scan_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Scan for 10 seconds with light blue LED blinking
+    bool led_on = false;
+    for (int i = 0; i < 100 && bt_scan_active; i++) {
+        // Toggle LED every 500ms (every 5 iterations)
+        if (i % 5 == 0) {
+            led_on = !led_on;
+            if (led_on) {
+                led_set_color(100, 200, 255); // Light blue
+            } else {
+                led_clear();
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    // Restore idle LED
+    led_set_idle();
+    
+    bt_stop_scan();
+    bt_scan_active = false;
+    
+    // Print results
+    MY_LOG_INFO(TAG, "");
+    MY_LOG_INFO(TAG, "=== BLE Scan Results ===");
+    MY_LOG_INFO(TAG, "Found %d devices:", bt_device_count);
+    MY_LOG_INFO(TAG, "");
+    
+    for (int i = 0; i < bt_device_count; i++) {
+        bt_device_info_t *dev = &bt_devices[i];
+        char addr_str[18];
+        bt_format_addr(dev->addr, addr_str);
+        
+        char type_str[32] = "";
+        if (dev->is_airtag) {
+            strcpy(type_str, " [AirTag]");
+        } else if (dev->is_smarttag) {
+            strcpy(type_str, " [SmartTag]");
+        }
+        
+        if (dev->name[0] != '\0') {
+            MY_LOG_INFO(TAG, "%3d. %s  RSSI: %d dBm  Name: %s%s", 
+                       i + 1, addr_str, dev->rssi, dev->name, type_str);
+        } else {
+            MY_LOG_INFO(TAG, "%3d. %s  RSSI: %d dBm%s", 
+                       i + 1, addr_str, dev->rssi, type_str);
+        }
+    }
+    
+    MY_LOG_INFO(TAG, "");
+    MY_LOG_INFO(TAG, "Summary: %d AirTags, %d SmartTags, %d total devices",
+               bt_airtag_count, bt_smarttag_count, bt_device_count);
+    
+    bt_scan_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+/**
+ * Task for continuous AirTag scan (scan_airtag command)
+ */
+static void bt_airtag_scan_task(void *pvParameters)
+{
+    MY_LOG_INFO(TAG, "AirTag scanner starting (continuous)...");
+    MY_LOG_INFO(TAG, "Output format: <airtag_count>,<smarttag_count>");
+    MY_LOG_INFO(TAG, "Use 'stop' command to stop scanning.");
+    MY_LOG_INFO(TAG, "");
+    
+    while (bt_airtag_scan_active && !operation_stop_requested) {
+        bt_reset_counters();
+        
+        int rc = bt_start_scan();
+        if (rc != 0) {
+            MY_LOG_INFO(TAG, "BLE scan start failed: %d", rc);
+            break;
+        }
+        
+        // Scan for 10 seconds with light blue LED blinking
+        bool led_on = false;
+        for (int i = 0; i < 100 && bt_airtag_scan_active && !operation_stop_requested; i++) {
+            // Toggle LED every 500ms (every 5 iterations)
+            if (i % 5 == 0) {
+                led_on = !led_on;
+                if (led_on) {
+                    led_set_color(100, 200, 255); // Light blue
+                } else {
+                    led_clear();
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        
+        bt_stop_scan();
+        
+        if (!bt_airtag_scan_active || operation_stop_requested) {
+            break;
+        }
+        
+        // Output in requested format: airtag_count,smarttag_count
+        printf("%d,%d\n", bt_airtag_count, bt_smarttag_count);
+        
+        // Immediately start next scan cycle (no wait)
+    }
+    
+    // Restore idle LED
+    led_set_idle();
+    
+    bt_airtag_scan_active = false;
+    bt_scan_task_handle = NULL;
+    MY_LOG_INFO(TAG, "AirTag scanner stopped.");
+    vTaskDelete(NULL);
+}
+
+/**
+ * Task for MAC tracking mode (scan_bt with MAC argument)
+ * Scans every 10 seconds and outputs RSSI for the tracked MAC
+ */
+static void bt_tracking_task(void *pvParameters)
+{
+    char mac_str[18];
+    bt_format_addr(bt_tracking_mac, mac_str);
+    
+    MY_LOG_INFO(TAG, "Tracking %s (10s intervals)...", mac_str);
+    MY_LOG_INFO(TAG, "Use 'stop' command to stop tracking.");
+    MY_LOG_INFO(TAG, "");
+    
+    while (bt_scan_active && !operation_stop_requested) {
+        // Reset tracking state
+        bt_tracking_found = false;
+        bt_tracking_rssi = 0;
+        
+        int rc = bt_start_scan();
+        if (rc != 0) {
+            MY_LOG_INFO(TAG, "BLE scan start failed: %d", rc);
+            break;
+        }
+        
+        // Scan for 10 seconds with light blue LED blinking
+        bool led_on = false;
+        for (int i = 0; i < 100 && bt_scan_active && !operation_stop_requested; i++) {
+            // Toggle LED every 500ms (every 5 iterations)
+            if (i % 5 == 0) {
+                led_on = !led_on;
+                if (led_on) {
+                    led_set_color(100, 200, 255); // Light blue
+                } else {
+                    led_clear();
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        
+        bt_stop_scan();
+        
+        if (!bt_scan_active || operation_stop_requested) {
+            break;
+        }
+        
+        // Output result
+        if (bt_tracking_found) {
+            if (bt_tracking_name[0] != '\0') {
+                printf("%s  RSSI: %d dBm  Name: %s\n", mac_str, bt_tracking_rssi, bt_tracking_name);
+            } else {
+                printf("%s  RSSI: %d dBm\n", mac_str, bt_tracking_rssi);
+            }
+        } else {
+            printf("%s  not found\n", mac_str);
+        }
+    }
+    
+    // Restore idle LED
+    led_set_idle();
+    
+    bt_tracking_mode = false;
+    bt_scan_active = false;
+    bt_scan_task_handle = NULL;
+    MY_LOG_INFO(TAG, "MAC tracking stopped.");
+    vTaskDelete(NULL);
+}
+
+/**
+ * Command: scan_bt - One-time BLE device scan
+ * With MAC argument: continuous tracking of specific device
+ * 
+ * Usage:
+ *   scan_bt              - One-time 10s scan, show all devices
+ *   scan_bt XX:XX:XX:XX:XX:XX - Continuous tracking of specific MAC (2s intervals)
+ */
+static int cmd_scan_bt(int argc, char **argv)
+{
+    log_memory_info("scan_bt");
+    
+    // Ensure BLE is initialized (may reboot if WiFi was active)
+    if (!ensure_ble_mode()) {
+        return 1;
+    }
+    
+    if (bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "BLE scan already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    bt_scan_active = true;
+    operation_stop_requested = false;
+    
+    // Check if MAC argument provided
+    if (argc > 1) {
+        // Tracking mode - parse MAC address
+        if (!bt_parse_mac(argv[1], bt_tracking_mac)) {
+            MY_LOG_INFO(TAG, "Invalid MAC address format. Use XX:XX:XX:XX:XX:XX");
+            bt_scan_active = false;
+            return 1;
+        }
+        
+        bt_tracking_mode = true;
+        bt_tracking_found = false;
+        bt_tracking_rssi = 0;
+        bt_tracking_name[0] = '\0';
+        
+        BaseType_t task_ret = xTaskCreate(
+            bt_tracking_task,
+            "bt_tracking_task",
+            4096,
+            NULL,
+            5,
+            &bt_scan_task_handle
+        );
+        
+        if (task_ret != pdPASS) {
+            bt_scan_active = false;
+            bt_tracking_mode = false;
+            MY_LOG_INFO(TAG, "Failed to create MAC tracking task");
+            return 1;
+        }
+    } else {
+        // Normal scan mode
+        bt_tracking_mode = false;
+        
+        BaseType_t task_ret = xTaskCreate(
+            bt_scan_task,
+            "bt_scan_task",
+            4096,
+            NULL,
+            5,
+            &bt_scan_task_handle
+        );
+        
+        if (task_ret != pdPASS) {
+            bt_scan_active = false;
+            MY_LOG_INFO(TAG, "Failed to create BLE scan task");
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+/**
+ * Command: scan_airtag - Continuous AirTag/SmartTag scanning
+ */
+static int cmd_scan_airtag(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    log_memory_info("scan_airtag");
+    
+    // Ensure BLE is initialized (may reboot if WiFi was active)
+    if (!ensure_ble_mode()) {
+        return 1;
+    }
+    
+    if (bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "BLE scan already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    bt_airtag_scan_active = true;
+    operation_stop_requested = false;
+    
+    BaseType_t task_ret = xTaskCreate(
+        bt_airtag_scan_task,
+        "bt_airtag_task",
+        4096,
+        NULL,
+        5,
+        &bt_scan_task_handle
+    );
+    
+    if (task_ret != pdPASS) {
+        bt_airtag_scan_active = false;
+        MY_LOG_INFO(TAG, "Failed to create AirTag scan task");
+        return 1;
+    }
+    
+    return 0;
+}
+
+// ============================================================================
+
 // --- Command registration in esp_console ---
 static void register_commands(void)
 {
@@ -5872,6 +7187,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_dog_cmd));
+
+    const esp_console_cmd_t deauth_detector_cmd = {
+        .command = "deauth_detector",
+        .help = "Detect deauth frames. No args: scan+all channels. With indices: selected channels only",
+        .hint = "[index1 index2 ...]",
+        .func = &cmd_deauth_detector,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&deauth_detector_cmd));
 
     const esp_console_cmd_t select_cmd = {
         .command = "select_networks",
@@ -6079,9 +7403,34 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&select_html_cmd));
+
+    // BLE Scanner commands
+    const esp_console_cmd_t scan_bt_cmd = {
+        .command = "scan_bt",
+        .help = "One-time BLE device scan (10 seconds)",
+        .hint = NULL,
+        .func = &cmd_scan_bt,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&scan_bt_cmd));
+
+    const esp_console_cmd_t scan_airtag_cmd = {
+        .command = "scan_airtag",
+        .help = "Continuous AirTag/SmartTag scan (outputs count every 30s)",
+        .hint = NULL,
+        .func = &cmd_scan_airtag,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&scan_airtag_cmd));
 }
 
 void app_main(void) {
+
+
+    // printf("Heap regions:\n");
+    // printf("  DRAM total: %u KB\n", (unsigned)(heap_caps_get_total_size(MALLOC_CAP_8BIT) / 1024));
+    // printf("  IRAM total: %u KB\n", (unsigned)(heap_caps_get_total_size(MALLOC_CAP_EXEC) / 1024));
+    // heap_caps_print_heap_info(MALLOC_CAP_DEFAULT);
 
     printf("\n\n=== APP_MAIN START (v" JANOS_VERSION ") ===\n");
     
@@ -6093,23 +7442,31 @@ void app_main(void) {
     // esp_log_level_set(TAG, ESP_LOG_DEBUG);
     // esp_log_level_set("espnow", ESP_LOG_DEBUG);
 
-#ifdef CONFIG_SPIRAM
-    printf("Step 1: Manual PSRAM init\n");
+ #ifdef CONFIG_SPIRAM
+//     printf("Step 1: Manual PSRAM init\n");
     
     // Manual PSRAM initialization (CONFIG_SPIRAM_BOOT_INIT=n)
     esp_err_t ret1 = esp_psram_init();
     if (ret1 == ESP_OK) {
         size_t psram_size = esp_psram_get_size();
-        printf("PSRAM initialized successfully, size: %zu bytes\n", psram_size);
+        (void)psram_size;
+        //printf("PSRAM initialized successfully, size: %zu bytes\n", psram_size);
         
-        printf("Step 2: Test PSRAM malloc\n");
+        //printf("Step 2: Test PSRAM malloc\n");
         void* ptr = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
         if (ptr != NULL) {
-            printf("Malloc from PSRAM succeeded\n");
+            //printf("Malloc from PSRAM succeeded\n");
             heap_caps_free(ptr);
         } else {
             printf("Malloc from PSRAM failed\n");
         }
+        
+        //printf("Step 2b: Allocate buffers in PSRAM\n");
+        if (!init_psram_buffers()) {
+            printf("FATAL: PSRAM buffer allocation failed!\n");
+            return;
+        }
+        //printf("PSRAM buffers allocated (~110 KB)\n");
     } else {
         printf("PSRAM init failed: %s (continuing without PSRAM)\n", esp_err_to_name(ret1));
     }
@@ -6117,13 +7474,13 @@ void app_main(void) {
     printf("PSRAM support disabled in config\n");
 #endif
 
-    printf("Step 3: Init NVS\n");
+//     printf("Step 3: Init NVS\n");
     ESP_ERROR_CHECK(nvs_flash_init());
-    printf("NVS initialized OK\n");
+    //printf("NVS initialized OK\n");
 
     channel_time_load_state_from_nvs();
 
-    printf("Step 4: Init LED strip\n");
+    //printf("Step 4: Init LED strip\n");
     // 1. LED strip configuration
     led_strip_config_t strip_cfg = {
         .strip_gpio_num            = NEOPIXEL_GPIO,
@@ -6142,12 +7499,12 @@ void app_main(void) {
 
     // 3. strip instance
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &strip));
-    printf("LED strip initialized OK\n");
+    //printf("LED strip initialized OK\n");
 
     led_initialized = true;
-    printf("Step 5: LED boot sequence\n");
+    //printf("Step 5: LED boot sequence\n");
     led_boot_sequence();
-    printf("Step 6: Vendor load state\n");
+    //printf("Step 6: Vendor load state\n");
     MY_LOG_INFO(TAG, "Status LED ready (brightness %u%%, %s)", led_brightness_percent, led_user_enabled ? "on" : "off");
     vendor_load_state_from_nvs();
     vendor_last_valid = false;
@@ -6156,60 +7513,55 @@ void app_main(void) {
     vendor_file_checked = false;
     vendor_file_present = false;
     vendor_record_count = 0;
-    printf("Step 7: Boot config load\n");
+    //printf("Step 7: Boot config load\n");
     boot_config_load_from_nvs();
 
-    printf("Step 8: WiFi init\n");
-    ESP_ERROR_CHECK(wifi_init_ap_sta());
-    printf("WiFi initialized OK\n"); 
+    // Note: WiFi and BLE are initialized lazily on first command that needs them
+    // This saves memory and allows SD card to work properly
+    //printf("Radio init: deferred (lazy initialization)\n");
+    
+    // Show memory status at boot
+    log_memory_info("BOOT");
 
-    wifi_country_t wifi_country = {
-        .cc = "PH",
-        .schan = 1,
-        .nchan = 14,
-        .policy = WIFI_COUNTRY_POLICY_AUTO,
-    };
-    esp_err_t retC = esp_wifi_set_country(&wifi_country);
-    if (retC != ESP_OK) {
-           ESP_LOGE(TAG, "Failed to set Wi-Fi country code: %s", esp_err_to_name(retC));
-    } else {
-           ESP_LOGW(TAG, "Wi-Fi country code set to %s", wifi_country.cc);
-    }
+    MY_LOG_INFO(TAG,"JanOS version: " JANOS_VERSION);
 
 
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
      MY_LOG_INFO(TAG,"");
     MY_LOG_INFO(TAG,"Available commands:");
-    MY_LOG_INFO(TAG,"  scan_networks");
-    MY_LOG_INFO(TAG,"  show_scan_results");
-    MY_LOG_INFO(TAG,"  select_networks <index1> [index2] ...");
-    MY_LOG_INFO(TAG,"  start_evil_twin");
-    MY_LOG_INFO(TAG,"  start_deauth");
-    MY_LOG_INFO(TAG,"  sae_overflow");
-    MY_LOG_INFO(TAG,"  start_blackout");
-    MY_LOG_INFO(TAG,"  start_wardrive");
-    MY_LOG_INFO(TAG,"  start_portal <SSID>");
-    MY_LOG_INFO(TAG,"  list_sd");
-    MY_LOG_INFO(TAG,"  list_dir <path>");
-    MY_LOG_INFO(TAG,"  list_ssid");
-    MY_LOG_INFO(TAG,"  select_html <index>");
-    MY_LOG_INFO(TAG,"  file_delete <path>");
-    MY_LOG_INFO(TAG,"  start_sniffer");
-    MY_LOG_INFO(TAG,"  packet_monitor <channel>");
-    MY_LOG_INFO(TAG,"  channel_view");
-    MY_LOG_INFO(TAG,"  show_sniffer_results");
-    MY_LOG_INFO(TAG,"  show_probes");
-    MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
-    MY_LOG_INFO(TAG,"  start_sniffer_dog");
-    MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
-    MY_LOG_INFO(TAG,"  boot_button read|list|set|status");
-    MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
-    MY_LOG_INFO(TAG,"  channel_time set <min|max> <ms> | channel_time read <min|max>");
-    MY_LOG_INFO(TAG,"  download");
-    MY_LOG_INFO(TAG,"  ping");
-    MY_LOG_INFO(TAG,"  stop");
-    MY_LOG_INFO(TAG,"  reboot");
+      MY_LOG_INFO(TAG,"  boot_button read|list|set|status");
+      MY_LOG_INFO(TAG,"  channel_time set <min|max> <ms> | channel_time read <min|max>");
+      MY_LOG_INFO(TAG,"  channel_view");
+      MY_LOG_INFO(TAG,"  deauth_detector");
+      MY_LOG_INFO(TAG,"  download");
+      MY_LOG_INFO(TAG,"  file_delete <path>");
+      MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
+      MY_LOG_INFO(TAG,"  list_dir <path>");
+      MY_LOG_INFO(TAG,"  list_sd");
+      MY_LOG_INFO(TAG,"  list_ssid");
+      MY_LOG_INFO(TAG,"  packet_monitor <channel>");
+      MY_LOG_INFO(TAG,"  ping");
+      MY_LOG_INFO(TAG,"  reboot");
+      MY_LOG_INFO(TAG,"  sae_overflow");
+      MY_LOG_INFO(TAG,"  scan_airtag");
+      MY_LOG_INFO(TAG,"  scan_bt");
+      MY_LOG_INFO(TAG,"  scan_networks");
+      MY_LOG_INFO(TAG,"  select_html <index>");
+      MY_LOG_INFO(TAG,"  select_networks <index1> [index2] ...");
+      MY_LOG_INFO(TAG,"  show_probes");
+      MY_LOG_INFO(TAG,"  show_scan_results");
+      MY_LOG_INFO(TAG,"  show_sniffer_results");
+      MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
+      MY_LOG_INFO(TAG,"  start_blackout");
+      MY_LOG_INFO(TAG,"  start_deauth");
+      MY_LOG_INFO(TAG,"  start_evil_twin");
+      MY_LOG_INFO(TAG,"  start_portal <SSID>");
+      MY_LOG_INFO(TAG,"  start_sniffer");
+      MY_LOG_INFO(TAG,"  start_sniffer_dog");
+      MY_LOG_INFO(TAG,"  start_wardrive");
+      MY_LOG_INFO(TAG,"  stop");
+      MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
 
     repl_config.prompt = ">";
     repl_config.max_cmdline_length = 100;
@@ -6755,7 +8107,7 @@ static void sniffer_process_scan_results(void) {
     
     // Clear existing sniffer data
     sniffer_ap_count = 0;
-    memset(sniffer_aps, 0, sizeof(sniffer_aps));
+    memset(sniffer_aps, 0, MAX_SNIFFER_APS * sizeof(sniffer_ap_t));
     
     // Copy scan results to sniffer structure
     for (int i = 0; i < g_scan_count && i < MAX_SNIFFER_APS; i++) {
@@ -6785,7 +8137,7 @@ static void sniffer_init_selected_networks(void) {
     
     // Clear existing sniffer data
     sniffer_ap_count = 0;
-    memset(sniffer_aps, 0, sizeof(sniffer_aps));
+    memset(sniffer_aps, 0, MAX_SNIFFER_APS * sizeof(sniffer_ap_t));
     
     // Clear channel list
     sniffer_selected_channels_count = 0;
@@ -7463,6 +8815,134 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
                ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
                sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5],
                sniffer_dog_current_channel, pkt->rx_ctrl.rssi);
+}
+
+// === DEAUTH DETECTOR FUNCTIONS ===
+
+// Helper function to find SSID by BSSID from scan results
+static const char* deauth_detector_find_ssid_by_bssid(const uint8_t *bssid) {
+    for (int i = 0; i < g_scan_count; i++) {
+        if (memcmp(g_scan_results[i].bssid, bssid, 6) == 0) {
+            return (const char*)g_scan_results[i].ssid;
+        }
+    }
+    return NULL; // Unknown AP
+}
+
+static void deauth_detector_channel_hop(void) {
+    if (!deauth_detector_active) {
+        return;
+    }
+    
+    // Check if we're in selected channels mode
+    if (deauth_detector_selected_mode && deauth_detector_selected_channels_count > 0) {
+        // Use selected channels only
+        deauth_detector_current_channel = deauth_detector_selected_channels[deauth_detector_channel_index];
+        
+        deauth_detector_channel_index++;
+        if (deauth_detector_channel_index >= deauth_detector_selected_channels_count) {
+            deauth_detector_channel_index = 0;
+        }
+    } else {
+        // Use dual-band channel hopping (all channels)
+        deauth_detector_current_channel = dual_band_channels[deauth_detector_channel_index];
+        
+        deauth_detector_channel_index++;
+        if (deauth_detector_channel_index >= dual_band_channels_count) {
+            deauth_detector_channel_index = 0;
+        }
+    }
+    
+    esp_wifi_set_channel(deauth_detector_current_channel, WIFI_SECOND_CHAN_NONE);
+    deauth_detector_last_channel_hop = esp_timer_get_time() / 1000;
+}
+
+// Task that handles channel hopping for deauth_detector
+static void deauth_detector_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    log_memory_info("deauth_detector_task");
+    
+    while (deauth_detector_active) {
+        vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
+        
+        if (!deauth_detector_active) {
+            continue;
+        }
+        
+        // Force channel hop if 250ms passed
+        int64_t current_time = esp_timer_get_time() / 1000;
+        bool time_expired = (current_time - deauth_detector_last_channel_hop >= sniffer_channel_hop_delay_ms);
+        
+        if (time_expired) {
+            deauth_detector_channel_hop();
+            // Reset LED to yellow after channel hop (in case it was red from deauth detection)
+            (void)led_set_color(255, 255, 0);
+        }
+    }
+    
+    MY_LOG_INFO(TAG, "Deauth detector channel task ending");
+    deauth_detector_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Promiscuous callback for deauth_detector - detects deauthentication frames
+static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!deauth_detector_active) {
+        return;
+    }
+    
+    // Filter only MGMT packets (deauth is a management frame)
+    if (type != WIFI_PKT_MGMT) {
+        return;
+    }
+    
+    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+    
+    if (len < 24) { // Minimum 802.11 header size
+        return;
+    }
+    
+    // Check if this is a deauthentication frame
+    // Frame Control: Type=0 (Management), Subtype=12 (Deauthentication)
+    // Frame Control byte 0: 0xC0 = (subtype << 4) | (type << 2) = (12 << 4) | (0 << 2) = 0xC0
+    uint8_t frame_type = frame[0] & 0xFC;
+    if (frame_type != 0xC0) {
+        return; // Not a deauthentication frame
+    }
+    
+    // Extract BSSID (Address 3 in management frames)
+    // 802.11 header: FC(2) + Duration(2) + Addr1(6) + Addr2(6) + Addr3(6) + SeqCtl(2)
+    // Addr3 is at offset 16
+    const uint8_t *bssid_mac = &frame[16];
+    
+    // Get RSSI from rx_ctrl
+    int rssi = pkt->rx_ctrl.rssi;
+    
+    // Lookup SSID by BSSID from scan results
+    const char *ssid = deauth_detector_find_ssid_by_bssid(bssid_mac);
+    const char *ap_name = (ssid && ssid[0] != '\0') ? ssid : "<Unknown>";
+    
+    // Throttle LED flash - only flash red if 100ms passed since last flash
+    // This prevents RMT channel conflicts when deauth frames come rapidly
+    static int64_t last_led_flash_time = 0;
+    int64_t now = esp_timer_get_time() / 1000; // ms
+    
+    if (now - last_led_flash_time >= 100) {
+        (void)led_set_color(255, 0, 0); // Red flash
+        last_led_flash_time = now;
+    }
+    
+    // Print detection: CHANNEL | AP NAME (MAC) | RSSI
+    MY_LOG_INFO(TAG, "[DEAUTH] CH: %d | AP: %s (%02X:%02X:%02X:%02X:%02X:%02X) | RSSI: %d",
+               deauth_detector_current_channel,
+               ap_name,
+               bssid_mac[0], bssid_mac[1], bssid_mac[2], bssid_mac[3], bssid_mac[4], bssid_mac[5],
+               rssi);
+    
+    // Note: LED reset to yellow is handled by the task after channel hop
 }
 
 // === WARDRIVE HELPER FUNCTIONS ===

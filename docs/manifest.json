@@ -1,0 +1,11 @@
+{
+  "name": "projectZero ESP32-C5",
+  "version": "latest",
+  "build": "latest",
+  "chipFamily": "ESP32-C5",
+  "parts": [
+    { "path": "firmware/bootloader.bin", "offset": 8192 },
+    { "path": "firmware/partition-table.bin", "offset": 32768 },
+    { "path": "firmware/projectZero.bin", "offset": 65536 }
+  ]
+}
