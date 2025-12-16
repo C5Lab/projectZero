@@ -13,7 +13,6 @@
 #include <notification/notification.h>
 #include <notification/notification_messages.h>
 #include <storage/storage.h>
-#include <storage/storage_sd_api.h>
 #include <furi/core/stream_buffer.h>
 #include <gui/view_dispatcher.h>
 #include <gui/modules/text_input.h>
@@ -131,7 +130,7 @@ typedef enum {
 #define SCANNER_FILTER_VISIBLE_COUNT 3
 #define SCANNER_SCAN_COMMAND "scan_networks"
 #define TARGETS_RESULTS_COMMAND "show_scan_results"
-#define LAB_C5_CONFIG_DIR_PATH "apps_assets/labC5"
+#define LAB_C5_CONFIG_DIR_PATH "/int/apps_data/labC5"
 #define LAB_C5_CONFIG_FILE_PATH LAB_C5_CONFIG_DIR_PATH "/config.txt"
 
 #define BOARD_PING_INTERVAL_MS 4000
@@ -700,6 +699,7 @@ static void simple_app_apply_otg_power(SimpleApp* app);
 static void simple_app_toggle_otg_power(SimpleApp* app);
 static void simple_app_send_download(SimpleApp* app);
 static bool simple_app_usb_profile_ok(void);
+static void simple_app_show_usb_blocker(void);
 static bool simple_app_is_start_sniffer_command(const char* command);
 static void simple_app_send_start_sniffer(SimpleApp* app);
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial);
@@ -3695,11 +3695,10 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
     if(!app) return false;
     Storage* storage = furi_record_open(RECORD_STORAGE);
     if(!storage) return false;
-    storage_simply_mkdir(storage, EXT_PATH("apps_assets"));
-    storage_simply_mkdir(storage, EXT_PATH(LAB_C5_CONFIG_DIR_PATH));
+    storage_simply_mkdir(storage, LAB_C5_CONFIG_DIR_PATH);
     File* file = storage_file_alloc(storage);
     bool success = false;
-    if(storage_file_open(file, EXT_PATH(LAB_C5_CONFIG_FILE_PATH), FSAM_READ_WRITE, FSOM_CREATE_ALWAYS)) {
+    if(storage_file_open(file, LAB_C5_CONFIG_FILE_PATH, FSAM_READ_WRITE, FSOM_CREATE_ALWAYS)) {
         char buffer[512];
         uint8_t short_idx = (app->boot_short_command_index < BOOT_COMMAND_OPTION_COUNT)
                                 ? app->boot_short_command_index
@@ -3775,17 +3774,10 @@ static void simple_app_load_config(SimpleApp* app) {
     if(!app) return;
     Storage* storage = furi_record_open(RECORD_STORAGE);
     if(!storage) return;
-    // Wait briefly for SD to become ready; avoid crashing if card mounts slowly after boot
-    if(!simple_app_wait_for_sd(storage, 2000)) {
-        simple_app_show_status_message(app, "SD not ready", 2000, true);
-        furi_record_close(RECORD_STORAGE);
-        return;
-    }
-    storage_simply_mkdir(storage, EXT_PATH("apps_assets"));
-    storage_simply_mkdir(storage, EXT_PATH(LAB_C5_CONFIG_DIR_PATH));
+    storage_simply_mkdir(storage, LAB_C5_CONFIG_DIR_PATH);
     File* file = storage_file_alloc(storage);
     bool loaded = false;
-    if(storage_file_open(file, EXT_PATH(LAB_C5_CONFIG_FILE_PATH), FSAM_READ, FSOM_OPEN_EXISTING)) {
+    if(storage_file_open(file, LAB_C5_CONFIG_FILE_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
         char line[96];
         size_t pos = 0;
         uint8_t ch = 0;
@@ -11921,6 +11913,16 @@ int32_t Lab_C5_app(void* p) {
     // If USB is in mass-storage/qFlipper mode, exit immediately to avoid crashes
     if(!simple_app_usb_profile_ok()) {
         return 0;
+    }
+
+    // If SD is busy (e.g., mounted via qFlipper), exit immediately
+    Storage* early_storage = furi_record_open(RECORD_STORAGE);
+    if(early_storage) {
+        if(storage_sd_status(early_storage) != FSE_OK) {
+            furi_record_close(RECORD_STORAGE);
+            return 0;
+        }
+        furi_record_close(RECORD_STORAGE);
     }
 
     SimpleApp* app = malloc(sizeof(SimpleApp));
