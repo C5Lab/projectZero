@@ -5272,6 +5272,47 @@ static int cmd_select_html(int argc, char **argv)
     return 0;
 }
 
+// Command: set_html - Sets custom HTML from command line argument
+static int cmd_set_html(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: set_html <html_string>");
+        MY_LOG_INFO(TAG, "Example: set_html <!DOCTYPE html><html>...</html>");
+        return 1;
+    }
+    
+    // Concatenate all arguments (HTML may contain spaces)
+    size_t total_len = 0;
+    for (int i = 1; i < argc; i++) {
+        total_len += strlen(argv[i]) + 1; // +1 for space
+    }
+    
+    // Free previous custom HTML if exists
+    if (custom_portal_html != NULL) {
+        free(custom_portal_html);
+        custom_portal_html = NULL;
+    }
+    
+    // Allocate and build the HTML string
+    custom_portal_html = (char*)malloc(total_len + 1);
+    if (custom_portal_html == NULL) {
+        MY_LOG_INFO(TAG, "Failed to allocate memory for HTML.");
+        return 1;
+    }
+    
+    custom_portal_html[0] = '\0';
+    for (int i = 1; i < argc; i++) {
+        strcat(custom_portal_html, argv[i]);
+        if (i < argc - 1) {
+            strcat(custom_portal_html, " ");
+        }
+    }
+    
+    MY_LOG_INFO(TAG, "Custom HTML set (%u bytes). Portal/Evil Twin/Karma will use this HTML.",
+                (unsigned int)strlen(custom_portal_html));
+    return 0;
+}
+
 // Wardrive task function (runs in background)
 static void wardrive_task(void *pvParameters) {
     (void)pvParameters;
@@ -7404,6 +7445,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&select_html_cmd));
 
+    const esp_console_cmd_t set_html_cmd = {
+        .command = "set_html",
+        .help = "Set custom portal HTML from string: set_html <html>",
+        .hint = NULL,
+        .func = &cmd_set_html,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_html_cmd));
+
     // BLE Scanner commands
     const esp_console_cmd_t scan_bt_cmd = {
         .command = "scan_bt",
@@ -7434,13 +7484,13 @@ void app_main(void) {
 
     printf("\n\n=== APP_MAIN START (v" JANOS_VERSION ") ===\n");
     
-    // esp_log_level_set("wifi", ESP_LOG_INFO);
-    // esp_log_level_set("projectZero", ESP_LOG_INFO);
-    // esp_log_level_set("espnow", ESP_LOG_INFO);
-
-    // esp_log_level_set("wifi", ESP_LOG_DEBUG);
-    // esp_log_level_set(TAG, ESP_LOG_DEBUG);
-    // esp_log_level_set("espnow", ESP_LOG_DEBUG);
+    // Suppress WiFi internal WARNING logs (phy rate, etc.) - show only errors
+    esp_log_level_set("wifi", ESP_LOG_ERROR);
+    
+    // Suppress SD card initialization errors (we handle them gracefully with our own message)
+    esp_log_level_set("sdmmc_sd", ESP_LOG_NONE);
+    esp_log_level_set("vfs_fat_sdmmc", ESP_LOG_NONE);
+    esp_log_level_set("spi_common", ESP_LOG_NONE);
 
  #ifdef CONFIG_SPIRAM
 //     printf("Step 1: Manual PSRAM init\n");
@@ -7607,6 +7657,10 @@ void app_main(void) {
         if (vendor_is_enabled()) {
             ensure_vendor_file_checked();
         }
+    } else {
+        MY_LOG_INFO(TAG, "");
+        MY_LOG_INFO(TAG, "SD Card not detected. Custom portals won't be available, results won't be written to files.");
+        MY_LOG_INFO(TAG, "");
     }
     
     // Load BSSID whitelist from SD card
@@ -9030,11 +9084,6 @@ static esp_err_t init_sd_card(void) {
     ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
     
     if (ret != ESP_OK) {
-        if (ret == ESP_FAIL) {
-            MY_LOG_INFO(TAG, "Failed to mount filesystem. If you want the card to be formatted, set format_if_mount_failed = true.");
-        } else {
-            MY_LOG_INFO(TAG, "Failed to initialize the card (%s). Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
-        }
         return ret;
     }
     
