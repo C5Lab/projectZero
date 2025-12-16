@@ -700,7 +700,6 @@ static void simple_app_apply_otg_power(SimpleApp* app);
 static void simple_app_toggle_otg_power(SimpleApp* app);
 static void simple_app_send_download(SimpleApp* app);
 static bool simple_app_usb_profile_ok(void);
-static void simple_app_show_usb_blocker(void);
 static bool simple_app_is_start_sniffer_command(const char* command);
 static void simple_app_send_start_sniffer(SimpleApp* app);
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial);
@@ -3224,26 +3223,6 @@ static bool simple_app_usb_profile_ok(void) {
     const FuriHalUsbInterface* current = furi_hal_usb_get_config();
     if(!current) return true;
     return current == &usb_cdc_single;
-}
-
-static void simple_app_show_usb_blocker(void) {
-    DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
-    if(dialogs) {
-        DialogMessage* msg = dialog_message_alloc();
-        if(msg) {
-            dialog_message_set_header(msg, "USB busy", 64, 8, AlignCenter, AlignTop);
-            dialog_message_set_text(
-                msg,
-                "Switch USB to CDC/Serial\nthen relaunch.",
-                64,
-                32,
-                AlignCenter,
-                AlignCenter);
-            dialog_message_show(dialogs, msg);
-            dialog_message_free(msg);
-        }
-        furi_record_close(RECORD_DIALOGS);
-    }
 }
 
 static void simple_app_update_result_layout(SimpleApp* app) {
@@ -11939,8 +11918,8 @@ static void simple_app_serial_irq(FuriHalSerialHandle* handle, FuriHalSerialRxEv
 int32_t Lab_C5_app(void* p) {
     UNUSED(p);
 
+    // If USB is in mass-storage/qFlipper mode, exit immediately to avoid crashes
     if(!simple_app_usb_profile_ok()) {
-        simple_app_show_usb_blocker();
         return 0;
     }
 
@@ -12064,8 +12043,8 @@ int32_t Lab_C5_app(void* p) {
     simple_app_update_led_label(app);
     simple_app_update_boot_labels(app);
     simple_app_apply_backlight(app);
-    app->otg_power_enabled = furi_hal_power_is_otg_enabled();
     simple_app_update_otg_label(app);
+    simple_app_apply_otg_power(app);
     if(app->viewport) {
         view_port_update(app->viewport);
     }
