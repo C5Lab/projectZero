@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>projectZero FAP Web Uploader</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0b0f1d;
+      --card: #0f182b;
+      --accent: #48f0ff;
+      --accent-2: #ff8bcf;
+      --text: #e7f3ff;
+      --muted: #9bb0d4;
+      --border: rgba(255, 255, 255, 0.08);
+      --success: #5af29e;
+      --error: #ff6b6b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Space Grotesk", system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at 20% 20%, rgba(72, 240, 255, 0.06), transparent 32%),
+                  radial-gradient(circle at 80% -10%, rgba(255, 139, 207, 0.08), transparent 30%),
+                  var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 32px 18px 64px;
+    }
+    .container { max-width: 1180px; margin: 0 auto; display: grid; gap: 18px; }
+    header {
+      background: linear-gradient(135deg, rgba(72, 240, 255, 0.1), rgba(255, 139, 207, 0.07));
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 22px 22px 26px;
+      box-shadow: 0 18px 56px rgba(0,0,0,0.4);
+    }
+    header .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--muted);
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    h1 { margin: 12px 0 8px; font-size: clamp(30px, 4vw, 42px); letter-spacing: -0.02em; }
+    header p { margin: 0; max-width: 760px; color: var(--muted); line-height: 1.55; }
+    .split { display: grid; grid-template-columns: 1.3fr 1fr; gap: 14px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 12px 36px rgba(0,0,0,0.35);
+    }
+    .card h2 { margin: 0 0 10px; font-size: 18px; letter-spacing: 0.01em; }
+    .card p { margin: 0; color: var(--muted); line-height: 1.55; }
+    .controls { display: grid; gap: 12px; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    button {
+      border: none;
+      cursor: pointer;
+      font-size: 14px;
+      padding: 12px 18px;
+      border-radius: 12px;
+      font-weight: 600;
+      color: #0b0f1d;
+      background: linear-gradient(135deg, var(--accent), #5aa8ff);
+      box-shadow: 0 12px 32px rgba(72, 240, 255, 0.3);
+      transition: transform 0.08s ease, box-shadow 0.12s ease, opacity 0.2s;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; box-shadow: none; }
+    button:hover:not(:disabled) { transform: translateY(-1px); }
+    .ghost { background: rgba(255,255,255,0.04); color: var(--text); box-shadow: inset 0 0 0 1px var(--border); }
+    .status-line { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 4px; color: var(--muted); font-size: 14px; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.03);
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .pill strong { color: var(--text); }
+    label { font-size: 13px; color: var(--muted); display: block; margin-bottom: 6px; }
+    input[type="text"], input[type="file"], select {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.02);
+      color: var(--text);
+      font-size: 14px;
+    }
+    select {
+      appearance: none;
+      background: var(--card);
+      padding-right: 42px;
+      border: 1px solid rgba(255,255,255,0.14);
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.05), 0 8px 18px rgba(0,0,0,0.35);
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      position: relative;
+    }
+    select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(72,240,255,0.2); }
+    select option { background: #0f182b; color: var(--text); font-weight: 600; }
+    .select-wrap { position: relative; }
+    .select-wrap::after {
+      content: "⌄";
+      position: absolute;
+      right: 14px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--muted);
+      pointer-events: none;
+      font-size: 16px;
+    }
+    .row { display: grid; gap: 10px; grid-template-columns: 1fr 1fr; }
+    .progress { width: 100%; height: 10px; border-radius: 999px; background: rgba(255,255,255,0.05); overflow: hidden; border: 1px solid var(--border); margin-top: 6px; }
+    .progress span { display: block; height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.12s ease; }
+    .log { background: rgba(0,0,0,0.35); border: 1px solid var(--border); border-radius: 12px; padding: 12px; min-height: 140px; max-height: 240px; overflow-y: auto; font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 13px; color: #b8c7e6; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+    ul.steps { margin: 8px 0 0; padding-left: 18px; color: var(--muted); line-height: 1.6; }
+    .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; background: rgba(90, 242, 158, 0.12); color: var(--success); font-size: 12px; border: 1px solid rgba(90, 242, 158, 0.4); }
+    .error { color: var(--error); }
+    @media (max-width: 980px) { body { padding: 20px 14px 60px; } .split { grid-template-columns: 1fr; } .row { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="eyebrow">projectZero  Flipper Zero</div>
+      <h1>Upload Lab_C5.fap from your browser</h1>
+      <p>WebSerial uploader that speaks Flipper CLI <code>storage</code>. Connect the device, pick a .fap (or fetch latest), then hit Upload.</p>
+    </header>
+
+    <div class="split">
+      <div class="card">
+        <h2>Control</h2>
+        <div class="controls">
+          <div class="actions">
+            <button id="connectBtn">Connect</button>
+            <button id="uploadBtn" class="ghost" disabled>Upload</button>
+          </div>
+          <div class="row">
+            <div>
+              <label for="destPath">Target path on Flipper</label>
+              <input id="destPath" type="text" value="/ext/apps/lab_c5.fap" spellcheck="false" />
+            </div>
+          </div>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);">
+            <input id="runAfter" type="checkbox" checked style="width:auto;" />
+            Run app after upload
+          </label>
+          <div class="row">
+            <div class="select-wrap">
+              <label for="trackSelect">Firmware track</label>
+              <select id="trackSelect">
+                <option value="momentum" selected>Momentum</option>
+                <option value="unleashed">Unleashed</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <div class="status-line">
+              <span id="statusText">Ready to connect.</span>
+              <span id="chipText" class="pill" style="display:none;"></span>
+              <span id="speedText" class="pill" style="display:none;"></span>
+              <span id="fileText" class="pill" style="display:none;"></span>
+            </div>
+            <div class="progress" aria-label="Upload progress">
+              <span id="progressBar"></span>
+            </div>
+          </div>
+          <div class="log" id="log"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>How to</h2>
+        <p><span class="badge">CLI mode</span> Flipper must expose CDC/CLI (Settings -> Power -> USB mode -> CDC; you should see the <code>>:</code> prompt). WebSerial works in Chrome/Edge on desktop; HTTPS or localhost is required.</p>
+        <ul class="steps">
+          <li>Connect: click Connect and pick the Flipper CDC port.</li>
+          <li>Select a local .fap or fetch the latest Unleashed/Momentum release asset, confirm the target path.</li>
+          <li>Upload: the page streams <code>storage write_chunk</code> in 8 KB pieces and waits for the prompt every time.</li>
+          <li>After upload the app appears under Applications -> External; launch manually if needed.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const ui = {
+      connectBtn: document.getElementById("connectBtn"),
+      uploadBtn: document.getElementById("uploadBtn"),
+      destPath: document.getElementById("destPath"),
+      trackSelect: document.getElementById("trackSelect"),
+      runAfter: document.getElementById("runAfter"),
+      status: document.getElementById("statusText"),
+      chip: document.getElementById("chipText"),
+      speed: document.getElementById("speedText"),
+      fileText: document.getElementById("fileText"),
+      progress: document.getElementById("progressBar"),
+      log: document.getElementById("log"),
+    };
+
+    const state = {
+      port: null,
+      reader: null,
+      writer: null,
+      buffer: "",
+      connected: false,
+      fileData: null,
+      fileName: null,
+      onDisconnect: null,
+    };
+
+    const encoder = new TextEncoder();
+
+    const log = (msg) => {
+      const time = new Date().toLocaleTimeString();
+      const lines = Array.isArray(msg) ? msg : [msg];
+      for (const line of lines) {
+        ui.log.textContent += `[${time}] ${line}\n`;
+      }
+      ui.log.scrollTop = ui.log.scrollHeight;
+    };
+
+    const setStatus = (text, isError = false) => {
+      ui.status.textContent = text;
+      ui.status.classList.toggle("error", Boolean(isError));
+    };
+
+    const setFileInfo = (name, size) => {
+      if (!name) {
+        ui.fileText.style.display = "none";
+        ui.fileText.textContent = "";
+        return;
+      }
+      ui.fileText.style.display = "inline-flex";
+      const kb = Math.round(size / 1024);
+      ui.fileText.textContent = `${name} (${kb} KB)`;
+    };
+
+    const readUntil = async (marker, timeoutMs = 6000) => {
+      const start = performance.now();
+      while (true) {
+        const idx = state.buffer.indexOf(marker);
+        if (idx !== -1) {
+          const out = state.buffer.slice(0, idx + marker.length);
+          state.buffer = state.buffer.slice(idx + marker.length);
+          return out;
+        }
+        let value, done;
+        try {
+          ({ value, done } = await state.reader.read());
+        } catch (err) {
+          throw new Error("Port lost");
+        }
+        if (done) throw new Error("Port closed");
+        state.buffer += value;
+        if (performance.now() - start > timeoutMs) {
+          throw new Error(`Timeout waiting for "${marker}"`);
+        }
+      }
+    };
+
+    const sendText = async (text) => {
+      await state.writer.write(encoder.encode(text));
+    };
+
+    const waitForPrompt = () => readUntil(">: ");
+
+    const ensureSupport = () => {
+      if (!("serial" in navigator)) {
+        throw new Error("Web Serial not available. Use Chrome/Edge over HTTPS/localhost.");
+      }
+    };
+
+    const runApp = async (path) => {
+      try {
+        await sendText(`loader open "${path}"\r`);
+        await waitForPrompt();
+        log(`Launch command sent for ${path}`);
+      } catch (err) {
+        log(`Warning: could not start app automatically: ${err.message || err}`);
+      }
+    };
+
+    const disconnect = async () => {
+      if (state.port && state.onDisconnect) {
+        try { state.port.removeEventListener("disconnect", state.onDisconnect); } catch (e) {}
+      }
+      try { if (state.reader) await state.reader.cancel(); } catch (e) {}
+      try { if (state.writer) await state.writer.close(); } catch (e) {}
+      try { if (state.port) await state.port.close(); } catch (e) {}
+      state.port = null;
+      state.reader = null;
+      state.writer = null;
+      state.buffer = "";
+      state.connected = false;
+      ui.connectBtn.textContent = "Connect";
+      ui.uploadBtn.disabled = true;
+      ui.chip.style.display = "none";
+      ui.speed.style.display = "none";
+      setStatus("Disconnected.");
+    };
+
+    const connect = async () => {
+      ensureSupport();
+      if (state.connected) {
+        await disconnect();
+        return;
+      }
+
+      ui.connectBtn.disabled = true;
+      setStatus("Requesting serial port...");
+      try {
+        state.port = await navigator.serial.requestPort({});
+        state.onDisconnect = () => {
+          log("Device disconnected.");
+          disconnect().catch(() => {});
+          setStatus("Device disconnected. Reconnect to flash.", true);
+        };
+        try {
+          state.port.addEventListener("disconnect", state.onDisconnect);
+        } catch (_) {}
+        await state.port.open({ baudRate: 115200 });
+
+        const decoder = new TextDecoderStream();
+        state.port.readable.pipeTo(decoder.writable);
+        state.reader = decoder.readable.getReader();
+        state.writer = state.port.writable.getWriter();
+        state.buffer = "";
+
+        await waitForPrompt();
+        await sendText("device_info\r");
+        await readUntil("hardware_model");
+        await waitForPrompt();
+
+        state.connected = true;
+        ui.connectBtn.textContent = "Disconnect";
+        ui.uploadBtn.disabled = false;
+        ui.chip.style.display = "inline-flex";
+        ui.chip.textContent = "CLI ready";
+        ui.speed.textContent = "~0 KB/s";
+        setStatus("Connected to Flipper CLI.");
+        log("Connected. Prompt detected (>: ).");
+
+        if (!state.fileData) {
+          fetchLatest().catch((err) => log(`Fetch after connect failed: ${err.message || err}`));
+        }
+      } catch (err) {
+        await disconnect();
+        setStatus(err.message || "Connection failed", true);
+        log(`Error: ${err.message || err}`);
+        throw err;
+      } finally {
+        ui.connectBtn.disabled = false;
+      }
+    };
+
+    const setSelectedFile = (name, data) => {
+      state.fileName = name;
+      state.fileData = data;
+      setFileInfo(name, data?.length || 0);
+      const current = ui.destPath.value.trim();
+      if (!current || current === "/ext/apps/lab_c5.fap") {
+        ui.destPath.value = `/ext/apps/${name}`;
+      }
+    };
+
+    const fetchFirstAvailable = async (urls) => {
+      let lastErr;
+      for (const url of urls) {
+        try {
+          const res = await fetch(url, { headers: { Accept: "application/octet-stream" }, cache: "no-store", redirect: "follow" });
+          if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
+          const buf = new Uint8Array(await res.arrayBuffer());
+          const name = url.split("/").pop() || "lab_c5.fap";
+          return { name, buf };
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      throw lastErr || new Error("Download failed");
+    };
+
+    const fetchLatest = async () => {
+      const track = ui.trackSelect.value;
+      setStatus(`Fetching latest ${track} .fap ...`);
+      log(`Fetch latest release asset for ${track}`);
+      try {
+        const apiUrl = "https://api.github.com/repos/C5Lab/projectZero/releases/latest";
+        const res = await fetch(apiUrl, { cache: "no-store", headers: { Accept: "application/vnd.github+json" } });
+        if (!res.ok) throw new Error(`GitHub API failed: ${res.status} ${res.statusText}`);
+        const release = await res.json();
+        const matchKey = track;
+        const asset = (release.assets || []).find((a) => a.name && a.name.toLowerCase().includes(matchKey) && a.name.endsWith(".fap"));
+        if (!asset) throw new Error(`No .fap asset for ${track} found in latest release`);
+
+        const browserUrl = asset.browser_download_url || asset.url;
+        const rawFallback = `https://raw.githubusercontent.com/C5Lab/projectZero/main/FLIPPER/dist/${asset.name}`;
+        const { name, buf } = await fetchFirstAvailable([rawFallback, browserUrl]);
+        setSelectedFile(name, buf);
+        setStatus(`Ready to upload ${name}`);
+        log(`Fetched ${name} (${buf.length} bytes)`);
+      } catch (err) {
+        setStatus(err.message || "Fetch failed", true);
+        log(`Error: ${err.message || err}`);
+      }
+    };
+
+    const parseVersion = (name) => {
+      const m = name.match(/lab_c5_v(\d+(?:\.\d+)*).*?(unleashed|momentum)/i);
+      if (!m) return { version: null, track: null };
+      const version = m[1].split(".").map((n) => parseInt(n, 10));
+      return { version, track: m[2].toLowerCase() };
+    };
+
+    const compareVersions = (a, b) => {
+      const len = Math.max(a.length, b.length);
+      for (let i = 0; i < len; i++) {
+        const av = a[i] || 0;
+        const bv = b[i] || 0;
+        if (av > bv) return 1;
+        if (av < bv) return -1;
+      }
+      return 0;
+    };
+
+    const listApps = async () => {
+      await sendText('storage list "/ext/apps"\r');
+      const body = await readUntil(">: ");
+      const lines = body.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      return lines
+        .filter((l) => l.startsWith("[F]"))
+        .map((l) => {
+          const parts = l.split(" ");
+          const name = parts[1] || "";
+          return name;
+        });
+    };
+
+    const maybeDeleteConflicts = async () => {
+      const files = await listApps();
+      const conflicts = files.filter((f) => /^lab_c5_.*\.fap$/i.test(f) && f !== state.fileName);
+      if (!conflicts.length) return;
+      const confirmDelete = window.confirm(`Found existing lab_c5*.fap on device: ${conflicts.join(", ")}. Delete them before upload?`);
+      if (!confirmDelete) return;
+      for (const fname of conflicts) {
+        try {
+          await sendText(`storage remove "/ext/apps/${fname}"\r`);
+          await readUntil("\r\n");
+          await waitForPrompt();
+          log(`Deleted ${fname}`);
+        } catch (err) {
+          log(`Warning: could not delete ${fname}: ${err.message || err}`);
+        }
+      }
+    };
+
+    const maybeDeleteOld = async () => {
+      const selected = parseVersion(state.fileName || "");
+      if (!selected.track) return;
+      const files = await listApps();
+      const candidate = files.find((f) => f.toLowerCase().includes(selected.track) && f.toLowerCase().startsWith("lab_c5_v0."));
+      if (!candidate) return;
+      if (candidate === state.fileName) return;
+      const found = parseVersion(candidate);
+      if (!found.version) return;
+      if (!selected.version) return;
+      if (compareVersions(found.version, selected.version) >= 0) return;
+      const confirmDelete = window.confirm(`Found older ${candidate} on device. Delete it before upload?`);
+      if (confirmDelete) {
+        await sendText(`storage remove "/ext/apps/${candidate}"\r`);
+        await readUntil("\r\n");
+        await waitForPrompt();
+        log(`Deleted old ${candidate}`);
+      }
+    };
+
+    const upload = async () => {
+      if (!state.fileData || !state.fileName) {
+        setStatus("Pick a .fap or fetch latest first.", true);
+        return;
+      }
+      if (!state.connected) {
+        setStatus("Connect first.", true);
+        return;
+      }
+      const dest = ui.destPath.value.trim().replace(/\\\\/g, "/").replace(/\\/g, "/") || `/ext/apps/${state.fileName}`;
+      const data = state.fileData;
+      const chunkSize = 8192;
+
+      ui.uploadBtn.disabled = true;
+      ui.progress.style.width = "0%";
+      ui.speed.style.display = "inline-flex";
+      setStatus(`Upload ${state.fileName} → ${dest}`);
+      log(`Uploading ${state.fileName} (${data.length} bytes) to ${dest}`);
+
+      const started = performance.now();
+
+      await maybeDeleteConflicts().catch((err) => log(`Warning: could not clean conflicts: ${err.message || err}`));
+      await maybeDeleteOld().catch((err) => {
+        log(`Warning: could not delete old version: ${err.message || err}`);
+      });
+      // best-effort cleanup of old file (ignore errors)
+      try {
+        await sendText(`storage remove "${dest}"\r`);
+        await readUntil("\r\n");
+        await waitForPrompt();
+      } catch (e) {
+        state.buffer = "";
+      }
+
+      try {
+        let sent = 0;
+        while (sent < data.length) {
+          const chunk = data.subarray(sent, Math.min(sent + chunkSize, data.length));
+          await sendText(`storage write_chunk "${dest}" ${chunk.length}\r`);
+          const ack = await readUntil("\r\n");
+          if (ack.includes("Storage error")) {
+            await waitForPrompt().catch(() => {});
+            throw new Error(ack.trim());
+          }
+          await state.writer.write(chunk);
+          await waitForPrompt();
+
+          sent += chunk.length;
+          const pct = Math.round((sent / data.length) * 100);
+          ui.progress.style.width = `${pct}%`;
+          const elapsed = (performance.now() - started) / 1000;
+          const speed = sent / 1024 / Math.max(elapsed, 0.001);
+          ui.speed.textContent = `~${speed.toFixed(1)} KB/s`;
+          log(`chunk ${pct}% (${sent}/${data.length} bytes)`);
+        }
+        ui.progress.style.width = "100%";
+        setStatus("Upload complete. Launch from Applications -> External.");
+        log("Done.");
+
+        if (ui.runAfter.checked) {
+          await runApp(dest);
+        }
+      } catch (err) {
+        setStatus(err.message || "Upload failed", true);
+        log(`Error: ${err.message || err}`);
+      } finally {
+        ui.uploadBtn.disabled = false;
+      }
+    };
+
+    ui.connectBtn.addEventListener("click", () => connect().catch(() => {}));
+    ui.uploadBtn.addEventListener("click", () => upload().catch(() => {}));
+    ui.trackSelect.addEventListener("change", () => {
+      state.fileData = null;
+      state.fileName = null;
+      setFileInfo("", 0);
+      fetchLatest().catch(() => {});
+    });
+    // auto-fetch latest on load to reduce clicks
+    fetchLatest().catch(() => {});
+  </script>
+</body>
+</html>

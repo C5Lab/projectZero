@@ -109,6 +109,10 @@ Enrich CLI/Flipper listings with manufacturer names by feeding a compact OUI dat
 4. Connect the Flipper to your PC over USB; the flashing script will detect the bridge automatically (no qFlipper needed).
 5. Once the transfer begins the rest is automatic; the board reboots into the freshly flashed JanOS build.
 
+### Flipper `.fap` via browser (experimental)
+- Open `docs/flipper_fap.html` in Chrome/Edge (HTTPS/local). Make sure Flipper exposes CDC/CLI (`>:` prompt).
+- Pick track (Unleashed/Momentum). The page auto-fetches the latest release `.fap` and shows file+size; you can re-fetch or point to a local `FLIPPER/dist/*.fap`, then hit **Upload** (uses `storage write_chunk` over WebSerial).
+
 ### Flashing Troubleshooting
 
 - Make sure the qFlipper application is closed; it will keep the UART bridge busy and the script will hang.
