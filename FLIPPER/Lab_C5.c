@@ -13,14 +13,15 @@
 #include <notification/notification.h>
 #include <notification/notification_messages.h>
 #include <storage/storage.h>
+#include <storage/storage_sd_api.h>
 #include <furi/core/stream_buffer.h>
 #include <gui/view_dispatcher.h>
 #include <gui/modules/text_input.h>
 #include <furi_hal_usb.h>
 #include <furi_hal_usb_cdc.h>
+#include <usb_cdc.h>
 #include <furi_hal_vibro.h>
 #include <dialogs/dialogs.h>
-#include <usb_cdc.h>
 
 #define TAG "Lab_C5"
 
@@ -51,7 +52,6 @@ typedef enum {
     ScreenKarmaMenu,
     ScreenEvilTwinMenu,
     ScreenPortalMenu,
-    ScreenDownloadBridge,
     ScreenBtLocatorList,
 } AppScreen;
 
@@ -59,7 +59,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.35"
+#define LAB_C5_VERSION_TEXT "0.36"
 
 #define MAX_SCAN_RESULTS 64
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -349,8 +349,8 @@ typedef struct {
     char wardrive_status_text[32];
     char wardrive_line_buffer[96];
     size_t wardrive_line_length;
-    bool wardrive_otg_forced;
-    bool wardrive_otg_previous_state;
+    bool otg_power_enabled;
+    bool otg_power_initial_state;
     bool bt_scan_view_active;
     bool bt_scan_summary_seen;
     bool airtag_scan_mode;
@@ -580,8 +580,6 @@ typedef struct {
     size_t scanner_timing_read_length;
     size_t scanner_setup_index;
     bool scanner_adjusting_power;
-    bool otg_power_enabled;
-    bool otg_power_initial_state;
     bool backlight_enabled;
     bool backlight_insomnia;
     bool led_enabled;
@@ -653,14 +651,6 @@ typedef struct {
     char channel_view_status_text[32];
     uint8_t channel_view_offset_24;
     uint8_t channel_view_offset_5;
-    // Download/bridge state
-    bool download_bridge_active;
-    uint8_t download_cdc_if;
-    FuriThread* download_thread;
-    uint32_t download_baud;
-    uint32_t download_baud_new;
-    uint32_t download_uart_to_usb;
-    uint32_t download_usb_to_uart;
 } SimpleApp;
 static void simple_app_reset_result_scroll(SimpleApp* app);
 static void simple_app_update_result_scroll(SimpleApp* app);
@@ -689,11 +679,6 @@ static bool simple_app_handle_boot_status_line(SimpleApp* app, const char* line)
 static void simple_app_boot_feed(SimpleApp* app, char ch);
 static void simple_app_serial_irq(
     FuriHalSerialHandle* handle, FuriHalSerialRxEvent event, void* context);
-static void simple_app_draw_download_bridge(SimpleApp* app, Canvas* canvas);
-static bool simple_app_download_bridge_start(SimpleApp* app);
-static void simple_app_download_bridge_stop(SimpleApp* app);
-static bool simple_app_usb_profile_ok(void);
-static void simple_app_show_usb_blocker(void);
 static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long);
 static void simple_app_on_board_online(SimpleApp* app, const char* source);
 static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas);
@@ -710,16 +695,17 @@ static void simple_app_modify_channel_time(SimpleApp* app, bool is_min, int32_t 
 static void simple_app_reset_wardrive_status(SimpleApp* app);
 static void simple_app_process_wardrive_line(SimpleApp* app, const char* line);
 static void simple_app_wardrive_feed(SimpleApp* app, char ch);
-static void simple_app_force_otg_for_wardrive(SimpleApp* app);
-static void simple_app_restore_otg_after_wardrive(SimpleApp* app);
+static void simple_app_update_otg_label(SimpleApp* app);
+static void simple_app_apply_otg_power(SimpleApp* app);
+static void simple_app_toggle_otg_power(SimpleApp* app);
+static void simple_app_send_download(SimpleApp* app);
+static bool simple_app_usb_profile_ok(void);
+static void simple_app_show_usb_blocker(void);
 static bool simple_app_is_start_sniffer_command(const char* command);
 static void simple_app_send_start_sniffer(SimpleApp* app);
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial);
 static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, size_t length);
 static void simple_app_draw_wardrive_serial(SimpleApp* app, Canvas* canvas);
-static void simple_app_update_otg_label(SimpleApp* app);
-static void simple_app_apply_otg_power(SimpleApp* app);
-static void simple_app_toggle_otg_power(SimpleApp* app);
 static void simple_app_mark_config_dirty(SimpleApp* app);
 static void simple_app_show_hint(SimpleApp* app, const char* title, const char* text);
 static void simple_app_hide_hint(SimpleApp* app);
@@ -953,7 +939,9 @@ static const char hint_bluetooth_locator[] =
 static const char hint_setup_backlight[] =
     "Toggle screen light\nKeep brightness high\nOr allow auto dim\nGreat for console\nLong sessions.";
 static const char hint_setup_otg[] =
-    "Control USB OTG 5V\nPower external gear\nDisable to save\nBattery capacity\nWhen unused.";
+    "Toggle 5V rail\nPowers GPIO 5V pin\nUse only if needed\nLeave off to save\nbattery.";
+static const char hint_setup_download[] =
+    "Send download cmd\nThen open UART GPIO\nbridge manually and\nreconnect USB to PC\nfor flashing.";
 static const char hint_setup_led[] =
     "Control status LED\nLeft/Right toggles\nSends CLI command\nAdjust brightness\nRange 1 to 100.";
 static const char hint_setup_boot[] =
@@ -964,8 +952,6 @@ static const char hint_setup_scanner_timing[] =
     "Channel dwell times\nLeft/Right adjusts\nMin/Max per channel\nSync with board\nStored in config.";
 static const char hint_setup_console[] =
     "Open live console\nStream UART output\nWatch commands\nDebug operations\nClose with Back.";
-static const char hint_setup_download[] =
-    "Send download cmd\nThen open UART GPIO\nbridge manually and\nreconnect USB to PC\nfor flashing.";
 static const char hint_setup_sd_manager[] =
     "Browse SD folders\nPick lab captures\nDelete safely\nDefault: handshakes.";
 
@@ -3201,28 +3187,6 @@ static void simple_app_bt_locator_begin_scan(SimpleApp* app) {
     app->bt_locator_mode = false;
 }
 
-static void simple_app_force_otg_for_wardrive(SimpleApp* app) {
-    if(!app) return;
-    if(!app->wardrive_otg_forced) {
-        app->wardrive_otg_forced = true;
-        app->wardrive_otg_previous_state = app->otg_power_enabled;
-    }
-    if(!app->otg_power_enabled) {
-        app->otg_power_enabled = true;
-    }
-    simple_app_apply_otg_power(app);
-}
-
-static void simple_app_restore_otg_after_wardrive(SimpleApp* app) {
-    if(!app || !app->wardrive_otg_forced) return;
-    app->wardrive_otg_forced = false;
-    bool desired_state = app->wardrive_otg_previous_state;
-    if(app->otg_power_enabled != desired_state) {
-        app->otg_power_enabled = desired_state;
-    }
-    simple_app_apply_otg_power(app);
-}
-
 static void simple_app_update_otg_label(SimpleApp* app) {
     if(!app) return;
     snprintf(
@@ -3235,23 +3199,9 @@ static void simple_app_update_otg_label(SimpleApp* app) {
 static void simple_app_apply_otg_power(SimpleApp* app) {
     if(!app) return;
     bool currently_enabled = furi_hal_power_is_otg_enabled();
-    if(app->otg_power_enabled) {
-        if(!currently_enabled) {
-            bool enabled = furi_hal_power_enable_otg();
-            currently_enabled = furi_hal_power_is_otg_enabled();
-            if(!enabled && !currently_enabled) {
-                float usb_voltage = furi_hal_power_get_usb_voltage();
-                app->otg_power_enabled = false;
-                simple_app_update_otg_label(app);
-                if(usb_voltage < 1.0f) {
-                    simple_app_show_status_message(app, "5V enable failed", 2000, false);
-                }
-                return;
-            }
-        } else {
-            app->otg_power_enabled = true;
-        }
-    } else if(currently_enabled) {
+    if(app->otg_power_enabled && !currently_enabled) {
+        furi_hal_power_enable_otg();
+    } else if(!app->otg_power_enabled && currently_enabled) {
         furi_hal_power_disable_otg();
     }
     simple_app_update_otg_label(app);
@@ -3262,6 +3212,38 @@ static void simple_app_toggle_otg_power(SimpleApp* app) {
     app->otg_power_enabled = !app->otg_power_enabled;
     simple_app_apply_otg_power(app);
     simple_app_mark_config_dirty(app);
+}
+
+static void simple_app_send_download(SimpleApp* app) {
+    if(!app) return;
+    simple_app_send_command_quiet(app, "download");
+    simple_app_show_status_message(app, "Download sent", 2000, true);
+}
+
+static bool simple_app_usb_profile_ok(void) {
+    const FuriHalUsbInterface* current = furi_hal_usb_get_config();
+    if(!current) return true;
+    return current == &usb_cdc_single;
+}
+
+static void simple_app_show_usb_blocker(void) {
+    DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
+    if(dialogs) {
+        DialogMessage* msg = dialog_message_alloc();
+        if(msg) {
+            dialog_message_set_header(msg, "USB busy", 64, 8, AlignCenter, AlignTop);
+            dialog_message_set_text(
+                msg,
+                "Switch USB to CDC/Serial\nthen relaunch.",
+                64,
+                32,
+                AlignCenter,
+                AlignCenter);
+            dialog_message_show(dialogs, msg);
+            dialog_message_free(msg);
+        }
+        furi_record_close(RECORD_DIALOGS);
+    }
 }
 
 static void simple_app_update_result_layout(SimpleApp* app) {
@@ -3606,6 +3588,23 @@ static void simple_app_mark_config_dirty(SimpleApp* app) {
     app->config_dirty = true;
 }
 
+static bool simple_app_wait_for_sd(Storage* storage, uint32_t timeout_ms) {
+    if(!storage) return false;
+    uint32_t start = furi_get_tick();
+    while(true) {
+        if(storage_sd_status(storage) == FSE_OK) {
+            return true;
+        }
+        if(timeout_ms > 0) {
+            uint32_t elapsed = furi_get_tick() - start;
+            if(elapsed >= furi_ms_to_ticks(timeout_ms)) {
+                return false;
+            }
+        }
+        furi_delay_ms(50);
+    }
+}
+
 static bool simple_app_parse_bool_value(const char* value, bool current) {
     if(!value) return current;
     size_t len = strlen(value);
@@ -3797,6 +3796,12 @@ static void simple_app_load_config(SimpleApp* app) {
     if(!app) return;
     Storage* storage = furi_record_open(RECORD_STORAGE);
     if(!storage) return;
+    // Wait briefly for SD to become ready; avoid crashing if card mounts slowly after boot
+    if(!simple_app_wait_for_sd(storage, 2000)) {
+        simple_app_show_status_message(app, "SD not ready", 2000, true);
+        furi_record_close(RECORD_STORAGE);
+        return;
+    }
     storage_simply_mkdir(storage, EXT_PATH("apps_assets"));
     storage_simply_mkdir(storage, EXT_PATH(LAB_C5_CONFIG_DIR_PATH));
     File* file = storage_file_alloc(storage);
@@ -4650,7 +4655,6 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     if(is_wardrive_command) {
         app->wardrive_view_active = true;
         simple_app_reset_wardrive_status(app);
-        simple_app_force_otg_for_wardrive(app);
     } else if(app->wardrive_view_active) {
         app->wardrive_view_active = false;
         simple_app_reset_wardrive_status(app);
@@ -4686,9 +4690,6 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
         simple_app_start_deauth_guard(app);
     } else if(is_stop_command || app->deauth_guard_view_active) {
         simple_app_reset_deauth_guard(app);
-    }
-    if(is_stop_command) {
-        simple_app_restore_otg_after_wardrive(app);
     }
     if(is_start_sniffer) {
         simple_app_reset_sniffer_status(app);
@@ -9310,9 +9311,6 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenPortalMenu:
         simple_app_draw_portal_menu(app, canvas);
         break;
-    case ScreenDownloadBridge:
-        simple_app_draw_download_bridge(app, canvas);
-        break;
     case ScreenBtLocatorList:
         simple_app_draw_bt_locator_list(app, canvas);
         break;
@@ -9501,7 +9499,7 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             simple_app_open_sd_manager(app);
             return;
         } else if(entry->action == MenuActionOpenDownload) {
-            simple_app_download_bridge_start(app);
+            simple_app_send_download(app);
         } else if(entry->action == MenuActionOpenScannerTiming) {
             app->screen = ScreenSetupScannerTiming;
             app->scanner_timing_index = 0;
@@ -11885,11 +11883,6 @@ static void simple_app_input(InputEvent* event, void* context) {
     case ScreenPortalMenu:
         simple_app_handle_portal_menu_input(app, event->key);
         break;
-    case ScreenDownloadBridge:
-        if(event->key == InputKeyBack) {
-            simple_app_download_bridge_stop(app);
-        }
-        break;
     case ScreenBtLocatorList:
         simple_app_handle_bt_locator_input(app, event->key);
         break;
@@ -11932,43 +11925,6 @@ static void simple_app_process_stream(SimpleApp* app) {
     }
 }
 
-static bool simple_app_download_bridge_start(SimpleApp* app) {
-    if(!app) return false;
-    simple_app_send_command_quiet(app, "download");
-    simple_app_show_status_message(app, "Download sent.\nStart UART bridge\nand reconnect USB.", 5000, true);
-    return true;
-}
-
-static void simple_app_download_bridge_stop(SimpleApp* app) {
-    (void)app;
-}
-
-static bool simple_app_usb_profile_ok(void) {
-    const FuriHalUsbInterface* current = furi_hal_usb_get_config();
-    if(!current) return true;
-    return current == &usb_cdc_single;
-}
-
-static void simple_app_show_usb_blocker(void) {
-    DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
-    if(dialogs) {
-        DialogMessage* msg = dialog_message_alloc();
-        if(msg) {
-            dialog_message_set_header(msg, "USB in use", 64, 8, AlignCenter, AlignTop);
-            dialog_message_set_text(
-                msg,
-                "Close qFlipper/mass\nstorage.\nSet USB to CDC/Serial\nthen relaunch.",
-                64,
-                32,
-                AlignCenter,
-                AlignCenter);
-            dialog_message_show(dialogs, msg);
-            dialog_message_free(msg);
-        }
-        furi_record_close(RECORD_DIALOGS);
-    }
-}
-
 static void simple_app_serial_irq(FuriHalSerialHandle* handle, FuriHalSerialRxEvent event, void* context) {
     SimpleApp* app = context;
     if(!app || !app->rx_stream || !(event & FuriHalSerialRxEventData)) return;
@@ -11980,31 +11936,12 @@ static void simple_app_serial_irq(FuriHalSerialHandle* handle, FuriHalSerialRxEv
     } while(furi_hal_serial_async_rx_available(handle));
 }
 
-static void simple_app_draw_download_bridge(SimpleApp* app, Canvas* canvas) {
-    if(!app) return;
-    canvas_set_color(canvas, ColorBlack);
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 14, AlignCenter, AlignCenter, "Download mode");
-    canvas_set_font(canvas, FontSecondary);
-    char line1[32];
-    char line2[32];
-    snprintf(line1, sizeof(line1), "Baud: %lu", (unsigned long)app->download_baud);
-    snprintf(
-        line2,
-        sizeof(line2),
-        "TX:%lu RX:%lu",
-        (unsigned long)app->download_uart_to_usb,
-        (unsigned long)app->download_usb_to_uart);
-    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 28, AlignCenter, AlignCenter, line1);
-    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 40, AlignCenter, AlignCenter, line2);
-    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 52, AlignCenter, AlignCenter, "Back = exit bridge");
-}
-
 int32_t Lab_C5_app(void* p) {
     UNUSED(p);
 
     if(!simple_app_usb_profile_ok()) {
         simple_app_show_usb_blocker();
+        return 0;
     }
 
     SimpleApp* app = malloc(sizeof(SimpleApp));
@@ -12074,8 +12011,6 @@ int32_t Lab_C5_app(void* p) {
     if(sd_folder_option_count > 0) {
         simple_app_copy_sd_folder(app, &sd_folder_options[0]);
     }
-    simple_app_update_otg_label(app);
-    simple_app_apply_otg_power(app);
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
     app->menu_state = MenuStateSections;
     app->screen = ScreenMenu;
@@ -12129,8 +12064,8 @@ int32_t Lab_C5_app(void* p) {
     simple_app_update_led_label(app);
     simple_app_update_boot_labels(app);
     simple_app_apply_backlight(app);
+    app->otg_power_enabled = furi_hal_power_is_otg_enabled();
     simple_app_update_otg_label(app);
-    simple_app_apply_otg_power(app);
     if(app->viewport) {
         view_port_update(app->viewport);
     }
@@ -12144,16 +12079,14 @@ int32_t Lab_C5_app(void* p) {
     }
 
     while(!app->exit_app) {
-        if(!app->download_bridge_active) {
-            simple_app_process_stream(app);
-            simple_app_update_karma_sniffer(app);
-            simple_app_update_result_scroll(app);
-            simple_app_update_sd_scroll(app);
-            simple_app_update_deauth_guard(app);
-            simple_app_ping_watchdog(app);
-        }
+        simple_app_process_stream(app);
+        simple_app_update_karma_sniffer(app);
+        simple_app_update_result_scroll(app);
+        simple_app_update_sd_scroll(app);
+        simple_app_update_deauth_guard(app);
+        simple_app_ping_watchdog(app);
 
-        if(!app->download_bridge_active && app->portal_input_requested && !app->portal_input_active) {
+        if(app->portal_input_requested && !app->portal_input_active) {
             app->portal_input_requested = false;
             bool accepted = simple_app_portal_run_text_input(app);
             if(accepted) {
@@ -12208,14 +12141,10 @@ int32_t Lab_C5_app(void* p) {
             view_port_update(app->viewport);
         }
 
-        furi_delay_ms(app->download_bridge_active ? 1 : 20);
+        furi_delay_ms(20);
     }
 
     simple_app_prepare_exit(app);
-
-    if(app->download_bridge_active) {
-        simple_app_download_bridge_stop(app);
-    }
 
     simple_app_save_config_if_dirty(app, NULL, false);
 

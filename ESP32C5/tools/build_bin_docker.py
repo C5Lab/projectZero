@@ -21,8 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--image",
-        default="espressif/idf:v6.0-dev",
-        help="Docker image to use (default: espressif/idf:v6.0-dev)",
+        default="espressif/idf:v6.0-beta1",
+        help="Docker image to use (default: espressif/idf:v6.0-beta1)",
     )
     return parser.parse_args()
 
