@@ -16,11 +16,11 @@
 #include <furi/core/stream_buffer.h>
 #include <gui/view_dispatcher.h>
 #include <gui/modules/text_input.h>
+#include <furi_hal_vibro.h>
+#include <dialogs/dialogs.h>
 #include <furi_hal_usb.h>
 #include <furi_hal_usb_cdc.h>
 #include <usb_cdc.h>
-#include <furi_hal_vibro.h>
-#include <dialogs/dialogs.h>
 
 #define TAG "Lab_C5"
 
@@ -130,8 +130,8 @@ typedef enum {
 #define SCANNER_FILTER_VISIBLE_COUNT 3
 #define SCANNER_SCAN_COMMAND "scan_networks"
 #define TARGETS_RESULTS_COMMAND "show_scan_results"
-#define LAB_C5_CONFIG_DIR_PATH "/int/apps_data/labC5"
-#define LAB_C5_CONFIG_FILE_PATH LAB_C5_CONFIG_DIR_PATH "/config.txt"
+#define LAB_C5_CONFIG_DIR_PATH INT_PATH("apps_data/labC5")
+#define LAB_C5_CONFIG_FILE_PATH INT_PATH("apps_data/labC5/config.txt")
 
 #define BOARD_PING_INTERVAL_MS 4000
 #define BOARD_PING_TIMEOUT_MS 3000
@@ -699,7 +699,6 @@ static void simple_app_apply_otg_power(SimpleApp* app);
 static void simple_app_toggle_otg_power(SimpleApp* app);
 static void simple_app_send_download(SimpleApp* app);
 static bool simple_app_usb_profile_ok(void);
-static void simple_app_show_usb_blocker(void);
 static bool simple_app_is_start_sniffer_command(const char* command);
 static void simple_app_send_start_sniffer(SimpleApp* app);
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial);
@@ -3567,23 +3566,6 @@ static void simple_app_mark_config_dirty(SimpleApp* app) {
     app->config_dirty = true;
 }
 
-static bool simple_app_wait_for_sd(Storage* storage, uint32_t timeout_ms) {
-    if(!storage) return false;
-    uint32_t start = furi_get_tick();
-    while(true) {
-        if(storage_sd_status(storage) == FSE_OK) {
-            return true;
-        }
-        if(timeout_ms > 0) {
-            uint32_t elapsed = furi_get_tick() - start;
-            if(elapsed >= furi_ms_to_ticks(timeout_ms)) {
-                return false;
-            }
-        }
-        furi_delay_ms(50);
-    }
-}
-
 static bool simple_app_parse_bool_value(const char* value, bool current) {
     if(!value) return current;
     size_t len = strlen(value);
@@ -3695,6 +3677,7 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
     if(!app) return false;
     Storage* storage = furi_record_open(RECORD_STORAGE);
     if(!storage) return false;
+    storage_simply_mkdir(storage, INT_PATH("apps_data"));
     storage_simply_mkdir(storage, LAB_C5_CONFIG_DIR_PATH);
     File* file = storage_file_alloc(storage);
     bool success = false;
@@ -3774,6 +3757,7 @@ static void simple_app_load_config(SimpleApp* app) {
     if(!app) return;
     Storage* storage = furi_record_open(RECORD_STORAGE);
     if(!storage) return;
+    storage_simply_mkdir(storage, INT_PATH("apps_data"));
     storage_simply_mkdir(storage, LAB_C5_CONFIG_DIR_PATH);
     File* file = storage_file_alloc(storage);
     bool loaded = false;
@@ -11910,20 +11894,12 @@ static void simple_app_serial_irq(FuriHalSerialHandle* handle, FuriHalSerialRxEv
 int32_t Lab_C5_app(void* p) {
     UNUSED(p);
 
-    // If USB is in mass-storage/qFlipper mode, exit immediately to avoid crashes
+    // Bail out immediately if USB is not in CDC mode (e.g., qFlipper/MSC) to avoid crashes
     if(!simple_app_usb_profile_ok()) {
         return 0;
     }
 
-    // If SD is busy (e.g., mounted via qFlipper), exit immediately
-    Storage* early_storage = furi_record_open(RECORD_STORAGE);
-    if(early_storage) {
-        if(storage_sd_status(early_storage) != FSE_OK) {
-            furi_record_close(RECORD_STORAGE);
-            return 0;
-        }
-        furi_record_close(RECORD_STORAGE);
-    }
+    FURI_LOG_I(TAG, "Startup: begin init");
 
     SimpleApp* app = malloc(sizeof(SimpleApp));
     if(!app) {
@@ -12040,6 +12016,7 @@ int32_t Lab_C5_app(void* p) {
     gui_add_view_port(app->gui, app->viewport, GuiLayerFullscreen);
 
     simple_app_load_config(app);
+    FURI_LOG_I(TAG, "Config loaded: otg=%d", app->otg_power_enabled ? 1 : 0);
     app->vendor_scan_enabled = app->scanner_show_vendor;
     simple_app_update_backlight_label(app);
     simple_app_update_led_label(app);
@@ -12054,11 +12031,13 @@ int32_t Lab_C5_app(void* p) {
     if(!simple_app_status_message_is_active(app)) {
         simple_app_show_status_message(app, "Board discovery\nSending ping...", 0, true);
     }
+    FURI_LOG_I(TAG, "Startup: ping send");
     simple_app_send_ping(app);
     if(app->viewport) {
         view_port_update(app->viewport);
     }
 
+    FURI_LOG_I(TAG, "Entering main loop");
     while(!app->exit_app) {
         simple_app_process_stream(app);
         simple_app_update_karma_sniffer(app);
