@@ -25,6 +25,8 @@
 
 #define TAG "Lab_C5"
 
+#define USB_RUNTIME_GUARD_INTERVAL_MS 50
+
 static size_t simple_app_bounded_strlen(const char* s, size_t max_len) {
     size_t len = 0;
     while(len < max_len && s[len] != '\0') {
@@ -536,16 +538,16 @@ typedef struct {
     bool karma_pending_probe_refresh;
     uint32_t karma_pending_probe_tick;
     bool karma_status_active;
-    ScanResult scan_results[MAX_SCAN_RESULTS];
+    ScanResult* scan_results;
     size_t scan_result_count;
     size_t scan_result_index;
     size_t scan_result_offset;
-    uint16_t scan_selected_numbers[MAX_SCAN_RESULTS];
+    uint16_t* scan_selected_numbers;
     size_t scan_selected_count;
     bool scan_results_loading;
     char scan_line_buffer[SCAN_LINE_BUFFER_SIZE];
     size_t scan_line_len;
-    uint16_t visible_result_indices[MAX_SCAN_RESULTS];
+    uint16_t* visible_result_indices;
     size_t visible_result_count;
     bool scanner_view_active;
     bool scanner_full_console;
@@ -626,6 +628,7 @@ typedef struct {
     bool board_bootstrap_reboot_sent;
     uint32_t last_input_tick;
     uint32_t last_back_tick;
+    uint32_t usb_guard_last_tick;
     bool help_hint_visible;
     bool package_monitor_active;
     uint8_t package_monitor_channel;
@@ -741,6 +744,11 @@ static void simple_app_handle_bt_locator_input(SimpleApp* app, InputKey key);
 static void simple_app_bt_locator_reset_scroll(SimpleApp* app);
 static void simple_app_bt_locator_set_scroll_text(SimpleApp* app, const char* text);
 static void simple_app_bt_locator_tick_scroll(SimpleApp* app, size_t char_limit);
+static void simple_app_usb_runtime_guard(SimpleApp* app);
+static bool simple_app_sd_ok(void);
+static void simple_app_show_sd_busy(void);
+static bool simple_app_scan_alloc_buffers(SimpleApp* app);
+static void simple_app_scan_free_buffers(SimpleApp* app);
 static void simple_app_channel_view_show_status(SimpleApp* app, const char* status);
 static void simple_app_reset_deauth_guard(SimpleApp* app);
 static void simple_app_start_deauth_guard(SimpleApp* app);
@@ -1375,10 +1383,16 @@ static void simple_app_update_scanner_stats(SimpleApp* app, const ScanResult* re
 
 static void simple_app_reset_scan_results(SimpleApp* app) {
     if(!app) return;
-    memset(app->scan_results, 0, sizeof(app->scan_results));
-    memset(app->scan_selected_numbers, 0, sizeof(app->scan_selected_numbers));
+    if(app->scan_results) {
+        memset(app->scan_results, 0, sizeof(ScanResult) * MAX_SCAN_RESULTS);
+    }
+    if(app->scan_selected_numbers) {
+        memset(app->scan_selected_numbers, 0, sizeof(uint16_t) * MAX_SCAN_RESULTS);
+    }
     memset(app->scan_line_buffer, 0, sizeof(app->scan_line_buffer));
-    memset(app->visible_result_indices, 0, sizeof(app->visible_result_indices));
+    if(app->visible_result_indices) {
+        memset(app->visible_result_indices, 0, sizeof(uint16_t) * MAX_SCAN_RESULTS);
+    }
     app->scan_result_count = 0;
     app->scan_result_index = 0;
     app->scan_result_offset = 0;
@@ -1400,6 +1414,7 @@ static bool simple_app_result_is_visible(const SimpleApp* app, const ScanResult*
 
 static void simple_app_rebuild_visible_results(SimpleApp* app) {
     if(!app) return;
+    if(!app->scan_results || !app->visible_result_indices) return;
     app->visible_result_count = 0;
     for(size_t i = 0; i < app->scan_result_count && i < MAX_SCAN_RESULTS; i++) {
         if(simple_app_result_is_visible(app, &app->scan_results[i])) {
@@ -1472,14 +1487,16 @@ static bool* simple_app_scanner_option_flag(SimpleApp* app, ScannerOption option
 }
 
 static ScanResult* simple_app_visible_result(SimpleApp* app, size_t visible_index) {
-    if(!app || visible_index >= app->visible_result_count) return NULL;
+    if(!app || !app->scan_results || !app->visible_result_indices) return NULL;
+    if(visible_index >= app->visible_result_count) return NULL;
     uint16_t actual_index = app->visible_result_indices[visible_index];
     if(actual_index >= MAX_SCAN_RESULTS) return NULL;
     return &app->scan_results[actual_index];
 }
 
 static const ScanResult* simple_app_visible_result_const(const SimpleApp* app, size_t visible_index) {
-    if(!app || visible_index >= app->visible_result_count) return NULL;
+    if(!app || !app->scan_results || !app->visible_result_indices) return NULL;
+    if(visible_index >= app->visible_result_count) return NULL;
     uint16_t actual_index = app->visible_result_indices[visible_index];
     if(actual_index >= MAX_SCAN_RESULTS) return NULL;
     return &app->scan_results[actual_index];
@@ -3227,6 +3244,69 @@ static bool simple_app_usb_profile_ok(void) {
     return current == &usb_cdc_single;
 }
 
+static bool simple_app_sd_ok(void) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return true;
+    bool ok = (storage_sd_status(storage) == FSE_OK);
+    furi_record_close(RECORD_STORAGE);
+    return ok;
+}
+
+static void simple_app_show_sd_busy(void) {
+    DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
+    if(dialogs) {
+        DialogMessage* msg = dialog_message_alloc();
+        if(msg) {
+            dialog_message_set_header(msg, "SD busy", 64, 8, AlignCenter, AlignTop);
+            dialog_message_set_text(
+                msg,
+                "Close qFlipper/FileMgr\nor disable USB storage,\nthen relaunch.",
+                64,
+                32,
+                AlignCenter,
+                AlignCenter);
+            dialog_message_show(dialogs, msg);
+            dialog_message_free(msg);
+        }
+        furi_record_close(RECORD_DIALOGS);
+    }
+}
+
+static bool simple_app_scan_alloc_buffers(SimpleApp* app) {
+    if(!app) return false;
+    if(app->scan_results && app->scan_selected_numbers && app->visible_result_indices) {
+        return true;
+    }
+
+    simple_app_scan_free_buffers(app);
+
+    app->scan_results = calloc(MAX_SCAN_RESULTS, sizeof(ScanResult));
+    app->scan_selected_numbers = calloc(MAX_SCAN_RESULTS, sizeof(uint16_t));
+    app->visible_result_indices = calloc(MAX_SCAN_RESULTS, sizeof(uint16_t));
+
+    if(!app->scan_results || !app->scan_selected_numbers || !app->visible_result_indices) {
+        simple_app_scan_free_buffers(app);
+        return false;
+    }
+    return true;
+}
+
+static void simple_app_scan_free_buffers(SimpleApp* app) {
+    if(!app) return;
+    if(app->scan_results) {
+        free(app->scan_results);
+        app->scan_results = NULL;
+    }
+    if(app->scan_selected_numbers) {
+        free(app->scan_selected_numbers);
+        app->scan_selected_numbers = NULL;
+    }
+    if(app->visible_result_indices) {
+        free(app->visible_result_indices);
+        app->visible_result_indices = NULL;
+    }
+}
+
 static void simple_app_show_low_memory(size_t free_heap, size_t needed) {
     DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
     if(dialogs) {
@@ -3265,6 +3345,31 @@ static void simple_app_show_usb_blocker(void) {
             dialog_message_free(msg);
         }
         furi_record_close(RECORD_DIALOGS);
+    }
+}
+
+static void simple_app_usb_runtime_guard(SimpleApp* app) {
+    if(!app) return;
+    uint32_t now = furi_get_tick();
+    if(app->usb_guard_last_tick != 0) {
+        uint32_t interval = furi_ms_to_ticks(USB_RUNTIME_GUARD_INTERVAL_MS);
+        if(interval == 0) interval = 1;
+        if((now - app->usb_guard_last_tick) < interval) {
+            return;
+        }
+    }
+    app->usb_guard_last_tick = now;
+
+    if(!simple_app_usb_profile_ok()) {
+        simple_app_show_usb_blocker();
+        app->exit_app = true;
+        return;
+    }
+
+    if(!simple_app_sd_ok()) {
+        simple_app_show_sd_busy();
+        app->exit_app = true;
+        return;
     }
 }
 
@@ -3996,6 +4101,7 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
 
     if(cursor[0] != '"') return;
     if(app->scan_result_count >= MAX_SCAN_RESULTS) return;
+    if(!app->scan_results) return;
 
     char fields[8][SCAN_FIELD_BUFFER_LEN];
     for(size_t i = 0; i < 8; i++) {
@@ -4883,6 +4989,7 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     simple_app_reset_karma_probe_listing(app);
     simple_app_reset_karma_html_listing(app);
     simple_app_reset_scan_results(app);
+    simple_app_scan_free_buffers(app);
     simple_app_reset_deauth_guard(app);
     simple_app_clear_status_message(app);
 
@@ -4911,6 +5018,10 @@ static void simple_app_prepare_exit(SimpleApp* app) {
 
 static void simple_app_request_scan_results(SimpleApp* app, const char* command) {
     if(!app) return;
+    if(!simple_app_scan_alloc_buffers(app)) {
+        simple_app_show_status_message(app, "OOM: scan buffers", 2000, true);
+        return;
+    }
     simple_app_reset_scan_results(app);
     app->scan_results_loading = true;
     app->serial_targets_hint = false;
@@ -12082,6 +12193,18 @@ int32_t Lab_C5_app(void* p) {
     furi_stream_buffer_reset(app->rx_stream);
     simple_app_reset_serial_log(app, "READY");
 
+    {
+        char line[96];
+        snprintf(
+            line,
+            sizeof(line),
+            "Heap start free:%lu min:%lu SimpleApp:%lu\n",
+            (unsigned long)memmgr_get_free_heap(),
+            (unsigned long)memmgr_get_minimum_free_heap(),
+            (unsigned long)sizeof(SimpleApp));
+        simple_app_append_serial_data(app, (const uint8_t*)line, strlen(line));
+    }
+
     furi_hal_serial_async_rx_start(app->serial, simple_app_serial_irq, app, false);
 
     app->gui = furi_record_open(RECORD_GUI);
@@ -12096,8 +12219,8 @@ int32_t Lab_C5_app(void* p) {
     simple_app_update_led_label(app);
     simple_app_update_boot_labels(app);
     simple_app_apply_backlight(app);
-    app->otg_power_enabled = furi_hal_power_is_otg_enabled();
-    simple_app_update_otg_label(app);
+    // Respect config value (loaded by simple_app_load_config) and apply it to HW
+    simple_app_apply_otg_power(app);
     if(app->viewport) {
         view_port_update(app->viewport);
     }
@@ -12117,6 +12240,7 @@ int32_t Lab_C5_app(void* p) {
         simple_app_update_sd_scroll(app);
         simple_app_update_deauth_guard(app);
         simple_app_ping_watchdog(app);
+        simple_app_usb_runtime_guard(app);
 
         if(app->portal_input_requested && !app->portal_input_active) {
             app->portal_input_requested = false;
@@ -12201,14 +12325,7 @@ int32_t Lab_C5_app(void* p) {
         furi_hal_power_insomnia_exit();
         app->backlight_insomnia = false;
     }
-    bool current_otg_state = furi_hal_power_is_otg_enabled();
-    if(current_otg_state != app->otg_power_initial_state) {
-        if(app->otg_power_initial_state) {
-            furi_hal_power_enable_otg();
-        } else {
-            furi_hal_power_disable_otg();
-        }
-    }
+    // Do not restore OTG state on exit: 5V setting is user-configurable and persisted via config.
     furi_hal_light_set(LightBacklight, BACKLIGHT_ON_LEVEL);
     free(app);
 
