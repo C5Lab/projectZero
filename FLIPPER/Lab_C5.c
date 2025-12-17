@@ -456,7 +456,7 @@ typedef struct {
     bool exit_confirm_active;
     uint32_t exit_confirm_tick;
     size_t evil_twin_menu_index;
-    EvilTwinHtmlEntry evil_twin_html_entries[EVIL_TWIN_MAX_HTML_FILES];
+    EvilTwinHtmlEntry* evil_twin_html_entries;
     size_t evil_twin_html_count;
     size_t evil_twin_html_popup_index;
     size_t evil_twin_html_popup_offset;
@@ -472,7 +472,7 @@ typedef struct {
     size_t portal_menu_offset;
     bool portal_input_requested;
     bool portal_input_active;
-    PortalSsidEntry portal_ssid_entries[PORTAL_MAX_SSID_PRESETS];
+    PortalSsidEntry* portal_ssid_entries;
     size_t portal_ssid_count;
     size_t portal_ssid_popup_index;
     size_t portal_ssid_popup_offset;
@@ -485,7 +485,7 @@ typedef struct {
     size_t sd_folder_index;
     size_t sd_folder_offset;
     bool sd_folder_popup_active;
-    SdFileEntry sd_files[SD_MANAGER_MAX_FILES];
+    SdFileEntry* sd_files;
     size_t sd_file_count;
     size_t sd_file_popup_index;
     size_t sd_file_popup_offset;
@@ -510,7 +510,7 @@ typedef struct {
     char sd_scroll_text[SD_MANAGER_FILE_NAME_MAX];
     size_t karma_menu_index;
     size_t karma_menu_offset;
-    KarmaProbeEntry karma_probes[KARMA_MAX_PROBES];
+    KarmaProbeEntry* karma_probes;
     size_t karma_probe_count;
     size_t karma_probe_popup_index;
     size_t karma_probe_popup_offset;
@@ -521,7 +521,7 @@ typedef struct {
     size_t karma_probe_list_length;
     uint8_t karma_selected_probe_id;
     char karma_selected_probe_name[KARMA_PROBE_NAME_MAX];
-    KarmaHtmlEntry karma_html_entries[KARMA_MAX_HTML_FILES];
+    KarmaHtmlEntry* karma_html_entries;
     size_t karma_html_count;
     size_t karma_html_popup_index;
     size_t karma_html_popup_offset;
@@ -749,6 +749,16 @@ static bool simple_app_sd_ok(void);
 static void simple_app_show_sd_busy(void);
 static bool simple_app_scan_alloc_buffers(SimpleApp* app);
 static void simple_app_scan_free_buffers(SimpleApp* app);
+static bool simple_app_portal_alloc_ssid_entries(SimpleApp* app);
+static void simple_app_portal_free_ssid_entries(SimpleApp* app);
+static bool simple_app_sd_alloc_files(SimpleApp* app);
+static void simple_app_sd_free_files(SimpleApp* app);
+static bool simple_app_evil_twin_alloc_html_entries(SimpleApp* app);
+static void simple_app_evil_twin_free_html_entries(SimpleApp* app);
+static bool simple_app_karma_alloc_probes(SimpleApp* app);
+static void simple_app_karma_free_probes(SimpleApp* app);
+static bool simple_app_karma_alloc_html_entries(SimpleApp* app);
+static void simple_app_karma_free_html_entries(SimpleApp* app);
 static void simple_app_channel_view_show_status(SimpleApp* app, const char* status);
 static void simple_app_reset_deauth_guard(SimpleApp* app);
 static void simple_app_start_deauth_guard(SimpleApp* app);
@@ -3307,6 +3317,81 @@ static void simple_app_scan_free_buffers(SimpleApp* app) {
     }
 }
 
+static bool simple_app_portal_alloc_ssid_entries(SimpleApp* app) {
+    if(!app) return false;
+    if(app->portal_ssid_entries) return true;
+    app->portal_ssid_entries = calloc(PORTAL_MAX_SSID_PRESETS, sizeof(PortalSsidEntry));
+    return app->portal_ssid_entries != NULL;
+}
+
+static void simple_app_portal_free_ssid_entries(SimpleApp* app) {
+    if(!app) return;
+    if(app->portal_ssid_entries) {
+        free(app->portal_ssid_entries);
+        app->portal_ssid_entries = NULL;
+    }
+}
+
+static bool simple_app_sd_alloc_files(SimpleApp* app) {
+    if(!app) return false;
+    if(app->sd_files) return true;
+    app->sd_files = calloc(SD_MANAGER_MAX_FILES, sizeof(SdFileEntry));
+    return app->sd_files != NULL;
+}
+
+static void simple_app_sd_free_files(SimpleApp* app) {
+    if(!app) return;
+    if(app->sd_files) {
+        free(app->sd_files);
+        app->sd_files = NULL;
+    }
+}
+
+static bool simple_app_evil_twin_alloc_html_entries(SimpleApp* app) {
+    if(!app) return false;
+    if(app->evil_twin_html_entries) return true;
+    app->evil_twin_html_entries = calloc(EVIL_TWIN_MAX_HTML_FILES, sizeof(EvilTwinHtmlEntry));
+    return app->evil_twin_html_entries != NULL;
+}
+
+static void simple_app_evil_twin_free_html_entries(SimpleApp* app) {
+    if(!app) return;
+    if(app->evil_twin_html_entries) {
+        free(app->evil_twin_html_entries);
+        app->evil_twin_html_entries = NULL;
+    }
+}
+
+static bool simple_app_karma_alloc_probes(SimpleApp* app) {
+    if(!app) return false;
+    if(app->karma_probes) return true;
+    app->karma_probes = calloc(KARMA_MAX_PROBES, sizeof(KarmaProbeEntry));
+    return app->karma_probes != NULL;
+}
+
+static void simple_app_karma_free_probes(SimpleApp* app) {
+    if(!app) return;
+    if(app->karma_probes) {
+        free(app->karma_probes);
+        app->karma_probes = NULL;
+    }
+}
+
+static bool simple_app_karma_alloc_html_entries(SimpleApp* app) {
+    if(!app) return false;
+    if(app->karma_html_entries) return true;
+    app->karma_html_entries = calloc(KARMA_MAX_HTML_FILES, sizeof(KarmaHtmlEntry));
+    return app->karma_html_entries != NULL;
+}
+
+static void simple_app_karma_free_html_entries(SimpleApp* app) {
+    if(!app) return;
+    if(app->karma_html_entries) {
+        free(app->karma_html_entries);
+        app->karma_html_entries = NULL;
+    }
+}
+
 static void simple_app_show_low_memory(size_t free_heap, size_t needed) {
     DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
     if(dialogs) {
@@ -4761,6 +4846,15 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     bool is_wifi_scan_command = strstr(command, SCANNER_SCAN_COMMAND) != NULL;
     bool is_deauth_guard_command = strstr(command, "deauth_detector") != NULL;
     if(is_wifi_scan_command) {
+        if(!simple_app_scan_alloc_buffers(app)) {
+            app->scan_results_loading = false;
+            app->scanner_view_active = false;
+            app->scanner_full_console = false;
+            app->scanner_scan_running = false;
+            simple_app_show_status_message(app, "OOM: scan buffers", 2000, true);
+            if(app->viewport) view_port_update(app->viewport);
+            return;
+        }
         simple_app_reset_scan_results(app);
         app->scan_results_loading = true;
         app->scanner_view_active = true;
@@ -6409,6 +6503,7 @@ static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key) {
 
 static void simple_app_reset_portal_ssid_listing(SimpleApp* app) {
     if(!app) return;
+    simple_app_portal_free_ssid_entries(app);
     app->portal_ssid_listing_active = false;
     app->portal_ssid_list_header_seen = false;
     app->portal_ssid_list_length = 0;
@@ -6420,7 +6515,7 @@ static void simple_app_reset_portal_ssid_listing(SimpleApp* app) {
 }
 
 static void simple_app_open_portal_ssid_popup(SimpleApp* app) {
-    if(!app || app->portal_ssid_count == 0) return;
+    if(!app || app->portal_ssid_count == 0 || !app->portal_ssid_entries) return;
 
     size_t total_options = app->portal_ssid_count + 1; // +1 for manual entry
     size_t target_index = 0; // manual by default
@@ -6485,6 +6580,7 @@ static void simple_app_finish_portal_ssid_listing(SimpleApp* app) {
 
 static void simple_app_process_portal_ssid_line(SimpleApp* app, const char* line) {
     if(!app || !line || !app->portal_ssid_listing_active) return;
+    if(!app->portal_ssid_entries) return;
 
     const char* cursor = line;
     while(*cursor == ' ' || *cursor == '\t') {
@@ -6586,6 +6682,10 @@ static void simple_app_portal_ssid_feed(SimpleApp* app, char ch) {
 static void simple_app_request_portal_ssid_list(SimpleApp* app) {
     if(!app) return;
     simple_app_reset_portal_ssid_listing(app);
+    if(!simple_app_portal_alloc_ssid_entries(app)) {
+        simple_app_show_status_message(app, "OOM: SSID list", 2000, true);
+        return;
+    }
     app->portal_ssid_listing_active = true;
     simple_app_show_status_message(app, "Listing SSID...", 0, false);
     simple_app_send_command(app, "list_ssid", false);
@@ -6738,6 +6838,7 @@ static bool simple_app_portal_run_text_input(SimpleApp* app) {
 
 static void simple_app_draw_portal_ssid_popup(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas || !app->portal_ssid_popup_active) return;
+    if(!app->portal_ssid_entries) return;
 
     const uint8_t bubble_x = 4;
     const uint8_t bubble_y = 4;
@@ -6810,6 +6911,7 @@ static void simple_app_draw_portal_ssid_popup(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_handle_portal_ssid_popup_event(SimpleApp* app, const InputEvent* event) {
     if(!app || !event || !app->portal_ssid_popup_active) return;
+    if(!app->portal_ssid_entries) return;
     if(event->type != InputTypeShort && event->type != InputTypeRepeat && event->type != InputTypeLong) return;
 
     InputKey key = event->key;
@@ -6960,6 +7062,7 @@ static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_draw_evil_twin_popup(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas || !app->evil_twin_popup_active) return;
+    if(!app->evil_twin_html_entries) return;
 
     const uint8_t bubble_x = 4;
     const uint8_t bubble_y = 4;
@@ -8461,6 +8564,7 @@ static void simple_app_draw_setup_boot(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_reset_sd_listing(SimpleApp* app) {
     if(!app) return;
+    simple_app_sd_free_files(app);
     app->sd_listing_active = false;
     app->sd_list_header_seen = false;
     app->sd_list_length = 0;
@@ -8522,6 +8626,10 @@ static void simple_app_request_sd_listing(SimpleApp* app, const SdFolderOption* 
 
     app->sd_folder_popup_active = false;
     simple_app_reset_sd_listing(app);
+    if(!simple_app_sd_alloc_files(app)) {
+        simple_app_show_status_message(app, "OOM: SD list", 2000, true);
+        return;
+    }
     simple_app_copy_sd_folder(app, folder);
     app->sd_listing_active = true;
     app->sd_refresh_pending = false;
@@ -8612,6 +8720,7 @@ static void simple_app_sd_scroll_buffer(
 
 static void simple_app_process_sd_line(SimpleApp* app, const char* line) {
     if(!app || !line || !app->sd_listing_active) return;
+    if(!app->sd_files) return;
 
     const char* cursor = line;
     while(*cursor == ' ' || *cursor == '\t') {
@@ -8794,6 +8903,7 @@ static void simple_app_draw_sd_folder_popup(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_draw_sd_file_popup(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas || !app->sd_file_popup_active) return;
+    if(!app->sd_files) return;
 
     const uint8_t bubble_x = 4;
     const uint8_t bubble_y = 4;
@@ -9017,6 +9127,7 @@ static void simple_app_handle_sd_folder_popup_event(SimpleApp* app, const InputE
 
 static void simple_app_handle_sd_file_popup_event(SimpleApp* app, const InputEvent* event) {
     if(!app || !event || !app->sd_file_popup_active) return;
+    if(!app->sd_files) return;
     if(event->type != InputTypeShort && event->type != InputTypeRepeat) return;
 
     InputKey key = event->key;
@@ -9720,6 +9831,10 @@ static void simple_app_request_evil_twin_html_list(SimpleApp* app) {
     if(!app) return;
     simple_app_close_evil_twin_popup(app);
     simple_app_reset_evil_twin_listing(app);
+    if(!simple_app_evil_twin_alloc_html_entries(app)) {
+        simple_app_show_status_message(app, "OOM: HTML list", 2000, true);
+        return;
+    }
     app->evil_twin_listing_active = true;
     simple_app_show_status_message(app, "Listing HTML...", 0, false);
     simple_app_send_command(app, "list_sd", true);
@@ -9756,6 +9871,7 @@ static void simple_app_close_evil_twin_popup(SimpleApp* app) {
 
 static void simple_app_reset_evil_twin_listing(SimpleApp* app) {
     if(!app) return;
+    simple_app_evil_twin_free_html_entries(app);
     app->evil_twin_listing_active = false;
     app->evil_twin_list_header_seen = false;
     app->evil_twin_list_length = 0;
@@ -9818,6 +9934,7 @@ static void simple_app_finish_evil_twin_listing(SimpleApp* app) {
 
 static void simple_app_process_evil_twin_line(SimpleApp* app, const char* line) {
     if(!app || !line || !app->evil_twin_listing_active) return;
+    if(!app->evil_twin_html_entries) return;
 
     const char* cursor = line;
     while(*cursor == ' ' || *cursor == '\t') {
@@ -9915,6 +10032,7 @@ static void simple_app_evil_twin_feed(SimpleApp* app, char ch) {
 
 static void simple_app_handle_evil_twin_popup_event(SimpleApp* app, const InputEvent* event) {
     if(!app || !event || !app->evil_twin_popup_active) return;
+    if(!app->evil_twin_html_entries) return;
 
     if(event->type != InputTypeShort && event->type != InputTypeRepeat) return;
 
@@ -10032,6 +10150,7 @@ static void simple_app_modify_karma_duration(SimpleApp* app, int32_t delta) {
 
 static void simple_app_reset_karma_probe_listing(SimpleApp* app) {
     if(!app) return;
+    simple_app_karma_free_probes(app);
     app->karma_probe_listing_active = false;
     app->karma_probe_list_header_seen = false;
     app->karma_probe_list_length = 0;
@@ -10108,6 +10227,7 @@ static void simple_app_finish_karma_probe_listing(SimpleApp* app) {
 
 static void simple_app_process_karma_probe_line(SimpleApp* app, const char* line) {
     if(!app || !line || !app->karma_probe_listing_active) return;
+    if(!app->karma_probes) return;
 
     const char* cursor = line;
     while(*cursor == ' ' || *cursor == '\t') {
@@ -10207,6 +10327,7 @@ static void simple_app_karma_probe_feed(SimpleApp* app, char ch) {
 
 static void simple_app_draw_karma_probe_popup(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas || !app->karma_probe_popup_active) return;
+    if(!app->karma_probes) return;
 
     const uint8_t bubble_x = 4;
     const uint8_t bubble_y = 4;
@@ -10274,6 +10395,7 @@ static void simple_app_draw_karma_probe_popup(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_handle_karma_probe_popup_event(SimpleApp* app, const InputEvent* event) {
     if(!app || !event || !app->karma_probe_popup_active) return;
+    if(!app->karma_probes) return;
     if(event->type != InputTypeShort && event->type != InputTypeRepeat) return;
 
     InputKey key = event->key;
@@ -10352,6 +10474,10 @@ static void simple_app_handle_karma_probe_popup_event(SimpleApp* app, const Inpu
 static void simple_app_request_karma_probe_list(SimpleApp* app) {
     if(!app) return;
     simple_app_reset_karma_probe_listing(app);
+    if(!simple_app_karma_alloc_probes(app)) {
+        simple_app_show_status_message(app, "OOM: probe list", 2000, true);
+        return;
+    }
     app->karma_probe_listing_active = true;
     app->karma_pending_probe_refresh = false;
     bool show_status = (app->screen == ScreenKarmaMenu);
@@ -10369,6 +10495,7 @@ static void simple_app_request_karma_probe_list(SimpleApp* app) {
 
 static void simple_app_reset_karma_html_listing(SimpleApp* app) {
     if(!app) return;
+    simple_app_karma_free_html_entries(app);
     app->karma_html_listing_active = false;
     app->karma_html_list_header_seen = false;
     app->karma_html_list_length = 0;
@@ -10445,6 +10572,7 @@ static void simple_app_finish_karma_html_listing(SimpleApp* app) {
 
 static void simple_app_process_karma_html_line(SimpleApp* app, const char* line) {
     if(!app || !line || !app->karma_html_listing_active) return;
+    if(!app->karma_html_entries) return;
 
     const char* cursor = line;
     while(*cursor == ' ' || *cursor == '\t') {
@@ -10543,6 +10671,7 @@ static void simple_app_karma_html_feed(SimpleApp* app, char ch) {
 
 static void simple_app_draw_karma_html_popup(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas || !app->karma_html_popup_active) return;
+    if(!app->karma_html_entries) return;
 
     const uint8_t bubble_x = 4;
     const uint8_t bubble_y = 4;
@@ -10610,6 +10739,7 @@ static void simple_app_draw_karma_html_popup(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const InputEvent* event) {
     if(!app || !event || !app->karma_html_popup_active) return;
+    if(!app->karma_html_entries) return;
     if(event->type != InputTypeShort && event->type != InputTypeRepeat && event->type != InputTypeLong) return;
 
     InputKey key = event->key;
@@ -10707,6 +10837,10 @@ static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const Input
 static void simple_app_request_karma_html_list(SimpleApp* app) {
     if(!app) return;
     simple_app_reset_karma_html_listing(app);
+    if(!simple_app_karma_alloc_html_entries(app)) {
+        simple_app_show_status_message(app, "OOM: HTML list", 2000, true);
+        return;
+    }
     app->karma_html_listing_active = true;
     bool show_status = (app->screen == ScreenKarmaMenu) || (app->screen == ScreenPortalMenu);
     if(show_status) {
