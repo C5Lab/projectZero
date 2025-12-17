@@ -3225,6 +3225,26 @@ static bool simple_app_usb_profile_ok(void) {
     return current == &usb_cdc_single;
 }
 
+static void simple_app_show_usb_blocker(void) {
+    DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
+    if(dialogs) {
+        DialogMessage* msg = dialog_message_alloc();
+        if(msg) {
+            dialog_message_set_header(msg, "USB busy", 64, 8, AlignCenter, AlignTop);
+            dialog_message_set_text(
+                msg,
+                "Switch USB to CDC/Serial\nthen relaunch.",
+                64,
+                32,
+                AlignCenter,
+                AlignCenter);
+            dialog_message_show(dialogs, msg);
+            dialog_message_free(msg);
+        }
+        furi_record_close(RECORD_DIALOGS);
+    }
+}
+
 static void simple_app_update_result_layout(SimpleApp* app) {
     if(!app) return;
     size_t enabled_fields = simple_app_enabled_field_count(app);
@@ -11910,8 +11930,8 @@ static void simple_app_serial_irq(FuriHalSerialHandle* handle, FuriHalSerialRxEv
 int32_t Lab_C5_app(void* p) {
     UNUSED(p);
 
-    // If USB is in mass-storage/qFlipper mode, exit immediately to avoid crashes
     if(!simple_app_usb_profile_ok()) {
+        simple_app_show_usb_blocker();
         return 0;
     }
 
@@ -12045,8 +12065,8 @@ int32_t Lab_C5_app(void* p) {
     simple_app_update_led_label(app);
     simple_app_update_boot_labels(app);
     simple_app_apply_backlight(app);
+    app->otg_power_enabled = furi_hal_power_is_otg_enabled();
     simple_app_update_otg_label(app);
-    simple_app_apply_otg_power(app);
     if(app->viewport) {
         view_port_update(app->viewport);
     }
