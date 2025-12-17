@@ -14,6 +14,7 @@
 #include <notification/notification_messages.h>
 #include <storage/storage.h>
 #include <furi/core/stream_buffer.h>
+#include <furi/core/memmgr.h>
 #include <gui/view_dispatcher.h>
 #include <gui/modules/text_input.h>
 #include <furi_hal_usb.h>
@@ -60,13 +61,13 @@ typedef enum {
 } MenuState;
 #define LAB_C5_VERSION_TEXT "0.36"
 
-#define MAX_SCAN_RESULTS 64
+#define MAX_SCAN_RESULTS 48
 #define SCAN_LINE_BUFFER_SIZE 192
 #define SCAN_SSID_MAX_LEN 33
 #define SCAN_CHANNEL_MAX_LEN 8
 #define SCAN_TYPE_MAX_LEN 16
-#define SCAN_FIELD_BUFFER_LEN 64
-#define SCAN_VENDOR_MAX_LEN 64
+#define SCAN_FIELD_BUFFER_LEN 48
+#define SCAN_VENDOR_MAX_LEN 48
 #define SCAN_POWER_MIN_DBM (-110)
 #define SCAN_POWER_MAX_DBM 0
 #define SCAN_POWER_STEP 1
@@ -96,14 +97,15 @@ typedef enum {
 #define BT_SCAN_CONSOLE_LINES 3
 #define SNIFFER_CONSOLE_LINES 3
 #define SNIFFER_MAX_APS 32
-#define SNIFFER_MAX_CLIENTS 96
+#define SNIFFER_MAX_CLIENTS 64
 #define SNIFFER_RESULTS_ARROW_THRESHOLD 200
 #define PROBE_MAX_SSIDS 32
-#define PROBE_MAX_CLIENTS 96
-#define BT_LOCATOR_MAX_DEVICES 64
+#define PROBE_MAX_CLIENTS 64
+#define BT_LOCATOR_MAX_DEVICES 24
 #define BT_LOCATOR_VISIBLE_COUNT 6
 #define BT_LOCATOR_WARMUP_MS 10000
-#define BT_SCAN_PREVIEW_MAX 64
+#define BT_LOCATOR_NAME_MAX_LEN 24
+#define BT_SCAN_PREVIEW_MAX 32
 #define RESULT_DEFAULT_MAX_LINES 4
 #define RESULT_DEFAULT_LINE_HEIGHT 12
 #define RESULT_DEFAULT_CHAR_LIMIT (SERIAL_LINE_CHAR_LIMIT - 3)
@@ -202,7 +204,7 @@ static const char* boot_command_options[BOOT_COMMAND_OPTION_COUNT] = {
 #define KARMA_AUTO_LIST_DELAY_MS 500
 #define HELP_HINT_IDLE_MS 3000
 #define DOUBLE_BACK_EXIT_MS 700
-#define SD_MANAGER_MAX_FILES 64
+#define SD_MANAGER_MAX_FILES 48
 #define SD_MANAGER_FILE_NAME_MAX 64
 #define SD_MANAGER_POPUP_VISIBLE_LINES 3
 #define SD_MANAGER_FOLDER_LABEL_MAX 24
@@ -379,7 +381,7 @@ typedef struct {
     size_t bt_locator_index;
     size_t bt_locator_offset;
     int32_t bt_locator_selected; // -1 none, otherwise index
-    char bt_locator_current_name[32];
+    char bt_locator_current_name[BT_LOCATOR_NAME_MAX_LEN];
     char bt_locator_scroll_text[64];
     size_t bt_locator_scroll_offset;
     int bt_locator_scroll_dir;
@@ -391,7 +393,7 @@ typedef struct {
         char mac[18];
         int rssi;
         bool has_rssi;
-        char name[32];
+        char name[BT_LOCATOR_NAME_MAX_LEN];
     } bt_locator_devices[BT_LOCATOR_MAX_DEVICES];
     char bt_scan_line_buffer[96];
     size_t bt_scan_line_length;
@@ -3002,7 +3004,7 @@ static void simple_app_bt_locator_add(SimpleApp* app, const char* mac, int rssi,
                 char mac[18];
                 int rssi;
                 bool has_rssi;
-                char name[32];
+                char name[BT_LOCATOR_NAME_MAX_LEN];
             } tmp = {0};
             memcpy(tmp.mac, app->bt_locator_devices[i].mac, sizeof(tmp.mac));
             tmp.rssi = app->bt_locator_devices[i].rssi;
@@ -3223,6 +3225,27 @@ static bool simple_app_usb_profile_ok(void) {
     const FuriHalUsbInterface* current = furi_hal_usb_get_config();
     if(!current) return true;
     return current == &usb_cdc_single;
+}
+
+static void simple_app_show_low_memory(size_t free_heap, size_t needed) {
+    DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
+    if(dialogs) {
+        DialogMessage* msg = dialog_message_alloc();
+        if(msg) {
+            dialog_message_set_header(msg, "Low memory", 64, 8, AlignCenter, AlignTop);
+            char text[96];
+            snprintf(
+                text,
+                sizeof(text),
+                "Free: %lu B\nNeed: %lu B\nClose qFlipper/USB\nand relaunch.",
+                (unsigned long)free_heap,
+                (unsigned long)needed);
+            dialog_message_set_text(msg, text, 64, 32, AlignCenter, AlignCenter);
+            dialog_message_show(dialogs, msg);
+            dialog_message_free(msg);
+        }
+        furi_record_close(RECORD_DIALOGS);
+    }
 }
 
 static void simple_app_show_usb_blocker(void) {
@@ -3587,7 +3610,7 @@ static void simple_app_mark_config_dirty(SimpleApp* app) {
     app->config_dirty = true;
 }
 
-static bool simple_app_wait_for_sd(Storage* storage, uint32_t timeout_ms) {
+static bool __attribute__((unused)) simple_app_wait_for_sd(Storage* storage, uint32_t timeout_ms) {
     if(!storage) return false;
     uint32_t start = furi_get_tick();
     while(true) {
@@ -11945,8 +11968,16 @@ int32_t Lab_C5_app(void* p) {
         furi_record_close(RECORD_STORAGE);
     }
 
+    const size_t free_heap = memmgr_get_free_heap();
+    const size_t needed_heap = sizeof(SimpleApp) + 4096;
+    if(free_heap < needed_heap) {
+        simple_app_show_low_memory(free_heap, needed_heap);
+        return 0;
+    }
+
     SimpleApp* app = malloc(sizeof(SimpleApp));
     if(!app) {
+        simple_app_show_low_memory(free_heap, needed_heap);
         return 0;
     }
     memset(app, 0, sizeof(SimpleApp));
