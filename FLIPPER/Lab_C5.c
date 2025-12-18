@@ -61,7 +61,7 @@ typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.36"
+#define LAB_C5_VERSION_TEXT "0.37"
 
 #define MAX_SCAN_RESULTS 48
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -1136,6 +1136,92 @@ static void simple_app_truncate_text(char* text, size_t max_chars) {
     }
     text[max_chars - 1] = '.';
     text[max_chars] = '\0';
+}
+
+static size_t simple_app_utf8_sequence_len(uint8_t lead) {
+    if(lead < 0x80) return 1;
+    if((lead & 0xE0) == 0xC0) return 2;
+    if((lead & 0xF0) == 0xE0) return 3;
+    if((lead & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+static bool simple_app_utf8_has_valid_continuation(const uint8_t* bytes, size_t len) {
+    if(len <= 1) return true;
+    for(size_t i = 1; i < len; i++) {
+        if((bytes[i] & 0xC0) != 0x80) return false;
+    }
+    return true;
+}
+
+static void simple_app_utf8_to_ascii_pl(const char* src, char* dst, size_t dst_size) {
+    if(!dst || dst_size == 0) return;
+    if(!src) {
+        dst[0] = '\0';
+        return;
+    }
+
+    size_t out = 0;
+    for(size_t i = 0; src[i] != '\0' && out + 1 < dst_size;) {
+        uint8_t b0 = (uint8_t)src[i];
+        if(b0 < 0x80) {
+            dst[out++] = (char)b0;
+            i++;
+            continue;
+        }
+
+        size_t seq_len = simple_app_utf8_sequence_len(b0);
+        if(seq_len == 1) {
+            dst[out++] = '?';
+            i++;
+            continue;
+        }
+
+        uint8_t bytes[4] = {0};
+        size_t available = 0;
+        while(available < seq_len && src[i + available] != '\0') {
+            bytes[available] = (uint8_t)src[i + available];
+            available++;
+        }
+        if(available < seq_len) seq_len = available;
+        if(seq_len == 0 || !simple_app_utf8_has_valid_continuation(bytes, seq_len)) {
+            dst[out++] = '?';
+            i++;
+            continue;
+        }
+
+        char mapped = '\0';
+        if(seq_len == 2) {
+            uint8_t b1 = bytes[1];
+            if(b0 == 0xC4) {
+                if(b1 == 0x84) mapped = 'A'; // Ą
+                else if(b1 == 0x85) mapped = 'a'; // ą
+                else if(b1 == 0x86) mapped = 'C'; // Ć
+                else if(b1 == 0x87) mapped = 'c'; // ć
+                else if(b1 == 0x98) mapped = 'E'; // Ę
+                else if(b1 == 0x99) mapped = 'e'; // ę
+            } else if(b0 == 0xC5) {
+                if(b1 == 0x81) mapped = 'L'; // Ł
+                else if(b1 == 0x82) mapped = 'l'; // ł
+                else if(b1 == 0x83) mapped = 'N'; // Ń
+                else if(b1 == 0x84) mapped = 'n'; // ń
+                else if(b1 == 0x9A) mapped = 'S'; // Ś
+                else if(b1 == 0x9B) mapped = 's'; // ś
+                else if(b1 == 0xB9) mapped = 'Z'; // Ź
+                else if(b1 == 0xBA) mapped = 'z'; // ź
+                else if(b1 == 0xBB) mapped = 'Z'; // Ż
+                else if(b1 == 0xBC) mapped = 'z'; // ż
+            } else if(b0 == 0xC3) {
+                if(b1 == 0x93) mapped = 'O'; // Ó
+                else if(b1 == 0xB3) mapped = 'o'; // ó
+            }
+        }
+
+        dst[out++] = (mapped != '\0') ? mapped : '?';
+        i += seq_len;
+    }
+
+    dst[out] = '\0';
 }
 
 static void simple_app_draw_scroll_arrow(Canvas* canvas, uint8_t base_left_x, int16_t base_y, bool upwards) {
@@ -2298,6 +2384,32 @@ static void simple_app_sniffer_trim(char* text) {
     text[len] = '\0';
 }
 
+static bool simple_app_sniffer_extract_mac_token(const char* line, char* out_mac, size_t out_mac_size) {
+    if(!line || !out_mac || out_mac_size == 0) return false;
+
+    char buf[64];
+    strncpy(buf, line, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    simple_app_sniffer_trim(buf);
+
+    const char* start = buf;
+    while(*start != '\0' && !isxdigit((unsigned char)*start)) start++;
+    if(*start == '\0') return false;
+
+    const char* end = start;
+    while(*end != '\0' && !isspace((unsigned char)*end) && *end != ',' && *end != ')' && *end != '(') {
+        end++;
+    }
+
+    size_t len = (size_t)(end - start);
+    if(len == 0) return false;
+    if(len >= out_mac_size) len = out_mac_size - 1;
+    memcpy(out_mac, start, len);
+    out_mac[len] = '\0';
+    simple_app_sniffer_trim(out_mac);
+    return out_mac[0] != '\0';
+}
+
 static bool simple_app_sniffer_parse_header(
     SimpleApp* app,
     const char* line,
@@ -2322,14 +2434,18 @@ static bool simple_app_sniffer_parse_header(
 
     const char* comma = strchr(line, ',');
     size_t ssid_len = 0;
+    const char* ssid_end = NULL;
     if(comma && comma < ch_ptr) {
-        ssid_len = (size_t)(comma - line);
-        if(ssid_len >= sizeof(out_entry->ssid)) {
-            ssid_len = sizeof(out_entry->ssid) - 1;
+        ssid_end = comma;
+    } else {
+        ssid_end = ch_ptr;
+        while(ssid_end > line && isspace((unsigned char)*(ssid_end - 1))) {
+            ssid_end--;
         }
-        memcpy(out_entry->ssid, line, ssid_len);
-    } else if(line[0] != '\0' && line[0] != '>') {
-        ssid_len = strlen(line);
+    }
+
+    if(ssid_end && ssid_end > line) {
+        ssid_len = (size_t)(ssid_end - line);
         if(ssid_len >= sizeof(out_entry->ssid)) {
             ssid_len = sizeof(out_entry->ssid) - 1;
         }
@@ -2339,6 +2455,10 @@ static bool simple_app_sniffer_parse_header(
     }
     out_entry->ssid[ssid_len] = '\0';
     simple_app_sniffer_trim(out_entry->ssid);
+    char ssid_ascii[sizeof(out_entry->ssid)];
+    simple_app_utf8_to_ascii_pl(out_entry->ssid, ssid_ascii, sizeof(ssid_ascii));
+    strncpy(out_entry->ssid, ssid_ascii, sizeof(out_entry->ssid) - 1);
+    out_entry->ssid[sizeof(out_entry->ssid) - 1] = '\0';
     if(out_entry->ssid[0] == '\0') {
         strncpy(out_entry->ssid, "<hidden>", sizeof(out_entry->ssid) - 1);
         out_entry->ssid[sizeof(out_entry->ssid) - 1] = '\0';
@@ -2398,10 +2518,11 @@ static void simple_app_process_sniffer_line(SimpleApp* app, const char* line) {
 
         if(simple_app_sniffer_is_mac(line) && app->sniffer_ap_count > 0) {
             if(app->sniffer_client_count < SNIFFER_MAX_CLIENTS) {
-                SnifferClientEntry* client = &app->sniffer_clients[app->sniffer_client_count++];
-                strncpy(client->mac, line, sizeof(client->mac) - 1);
-                client->mac[sizeof(client->mac) - 1] = '\0';
-                simple_app_sniffer_trim(client->mac);
+                SnifferClientEntry* client = &app->sniffer_clients[app->sniffer_client_count];
+                if(!simple_app_sniffer_extract_mac_token(line, client->mac, sizeof(client->mac))) {
+                    return;
+                }
+                app->sniffer_client_count++;
                 SnifferApEntry* last_ap = &app->sniffer_aps[app->sniffer_ap_count - 1];
                 if(last_ap->client_count < UINT16_MAX) {
                     last_ap->client_count++;
@@ -2535,6 +2656,10 @@ static void simple_app_process_probe_line(SimpleApp* app, const char* line) {
     memcpy(ssid, line, ssid_len);
     ssid[ssid_len] = '\0';
     simple_app_sniffer_trim(ssid);
+    char ssid_ascii[sizeof(ssid)];
+    simple_app_utf8_to_ascii_pl(ssid, ssid_ascii, sizeof(ssid_ascii));
+    strncpy(ssid, ssid_ascii, sizeof(ssid) - 1);
+    ssid[sizeof(ssid) - 1] = '\0';
     if(ssid[0] == '\0') {
         strncpy(ssid, "<hidden>", sizeof(ssid) - 1);
         ssid[sizeof(ssid) - 1] = '\0';
@@ -3543,6 +3668,11 @@ static size_t simple_app_build_result_lines(
     if(char_limit == 0) char_limit = RESULT_DEFAULT_CHAR_LIMIT;
     if(char_limit >= 63) char_limit = 63;
 
+    char ssid_ascii[SCAN_SSID_MAX_LEN];
+    simple_app_utf8_to_ascii_pl(result->ssid, ssid_ascii, sizeof(ssid_ascii));
+    char vendor_ascii[SCAN_VENDOR_MAX_LEN];
+    simple_app_utf8_to_ascii_pl(result->vendor, vendor_ascii, sizeof(vendor_ascii));
+
     bool store_lines = (lines != NULL);
     if(max_lines > RESULT_DEFAULT_MAX_LINES) {
         max_lines = RESULT_DEFAULT_MAX_LINES;
@@ -3580,9 +3710,9 @@ static size_t simple_app_build_result_lines(
             size_t remaining = sizeof(first_line) - len - 1;
             if(remaining > 0) {
                 first_line[len++] = ' ';
-                size_t ssid_len = strlen(result->ssid);
+                size_t ssid_len = strlen(ssid_ascii);
                 if(ssid_len > remaining) ssid_len = remaining;
-                memcpy(first_line + len, result->ssid, ssid_len);
+                memcpy(first_line + len, ssid_ascii, ssid_len);
                 len += ssid_len;
                 first_line[len] = '\0';
             }
@@ -3592,12 +3722,12 @@ static size_t simple_app_build_result_lines(
             if(len_after_ssid < sizeof(first_line) - 1) {
                 size_t remaining = sizeof(first_line) - len_after_ssid - 1;
                 if(remaining > 3) {
-                    size_t vendor_len = strlen(result->vendor);
+                    size_t vendor_len = strlen(vendor_ascii);
                     if(vendor_len > remaining - 1) vendor_len = remaining - 1;
                     if(vendor_len > 0) {
                         first_line[len_after_ssid++] = ' ';
                         first_line[len_after_ssid++] = '(';
-                        memcpy(first_line + len_after_ssid, result->vendor, vendor_len);
+                        memcpy(first_line + len_after_ssid, vendor_ascii, vendor_len);
                         len_after_ssid += vendor_len;
                         if(len_after_ssid < sizeof(first_line) - 1) {
                             first_line[len_after_ssid++] = ')';
@@ -3671,9 +3801,9 @@ static size_t simple_app_build_result_lines(
         vendor_line[len++] = ' ';
         if(len < sizeof(vendor_line) - 1) {
             size_t remaining = sizeof(vendor_line) - len - 1;
-            size_t vendor_len = strlen(result->vendor);
+            size_t vendor_len = strlen(vendor_ascii);
             if(vendor_len > remaining) vendor_len = remaining;
-            memcpy(vendor_line + len, result->vendor, vendor_len);
+            memcpy(vendor_line + len, vendor_ascii, vendor_len);
             len += vendor_len;
             vendor_line[len] = '\0';
         } else {
@@ -5070,6 +5200,17 @@ static void simple_app_send_stop_if_needed(SimpleApp* app) {
     simple_app_reset_sniffer_status(app);
     simple_app_reset_sniffer_results(app);
     simple_app_reset_probe_results(app);
+}
+
+static void simple_app_send_stop_preserve_results(SimpleApp* app) {
+    if(!app) return;
+    simple_app_send_command_quiet(app, "stop");
+    app->last_command_sent = false;
+    app->sniffer_running = false;
+    app->sniffer_view_active = false;
+    app->blackout_view_active = false;
+    app->bt_scan_running = false;
+    app->scanner_scan_running = false;
 }
 
 static void simple_app_prepare_exit(SimpleApp* app) {
@@ -7613,6 +7754,10 @@ static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canv
     char title[32];
     canvas_set_font(canvas, FontPrimary);
     snprintf(title, sizeof(title), "%s", ap->ssid[0] ? ap->ssid : "<hidden>");
+    char title_ascii[sizeof(title)];
+    simple_app_utf8_to_ascii_pl(title, title_ascii, sizeof(title_ascii));
+    strncpy(title, title_ascii, sizeof(title) - 1);
+    title[sizeof(title) - 1] = '\0';
     simple_app_truncate_text(title, 14);
     canvas_draw_str(canvas, 2, 30, title);
 
@@ -7737,6 +7882,10 @@ static void simple_app_draw_probe_results_overlay(SimpleApp* app, Canvas* canvas
     char title[32];
     canvas_set_font(canvas, FontPrimary);
     snprintf(title, sizeof(title), "%s", ssid->ssid[0] ? ssid->ssid : "<hidden>");
+    char title_ascii[sizeof(title)];
+    simple_app_utf8_to_ascii_pl(title, title_ascii, sizeof(title_ascii));
+    strncpy(title, title_ascii, sizeof(title) - 1);
+    title[sizeof(title) - 1] = '\0';
     simple_app_truncate_text(title, 14);
     canvas_draw_str(canvas, 2, 30, title);
 
@@ -11526,6 +11675,7 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
 
     if(app->probe_results_active) {
         if(key == InputKeyBack) {
+            simple_app_send_stop_preserve_results(app);
             app->probe_results_active = false;
             app->probe_full_console = false;
             app->screen = ScreenMenu;
@@ -11602,6 +11752,7 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
             ap_count > 0 || app->sniffer_client_count > 0;
 
         if(key == InputKeyBack) {
+            simple_app_send_stop_preserve_results(app);
             app->sniffer_results_active = false;
             app->sniffer_full_console = false;
             app->sniffer_view_active = false;
