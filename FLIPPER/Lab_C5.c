@@ -1138,22 +1138,6 @@ static void simple_app_truncate_text(char* text, size_t max_chars) {
     text[max_chars] = '\0';
 }
 
-static size_t simple_app_utf8_sequence_len(uint8_t lead) {
-    if(lead < 0x80) return 1;
-    if((lead & 0xE0) == 0xC0) return 2;
-    if((lead & 0xF0) == 0xE0) return 3;
-    if((lead & 0xF8) == 0xF0) return 4;
-    return 1;
-}
-
-static bool simple_app_utf8_has_valid_continuation(const uint8_t* bytes, size_t len) {
-    if(len <= 1) return true;
-    for(size_t i = 1; i < len; i++) {
-        if((bytes[i] & 0xC0) != 0x80) return false;
-    }
-    return true;
-}
-
 static void simple_app_utf8_to_ascii_pl(const char* src, char* dst, size_t dst_size) {
     if(!dst || dst_size == 0) return;
     if(!src) {
@@ -1170,55 +1154,43 @@ static void simple_app_utf8_to_ascii_pl(const char* src, char* dst, size_t dst_s
             continue;
         }
 
-        size_t seq_len = simple_app_utf8_sequence_len(b0);
-        if(seq_len == 1) {
+        uint8_t b1 = (uint8_t)src[i + 1];
+        if(b1 == 0) {
             dst[out++] = '?';
-            i++;
-            continue;
-        }
-
-        uint8_t bytes[4] = {0};
-        size_t available = 0;
-        while(available < seq_len && src[i + available] != '\0') {
-            bytes[available] = (uint8_t)src[i + available];
-            available++;
-        }
-        if(available < seq_len) seq_len = available;
-        if(seq_len == 0 || !simple_app_utf8_has_valid_continuation(bytes, seq_len)) {
-            dst[out++] = '?';
-            i++;
-            continue;
+            break;
         }
 
         char mapped = '\0';
-        if(seq_len == 2) {
-            uint8_t b1 = bytes[1];
-            if(b0 == 0xC4) {
-                if(b1 == 0x84) mapped = 'A'; // Ą
-                else if(b1 == 0x85) mapped = 'a'; // ą
-                else if(b1 == 0x86) mapped = 'C'; // Ć
-                else if(b1 == 0x87) mapped = 'c'; // ć
-                else if(b1 == 0x98) mapped = 'E'; // Ę
-                else if(b1 == 0x99) mapped = 'e'; // ę
-            } else if(b0 == 0xC5) {
-                if(b1 == 0x81) mapped = 'L'; // Ł
-                else if(b1 == 0x82) mapped = 'l'; // ł
-                else if(b1 == 0x83) mapped = 'N'; // Ń
-                else if(b1 == 0x84) mapped = 'n'; // ń
-                else if(b1 == 0x9A) mapped = 'S'; // Ś
-                else if(b1 == 0x9B) mapped = 's'; // ś
-                else if(b1 == 0xB9) mapped = 'Z'; // Ź
-                else if(b1 == 0xBA) mapped = 'z'; // ź
-                else if(b1 == 0xBB) mapped = 'Z'; // Ż
-                else if(b1 == 0xBC) mapped = 'z'; // ż
-            } else if(b0 == 0xC3) {
-                if(b1 == 0x93) mapped = 'O'; // Ó
-                else if(b1 == 0xB3) mapped = 'o'; // ó
-            }
+        if(b0 == 0xC4) {
+            if(b1 == 0x84) mapped = 'A'; // Ą
+            else if(b1 == 0x85) mapped = 'a'; // ą
+            else if(b1 == 0x86) mapped = 'C'; // Ć
+            else if(b1 == 0x87) mapped = 'c'; // ć
+            else if(b1 == 0x98) mapped = 'E'; // Ę
+            else if(b1 == 0x99) mapped = 'e'; // ę
+        } else if(b0 == 0xC5) {
+            if(b1 == 0x81) mapped = 'L'; // Ł
+            else if(b1 == 0x82) mapped = 'l'; // ł
+            else if(b1 == 0x83) mapped = 'N'; // Ń
+            else if(b1 == 0x84) mapped = 'n'; // ń
+            else if(b1 == 0x9A) mapped = 'S'; // Ś
+            else if(b1 == 0x9B) mapped = 's'; // ś
+            else if(b1 == 0xB9) mapped = 'Z'; // Ź
+            else if(b1 == 0xBA) mapped = 'z'; // ź
+            else if(b1 == 0xBB) mapped = 'Z'; // Ż
+            else if(b1 == 0xBC) mapped = 'z'; // ż
+        } else if(b0 == 0xC3) {
+            if(b1 == 0x93) mapped = 'O'; // Ó
+            else if(b1 == 0xB3) mapped = 'o'; // ó
         }
 
-        dst[out++] = (mapped != '\0') ? mapped : '?';
-        i += seq_len;
+        if(mapped != '\0') {
+            dst[out++] = mapped;
+            i += 2;
+        } else {
+            dst[out++] = '?';
+            i += 1;
+        }
     }
 
     dst[out] = '\0';
@@ -2455,10 +2427,6 @@ static bool simple_app_sniffer_parse_header(
     }
     out_entry->ssid[ssid_len] = '\0';
     simple_app_sniffer_trim(out_entry->ssid);
-    char ssid_ascii[sizeof(out_entry->ssid)];
-    simple_app_utf8_to_ascii_pl(out_entry->ssid, ssid_ascii, sizeof(ssid_ascii));
-    strncpy(out_entry->ssid, ssid_ascii, sizeof(out_entry->ssid) - 1);
-    out_entry->ssid[sizeof(out_entry->ssid) - 1] = '\0';
     if(out_entry->ssid[0] == '\0') {
         strncpy(out_entry->ssid, "<hidden>", sizeof(out_entry->ssid) - 1);
         out_entry->ssid[sizeof(out_entry->ssid) - 1] = '\0';
@@ -2656,10 +2624,6 @@ static void simple_app_process_probe_line(SimpleApp* app, const char* line) {
     memcpy(ssid, line, ssid_len);
     ssid[ssid_len] = '\0';
     simple_app_sniffer_trim(ssid);
-    char ssid_ascii[sizeof(ssid)];
-    simple_app_utf8_to_ascii_pl(ssid, ssid_ascii, sizeof(ssid_ascii));
-    strncpy(ssid, ssid_ascii, sizeof(ssid) - 1);
-    ssid[sizeof(ssid) - 1] = '\0';
     if(ssid[0] == '\0') {
         strncpy(ssid, "<hidden>", sizeof(ssid) - 1);
         ssid[sizeof(ssid) - 1] = '\0';
