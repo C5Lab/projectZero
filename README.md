@@ -64,7 +64,7 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 - `channel_time set <min|max> <ms>` / `channel_time read <min|max>` - tune how long scans dwell on each channel for faster or deeper recon runs.
 - `vendor set <on|off>` / `vendor read` - toggles OUI lookup backed by `/lab/oui_wifi.bin` on the SD card.
 - `led set <on|off>` / `led level <1-100>` - controls the WS2812 status LED (purple for portal, other colors for attacks).
-- GPS helpers: `gps_set <m5|atgm>` switches between M5Stack GPS v1.1 (115200 bps) and ATGM336H (9600 bps, default); `start_gps_raw [baud]` streams NMEA for quick validation without rebooting.
+- GPS helpers: `gps_set <m5|atgm>` switches between M5Stack GPS v1.1 (115200 bps) and ATGM336H (9600 bps, default); `start_gps_raw [baud]` streams NMEA for quick validation without rebooting (baud optional, overrides module default).
 - `download` - reboot straight into ROM download mode for UART flashing.
 - `ping` - quick CLI connectivity check (prints pong).
 - `stop` - flips the global stop flag so every running task can wind down gracefully.
