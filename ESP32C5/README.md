@@ -5,6 +5,11 @@ Project Zero is an ESP32-C5 firmware that bundles Wi-Fi assessment tooling, cons
 
 The firmware boots into an `esp_console` REPL, so most capabilities are exposed as CLI commands (`start_blackout`, `start_sniffer_dog`, `start_portal`, and more). Refer to the serial console banner for the full list after flashing.
 
+## GPS Modules
+- Default profile targets ATGM336H at 9600 bps.
+- M5Stack GPS v1.1 (115200 bps) is supported via `gps_set m5`; switch back with `gps_set atgm`. No reboot required.
+- Use `start_gps_raw [baud]` to stream NMEA sentences to the console for quick verification.
+
 ## Boot Button Usage
 The Boot button is wired to GPIO28 and is configured for two different actions while the device is running the firmware:
 

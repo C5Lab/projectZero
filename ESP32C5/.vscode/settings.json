@@ -3,7 +3,7 @@
   "idf.monitorPort": "COM10",
   "idf.port": "/dev/tty.usbserial-240",
   "idf.portWin": "COM10",
-  "idf.espIdfPathWin": "C:\\Users\\mati\\Documents\\GitHub\\ESP\\master\\esp-idf",
+  "idf.espIdfPathWin": "C:\\Users\\mati\\esp\\v6.0-beta1\\esp-idf",
   "idf.toolsPathWin": "C:\\Users\\mati\\.espressif",
   "idf.pythonInstallPath": "C:\\Users\\mati\\.espressif\\tools\\idf-python\\3.11.2\\python.exe",
   "idf.openOcdConfigs": [

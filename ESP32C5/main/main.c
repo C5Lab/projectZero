@@ -87,7 +87,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.0.0"
+#define JANOS_VERSION "1.0.1"
 
 
 #define NEOPIXEL_GPIO      27
@@ -106,6 +106,8 @@
 #define GPS_TX_PIN         13
 #define GPS_RX_PIN         14
 #define GPS_BUF_SIZE       1024
+#define GPS_BAUD_ATGM336H  9600
+#define GPS_BAUD_M5STACK   115200
 
 // SD Card SPI pins (Marauder compatible)
 #define SD_MISO_PIN        2
@@ -178,11 +180,18 @@ typedef struct {
     bool valid;
 } gps_data_t;
 
+typedef enum {
+    GPS_MODULE_ATGM336H = 0,
+    GPS_MODULE_M5STACK_GPS_V11 = 1,
+} gps_module_t;
+
 // Wardrive state
 static bool wardrive_active = false;
 static int wardrive_file_counter = 1;
 static gps_data_t current_gps = {0};
 static bool gps_uart_initialized = false;
+static gps_module_t current_gps_module = GPS_MODULE_ATGM336H;
+static volatile bool gps_raw_active = false;
 
 // Global stop flag for all operations
 static volatile bool operation_stop_requested = false;
@@ -267,6 +276,7 @@ static int deauth_detector_selected_channels[MAX_AP_CNT];
 static int deauth_detector_selected_channels_count = 0;
 
 // Wardrive task
+static TaskHandle_t gps_raw_task_handle = NULL;
 static TaskHandle_t wardrive_task_handle = NULL;
 
 // Handshake attack task
@@ -680,8 +690,6 @@ static void led_boot_sequence(void) {
     led_brightness_percent = LED_BRIGHTNESS_DEFAULT;
     led_current_color = (led_color_t){0, 0, 0};
 
-    led_load_state_from_nvs();
-
     if (!led_initialized) {
         return;
     }
@@ -741,6 +749,8 @@ static bool init_psram_buffers(void)
 #define SD_OUI_BIN_PATH "/sdcard/lab/oui_wifi.bin"
 #define VENDOR_NVS_NAMESPACE "vendorcfg"
 #define VENDOR_NVS_KEY_ENABLED "enabled"
+#define GPS_NVS_NAMESPACE "gpscfg"
+#define GPS_NVS_KEY_MODULE "module"
 
 // Boot button configuration (stored in NVS)
 #define BOOTCFG_NVS_NAMESPACE "bootcfg"
@@ -757,6 +767,7 @@ static const char* boot_allowed_commands[] = {
     "packet_monitor",
     "start_sniffer",
     "scan_networks",
+    "start_gps_raw",
     "start_wardrive",
     "deauth_detector"
 };
@@ -791,6 +802,8 @@ static int cmd_select_networks(int argc, char **argv);
 static int cmd_start_evil_twin(int argc, char **argv);
 static int cmd_start_handshake(int argc, char **argv);
 static int cmd_save_handshake(int argc, char **argv);
+static int cmd_start_gps_raw(int argc, char **argv);
+static int cmd_gps_set(int argc, char **argv);
 static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_start_sniffer(int argc, char **argv);
 static int cmd_packet_monitor(int argc, char **argv);
@@ -832,6 +845,7 @@ static bool check_handshake_file_exists(const char *ssid);
 static void handshake_cleanup(void);
 static void quick_scan_all_channels(void);
 static void attack_network_with_burst(const wifi_ap_record_t *ap);
+static void gps_raw_task(void *pvParameters);
 // DNS server task
 static void dns_server_task(void *pvParameters);
 // Portal HTTP handlers
@@ -878,7 +892,10 @@ static bool is_broadcast_bssid(const uint8_t *bssid);
 static bool is_own_device_mac(const uint8_t *mac);
 static void add_client_to_ap(int ap_index, const uint8_t *client_mac, int rssi);
 // Wardrive functions
-static esp_err_t init_gps_uart(void);
+static esp_err_t init_gps_uart(int baud_rate);
+static int gps_get_baud_for_module(gps_module_t module);
+static void gps_load_state_from_nvs(void);
+static void gps_save_state_to_nvs(void);
 static esp_err_t init_sd_card(void);
 static esp_err_t create_sd_directories(void);
 static bool parse_gps_nmea(const char* nmea_sentence);
@@ -1929,6 +1946,8 @@ static void boot_execute_command(const char* command) {
         (void)cmd_start_sniffer(0, NULL);
     } else if (strcasecmp(command, "scan_networks") == 0) {
         (void)cmd_scan_networks(0, NULL);
+    } else if (strcasecmp(command, "start_gps_raw") == 0) {
+        (void)cmd_start_gps_raw(0, NULL);
     } else if (strcasecmp(command, "start_wardrive") == 0) {
         (void)cmd_start_wardrive(0, NULL);
     } else if (strcasecmp(command, "deauth_detector") == 0) {
@@ -3547,6 +3566,24 @@ static int cmd_stop(int argc, char **argv) {
         }
         
         MY_LOG_INFO(TAG, "Deauth Detector stopped.");
+    }
+    
+    // Stop GPS raw task if running
+    if (gps_raw_active || gps_raw_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping GPS raw task...");
+        gps_raw_active = false;
+
+        // Wait a bit for task to finish
+        for (int i = 0; i < 20 && gps_raw_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+        // Force delete if still running
+        if (gps_raw_task_handle != NULL) {
+            vTaskDelete(gps_raw_task_handle);
+            gps_raw_task_handle = NULL;
+            MY_LOG_INFO(TAG, "GPS raw task forcefully stopped.");
+        }
     }
     
     // Stop wardrive task if running
@@ -5313,6 +5350,57 @@ static int cmd_set_html(int argc, char **argv)
     return 0;
 }
 
+static void gps_raw_task(void *pvParameters) {
+    (void)pvParameters;
+
+    MY_LOG_INFO(TAG, "GPS raw reader started. Use 'stop' to exit.");
+
+    while (gps_raw_active && !operation_stop_requested) {
+        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t *)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(500));
+        if (len > 0) {
+            wardrive_gps_buffer[len] = '\0';
+            char *line = strtok(wardrive_gps_buffer, "\r\n");
+            while (line != NULL) {
+                MY_LOG_INFO(TAG, "[GPS RAW] %s", line);
+                line = strtok(NULL, "\r\n");
+            }
+        }
+    }
+
+    gps_raw_active = false;
+    operation_stop_requested = false;
+    gps_raw_task_handle = NULL;
+    MY_LOG_INFO(TAG, "GPS raw reader stopped.");
+    vTaskDelete(NULL);
+}
+
+static int cmd_gps_set(int argc, char **argv) {
+    if (argc < 2 || argv[1] == NULL) {
+        MY_LOG_INFO(TAG, "Usage: gps_set <m5|atgm>");
+        MY_LOG_INFO(TAG, "Current GPS module: %s (baud %d)",
+                    (current_gps_module == GPS_MODULE_M5STACK_GPS_V11) ? "M5StackGPS1.1" : "ATGM336H",
+                    gps_get_baud_for_module(current_gps_module));
+        return 0;
+    }
+
+    gps_module_t selected = current_gps_module;
+    if (strcasecmp(argv[1], "m5") == 0 || strcasecmp(argv[1], "m5stack") == 0 || strcasecmp(argv[1], "m5stackgps1.1") == 0 || strcasecmp(argv[1], "m5stackgpsv11") == 0) {
+        selected = GPS_MODULE_M5STACK_GPS_V11;
+    } else if (strcasecmp(argv[1], "atgm") == 0 || strcasecmp(argv[1], "atgm336h") == 0) {
+        selected = GPS_MODULE_ATGM336H;
+    } else {
+        MY_LOG_INFO(TAG, "Unknown module '%s'. Use 'm5' or 'atgm'.", argv[1]);
+        return 1;
+    }
+
+    current_gps_module = selected;
+    gps_save_state_to_nvs();
+    MY_LOG_INFO(TAG, "GPS module set to %s (baud %d). Restart GPS tasks if running.",
+                (current_gps_module == GPS_MODULE_M5STACK_GPS_V11) ? "M5StackGPS1.1" : "ATGM336H",
+                gps_get_baud_for_module(current_gps_module));
+    return 0;
+}
+
 // Wardrive task function (runs in background)
 static void wardrive_task(void *pvParameters) {
     (void)pvParameters;
@@ -5529,6 +5617,62 @@ static void wardrive_task(void *pvParameters) {
     vTaskDelete(NULL); // Delete this task
 }
 
+static int cmd_start_gps_raw(int argc, char **argv) {
+    log_memory_info("start_gps_raw");
+
+    int baud = gps_get_baud_for_module(current_gps_module);
+    if (argc >= 2 && argv[1] != NULL) {
+        char *endptr = NULL;
+        long val = strtol(argv[1], &endptr, 10);
+        if (endptr == argv[1] || (endptr != NULL && *endptr != '\0') || val <= 0) {
+            MY_LOG_INFO(TAG, "Invalid baud rate '%s'. Use numeric value, e.g. 9600 or 115200.", argv[1]);
+            return 1;
+        }
+        baud = (int)val;
+    }
+
+    if (gps_raw_active || gps_raw_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "GPS raw reader already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+
+    if (wardrive_active || wardrive_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start GPS raw while wardrive is active. Use 'stop' to stop wardrive first.");
+        return 1;
+    }
+
+    // Reset stop flag at the beginning of operation
+    operation_stop_requested = false;
+
+    esp_err_t ret = init_gps_uart(baud);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    gps_raw_active = true;
+    BaseType_t result = xTaskCreate(
+        gps_raw_task,
+        "gps_raw_task",
+        4096,
+        NULL,
+        4,
+        &gps_raw_task_handle
+    );
+
+    if (result != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create GPS raw task!");
+        gps_raw_active = false;
+        gps_raw_task_handle = NULL;
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "GPS raw reader started at %d baud (%s). Use 'stop' to stop.",
+                baud,
+                (current_gps_module == GPS_MODULE_M5STACK_GPS_V11) ? "M5StackGPS1.1" : "ATGM336H");
+    return 0;
+}
+
 static int cmd_start_wardrive(int argc, char **argv) {
     (void)argc; (void)argv;
     log_memory_info("start_wardrive");
@@ -5543,6 +5687,10 @@ static int cmd_start_wardrive(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Wardrive already running. Use 'stop' to stop it first.");
         return 1;
     }
+    if (gps_raw_active || gps_raw_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start wardrive while GPS raw reader is running. Use 'stop' to stop it first.");
+        return 1;
+    }
     
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
@@ -5550,12 +5698,14 @@ static int cmd_start_wardrive(int argc, char **argv) {
     MY_LOG_INFO(TAG, "Starting wardrive mode...");
     
     // Initialize GPS UART
-    esp_err_t ret = init_gps_uart();
+    int wardrive_baud = gps_get_baud_for_module(current_gps_module);
+    esp_err_t ret = init_gps_uart(wardrive_baud);
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to initialize GPS UART: %s", esp_err_to_name(ret));
         return 1;
     }
-    MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX)", GPS_TX_PIN, GPS_RX_PIN);
+    MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
+                GPS_TX_PIN, GPS_RX_PIN, wardrive_baud);
     
     // Initialize SD card
     ret = init_sd_card();
@@ -7301,6 +7451,24 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&blackout_cmd));
 
+    const esp_console_cmd_t gps_raw_cmd = {
+        .command = "start_gps_raw",
+        .help = "Prints raw GPS NMEA sentences: start_gps_raw [baud] (default depends on gps_set)",
+        .hint = "[baud]",
+        .func = &cmd_start_gps_raw,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&gps_raw_cmd));
+
+    const esp_console_cmd_t gps_set_cmd = {
+        .command = "gps_set",
+        .help = "Select GPS module: gps_set <m5|atgm>",
+        .hint = "<m5|atgm>",
+        .func = &cmd_gps_set,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&gps_set_cmd));
+
     const esp_console_cmd_t wardrive_cmd = {
         .command = "start_wardrive",
         .help = "Starts wardriving with GPS and SD logging",
@@ -7529,6 +7697,11 @@ void app_main(void) {
     //printf("NVS initialized OK\n");
 
     channel_time_load_state_from_nvs();
+    gps_load_state_from_nvs();
+    led_load_state_from_nvs();
+    MY_LOG_INFO(TAG, "GPS module: %s (baud %d)",
+                (current_gps_module == GPS_MODULE_M5STACK_GPS_V11) ? "M5StackGPS1.1" : "ATGM336H",
+                gps_get_baud_for_module(current_gps_module));
 
     //printf("Step 4: Init LED strip\n");
     // 1. LED strip configuration
@@ -7547,13 +7720,19 @@ void app_main(void) {
         .flags.with_dma = false,
     };
 
-    // 3. strip instance
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &strip));
-    //printf("LED strip initialized OK\n");
-
-    led_initialized = true;
-    //printf("Step 5: LED boot sequence\n");
-    led_boot_sequence();
+    // 3. strip instance (non-fatal on failure)
+    esp_err_t led_init_err = led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &strip);
+    if (led_init_err != ESP_OK) {
+        ESP_LOGE(TAG, "LED strip init failed on GPIO %d (model %s): %s",
+                 strip_cfg.strip_gpio_num,
+                 "WS2812",
+                 esp_err_to_name(led_init_err));
+        strip = NULL;
+        led_initialized = false;
+    } else {
+        led_initialized = true;
+        led_boot_sequence();
+    }
     //printf("Step 6: Vendor load state\n");
     MY_LOG_INFO(TAG, "Status LED ready (brightness %u%%, %s)", led_brightness_percent, led_user_enabled ? "on" : "off");
     vendor_load_state_from_nvs();
@@ -7609,6 +7788,8 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  start_portal <SSID>");
       MY_LOG_INFO(TAG,"  start_sniffer");
       MY_LOG_INFO(TAG,"  start_sniffer_dog");
+      MY_LOG_INFO(TAG,"  start_gps_raw");
+      MY_LOG_INFO(TAG,"  gps_set <m5|atgm>");
       MY_LOG_INFO(TAG,"  start_wardrive");
       MY_LOG_INFO(TAG,"  stop");
       MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
@@ -9001,9 +9182,20 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
 
 // === WARDRIVE HELPER FUNCTIONS ===
 
-static esp_err_t init_gps_uart(void) {
+static int gps_get_baud_for_module(gps_module_t module) {
+    switch (module) {
+        case GPS_MODULE_M5STACK_GPS_V11:
+            return GPS_BAUD_M5STACK;
+        case GPS_MODULE_ATGM336H:
+        default:
+            return GPS_BAUD_ATGM336H;
+    }
+}
+
+static esp_err_t init_gps_uart(int baud_rate) {
+    int effective_baud = (baud_rate > 0) ? baud_rate : GPS_BAUD_ATGM336H;
     uart_config_t uart_config = {
-        .baud_rate = 9600,
+        .baud_rate = effective_baud,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
@@ -9011,19 +9203,17 @@ static esp_err_t init_gps_uart(void) {
         .source_clk = UART_SCLK_DEFAULT,
     };
 
-    esp_err_t err;
-
-    if (!gps_uart_initialized) {
-        err = uart_driver_install(GPS_UART_NUM, GPS_BUF_SIZE * 2, 0, 0, NULL, 0);
-        if (err == ESP_ERR_INVALID_STATE) {
-            // Driver already installed from a previous run
-            gps_uart_initialized = true;
-        } else if (err != ESP_OK) {
-            return err;
-        } else {
-            gps_uart_initialized = true;
-        }
+    // Always reinstall driver to ensure clean queues when switching modules/baud without reboot
+    if (gps_uart_initialized) {
+        uart_driver_delete(GPS_UART_NUM);
+        gps_uart_initialized = false;
     }
+
+    esp_err_t err = uart_driver_install(GPS_UART_NUM, GPS_BUF_SIZE * 2, 0, 0, NULL, 0);
+    if (err != ESP_OK) {
+        return err;
+    }
+    gps_uart_initialized = true;
 
     err = uart_param_config(GPS_UART_NUM, &uart_config);
     if (err != ESP_OK) {
@@ -9035,7 +9225,48 @@ static esp_err_t init_gps_uart(void) {
         return err;
     }
 
+    err = uart_set_baudrate(GPS_UART_NUM, effective_baud);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uart_flush_input(GPS_UART_NUM);
     return ESP_OK;
+}
+
+static void gps_save_state_to_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(GPS_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "GPS cfg NVS open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_u8(handle, GPS_NVS_KEY_MODULE, (uint8_t)current_gps_module);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "GPS cfg NVS save failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void gps_load_state_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(GPS_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "GPS cfg NVS read open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    uint8_t module_val = (uint8_t)current_gps_module;
+    err = nvs_get_u8(handle, GPS_NVS_KEY_MODULE, &module_val);
+    nvs_close(handle);
+    if (err == ESP_OK && module_val <= GPS_MODULE_M5STACK_GPS_V11) {
+        current_gps_module = (gps_module_t)module_val;
+    }
 }
 
 static esp_err_t init_sd_card(void) {
