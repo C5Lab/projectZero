@@ -119,6 +119,7 @@ typedef enum {
 #define RESULT_SCROLL_GAP 0
 #define RESULT_SCROLL_INTERVAL_MS 200
 #define RESULT_SCROLL_EDGE_PAUSE_STEPS 3
+#define OVERLAY_TITLE_CHAR_LIMIT 22
 #define DEAUTH_GUARD_BLINK_MS 500
 #define DEAUTH_GUARD_VIBRO_MS 400
 #define DEAUTH_GUARD_BLINK_TOGGLES 6
@@ -607,6 +608,11 @@ typedef struct {
     uint8_t result_scroll_hold;
     uint32_t result_scroll_last_tick;
     char result_scroll_text[64];
+    uint8_t overlay_title_scroll_offset;
+    int8_t overlay_title_scroll_direction;
+    uint8_t overlay_title_scroll_hold;
+    uint32_t overlay_title_scroll_last_tick;
+    char overlay_title_scroll_text[64];
     bool hint_active;
     char hint_title[24];
     char hint_lines[HINT_MAX_LINES][HINT_LINE_CHAR_LIMIT];
@@ -658,6 +664,8 @@ typedef struct {
 } SimpleApp;
 static void simple_app_reset_result_scroll(SimpleApp* app);
 static void simple_app_update_result_scroll(SimpleApp* app);
+static void simple_app_reset_overlay_title_scroll(SimpleApp* app);
+static void simple_app_update_overlay_title_scroll(SimpleApp* app);
 static void simple_app_adjust_result_offset(SimpleApp* app);
 static void simple_app_rebuild_visible_results(SimpleApp* app);
 static bool simple_app_result_is_visible(const SimpleApp* app, const ScanResult* result);
@@ -4374,6 +4382,15 @@ static void simple_app_reset_result_scroll(SimpleApp* app) {
     app->result_scroll_text[0] = '\0';
 }
 
+static void simple_app_reset_overlay_title_scroll(SimpleApp* app) {
+    if(!app) return;
+    app->overlay_title_scroll_offset = 0;
+    app->overlay_title_scroll_direction = 1;
+    app->overlay_title_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+    app->overlay_title_scroll_last_tick = furi_get_tick();
+    app->overlay_title_scroll_text[0] = '\0';
+}
+
 static void simple_app_reset_sd_scroll(SimpleApp* app) {
     if(!app) return;
     app->sd_scroll_offset = 0;
@@ -4498,6 +4515,152 @@ static void simple_app_update_result_scroll(SimpleApp* app) {
         } else {
             app->result_scroll_direction = 1;
             app->result_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        }
+    }
+
+    if(changed && app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_update_overlay_title_scroll(SimpleApp* app) {
+    if(!app) return;
+
+    bool overlay_active = (app->sniffer_results_active && !app->sniffer_full_console) ||
+                          (app->probe_results_active && !app->probe_full_console);
+
+    if(!overlay_active) {
+        if(app->overlay_title_scroll_text[0] != '\0' || app->overlay_title_scroll_offset != 0) {
+            simple_app_reset_overlay_title_scroll(app);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    char desired_title[64];
+    desired_title[0] = '\0';
+
+    if(app->sniffer_results_active && !app->sniffer_full_console) {
+        if(app->sniffer_ap_count == 0) {
+            if(app->overlay_title_scroll_text[0] != '\0' || app->overlay_title_scroll_offset != 0) {
+                simple_app_reset_overlay_title_scroll(app);
+                if(app->viewport) {
+                    view_port_update(app->viewport);
+                }
+            }
+            return;
+        }
+
+        size_t ap_index = app->sniffer_results_ap_index;
+        if(ap_index >= app->sniffer_ap_count) {
+            ap_index = app->sniffer_ap_count - 1;
+        }
+        const SnifferApEntry* ap = &app->sniffer_aps[ap_index];
+        const char* ssid = ap->ssid[0] ? ap->ssid : "<hidden>";
+        snprintf(desired_title, sizeof(desired_title), "%s", ssid);
+    } else if(app->probe_results_active && !app->probe_full_console) {
+        if(app->probe_ssid_count == 0) {
+            if(app->overlay_title_scroll_text[0] != '\0' || app->overlay_title_scroll_offset != 0) {
+                simple_app_reset_overlay_title_scroll(app);
+                if(app->viewport) {
+                    view_port_update(app->viewport);
+                }
+            }
+            return;
+        }
+
+        size_t ssid_index = app->probe_ssid_index;
+        if(ssid_index >= app->probe_ssid_count) {
+            ssid_index = app->probe_ssid_count - 1;
+        }
+        const ProbeSsidEntry* ssid = &app->probe_ssids[ssid_index];
+        const char* ssid_text = ssid->ssid[0] ? ssid->ssid : "<hidden>";
+        snprintf(desired_title, sizeof(desired_title), "%s", ssid_text);
+    } else {
+        if(app->overlay_title_scroll_text[0] != '\0' || app->overlay_title_scroll_offset != 0) {
+            simple_app_reset_overlay_title_scroll(app);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    char desired_ascii[sizeof(desired_title)];
+    simple_app_utf8_to_ascii_pl(desired_title, desired_ascii, sizeof(desired_ascii));
+    strncpy(desired_title, desired_ascii, sizeof(desired_title) - 1);
+    desired_title[sizeof(desired_title) - 1] = '\0';
+
+    if(strncmp(desired_title, app->overlay_title_scroll_text, sizeof(app->overlay_title_scroll_text)) != 0) {
+        strncpy(app->overlay_title_scroll_text, desired_title, sizeof(app->overlay_title_scroll_text) - 1);
+        app->overlay_title_scroll_text[sizeof(app->overlay_title_scroll_text) - 1] = '\0';
+        app->overlay_title_scroll_offset = 0;
+        app->overlay_title_scroll_direction = 1;
+        app->overlay_title_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        app->overlay_title_scroll_last_tick = furi_get_tick();
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    size_t char_limit = OVERLAY_TITLE_CHAR_LIMIT;
+    if(char_limit >= sizeof(app->overlay_title_scroll_text)) {
+        char_limit = sizeof(app->overlay_title_scroll_text) - 1;
+    }
+    if(char_limit == 0) char_limit = 1;
+
+    size_t line_length = strlen(app->overlay_title_scroll_text);
+    if(line_length <= char_limit) {
+        if(app->overlay_title_scroll_offset != 0) {
+            app->overlay_title_scroll_offset = 0;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    size_t max_offset = line_length - char_limit;
+    uint32_t now = furi_get_tick();
+    uint32_t interval_ticks = furi_ms_to_ticks(RESULT_SCROLL_INTERVAL_MS);
+    if(interval_ticks == 0) interval_ticks = 1;
+    if((now - app->overlay_title_scroll_last_tick) < interval_ticks) {
+        return;
+    }
+    app->overlay_title_scroll_last_tick = now;
+
+    if(app->overlay_title_scroll_hold > 0) {
+        app->overlay_title_scroll_hold--;
+        return;
+    }
+
+    bool changed = false;
+    if(app->overlay_title_scroll_direction > 0) {
+        if(app->overlay_title_scroll_offset < max_offset) {
+            app->overlay_title_scroll_offset++;
+            changed = true;
+            if(app->overlay_title_scroll_offset >= max_offset) {
+                app->overlay_title_scroll_direction = -1;
+                app->overlay_title_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+            }
+        } else {
+            app->overlay_title_scroll_direction = -1;
+            app->overlay_title_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        }
+    } else {
+        if(app->overlay_title_scroll_offset > 0) {
+            app->overlay_title_scroll_offset--;
+            changed = true;
+            if(app->overlay_title_scroll_offset == 0) {
+                app->overlay_title_scroll_direction = 1;
+                app->overlay_title_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+            }
+        } else {
+            app->overlay_title_scroll_direction = 1;
+            app->overlay_title_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
         }
     }
 
@@ -7715,15 +7878,34 @@ static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canv
     }
 
     const SnifferApEntry* ap = &app->sniffer_aps[app->sniffer_results_ap_index];
-    char title[32];
     canvas_set_font(canvas, FontPrimary);
-    snprintf(title, sizeof(title), "%s", ap->ssid[0] ? ap->ssid : "<hidden>");
-    char title_ascii[sizeof(title)];
-    simple_app_utf8_to_ascii_pl(title, title_ascii, sizeof(title_ascii));
-    strncpy(title, title_ascii, sizeof(title) - 1);
-    title[sizeof(title) - 1] = '\0';
-    simple_app_truncate_text(title, 14);
-    canvas_draw_str(canvas, 2, 30, title);
+    char computed_title[64];
+    snprintf(computed_title, sizeof(computed_title), "%s", ap->ssid[0] ? ap->ssid : "<hidden>");
+    char computed_title_ascii[sizeof(computed_title)];
+    simple_app_utf8_to_ascii_pl(computed_title, computed_title_ascii, sizeof(computed_title_ascii));
+    strncpy(computed_title, computed_title_ascii, sizeof(computed_title) - 1);
+    computed_title[sizeof(computed_title) - 1] = '\0';
+
+    const char* full_title =
+        (app->overlay_title_scroll_text[0] != '\0') ? app->overlay_title_scroll_text : computed_title;
+    size_t title_len = strlen(full_title);
+    size_t char_limit = OVERLAY_TITLE_CHAR_LIMIT;
+    if(char_limit >= sizeof(computed_title)) char_limit = sizeof(computed_title) - 1;
+    if(char_limit == 0) char_limit = 1;
+    if(title_len <= char_limit) {
+        canvas_draw_str(canvas, 2, 30, full_title);
+    } else {
+        size_t offset = app->overlay_title_scroll_offset;
+        size_t max_offset = title_len - char_limit;
+        if(offset > max_offset) offset = max_offset;
+        size_t copy_len = char_limit;
+        if(offset + copy_len > title_len) copy_len = title_len - offset;
+        char title_window[64];
+        if(copy_len >= sizeof(title_window)) copy_len = sizeof(title_window) - 1;
+        memcpy(title_window, full_title + offset, copy_len);
+        title_window[copy_len] = '\0';
+        canvas_draw_str(canvas, 2, 30, title_window);
+    }
 
     canvas_set_font(canvas, FontSecondary);
     uint16_t current_client =
@@ -7843,15 +8025,34 @@ static void simple_app_draw_probe_results_overlay(SimpleApp* app, Canvas* canvas
     }
 
     const ProbeSsidEntry* ssid = &app->probe_ssids[app->probe_ssid_index];
-    char title[32];
     canvas_set_font(canvas, FontPrimary);
-    snprintf(title, sizeof(title), "%s", ssid->ssid[0] ? ssid->ssid : "<hidden>");
-    char title_ascii[sizeof(title)];
-    simple_app_utf8_to_ascii_pl(title, title_ascii, sizeof(title_ascii));
-    strncpy(title, title_ascii, sizeof(title) - 1);
-    title[sizeof(title) - 1] = '\0';
-    simple_app_truncate_text(title, 14);
-    canvas_draw_str(canvas, 2, 30, title);
+    char computed_title[64];
+    snprintf(computed_title, sizeof(computed_title), "%s", ssid->ssid[0] ? ssid->ssid : "<hidden>");
+    char computed_title_ascii[sizeof(computed_title)];
+    simple_app_utf8_to_ascii_pl(computed_title, computed_title_ascii, sizeof(computed_title_ascii));
+    strncpy(computed_title, computed_title_ascii, sizeof(computed_title) - 1);
+    computed_title[sizeof(computed_title) - 1] = '\0';
+
+    const char* full_title =
+        (app->overlay_title_scroll_text[0] != '\0') ? app->overlay_title_scroll_text : computed_title;
+    size_t title_len = strlen(full_title);
+    size_t char_limit = OVERLAY_TITLE_CHAR_LIMIT;
+    if(char_limit >= sizeof(computed_title)) char_limit = sizeof(computed_title) - 1;
+    if(char_limit == 0) char_limit = 1;
+    if(title_len <= char_limit) {
+        canvas_draw_str(canvas, 2, 30, full_title);
+    } else {
+        size_t offset = app->overlay_title_scroll_offset;
+        size_t max_offset = title_len - char_limit;
+        if(offset > max_offset) offset = max_offset;
+        size_t copy_len = char_limit;
+        if(offset + copy_len > title_len) copy_len = title_len - offset;
+        char title_window[64];
+        if(copy_len >= sizeof(title_window)) copy_len = sizeof(title_window) - 1;
+        memcpy(title_window, full_title + offset, copy_len);
+        title_window[copy_len] = '\0';
+        canvas_draw_str(canvas, 2, 30, title_window);
+    }
 
     canvas_set_font(canvas, FontSecondary);
     uint16_t current_client =
@@ -12482,14 +12683,15 @@ int32_t Lab_C5_app(void* p) {
         view_port_update(app->viewport);
     }
 
-    while(!app->exit_app) {
-        simple_app_process_stream(app);
-        simple_app_update_karma_sniffer(app);
-        simple_app_update_result_scroll(app);
-        simple_app_update_sd_scroll(app);
-        simple_app_update_deauth_guard(app);
-        simple_app_ping_watchdog(app);
-        simple_app_usb_runtime_guard(app);
+        while(!app->exit_app) {
+            simple_app_process_stream(app);
+            simple_app_update_karma_sniffer(app);
+            simple_app_update_result_scroll(app);
+            simple_app_update_overlay_title_scroll(app);
+            simple_app_update_sd_scroll(app);
+            simple_app_update_deauth_guard(app);
+            simple_app_ping_watchdog(app);
+            simple_app_usb_runtime_guard(app);
 
         if(app->portal_input_requested && !app->portal_input_active) {
             app->portal_input_requested = false;
