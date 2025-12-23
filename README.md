@@ -136,7 +136,7 @@ We're regular tinkerers who got bored and decided to design the full stack ourse
 - Join the LAB Discord server to discuss ESP32-C5 builds and projectZero workflows: https://discord.gg/57wmJzzR8C
 
 ## Last Changes
-- 2025-12-23 JanOS 1.0.1 - fix evil rerun fail on bad pass / portal restart fix + new `show_pass` CLI; FAP 0.38 - Portal /Evil twin GUI + Show Password for Evil and Portal
+- 2025-12-23 JanOS 1.0.1 - fix evil rerun fail on bad pass / portal restart fix + new `show_pass` CLI / Fix boot_button fail to launch; FAP 0.38 - Portal /Evil twin / Blackout and Snifferdog GUI + Show Password for Evil and Portal
 - 2025-12-18 JanOS 1.0.1 - New GPS support for M5Stack GPS 1.1 / FAP 0.37 - Fix not full ssid and mac in Sniffer
 - 2025-12-17 FAP 0.36 - Fix Out of memory on flipper when using qfliper
 - 2025-12-11 FAP 0.35 - fixed qFlipper-connected crash; Sniffer flow adds 200+ pkt right-jump to Results then Probes, left/back returns; Probes label corrected for 2-digit SSID counts; haptics on Sniffer edge; hold Back to root, double Back opens Exit; Deauth Guard LED hit indicator removed; Wi-Fi Targets left re-runs Scanner and resets results; restored Scanner arrow after returning from console; build via `FLIPPER/build_fap.py`, deploy via `FLIPPER/dist/deploy_fap.py`.
