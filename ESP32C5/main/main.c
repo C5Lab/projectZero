@@ -5159,10 +5159,13 @@ static int cmd_list_sd(int argc, char **argv)
     return 0;
 }
 
-// Command: show_pass - Prints portals.txt contents from SD card
+// Command: show_pass - Prints password log contents from SD card
 static int cmd_show_pass(int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    const char *target = "portal";
+    if (argc >= 2 && argv[1] != NULL && argv[1][0] != '\0') {
+        target = argv[1];
+    }
 
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
@@ -5171,9 +5174,14 @@ static int cmd_show_pass(int argc, char **argv)
         return 1;
     }
 
-    FILE *file = fopen("/sdcard/lab/portals.txt", "r");
+    const char *path = "/sdcard/lab/portals.txt";
+    if (strcasecmp(target, "evil") == 0 || strcasecmp(target, "eviltwin") == 0) {
+        path = "/sdcard/lab/eviltwin.txt";
+    }
+
+    FILE *file = fopen(path, "r");
     if (file == NULL) {
-        MY_LOG_INFO(TAG, "portals.txt not found on SD card.");
+        MY_LOG_INFO(TAG, "%s not found on SD card.", path);
         return 0;
     }
 
@@ -5186,7 +5194,7 @@ static int cmd_show_pass(int argc, char **argv)
     fclose(file);
 
     if (!has_lines) {
-        MY_LOG_INFO(TAG, "portals.txt is empty.");
+        MY_LOG_INFO(TAG, "%s is empty.", path);
     }
 
     return 0;
@@ -7642,7 +7650,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t show_pass_cmd = {
         .command = "show_pass",
-        .help = "Prints /sdcard/lab/portals.txt contents",
+        .help = "Prints password log: show_pass [portal|evil]",
         .hint = NULL,
         .func = &cmd_show_pass,
         .argtable = NULL
@@ -7840,7 +7848,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
       MY_LOG_INFO(TAG,"  list_dir <path>");
       MY_LOG_INFO(TAG,"  list_sd");
-      MY_LOG_INFO(TAG,"  show_pass");
+      MY_LOG_INFO(TAG,"  show_pass [portal|evil]");
       MY_LOG_INFO(TAG,"  list_ssid");
       MY_LOG_INFO(TAG,"  packet_monitor <channel>");
       MY_LOG_INFO(TAG,"  ping");

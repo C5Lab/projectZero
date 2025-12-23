@@ -56,6 +56,7 @@ typedef enum {
     ScreenPortalMenu,
     ScreenBtLocatorList,
     ScreenPasswords,
+    ScreenPasswordsSelect,
 } AppScreen;
 
 typedef enum {
@@ -244,6 +245,11 @@ typedef enum {
     MenuActionOpenPortalMenu,
     MenuActionOpenBtLocator,
 } MenuAction;
+
+typedef enum {
+    PasswordsSourcePortal,
+    PasswordsSourceEvilTwin,
+} PasswordsSource;
 
 typedef enum {
     ChannelViewBand24,
@@ -503,6 +509,10 @@ typedef struct {
     size_t portal_line_length;
     bool passwords_listing_active;
     AppScreen passwords_return_screen;
+    AppScreen passwords_select_return_screen;
+    PasswordsSource passwords_source;
+    size_t passwords_select_index;
+    char passwords_title[24];
     char passwords_lines[PASSWORDS_MAX_LINES][PASSWORDS_LINE_CHAR_LIMIT];
     size_t passwords_line_count;
     size_t passwords_scroll;
@@ -824,11 +834,16 @@ static void simple_app_process_portal_status_line(SimpleApp* app, const char* li
 static void simple_app_portal_status_feed(SimpleApp* app, char ch);
 static void simple_app_draw_portal_overlay(SimpleApp* app, Canvas* canvas);
 static void simple_app_reset_passwords_listing(SimpleApp* app);
-static void simple_app_request_passwords(SimpleApp* app, AppScreen return_screen);
+static void simple_app_request_passwords(
+    SimpleApp* app,
+    AppScreen return_screen,
+    PasswordsSource source);
 static void simple_app_process_passwords_line(SimpleApp* app, const char* line);
 static void simple_app_passwords_feed(SimpleApp* app, char ch);
 static void simple_app_draw_passwords(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_passwords_input(SimpleApp* app, InputKey key);
+static void simple_app_draw_passwords_select(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_passwords_select_input(SimpleApp* app, InputKey key);
 static void simple_app_draw_portal_ssid_popup(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_portal_ssid_popup_event(SimpleApp* app, const InputEvent* event);
 static bool simple_app_portal_run_text_input(SimpleApp* app);
@@ -6831,7 +6846,12 @@ static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key) {
         } else if(app->portal_menu_index == 2) {
             simple_app_start_portal(app);
         } else {
-            simple_app_request_passwords(app, ScreenPortalMenu);
+            app->passwords_select_return_screen = ScreenPortalMenu;
+            app->passwords_select_index = 0;
+            app->screen = ScreenPasswordsSelect;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
         }
     }
 }
@@ -7207,18 +7227,34 @@ static void simple_app_reset_passwords_listing(SimpleApp* app) {
     app->passwords_scroll_x = 0;
     app->passwords_max_line_len = 0;
     app->passwords_line_length = 0;
+    app->passwords_title[0] = '\0';
+    app->passwords_source = PasswordsSourcePortal;
+    app->passwords_select_index = 0;
+    app->passwords_select_return_screen = ScreenMenu;
     for(size_t i = 0; i < PASSWORDS_MAX_LINES; i++) {
         app->passwords_lines[i][0] = '\0';
     }
 }
 
-static void simple_app_request_passwords(SimpleApp* app, AppScreen return_screen) {
+static void simple_app_request_passwords(
+    SimpleApp* app,
+    AppScreen return_screen,
+    PasswordsSource source) {
     if(!app) return;
     simple_app_reset_passwords_listing(app);
     app->passwords_listing_active = true;
     app->passwords_return_screen = return_screen;
+    app->passwords_source = source;
+    const char* title =
+        (source == PasswordsSourceEvilTwin) ? "Evil Twin" : "Portal";
+    strncpy(app->passwords_title, title, sizeof(app->passwords_title) - 1);
+    app->passwords_title[sizeof(app->passwords_title) - 1] = '\0';
     app->screen = ScreenPasswords;
-    simple_app_send_command_quiet(app, "show_pass");
+    if(source == PasswordsSourceEvilTwin) {
+        simple_app_send_command_quiet(app, "show_pass evil");
+    } else {
+        simple_app_send_command_quiet(app, "show_pass portal");
+    }
     if(app->viewport) {
         view_port_update(app->viewport);
     }
@@ -7300,7 +7336,13 @@ static void simple_app_draw_passwords(SimpleApp* app, Canvas* canvas) {
     canvas_set_color(canvas, ColorBlack);
     canvas_set_font(canvas, FontSecondary);
 
-    canvas_draw_str(canvas, 4, 12, "Passwords");
+    char header[32];
+    if(app->passwords_title[0] != '\0') {
+        snprintf(header, sizeof(header), "%s Pass", app->passwords_title);
+    } else {
+        snprintf(header, sizeof(header), "Passwords");
+    }
+    canvas_draw_str(canvas, 4, 12, header);
     canvas_draw_str_aligned(
         canvas, DISPLAY_WIDTH - 2, 12, AlignRight, AlignBottom, "Back");
 
@@ -7403,6 +7445,53 @@ static void simple_app_handle_passwords_input(SimpleApp* app, InputKey key) {
         if(app->passwords_scroll_x < max_scroll_x) {
             app->passwords_scroll_x++;
         }
+    } else {
+        return;
+    }
+
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_draw_passwords_select(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 4, 14, "Show Passwords");
+
+    canvas_set_font(canvas, FontSecondary);
+    const char* options[2] = {"Portal (portals.txt)", "Evil Twin (eviltwin.txt)"};
+    uint8_t y = 34;
+    for(size_t idx = 0; idx < 2; idx++) {
+        if(app->passwords_select_index == idx) {
+            canvas_draw_str(canvas, 2, y, ">");
+        }
+        canvas_draw_str(canvas, 14, y, options[idx]);
+        y += 12;
+    }
+    canvas_draw_str(canvas, 2, 62, "OK select, Back");
+}
+
+static void simple_app_handle_passwords_select_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+
+    if(key == InputKeyBack) {
+        app->screen = app->passwords_select_return_screen;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyUp || key == InputKeyDown) {
+        app->passwords_select_index = (app->passwords_select_index == 0) ? 1 : 0;
+    } else if(key == InputKeyOk) {
+        PasswordsSource source =
+            (app->passwords_select_index == 1) ? PasswordsSourceEvilTwin : PasswordsSourcePortal;
+        simple_app_request_passwords(app, app->passwords_select_return_screen, source);
+        return;
     } else {
         return;
     }
@@ -10416,6 +10505,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenPasswords:
         simple_app_draw_passwords(app, canvas);
         break;
+    case ScreenPasswordsSelect:
+        simple_app_draw_passwords_select(app, canvas);
+        break;
     default:
         simple_app_draw_results(app, canvas);
         break;
@@ -10690,7 +10782,12 @@ static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key)
         } else if(app->evil_twin_menu_index == 1) {
             simple_app_start_evil_portal(app);
         } else {
-            simple_app_request_passwords(app, ScreenEvilTwinMenu);
+            app->passwords_select_return_screen = ScreenEvilTwinMenu;
+            app->passwords_select_index = 1;
+            app->screen = ScreenPasswordsSelect;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
         }
     }
 }
@@ -13038,6 +13135,9 @@ static void simple_app_input(InputEvent* event, void* context) {
         break;
     case ScreenPasswords:
         simple_app_handle_passwords_input(app, event->key);
+        break;
+    case ScreenPasswordsSelect:
+        simple_app_handle_passwords_select_input(app, event->key);
         break;
     default:
         simple_app_handle_results_input(app, event->key);
