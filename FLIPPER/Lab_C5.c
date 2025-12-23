@@ -2690,7 +2690,24 @@ static void simple_app_process_blackout_line(SimpleApp* app, const char* line) {
         return;
     }
 
-    if(strstr(line, "Found") != NULL && strstr(line, "networks") != NULL) {
+    if(strstr(line, "Stopping blackout attack task") != NULL) {
+        app->blackout_view_active = true;
+        simple_app_blackout_set_phase(app, BlackoutPhaseStopping, "Stopping");
+        return;
+    }
+
+    if(strstr(line, "Blackout attack task finished") != NULL) {
+        app->blackout_view_active = true;
+        simple_app_blackout_set_phase(app, BlackoutPhaseFinished, "Done");
+        return;
+    }
+
+    if(!app->blackout_view_active) {
+        return;
+    }
+
+    if(strstr(line, "Found") != NULL && strstr(line, "networks") != NULL &&
+       strstr(line, "sorting by channel") != NULL) {
         uint32_t networks = 0;
         if(simple_app_blackout_extract_networks(line, &networks)) {
             app->blackout_networks = networks;
@@ -2738,12 +2755,6 @@ static void simple_app_process_blackout_line(SimpleApp* app, const char* line) {
     if(strstr(line, "Stop requested") != NULL || strstr(line, "Stopping blackout attack task") != NULL) {
         app->blackout_view_active = true;
         simple_app_blackout_set_phase(app, BlackoutPhaseStopping, "Stopping");
-        return;
-    }
-
-    if(strstr(line, "Blackout attack task finished") != NULL) {
-        app->blackout_view_active = true;
-        simple_app_blackout_set_phase(app, BlackoutPhaseFinished, "Done");
         return;
     }
 
