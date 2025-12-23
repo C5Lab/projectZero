@@ -353,12 +353,28 @@
       return `https://raw.githubusercontent.com/C5Lab/projectZero/${branch}/docs/manifest.json`;
     };
 
+    const rewritePartsForBranch = (manifest, branch) => {
+      if (!manifest || !Array.isArray(manifest.parts)) return manifest;
+      if (!branch || branch === "main") return manifest;
+      const next = { ...manifest };
+      next.parts = manifest.parts.map((part) => {
+        if (!part || !part.path) return part;
+        const replaced = part.path.replace(
+          "https://raw.githubusercontent.com/C5Lab/projectZero/main/",
+          `https://raw.githubusercontent.com/C5Lab/projectZero/${branch}/`
+        );
+        return { ...part, path: replaced };
+      });
+      return next;
+    };
+
     const loadManifest = async () => {
       try {
         const manifestUrl = getManifestUrl();
         const res = await fetch(manifestUrl, { cache: "no-store" });
         if (!res.ok) throw new Error("Manifest fetch failed");
-        const manifest = await res.json();
+        const manifestRaw = await res.json();
+        const manifest = rewritePartsForBranch(manifestRaw, getBranch());
         state.manifest = manifest;
         ui.manifest.style.display = "inline-flex";
         ui.manifest.textContent = `Build ${manifest.build || "n/a"} - ${manifest.version || "n/a"} - ${getBranch()}`;
