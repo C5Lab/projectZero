@@ -5530,8 +5530,12 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_vendor_feed(app, ch);
         simple_app_scanner_timing_feed(app, ch);
         simple_app_deauth_guard_feed(app, ch);
-        simple_app_blackout_feed(app, ch);
-        simple_app_sniffer_dog_feed(app, ch);
+        if(app->blackout_view_active) {
+            simple_app_blackout_feed(app, ch);
+        }
+        if(app->sniffer_dog_view_active) {
+            simple_app_sniffer_dog_feed(app, ch);
+        }
         simple_app_bt_scan_feed(app, ch);
         simple_app_bt_locator_feed(app, ch);
         simple_app_wardrive_feed(app, ch);
