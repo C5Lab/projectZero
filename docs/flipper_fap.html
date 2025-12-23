@@ -379,11 +379,13 @@
     };
 
     const setSelectedFile = (name, data) => {
+      const prevName = state.fileName;
       state.fileName = name;
       state.fileData = data;
       setFileInfo(name, data?.length || 0);
       const current = ui.destPath.value.trim();
-      if (!current || current === "/ext/apps/lab_c5.fap") {
+      const prevPath = prevName ? `/ext/apps/${prevName}` : "";
+      if (!current || current === "/ext/apps/lab_c5.fap" || (prevPath && current === prevPath)) {
         ui.destPath.value = `/ext/apps/${name}`;
       }
     };
