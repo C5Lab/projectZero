@@ -230,6 +230,7 @@
       connected: false,
       fileData: null,
       fileName: null,
+      lastFileName: null,
       onDisconnect: null,
     };
 
@@ -379,9 +380,10 @@
     };
 
     const setSelectedFile = (name, data) => {
-      const prevName = state.fileName;
+      const prevName = state.lastFileName || state.fileName;
       state.fileName = name;
       state.fileData = data;
+      state.lastFileName = name;
       setFileInfo(name, data?.length || 0);
       const current = ui.destPath.value.trim();
       const prevPath = prevName ? `/ext/apps/${prevName}` : "";
@@ -605,12 +607,14 @@
     ui.connectBtn.addEventListener("click", () => connect().catch(() => {}));
     ui.uploadBtn.addEventListener("click", () => upload().catch(() => {}));
     ui.trackSelect.addEventListener("change", () => {
+      state.lastFileName = state.fileName;
       state.fileData = null;
       state.fileName = null;
       setFileInfo("", 0);
       fetchLatest().catch(() => {});
     });
     ui.branchSelect.addEventListener("change", () => {
+      state.lastFileName = state.fileName;
       state.fileData = null;
       state.fileName = null;
       setFileInfo("", 0);
