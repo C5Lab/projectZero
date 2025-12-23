@@ -219,6 +219,14 @@
     }
     .error { color: var(--error); }
     .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    footer {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 13px;
+      text-align: center;
+    }
+    footer a { color: inherit; text-decoration: none; border-bottom: 1px solid transparent; }
+    footer a:hover { border-bottom-color: currentColor; }
     @media (max-width: 980px) {
       body { padding: 20px 14px 60px; }
       .split { grid-template-columns: 1fr; }
@@ -290,6 +298,9 @@
       </div>
     </div>
   </div>
+  <footer>
+    Product of <a href="https://github.com/C5Lab/projectZero/">C5Lab/projectZero</a>.
+  </footer>
 
   <script type="module">
     import { ESPLoader, Transport } from "https://unpkg.com/esptool-js/bundle.js";
