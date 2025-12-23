@@ -345,6 +345,22 @@
       return result;
     };
 
+    const resolveManifestPath = (path) => {
+      if (!path) return path;
+      try {
+        const parsed = new URL(path);
+        if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+          return path;
+        }
+      } catch {}
+      let cleaned = path.startsWith("/") ? path.slice(1) : path;
+      const branch = getBranch();
+      if (branch !== "main" && cleaned.startsWith("firmware/")) {
+        cleaned = cleaned.replace(/^firmware\//, "ESP32C5/binaries-esp32c5/");
+      }
+      return `https://raw.githubusercontent.com/C5Lab/projectZero/${branch}/${cleaned}`;
+    };
+
     const getBranch = () => ui.branch.value || "main";
 
     const getManifestUrl = () => {
@@ -478,7 +494,7 @@
       const parts = state.manifest.parts || [];
       const files = [];
       for (const part of parts) {
-        const url = part.path;
+        const url = resolveManifestPath(part.path);
         setStatus(`Downloading ${url}...`);
         log(`Fetching ${url} @ 0x${part.offset.toString(16)}`);
         const { buf, usedUrl } = await resolveAssetUrl(url);
