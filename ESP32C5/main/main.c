@@ -97,6 +97,7 @@
 // Boot/flash button (GPIO28) starts sniffer dog on tap, blackout on long-press
 #define BOOT_BUTTON_GPIO               28
 #define BOOT_BUTTON_TASK_STACK_SIZE    2048
+#define BOOT_ACTION_TASK_STACK_SIZE    6144
 #define BOOT_BUTTON_TASK_PRIORITY      5
 #define BOOT_BUTTON_POLL_DELAY_MS      20
 #define BOOT_BUTTON_LONG_PRESS_MS      1000
@@ -300,6 +301,7 @@ static volatile bool portal_active = false;
 static TaskHandle_t dns_server_task_handle = NULL;
 static int dns_server_socket = -1;
 static TaskHandle_t boot_button_task_handle = NULL;
+static TaskHandle_t boot_action_task_handle = NULL;
 
 // DNS server configuration
 #define DNS_PORT 53
@@ -759,6 +761,10 @@ static bool init_psram_buffers(void)
 #define BOOTCFG_KEY_SHORT_EN   "short_en"
 #define BOOTCFG_KEY_LONG_EN    "long_en"
 #define BOOTCFG_CMD_MAX_LEN    32
+
+typedef struct {
+    char command[BOOTCFG_CMD_MAX_LEN];
+} boot_action_params_t;
 
 static const char* boot_allowed_commands[] = {
     "start_blackout",
@@ -1980,6 +1986,16 @@ static void boot_execute_command(const char* command) {
     }
 }
 
+static void boot_action_task(void *arg) {
+    boot_action_params_t *params = (boot_action_params_t *)arg;
+    if (params != NULL) {
+        boot_execute_command(params->command);
+        free(params);
+    }
+    boot_action_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
 static void boot_handle_action(bool is_long_press) {
     const boot_action_config_t* action = is_long_press ? &boot_config.long_press : &boot_config.short_press;
     const char* label = is_long_press ? "long" : "short";
@@ -1992,7 +2008,31 @@ static void boot_handle_action(bool is_long_press) {
         return;
     }
     MY_LOG_INFO(TAG, "Boot %s executing: %s", label, action->command);
-    boot_execute_command(action->command);
+    if (boot_action_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Boot %s action busy, skipping '%s'", label, action->command);
+        return;
+    }
+
+    boot_action_params_t *params = calloc(1, sizeof(*params));
+    if (params == NULL) {
+        MY_LOG_INFO(TAG, "Boot %s action failed: no memory", label);
+        return;
+    }
+    strlcpy(params->command, action->command, sizeof(params->command));
+
+    BaseType_t result = xTaskCreate(
+        boot_action_task,
+        "boot_action",
+        BOOT_ACTION_TASK_STACK_SIZE,
+        params,
+        BOOT_BUTTON_TASK_PRIORITY,
+        &boot_action_task_handle
+    );
+    if (result != pdPASS) {
+        MY_LOG_INFO(TAG, "Boot %s action failed: task create", label);
+        boot_action_task_handle = NULL;
+        free(params);
+    }
 }
 
 static void ensure_vendor_file_checked(void) {
