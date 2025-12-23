@@ -435,8 +435,9 @@
       if (!res.ok) throw new Error(`GitHub API failed: ${res.status} ${res.statusText}`);
       const files = await res.json();
       const pick = pickLatestFromList(files || [], track);
-      if (!pick || !pick.download_url) throw new Error(`No .fap asset for ${track} found in ${branch} branch`);
-      const fileRes = await fetch(pick.download_url, { cache: "no-store", headers: { Accept: "application/octet-stream" } });
+      if (!pick || !pick.path) throw new Error(`No .fap asset for ${track} found in ${branch} branch`);
+      const rawUrl = `https://raw.githubusercontent.com/C5Lab/projectZero/${branch}/${pick.path}`;
+      const fileRes = await fetch(rawUrl, { cache: "no-store", headers: { Accept: "application/octet-stream" } });
       if (!fileRes.ok) throw new Error(`Download failed: ${fileRes.status} ${fileRes.statusText}`);
       const buf = new Uint8Array(await fileRes.arrayBuffer());
       return { name: pick.name || "lab_c5.fap", buf };
