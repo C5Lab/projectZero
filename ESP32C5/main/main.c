@@ -821,6 +821,7 @@ static int cmd_list_sd(int argc, char **argv);
 static int cmd_list_dir(int argc, char **argv);
 static int cmd_list_ssid(int argc, char **argv);
 static int cmd_select_html(int argc, char **argv);
+static int cmd_show_pass(int argc, char **argv);
 static int cmd_file_delete(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_reboot(int argc, char **argv);
@@ -1452,6 +1453,26 @@ static esp_netif_t *ensure_ap_mode(void)
     // Check if AP netif already exists
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (ap_netif) {
+        wifi_mode_t mode = WIFI_MODE_NULL;
+        if (esp_wifi_get_mode(&mode) == ESP_OK) {
+            if (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA) {
+                return ap_netif;
+            }
+        }
+        // AP netif exists but mode is not AP/APSTA, re-enable AP mode.
+        MY_LOG_INFO(TAG, "Re-enabling AP mode...");
+        esp_wifi_stop();
+        esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
+        if (ret != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to set APSTA mode: %s", esp_err_to_name(ret));
+            esp_wifi_start();
+            return NULL;
+        }
+        ret = esp_wifi_start();
+        if (ret != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to restart WiFi: %s", esp_err_to_name(ret));
+            return NULL;
+        }
         return ap_netif;
     }
     
@@ -3643,6 +3664,15 @@ static int cmd_stop(int argc, char **argv) {
         // Stop AP mode
         esp_wifi_stop();
         MY_LOG_INFO(TAG, "Portal stopped.");
+
+        // Destroy AP netif so next portal start recreates AP mode cleanly
+        ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (ap_netif) {
+            esp_netif_destroy(ap_netif);
+            if (ap_netif_handle == ap_netif) {
+                ap_netif_handle = NULL;
+            }
+        }
         
         // Restart WiFi in STA mode so it's ready for next command
         wifi_config_t wifi_config = { 0 };
@@ -5126,6 +5156,39 @@ static int cmd_list_sd(int argc, char **argv)
         printf("%d %s\n", i + 1, sd_html_files[i]);
     }
     
+    return 0;
+}
+
+// Command: show_pass - Prints portals.txt contents from SD card
+static int cmd_show_pass(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        MY_LOG_INFO(TAG, "Make sure SD card is properly inserted.");
+        return 1;
+    }
+
+    FILE *file = fopen("/sdcard/lab/portals.txt", "r");
+    if (file == NULL) {
+        MY_LOG_INFO(TAG, "portals.txt not found on SD card.");
+        return 0;
+    }
+
+    char line[128];
+    bool has_lines = false;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        has_lines = true;
+        printf("%s", line);
+    }
+    fclose(file);
+
+    if (!has_lines) {
+        MY_LOG_INFO(TAG, "portals.txt is empty.");
+    }
+
     return 0;
 }
 
@@ -7577,6 +7640,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&list_sd_cmd));
 
+    const esp_console_cmd_t show_pass_cmd = {
+        .command = "show_pass",
+        .help = "Prints /sdcard/lab/portals.txt contents",
+        .hint = NULL,
+        .func = &cmd_show_pass,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&show_pass_cmd));
+
     const esp_console_cmd_t list_dir_cmd = {
         .command = "list_dir",
         .help = "List files inside a directory on SD card: list_dir [path]",
@@ -7768,6 +7840,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  led set <on|off> | led level <1-100> | led read");
       MY_LOG_INFO(TAG,"  list_dir <path>");
       MY_LOG_INFO(TAG,"  list_sd");
+      MY_LOG_INFO(TAG,"  show_pass");
       MY_LOG_INFO(TAG,"  list_ssid");
       MY_LOG_INFO(TAG,"  packet_monitor <channel>");
       MY_LOG_INFO(TAG,"  ping");
