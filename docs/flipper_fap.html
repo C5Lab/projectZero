@@ -164,6 +164,13 @@
           </label>
           <div class="row">
             <div class="select-wrap">
+              <label for="branchSelect">Branch</label>
+              <select id="branchSelect">
+                <option value="main" selected>Main</option>
+                <option value="development">Development</option>
+              </select>
+            </div>
+            <div class="select-wrap">
               <label for="trackSelect">Firmware track</label>
               <select id="trackSelect">
                 <option value="momentum" selected>Momentum</option>
@@ -204,6 +211,7 @@
       connectBtn: document.getElementById("connectBtn"),
       uploadBtn: document.getElementById("uploadBtn"),
       destPath: document.getElementById("destPath"),
+      branchSelect: document.getElementById("branchSelect"),
       trackSelect: document.getElementById("trackSelect"),
       runAfter: document.getElementById("runAfter"),
       status: document.getElementById("statusText"),
@@ -396,22 +404,53 @@
       throw lastErr || new Error("Download failed");
     };
 
+    const getBranch = () => ui.branchSelect.value || "main";
+
+    const pickLatestFromList = (files, track) => {
+      const candidates = files.filter((f) => f.name && f.name.toLowerCase().includes(track) && f.name.toLowerCase().endsWith(".fap"));
+      if (!candidates.length) return null;
+      const sorted = candidates.sort((a, b) => {
+        const av = parseVersion(a.name).version || [];
+        const bv = parseVersion(b.name).version || [];
+        return compareVersions(bv, av);
+      });
+      return sorted[0];
+    };
+
+    const fetchFromRelease = async (track) => {
+      const apiUrl = "https://api.github.com/repos/C5Lab/projectZero/releases/latest";
+      const res = await fetch(apiUrl, { cache: "no-store", headers: { Accept: "application/vnd.github+json" } });
+      if (!res.ok) throw new Error(`GitHub API failed: ${res.status} ${res.statusText}`);
+      const release = await res.json();
+      const asset = (release.assets || []).find((a) => a.name && a.name.toLowerCase().includes(track) && a.name.endsWith(".fap"));
+      if (!asset) throw new Error(`No .fap asset for ${track} found in latest release`);
+      const browserUrl = asset.browser_download_url || asset.url;
+      const rawFallback = `https://raw.githubusercontent.com/C5Lab/projectZero/main/FLIPPER/dist/${asset.name}`;
+      return fetchFirstAvailable([rawFallback, browserUrl]);
+    };
+
+    const fetchFromBranch = async (track, branch) => {
+      const apiUrl = `https://api.github.com/repos/C5Lab/projectZero/contents/FLIPPER/dist?ref=${branch}`;
+      const res = await fetch(apiUrl, { cache: "no-store", headers: { Accept: "application/vnd.github+json" } });
+      if (!res.ok) throw new Error(`GitHub API failed: ${res.status} ${res.statusText}`);
+      const files = await res.json();
+      const pick = pickLatestFromList(files || [], track);
+      if (!pick || !pick.download_url) throw new Error(`No .fap asset for ${track} found in ${branch} branch`);
+      const fileRes = await fetch(pick.download_url, { cache: "no-store", headers: { Accept: "application/octet-stream" } });
+      if (!fileRes.ok) throw new Error(`Download failed: ${fileRes.status} ${fileRes.statusText}`);
+      const buf = new Uint8Array(await fileRes.arrayBuffer());
+      return { name: pick.name || "lab_c5.fap", buf };
+    };
+
     const fetchLatest = async () => {
       const track = ui.trackSelect.value;
-      setStatus(`Fetching latest ${track} .fap ...`);
-      log(`Fetch latest release asset for ${track}`);
+      const branch = getBranch();
+      setStatus(`Fetching ${track} (${branch}) .fap ...`);
+      log(`Fetch ${track} from ${branch}`);
       try {
-        const apiUrl = "https://api.github.com/repos/C5Lab/projectZero/releases/latest";
-        const res = await fetch(apiUrl, { cache: "no-store", headers: { Accept: "application/vnd.github+json" } });
-        if (!res.ok) throw new Error(`GitHub API failed: ${res.status} ${res.statusText}`);
-        const release = await res.json();
-        const matchKey = track;
-        const asset = (release.assets || []).find((a) => a.name && a.name.toLowerCase().includes(matchKey) && a.name.endsWith(".fap"));
-        if (!asset) throw new Error(`No .fap asset for ${track} found in latest release`);
-
-        const browserUrl = asset.browser_download_url || asset.url;
-        const rawFallback = `https://raw.githubusercontent.com/C5Lab/projectZero/main/FLIPPER/dist/${asset.name}`;
-        const { name, buf } = await fetchFirstAvailable([rawFallback, browserUrl]);
+        const { name, buf } = branch === "main"
+          ? await fetchFromRelease(track)
+          : await fetchFromBranch(track, branch);
         setSelectedFile(name, buf);
         setStatus(`Ready to upload ${name}`);
         log(`Fetched ${name} (${buf.length} bytes)`);
@@ -563,6 +602,12 @@
     ui.connectBtn.addEventListener("click", () => connect().catch(() => {}));
     ui.uploadBtn.addEventListener("click", () => upload().catch(() => {}));
     ui.trackSelect.addEventListener("change", () => {
+      state.fileData = null;
+      state.fileName = null;
+      setFileInfo("", 0);
+      fetchLatest().catch(() => {});
+    });
+    ui.branchSelect.addEventListener("change", () => {
       state.fileData = null;
       state.fileName = null;
       setFileInfo("", 0);
