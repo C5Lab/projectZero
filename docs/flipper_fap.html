@@ -422,8 +422,19 @@
 
     const getBranch = () => ui.branchSelect.value || "main";
 
+    const trackMatchesName = (name, track) => {
+      const lower = name.toLowerCase();
+      if (track === "momentum dev") {
+        return /momentum[-_ ]dev/.test(lower);
+      }
+      if (track === "momentum") {
+        return lower.includes("momentum") && !/momentum[-_ ]dev/.test(lower);
+      }
+      return lower.includes(track);
+    };
+
     const pickLatestFromList = (files, track) => {
-      const candidates = files.filter((f) => f.name && f.name.toLowerCase().includes(track) && f.name.toLowerCase().endsWith(".fap"));
+      const candidates = files.filter((f) => f.name && trackMatchesName(f.name, track) && f.name.toLowerCase().endsWith(".fap"));
       if (!candidates.length) return null;
       const sorted = candidates.sort((a, b) => {
         const av = parseVersion(a.name).version || [];
@@ -438,7 +449,7 @@
       const res = await fetch(apiUrl, { cache: "no-store", headers: { Accept: "application/vnd.github+json" } });
       if (!res.ok) throw new Error(`GitHub API failed: ${res.status} ${res.statusText}`);
       const release = await res.json();
-      const asset = (release.assets || []).find((a) => a.name && a.name.toLowerCase().includes(track) && a.name.endsWith(".fap"));
+      const asset = (release.assets || []).find((a) => a.name && trackMatchesName(a.name, track) && a.name.endsWith(".fap"));
       if (!asset) throw new Error(`No .fap asset for ${track} found in latest release`);
       const browserUrl = asset.browser_download_url || asset.url;
       const rawFallback = `https://raw.githubusercontent.com/C5Lab/projectZero/main/FLIPPER/dist/${asset.name}`;
