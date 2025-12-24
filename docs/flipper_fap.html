@@ -244,6 +244,41 @@
       fileName: null,
       lastFileName: null,
       onDisconnect: null,
+      autoUpload: false,
+      autoUploadTriggered: false,
+    };
+
+    const applyQueryParams = () => {
+      const params = new URLSearchParams(window.location.search);
+      const branch = params.get("branch");
+      if(branch) {
+        const normalized = branch.trim().toLowerCase();
+        if(normalized === "dev") {
+          ui.branchSelect.value = "development";
+        } else if(normalized === "main") {
+          ui.branchSelect.value = "main";
+        } else if(normalized === "development") {
+          ui.branchSelect.value = "development";
+        }
+      }
+
+      const fapParam = params.get("FapOS") || params.get("fapos") || params.get("track");
+      if(fapParam) {
+        const normalized = fapParam.trim().toLowerCase();
+        if(normalized === "momentum") {
+          ui.trackSelect.value = "momentum";
+        } else if(normalized === "momentumdev" || normalized === "momentum dev" || normalized === "momentum-dev") {
+          ui.trackSelect.value = "momentum dev";
+        } else if(normalized === "unleashed") {
+          ui.trackSelect.value = "unleashed";
+        }
+      }
+
+      const auto = params.get("auto") || params.get("autoupload");
+      if(auto) {
+        const normalized = auto.trim().toLowerCase();
+        state.autoUpload = normalized === "1" || normalized === "true" || normalized === "yes";
+      }
     };
 
     const encoder = new TextEncoder();
@@ -380,6 +415,9 @@
 
         if (!state.fileData) {
           fetchLatest().catch((err) => log(`Fetch after connect failed: ${err.message || err}`));
+        } else if(state.autoUpload && !state.autoUploadTriggered) {
+          state.autoUploadTriggered = true;
+          upload().catch((err) => log(`Auto upload failed: ${err.message || err}`));
         }
       } catch (err) {
         await disconnect();
@@ -401,6 +439,10 @@
       const prevPath = prevName ? `/ext/apps/${prevName}` : "";
       if (!current || current === "/ext/apps/lab_c5.fap" || (prevPath && current === prevPath)) {
         ui.destPath.value = `/ext/apps/${name}`;
+      }
+      if(state.autoUpload && state.connected && !state.autoUploadTriggered) {
+        state.autoUploadTriggered = true;
+        upload().catch((err) => log(`Auto upload failed: ${err.message || err}`));
       }
     };
 
@@ -566,6 +608,7 @@
         setStatus("Connect first.", true);
         return;
       }
+      state.autoUploadTriggered = true;
       const dest = ui.destPath.value.trim().replace(/\\\\/g, "/").replace(/\\/g, "/") || `/ext/apps/${state.fileName}`;
       const data = state.fileData;
       const chunkSize = 8192;
@@ -622,6 +665,7 @@
       } catch (err) {
         setStatus(err.message || "Upload failed", true);
         log(`Error: ${err.message || err}`);
+        state.autoUploadTriggered = false;
       } finally {
         ui.uploadBtn.disabled = false;
       }
@@ -644,6 +688,7 @@
       fetchLatest().catch(() => {});
     });
     // auto-fetch latest on load to reduce clicks
+    applyQueryParams();
     fetchLatest().catch(() => {});
   </script>
 </body>

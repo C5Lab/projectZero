@@ -327,6 +327,28 @@
       esploader: null,
       chip: null,
       isFlashing: false,
+      autoFlash: false,
+      autoFlashTriggered: false,
+    };
+
+    const applyQueryParams = () => {
+      const params = new URLSearchParams(window.location.search);
+      const branch = params.get("branch");
+      if(branch) {
+        const normalized = branch.trim().toLowerCase();
+        if(normalized === "dev") {
+          ui.branch.value = "development";
+        } else if(normalized === "main") {
+          ui.branch.value = "main";
+        } else if(normalized === "development") {
+          ui.branch.value = "development";
+        }
+      }
+      const auto = params.get("auto") || params.get("autoflash");
+      if(auto) {
+        const normalized = auto.trim().toLowerCase();
+        state.autoFlash = normalized === "1" || normalized === "true" || normalized === "yes";
+      }
     };
 
     const log = (msg) => {
@@ -470,6 +492,11 @@
         setStatus(`Connected to ${state.chip}. Ready to flash.`);
         log(`Connected: ${state.chip}`);
         ui.flashBtn.disabled = false;
+
+        if(state.autoFlash && !state.autoFlashTriggered && !state.isFlashing) {
+          state.autoFlashTriggered = true;
+          flash().catch((err) => log(`Auto flash failed: ${err.message || err}`));
+        }
       } catch (err) {
         console.error(err);
         setStatus(err.message || "Connection failed", "error");
@@ -602,6 +629,7 @@ const flash = async () => {
       loadManifest().catch(() => {});
     });
 
+    applyQueryParams();
     loadManifest().catch(() => {});
   </script>
 </body>
