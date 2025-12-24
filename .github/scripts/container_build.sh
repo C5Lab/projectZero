@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE="${IDF_DOCKER_IMAGE:-espressif/idf:release-v6.0}"
+IMAGE="${IDF_DOCKER_IMAGE:-espressif/idf:v6.0-beta1}"
 USE_DOCKER="${USE_DOCKER:-1}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,7 +15,7 @@ usage() {
 Usage: container_build.sh [--no-docker]
 
 Builds ESP32C5 firmware using esp-idf release/v6.0.
-Defaults to running inside Docker (espressif/idf:release-v6.0).
+Defaults to running inside Docker (espressif/idf:v6.0-beta1).
 
 Options:
   --no-docker   Run idf.py directly (for GitHub Actions container job or host with esp-idf installed)
