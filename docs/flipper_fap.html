@@ -244,6 +244,41 @@
       fileName: null,
       lastFileName: null,
       onDisconnect: null,
+      autoUpload: false,
+      autoUploadTriggered: false,
+    };
+
+    const applyQueryParams = () => {
+      const params = new URLSearchParams(window.location.search);
+      const branch = params.get("branch");
+      if(branch) {
+        const normalized = branch.trim().toLowerCase();
+        if(normalized === "dev") {
+          ui.branchSelect.value = "development";
+        } else if(normalized === "main") {
+          ui.branchSelect.value = "main";
+        } else if(normalized === "development") {
+          ui.branchSelect.value = "development";
+        }
+      }
+
+      const fapParam = params.get("FapOS") || params.get("fapos") || params.get("track");
+      if(fapParam) {
+        const normalized = fapParam.trim().toLowerCase();
+        if(normalized === "momentum") {
+          ui.trackSelect.value = "momentum";
+        } else if(normalized === "momentumdev" || normalized === "momentum dev" || normalized === "momentum-dev") {
+          ui.trackSelect.value = "momentum dev";
+        } else if(normalized === "unleashed") {
+          ui.trackSelect.value = "unleashed";
+        }
+      }
+
+      const auto = params.get("auto") || params.get("autoupload");
+      if(auto) {
+        const normalized = auto.trim().toLowerCase();
+        state.autoUpload = normalized === "1" || normalized === "true" || normalized === "yes";
+      }
     };
 
     const encoder = new TextEncoder();
@@ -380,6 +415,9 @@
 
         if (!state.fileData) {
           fetchLatest().catch((err) => log(`Fetch after connect failed: ${err.message || err}`));
+        } else if(state.autoUpload && !state.autoUploadTriggered) {
+          state.autoUploadTriggered = true;
+          upload().catch((err) => log(`Auto upload failed: ${err.message || err}`));
         }
       } catch (err) {
         await disconnect();
@@ -402,6 +440,10 @@
       if (!current || current === "/ext/apps/lab_c5.fap" || (prevPath && current === prevPath)) {
         ui.destPath.value = `/ext/apps/${name}`;
       }
+      if(state.autoUpload && state.connected && !state.autoUploadTriggered) {
+        state.autoUploadTriggered = true;
+        upload().catch((err) => log(`Auto upload failed: ${err.message || err}`));
+      }
     };
 
     const fetchFirstAvailable = async (urls) => {
@@ -422,8 +464,19 @@
 
     const getBranch = () => ui.branchSelect.value || "main";
 
+    const trackMatchesName = (name, track) => {
+      const lower = name.toLowerCase();
+      if (track === "momentum dev") {
+        return /momentum[-_ ]dev/.test(lower);
+      }
+      if (track === "momentum") {
+        return lower.includes("momentum") && !/momentum[-_ ]dev/.test(lower);
+      }
+      return lower.includes(track);
+    };
+
     const pickLatestFromList = (files, track) => {
-      const candidates = files.filter((f) => f.name && f.name.toLowerCase().includes(track) && f.name.toLowerCase().endsWith(".fap"));
+      const candidates = files.filter((f) => f.name && trackMatchesName(f.name, track) && f.name.toLowerCase().endsWith(".fap"));
       if (!candidates.length) return null;
       const sorted = candidates.sort((a, b) => {
         const av = parseVersion(a.name).version || [];
@@ -438,7 +491,7 @@
       const res = await fetch(apiUrl, { cache: "no-store", headers: { Accept: "application/vnd.github+json" } });
       if (!res.ok) throw new Error(`GitHub API failed: ${res.status} ${res.statusText}`);
       const release = await res.json();
-      const asset = (release.assets || []).find((a) => a.name && a.name.toLowerCase().includes(track) && a.name.endsWith(".fap"));
+      const asset = (release.assets || []).find((a) => a.name && trackMatchesName(a.name, track) && a.name.endsWith(".fap"));
       if (!asset) throw new Error(`No .fap asset for ${track} found in latest release`);
       const browserUrl = asset.browser_download_url || asset.url;
       const rawFallback = `https://raw.githubusercontent.com/C5Lab/projectZero/main/FLIPPER/dist/${asset.name}`;
@@ -555,6 +608,7 @@
         setStatus("Connect first.", true);
         return;
       }
+      state.autoUploadTriggered = true;
       const dest = ui.destPath.value.trim().replace(/\\\\/g, "/").replace(/\\/g, "/") || `/ext/apps/${state.fileName}`;
       const data = state.fileData;
       const chunkSize = 8192;
@@ -611,6 +665,7 @@
       } catch (err) {
         setStatus(err.message || "Upload failed", true);
         log(`Error: ${err.message || err}`);
+        state.autoUploadTriggered = false;
       } finally {
         ui.uploadBtn.disabled = false;
       }
@@ -633,6 +688,7 @@
       fetchLatest().catch(() => {});
     });
     // auto-fetch latest on load to reduce clicks
+    applyQueryParams();
     fetchLatest().catch(() => {});
   </script>
 </body>
