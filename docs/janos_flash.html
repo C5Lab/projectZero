@@ -320,6 +320,7 @@
 
     const state = {
       manifest: null,
+      latestRelease: null,
       files: [],
       port: null,
       transport: null,
@@ -366,7 +367,7 @@
       } catch {}
       let cleaned = path.startsWith("/") ? path.slice(1) : path;
       const branch = getBranch();
-      if (branch !== "main" && cleaned.startsWith("firmware/")) {
+      if (cleaned.startsWith("firmware/")) {
         cleaned = cleaned.replace(/^firmware\//, "ESP32C5/binaries-esp32c5/");
       }
       return `https://raw.githubusercontent.com/C5Lab/projectZero/${branch}/${cleaned}`;
@@ -395,6 +396,13 @@
       return next;
     };
 
+    const fetchLatestRelease = async () => {
+      const apiUrl = "https://api.github.com/repos/C5Lab/projectZero/releases/latest";
+      const res = await fetch(apiUrl, { cache: "no-store" });
+      if (!res.ok) throw new Error(`GitHub release fetch failed: ${res.status} ${res.statusText}`);
+      return res.json();
+    };
+
     const loadManifest = async () => {
       try {
         const manifestUrl = getManifestUrl();
@@ -403,10 +411,21 @@
         const manifestRaw = await res.json();
         const manifest = rewritePartsForBranch(manifestRaw, getBranch());
         state.manifest = manifest;
+        let releaseLabel = manifest.version || "n/a";
+        if (getBranch() === "main") {
+          try {
+            const release = await fetchLatestRelease();
+            state.latestRelease = release;
+            releaseLabel = release.tag_name || release.name || releaseLabel;
+          } catch (err) {
+            console.warn(err);
+          }
+        }
         ui.manifest.style.display = "inline-flex";
-        ui.manifest.textContent = `Build ${manifest.build || "n/a"} - ${manifest.version || "n/a"} - ${getBranch()}`;
+        ui.manifest.textContent = `Build ${manifest.build || "n/a"} - ${releaseLabel} - ${getBranch()}`;
         const files = (manifest.parts || []).length;
-        ui.releaseInfo.innerHTML = `<span class="badge">Manifest</span> ${manifest.name || "projectZero"} - ${files} file(s) - chip ${manifest.chipFamily || "ESP32-C5"} - ${getBranch()}`;
+        const releaseText = state.latestRelease ? ` - latest ${releaseLabel}` : "";
+        ui.releaseInfo.innerHTML = `<span class="badge">Manifest</span> ${manifest.name || "projectZero"}${releaseText} - ${files} file(s) - chip ${manifest.chipFamily || "ESP32-C5"} - ${getBranch()}`;
         setStatus("Manifest loaded.");
       } catch (err) {
         setStatus("Manifest not found. Publish a release first.", "error");
