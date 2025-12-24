@@ -14,15 +14,18 @@
 #include <notification/notification_messages.h>
 #include <storage/storage.h>
 #include <furi/core/stream_buffer.h>
+#include <furi/core/memmgr.h>
 #include <gui/view_dispatcher.h>
 #include <gui/modules/text_input.h>
 #include <furi_hal_usb.h>
 #include <furi_hal_usb_cdc.h>
+#include <usb_cdc.h>
 #include <furi_hal_vibro.h>
 #include <dialogs/dialogs.h>
-#include <usb_cdc.h>
 
 #define TAG "Lab_C5"
+
+#define USB_RUNTIME_GUARD_INTERVAL_MS 50
 
 static size_t simple_app_bounded_strlen(const char* s, size_t max_len) {
     size_t len = 0;
@@ -51,23 +54,43 @@ typedef enum {
     ScreenKarmaMenu,
     ScreenEvilTwinMenu,
     ScreenPortalMenu,
-    ScreenDownloadBridge,
     ScreenBtLocatorList,
+    ScreenPasswords,
+    ScreenPasswordsSelect,
 } AppScreen;
 
 typedef enum {
     MenuStateSections,
     MenuStateItems,
 } MenuState;
-#define LAB_C5_VERSION_TEXT "0.35"
 
-#define MAX_SCAN_RESULTS 64
+typedef enum {
+    BlackoutPhaseIdle,
+    BlackoutPhaseStarting,
+    BlackoutPhaseScanning,
+    BlackoutPhaseSorting,
+    BlackoutPhaseAttacking,
+    BlackoutPhaseStopping,
+    BlackoutPhaseFinished,
+} BlackoutPhase;
+
+typedef enum {
+    SnifferDogPhaseIdle,
+    SnifferDogPhaseStarting,
+    SnifferDogPhaseHunting,
+    SnifferDogPhaseStopping,
+    SnifferDogPhaseError,
+    SnifferDogPhaseFinished,
+} SnifferDogPhase;
+#define LAB_C5_VERSION_TEXT "0.38"
+
+#define MAX_SCAN_RESULTS 48
 #define SCAN_LINE_BUFFER_SIZE 192
 #define SCAN_SSID_MAX_LEN 33
 #define SCAN_CHANNEL_MAX_LEN 8
 #define SCAN_TYPE_MAX_LEN 16
-#define SCAN_FIELD_BUFFER_LEN 64
-#define SCAN_VENDOR_MAX_LEN 64
+#define SCAN_FIELD_BUFFER_LEN 48
+#define SCAN_VENDOR_MAX_LEN 48
 #define SCAN_POWER_MIN_DBM (-110)
 #define SCAN_POWER_MAX_DBM 0
 #define SCAN_POWER_STEP 1
@@ -97,14 +120,15 @@ typedef enum {
 #define BT_SCAN_CONSOLE_LINES 3
 #define SNIFFER_CONSOLE_LINES 3
 #define SNIFFER_MAX_APS 32
-#define SNIFFER_MAX_CLIENTS 96
+#define SNIFFER_MAX_CLIENTS 64
 #define SNIFFER_RESULTS_ARROW_THRESHOLD 200
 #define PROBE_MAX_SSIDS 32
-#define PROBE_MAX_CLIENTS 96
-#define BT_LOCATOR_MAX_DEVICES 64
+#define PROBE_MAX_CLIENTS 64
+#define BT_LOCATOR_MAX_DEVICES 24
 #define BT_LOCATOR_VISIBLE_COUNT 6
 #define BT_LOCATOR_WARMUP_MS 10000
-#define BT_SCAN_PREVIEW_MAX 64
+#define BT_LOCATOR_NAME_MAX_LEN 24
+#define BT_SCAN_PREVIEW_MAX 32
 #define RESULT_DEFAULT_MAX_LINES 4
 #define RESULT_DEFAULT_LINE_HEIGHT 12
 #define RESULT_DEFAULT_CHAR_LIMIT (SERIAL_LINE_CHAR_LIMIT - 3)
@@ -116,6 +140,7 @@ typedef enum {
 #define RESULT_SCROLL_GAP 0
 #define RESULT_SCROLL_INTERVAL_MS 200
 #define RESULT_SCROLL_EDGE_PAUSE_STEPS 3
+#define OVERLAY_TITLE_CHAR_LIMIT 22
 #define DEAUTH_GUARD_BLINK_MS 500
 #define DEAUTH_GUARD_VIBRO_MS 400
 #define DEAUTH_GUARD_BLINK_TOGGLES 6
@@ -131,7 +156,7 @@ typedef enum {
 #define SCANNER_FILTER_VISIBLE_COUNT 3
 #define SCANNER_SCAN_COMMAND "scan_networks"
 #define TARGETS_RESULTS_COMMAND "show_scan_results"
-#define LAB_C5_CONFIG_DIR_PATH "apps_assets/labC5"
+#define LAB_C5_CONFIG_DIR_PATH "/int/apps_data/labC5"
 #define LAB_C5_CONFIG_FILE_PATH LAB_C5_CONFIG_DIR_PATH "/config.txt"
 
 #define BOARD_PING_INTERVAL_MS 4000
@@ -186,15 +211,25 @@ static const char* boot_command_options[BOOT_COMMAND_OPTION_COUNT] = {
 #define EVIL_TWIN_MAX_HTML_FILES 16
 #define EVIL_TWIN_HTML_NAME_MAX 32
 #define EVIL_TWIN_POPUP_VISIBLE_LINES 3
-#define EVIL_TWIN_MENU_OPTION_COUNT 2
+#define EVIL_TWIN_MENU_OPTION_COUNT 4
+#define EVIL_TWIN_VISIBLE_COUNT 2
+#define EVIL_TWIN_STATUS_LINE_BUFFER 160
+#define EVIL_TWIN_STATUS_NOTE_MAX 16
 #define KARMA_MAX_PROBES 32
 #define KARMA_PROBE_NAME_MAX 48
 #define KARMA_POPUP_VISIBLE_LINES 3
 #define KARMA_MENU_OPTION_COUNT 5
-#define PORTAL_MENU_OPTION_COUNT 3
+#define PORTAL_MENU_OPTION_COUNT 4
 #define PORTAL_VISIBLE_COUNT 2
 #define PORTAL_MAX_SSID_PRESETS 48
 #define PORTAL_SSID_POPUP_VISIBLE_LINES 3
+#define PORTAL_PASSWORD_MAX_LEN 48
+#define PORTAL_STATUS_LINE_BUFFER 160
+#define PORTAL_USERNAME_MAX_LEN 48
+#define PASSWORDS_MAX_LINES 96
+#define PASSWORDS_LINE_CHAR_LIMIT 160
+#define PASSWORDS_VISIBLE_LINES 4
+#define PASSWORDS_LINE_VISIBLE_CHARS 26
 #define KARMA_MAX_HTML_FILES EVIL_TWIN_MAX_HTML_FILES
 #define KARMA_HTML_NAME_MAX EVIL_TWIN_HTML_NAME_MAX
 #define KARMA_SNIFFER_DURATION_MIN_SEC 5
@@ -203,7 +238,7 @@ static const char* boot_command_options[BOOT_COMMAND_OPTION_COUNT] = {
 #define KARMA_AUTO_LIST_DELAY_MS 500
 #define HELP_HINT_IDLE_MS 3000
 #define DOUBLE_BACK_EXIT_MS 700
-#define SD_MANAGER_MAX_FILES 64
+#define SD_MANAGER_MAX_FILES 48
 #define SD_MANAGER_FILE_NAME_MAX 64
 #define SD_MANAGER_POPUP_VISIBLE_LINES 3
 #define SD_MANAGER_FOLDER_LABEL_MAX 24
@@ -232,6 +267,11 @@ typedef enum {
     MenuActionOpenPortalMenu,
     MenuActionOpenBtLocator,
 } MenuAction;
+
+typedef enum {
+    PasswordsSourcePortal,
+    PasswordsSourceEvilTwin,
+} PasswordsSource;
 
 typedef enum {
     ChannelViewBand24,
@@ -344,13 +384,37 @@ typedef struct {
     bool serial_follow_tail;
     bool serial_targets_hint;
     bool blackout_view_active;
+    bool blackout_full_console;
+    bool blackout_running;
+    BlackoutPhase blackout_phase;
+    uint32_t blackout_networks;
+    uint32_t blackout_cycle;
+    uint8_t blackout_channel;
+    bool blackout_has_channel;
+    char blackout_note[32];
+    char blackout_line_buffer[96];
+    size_t blackout_line_length;
+    uint32_t blackout_last_update_tick;
+    bool sniffer_dog_view_active;
+    bool sniffer_dog_full_console;
+    bool sniffer_dog_running;
+    SnifferDogPhase sniffer_dog_phase;
+    uint32_t sniffer_dog_deauth_count;
+    uint8_t sniffer_dog_channel;
+    bool sniffer_dog_has_channel;
+    int sniffer_dog_rssi;
+    bool sniffer_dog_has_rssi;
+    char sniffer_dog_note[32];
+    char sniffer_dog_line_buffer[128];
+    size_t sniffer_dog_line_length;
+    uint32_t sniffer_dog_last_update_tick;
     bool wardrive_view_active;
     bool wardrive_status_is_numeric;
     char wardrive_status_text[32];
     char wardrive_line_buffer[96];
     size_t wardrive_line_length;
-    bool wardrive_otg_forced;
-    bool wardrive_otg_previous_state;
+    bool otg_power_enabled;
+    bool otg_power_initial_state;
     bool bt_scan_view_active;
     bool bt_scan_summary_seen;
     bool airtag_scan_mode;
@@ -380,7 +444,7 @@ typedef struct {
     size_t bt_locator_index;
     size_t bt_locator_offset;
     int32_t bt_locator_selected; // -1 none, otherwise index
-    char bt_locator_current_name[32];
+    char bt_locator_current_name[BT_LOCATOR_NAME_MAX_LEN];
     char bt_locator_scroll_text[64];
     size_t bt_locator_scroll_offset;
     int bt_locator_scroll_dir;
@@ -392,7 +456,7 @@ typedef struct {
         char mac[18];
         int rssi;
         bool has_rssi;
-        char name[32];
+        char name[BT_LOCATOR_NAME_MAX_LEN];
     } bt_locator_devices[BT_LOCATOR_MAX_DEVICES];
     char bt_scan_line_buffer[96];
     size_t bt_scan_line_length;
@@ -453,7 +517,8 @@ typedef struct {
     bool exit_confirm_active;
     uint32_t exit_confirm_tick;
     size_t evil_twin_menu_index;
-    EvilTwinHtmlEntry evil_twin_html_entries[EVIL_TWIN_MAX_HTML_FILES];
+    size_t evil_twin_menu_offset;
+    EvilTwinHtmlEntry* evil_twin_html_entries;
     size_t evil_twin_html_count;
     size_t evil_twin_html_popup_index;
     size_t evil_twin_html_popup_offset;
@@ -464,12 +529,19 @@ typedef struct {
     size_t evil_twin_list_length;
     uint8_t evil_twin_selected_html_id;
     char evil_twin_selected_html_name[EVIL_TWIN_HTML_NAME_MAX];
+    char evil_twin_status_ssid[SCAN_SSID_MAX_LEN];
+    int32_t evil_twin_client_count;
+    uint32_t evil_twin_password_count;
+    char evil_twin_last_password[PORTAL_PASSWORD_MAX_LEN];
+    char evil_twin_status_note[EVIL_TWIN_STATUS_NOTE_MAX];
+    char evil_twin_line_buffer[EVIL_TWIN_STATUS_LINE_BUFFER];
+    size_t evil_twin_line_length;
     size_t portal_menu_index;
     char portal_ssid[SCAN_SSID_MAX_LEN];
     size_t portal_menu_offset;
     bool portal_input_requested;
     bool portal_input_active;
-    PortalSsidEntry portal_ssid_entries[PORTAL_MAX_SSID_PRESETS];
+    PortalSsidEntry* portal_ssid_entries;
     size_t portal_ssid_count;
     size_t portal_ssid_popup_index;
     size_t portal_ssid_popup_offset;
@@ -479,10 +551,35 @@ typedef struct {
     char portal_ssid_list_buffer[64];
     size_t portal_ssid_list_length;
     bool portal_ssid_missing;
+    bool portal_running;
+    bool portal_full_console;
+    char portal_status_ssid[SCAN_SSID_MAX_LEN];
+    int32_t portal_client_count;
+    uint32_t portal_password_count;
+    char portal_last_password[PORTAL_PASSWORD_MAX_LEN];
+    uint32_t portal_username_count;
+    char portal_last_username[PORTAL_USERNAME_MAX_LEN];
+    char portal_line_buffer[PORTAL_STATUS_LINE_BUFFER];
+    size_t portal_line_length;
+    bool passwords_listing_active;
+    AppScreen passwords_return_screen;
+    AppScreen passwords_select_return_screen;
+    PasswordsSource passwords_source;
+    size_t passwords_select_index;
+    char passwords_title[24];
+    char passwords_lines[PASSWORDS_MAX_LINES][PASSWORDS_LINE_CHAR_LIMIT];
+    size_t passwords_line_count;
+    size_t passwords_scroll;
+    size_t passwords_scroll_x;
+    size_t passwords_max_line_len;
+    char passwords_line_buffer[PORTAL_STATUS_LINE_BUFFER];
+    size_t passwords_line_length;
+    bool evil_twin_running;
+    bool evil_twin_full_console;
     size_t sd_folder_index;
     size_t sd_folder_offset;
     bool sd_folder_popup_active;
-    SdFileEntry sd_files[SD_MANAGER_MAX_FILES];
+    SdFileEntry* sd_files;
     size_t sd_file_count;
     size_t sd_file_popup_index;
     size_t sd_file_popup_offset;
@@ -507,7 +604,7 @@ typedef struct {
     char sd_scroll_text[SD_MANAGER_FILE_NAME_MAX];
     size_t karma_menu_index;
     size_t karma_menu_offset;
-    KarmaProbeEntry karma_probes[KARMA_MAX_PROBES];
+    KarmaProbeEntry* karma_probes;
     size_t karma_probe_count;
     size_t karma_probe_popup_index;
     size_t karma_probe_popup_offset;
@@ -518,7 +615,7 @@ typedef struct {
     size_t karma_probe_list_length;
     uint8_t karma_selected_probe_id;
     char karma_selected_probe_name[KARMA_PROBE_NAME_MAX];
-    KarmaHtmlEntry karma_html_entries[KARMA_MAX_HTML_FILES];
+    KarmaHtmlEntry* karma_html_entries;
     size_t karma_html_count;
     size_t karma_html_popup_index;
     size_t karma_html_popup_offset;
@@ -535,16 +632,16 @@ typedef struct {
     bool karma_pending_probe_refresh;
     uint32_t karma_pending_probe_tick;
     bool karma_status_active;
-    ScanResult scan_results[MAX_SCAN_RESULTS];
+    ScanResult* scan_results;
     size_t scan_result_count;
     size_t scan_result_index;
     size_t scan_result_offset;
-    uint16_t scan_selected_numbers[MAX_SCAN_RESULTS];
+    uint16_t* scan_selected_numbers;
     size_t scan_selected_count;
     bool scan_results_loading;
     char scan_line_buffer[SCAN_LINE_BUFFER_SIZE];
     size_t scan_line_len;
-    uint16_t visible_result_indices[MAX_SCAN_RESULTS];
+    uint16_t* visible_result_indices;
     size_t visible_result_count;
     bool scanner_view_active;
     bool scanner_full_console;
@@ -580,8 +677,6 @@ typedef struct {
     size_t scanner_timing_read_length;
     size_t scanner_setup_index;
     bool scanner_adjusting_power;
-    bool otg_power_enabled;
-    bool otg_power_initial_state;
     bool backlight_enabled;
     bool backlight_insomnia;
     bool led_enabled;
@@ -606,6 +701,11 @@ typedef struct {
     uint8_t result_scroll_hold;
     uint32_t result_scroll_last_tick;
     char result_scroll_text[64];
+    uint8_t overlay_title_scroll_offset;
+    int8_t overlay_title_scroll_direction;
+    uint8_t overlay_title_scroll_hold;
+    uint32_t overlay_title_scroll_last_tick;
+    char overlay_title_scroll_text[64];
     bool hint_active;
     char hint_title[24];
     char hint_lines[HINT_MAX_LINES][HINT_LINE_CHAR_LIMIT];
@@ -627,6 +727,7 @@ typedef struct {
     bool board_bootstrap_reboot_sent;
     uint32_t last_input_tick;
     uint32_t last_back_tick;
+    uint32_t usb_guard_last_tick;
     bool help_hint_visible;
     bool package_monitor_active;
     uint8_t package_monitor_channel;
@@ -653,17 +754,11 @@ typedef struct {
     char channel_view_status_text[32];
     uint8_t channel_view_offset_24;
     uint8_t channel_view_offset_5;
-    // Download/bridge state
-    bool download_bridge_active;
-    uint8_t download_cdc_if;
-    FuriThread* download_thread;
-    uint32_t download_baud;
-    uint32_t download_baud_new;
-    uint32_t download_uart_to_usb;
-    uint32_t download_usb_to_uart;
 } SimpleApp;
 static void simple_app_reset_result_scroll(SimpleApp* app);
 static void simple_app_update_result_scroll(SimpleApp* app);
+static void simple_app_reset_overlay_title_scroll(SimpleApp* app);
+static void simple_app_update_overlay_title_scroll(SimpleApp* app);
 static void simple_app_adjust_result_offset(SimpleApp* app);
 static void simple_app_rebuild_visible_results(SimpleApp* app);
 static bool simple_app_result_is_visible(const SimpleApp* app, const ScanResult* result);
@@ -689,11 +784,6 @@ static bool simple_app_handle_boot_status_line(SimpleApp* app, const char* line)
 static void simple_app_boot_feed(SimpleApp* app, char ch);
 static void simple_app_serial_irq(
     FuriHalSerialHandle* handle, FuriHalSerialRxEvent event, void* context);
-static void simple_app_draw_download_bridge(SimpleApp* app, Canvas* canvas);
-static bool simple_app_download_bridge_start(SimpleApp* app);
-static void simple_app_download_bridge_stop(SimpleApp* app);
-static bool simple_app_usb_profile_ok(void);
-static void simple_app_show_usb_blocker(void);
 static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long);
 static void simple_app_on_board_online(SimpleApp* app, const char* source);
 static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas);
@@ -710,16 +800,25 @@ static void simple_app_modify_channel_time(SimpleApp* app, bool is_min, int32_t 
 static void simple_app_reset_wardrive_status(SimpleApp* app);
 static void simple_app_process_wardrive_line(SimpleApp* app, const char* line);
 static void simple_app_wardrive_feed(SimpleApp* app, char ch);
-static void simple_app_force_otg_for_wardrive(SimpleApp* app);
-static void simple_app_restore_otg_after_wardrive(SimpleApp* app);
+static void simple_app_reset_blackout_status(SimpleApp* app);
+static void simple_app_process_blackout_line(SimpleApp* app, const char* line);
+static void simple_app_blackout_feed(SimpleApp* app, char ch);
+static void simple_app_draw_blackout_overlay(SimpleApp* app, Canvas* canvas);
+static void simple_app_reset_sniffer_dog_status(SimpleApp* app);
+static void simple_app_process_sniffer_dog_line(SimpleApp* app, const char* line);
+static void simple_app_sniffer_dog_feed(SimpleApp* app, char ch);
+static void simple_app_draw_sniffer_dog_overlay(SimpleApp* app, Canvas* canvas);
+static void simple_app_update_otg_label(SimpleApp* app);
+static void simple_app_apply_otg_power(SimpleApp* app);
+static void simple_app_toggle_otg_power(SimpleApp* app);
+static void simple_app_send_download(SimpleApp* app);
+static bool simple_app_usb_profile_ok(void);
+static void simple_app_show_usb_blocker(void);
 static bool simple_app_is_start_sniffer_command(const char* command);
 static void simple_app_send_start_sniffer(SimpleApp* app);
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial);
 static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, size_t length);
 static void simple_app_draw_wardrive_serial(SimpleApp* app, Canvas* canvas);
-static void simple_app_update_otg_label(SimpleApp* app);
-static void simple_app_apply_otg_power(SimpleApp* app);
-static void simple_app_toggle_otg_power(SimpleApp* app);
 static void simple_app_mark_config_dirty(SimpleApp* app);
 static void simple_app_show_hint(SimpleApp* app, const char* title, const char* text);
 static void simple_app_hide_hint(SimpleApp* app);
@@ -754,6 +853,22 @@ static void simple_app_handle_bt_locator_input(SimpleApp* app, InputKey key);
 static void simple_app_bt_locator_reset_scroll(SimpleApp* app);
 static void simple_app_bt_locator_set_scroll_text(SimpleApp* app, const char* text);
 static void simple_app_bt_locator_tick_scroll(SimpleApp* app, size_t char_limit);
+static void simple_app_usb_runtime_guard(SimpleApp* app);
+static bool simple_app_sd_ok(void);
+static void simple_app_show_sd_busy(void);
+static bool simple_app_scan_alloc_buffers(SimpleApp* app);
+static void simple_app_scan_free_buffers(SimpleApp* app);
+static bool simple_app_portal_alloc_ssid_entries(SimpleApp* app);
+static void simple_app_portal_free_ssid_entries(SimpleApp* app);
+static void simple_app_trim(char* text);
+static bool simple_app_sd_alloc_files(SimpleApp* app);
+static void simple_app_sd_free_files(SimpleApp* app);
+static bool simple_app_evil_twin_alloc_html_entries(SimpleApp* app);
+static void simple_app_evil_twin_free_html_entries(SimpleApp* app);
+static bool simple_app_karma_alloc_probes(SimpleApp* app);
+static void simple_app_karma_free_probes(SimpleApp* app);
+static bool simple_app_karma_alloc_html_entries(SimpleApp* app);
+static void simple_app_karma_free_html_entries(SimpleApp* app);
 static void simple_app_channel_view_show_status(SimpleApp* app, const char* status);
 static void simple_app_reset_deauth_guard(SimpleApp* app);
 static void simple_app_start_deauth_guard(SimpleApp* app);
@@ -778,6 +893,25 @@ static void simple_app_open_portal_ssid_popup(SimpleApp* app);
 static void simple_app_finish_portal_ssid_listing(SimpleApp* app);
 static void simple_app_process_portal_ssid_line(SimpleApp* app, const char* line);
 static void simple_app_portal_ssid_feed(SimpleApp* app, char ch);
+static void simple_app_reset_portal_status(SimpleApp* app);
+static void simple_app_process_portal_status_line(SimpleApp* app, const char* line);
+static void simple_app_portal_status_feed(SimpleApp* app, char ch);
+static void simple_app_draw_portal_overlay(SimpleApp* app, Canvas* canvas);
+static void simple_app_reset_evil_twin_status(SimpleApp* app);
+static void simple_app_process_evil_twin_status_line(SimpleApp* app, const char* line);
+static void simple_app_evil_twin_status_feed(SimpleApp* app, char ch);
+static void simple_app_draw_evil_twin_overlay(SimpleApp* app, Canvas* canvas);
+static void simple_app_reset_passwords_listing(SimpleApp* app);
+static void simple_app_request_passwords(
+    SimpleApp* app,
+    AppScreen return_screen,
+    PasswordsSource source);
+static void simple_app_process_passwords_line(SimpleApp* app, const char* line);
+static void simple_app_passwords_feed(SimpleApp* app, char ch);
+static void simple_app_draw_passwords(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_passwords_input(SimpleApp* app, InputKey key);
+static void simple_app_draw_passwords_select(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_passwords_select_input(SimpleApp* app, InputKey key);
 static void simple_app_draw_portal_ssid_popup(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_portal_ssid_popup_event(SimpleApp* app, const InputEvent* event);
 static bool simple_app_portal_run_text_input(SimpleApp* app);
@@ -953,7 +1087,9 @@ static const char hint_bluetooth_locator[] =
 static const char hint_setup_backlight[] =
     "Toggle screen light\nKeep brightness high\nOr allow auto dim\nGreat for console\nLong sessions.";
 static const char hint_setup_otg[] =
-    "Control USB OTG 5V\nPower external gear\nDisable to save\nBattery capacity\nWhen unused.";
+    "Toggle 5V rail\nPowers GPIO 5V pin\nUse only if needed\nLeave off to save\nbattery.";
+static const char hint_setup_download[] =
+    "Send download cmd\nThen open UART GPIO\nbridge manually and\nreconnect USB to PC\nfor flashing.";
 static const char hint_setup_led[] =
     "Control status LED\nLeft/Right toggles\nSends CLI command\nAdjust brightness\nRange 1 to 100.";
 static const char hint_setup_boot[] =
@@ -964,8 +1100,6 @@ static const char hint_setup_scanner_timing[] =
     "Channel dwell times\nLeft/Right adjusts\nMin/Max per channel\nSync with board\nStored in config.";
 static const char hint_setup_console[] =
     "Open live console\nStream UART output\nWatch commands\nDebug operations\nClose with Back.";
-static const char hint_setup_download[] =
-    "Send download cmd\nThen open UART GPIO\nbridge manually and\nreconnect USB to PC\nfor flashing.";
 static const char hint_setup_sd_manager[] =
     "Browse SD folders\nPick lab captures\nDelete safely\nDefault: handshakes.";
 
@@ -1131,6 +1265,64 @@ static void simple_app_truncate_text(char* text, size_t max_chars) {
     }
     text[max_chars - 1] = '.';
     text[max_chars] = '\0';
+}
+
+static void simple_app_utf8_to_ascii_pl(const char* src, char* dst, size_t dst_size) {
+    if(!dst || dst_size == 0) return;
+    if(!src) {
+        dst[0] = '\0';
+        return;
+    }
+
+    size_t out = 0;
+    for(size_t i = 0; src[i] != '\0' && out + 1 < dst_size;) {
+        uint8_t b0 = (uint8_t)src[i];
+        if(b0 < 0x80) {
+            dst[out++] = (char)b0;
+            i++;
+            continue;
+        }
+
+        uint8_t b1 = (uint8_t)src[i + 1];
+        if(b1 == 0) {
+            dst[out++] = '?';
+            break;
+        }
+
+        char mapped = '\0';
+        if(b0 == 0xC4) {
+            if(b1 == 0x84) mapped = 'A'; // Ą
+            else if(b1 == 0x85) mapped = 'a'; // ą
+            else if(b1 == 0x86) mapped = 'C'; // Ć
+            else if(b1 == 0x87) mapped = 'c'; // ć
+            else if(b1 == 0x98) mapped = 'E'; // Ę
+            else if(b1 == 0x99) mapped = 'e'; // ę
+        } else if(b0 == 0xC5) {
+            if(b1 == 0x81) mapped = 'L'; // Ł
+            else if(b1 == 0x82) mapped = 'l'; // ł
+            else if(b1 == 0x83) mapped = 'N'; // Ń
+            else if(b1 == 0x84) mapped = 'n'; // ń
+            else if(b1 == 0x9A) mapped = 'S'; // Ś
+            else if(b1 == 0x9B) mapped = 's'; // ś
+            else if(b1 == 0xB9) mapped = 'Z'; // Ź
+            else if(b1 == 0xBA) mapped = 'z'; // ź
+            else if(b1 == 0xBB) mapped = 'Z'; // Ż
+            else if(b1 == 0xBC) mapped = 'z'; // ż
+        } else if(b0 == 0xC3) {
+            if(b1 == 0x93) mapped = 'O'; // Ó
+            else if(b1 == 0xB3) mapped = 'o'; // ó
+        }
+
+        if(mapped != '\0') {
+            dst[out++] = mapped;
+            i += 2;
+        } else {
+            dst[out++] = '?';
+            i += 1;
+        }
+    }
+
+    dst[out] = '\0';
 }
 
 static void simple_app_draw_scroll_arrow(Canvas* canvas, uint8_t base_left_x, int16_t base_y, bool upwards) {
@@ -1388,10 +1580,16 @@ static void simple_app_update_scanner_stats(SimpleApp* app, const ScanResult* re
 
 static void simple_app_reset_scan_results(SimpleApp* app) {
     if(!app) return;
-    memset(app->scan_results, 0, sizeof(app->scan_results));
-    memset(app->scan_selected_numbers, 0, sizeof(app->scan_selected_numbers));
+    if(app->scan_results) {
+        memset(app->scan_results, 0, sizeof(ScanResult) * MAX_SCAN_RESULTS);
+    }
+    if(app->scan_selected_numbers) {
+        memset(app->scan_selected_numbers, 0, sizeof(uint16_t) * MAX_SCAN_RESULTS);
+    }
     memset(app->scan_line_buffer, 0, sizeof(app->scan_line_buffer));
-    memset(app->visible_result_indices, 0, sizeof(app->visible_result_indices));
+    if(app->visible_result_indices) {
+        memset(app->visible_result_indices, 0, sizeof(uint16_t) * MAX_SCAN_RESULTS);
+    }
     app->scan_result_count = 0;
     app->scan_result_index = 0;
     app->scan_result_offset = 0;
@@ -1413,6 +1611,7 @@ static bool simple_app_result_is_visible(const SimpleApp* app, const ScanResult*
 
 static void simple_app_rebuild_visible_results(SimpleApp* app) {
     if(!app) return;
+    if(!app->scan_results || !app->visible_result_indices) return;
     app->visible_result_count = 0;
     for(size_t i = 0; i < app->scan_result_count && i < MAX_SCAN_RESULTS; i++) {
         if(simple_app_result_is_visible(app, &app->scan_results[i])) {
@@ -1485,17 +1684,41 @@ static bool* simple_app_scanner_option_flag(SimpleApp* app, ScannerOption option
 }
 
 static ScanResult* simple_app_visible_result(SimpleApp* app, size_t visible_index) {
-    if(!app || visible_index >= app->visible_result_count) return NULL;
+    if(!app || !app->scan_results || !app->visible_result_indices) return NULL;
+    if(visible_index >= app->visible_result_count) return NULL;
     uint16_t actual_index = app->visible_result_indices[visible_index];
     if(actual_index >= MAX_SCAN_RESULTS) return NULL;
     return &app->scan_results[actual_index];
 }
 
 static const ScanResult* simple_app_visible_result_const(const SimpleApp* app, size_t visible_index) {
-    if(!app || visible_index >= app->visible_result_count) return NULL;
+    if(!app || !app->scan_results || !app->visible_result_indices) return NULL;
+    if(visible_index >= app->visible_result_count) return NULL;
     uint16_t actual_index = app->visible_result_indices[visible_index];
     if(actual_index >= MAX_SCAN_RESULTS) return NULL;
     return &app->scan_results[actual_index];
+}
+
+static const ScanResult* simple_app_find_scan_result_by_number(const SimpleApp* app, uint16_t number) {
+    if(!app || !app->scan_results) return NULL;
+    for(size_t i = 0; i < app->scan_result_count; i++) {
+        const ScanResult* result = &app->scan_results[i];
+        if(result->number == number) {
+            return result;
+        }
+    }
+    return NULL;
+}
+
+static bool simple_app_get_first_selected_ssid(SimpleApp* app, char* out, size_t out_size) {
+    if(!app || !out || out_size == 0) return false;
+    if(app->scan_selected_count == 0 || !app->scan_selected_numbers) return false;
+    const ScanResult* result =
+        simple_app_find_scan_result_by_number(app, app->scan_selected_numbers[0]);
+    if(!result || result->ssid[0] == '\0') return false;
+    simple_app_utf8_to_ascii_pl(result->ssid, out, out_size);
+    simple_app_trim(out);
+    return out[0] != '\0';
 }
 
 static void simple_app_update_backlight_label(SimpleApp* app) {
@@ -2176,6 +2399,216 @@ static void simple_app_reset_wardrive_status(SimpleApp* app) {
     app->wardrive_line_length = 0;
 }
 
+static void simple_app_reset_blackout_status(SimpleApp* app) {
+    if(!app) return;
+    app->blackout_full_console = false;
+    app->blackout_running = false;
+    app->blackout_phase = BlackoutPhaseIdle;
+    app->blackout_networks = 0;
+    app->blackout_cycle = 0;
+    app->blackout_channel = 0;
+    app->blackout_has_channel = false;
+    app->blackout_note[0] = '\0';
+    app->blackout_line_length = 0;
+    app->blackout_last_update_tick = 0;
+}
+
+static void simple_app_blackout_set_phase(SimpleApp* app, BlackoutPhase phase, const char* note) {
+    if(!app) return;
+    app->blackout_phase = phase;
+    app->blackout_running = (phase != BlackoutPhaseIdle && phase != BlackoutPhaseFinished);
+    app->blackout_last_update_tick = furi_get_tick();
+    if(note && note[0] != '\0') {
+        strncpy(app->blackout_note, note, sizeof(app->blackout_note) - 1);
+        app->blackout_note[sizeof(app->blackout_note) - 1] = '\0';
+    } else if(note) {
+        app->blackout_note[0] = '\0';
+    }
+}
+
+static void simple_app_reset_sniffer_dog_status(SimpleApp* app) {
+    if(!app) return;
+    app->sniffer_dog_full_console = false;
+    app->sniffer_dog_running = false;
+    app->sniffer_dog_phase = SnifferDogPhaseIdle;
+    app->sniffer_dog_deauth_count = 0;
+    app->sniffer_dog_channel = 0;
+    app->sniffer_dog_has_channel = false;
+    app->sniffer_dog_rssi = 0;
+    app->sniffer_dog_has_rssi = false;
+    app->sniffer_dog_note[0] = '\0';
+    app->sniffer_dog_line_length = 0;
+    app->sniffer_dog_last_update_tick = 0;
+}
+
+static void simple_app_sniffer_dog_set_phase(SimpleApp* app, SnifferDogPhase phase, const char* note) {
+    if(!app) return;
+    app->sniffer_dog_phase = phase;
+    app->sniffer_dog_running =
+        (phase != SnifferDogPhaseIdle && phase != SnifferDogPhaseFinished && phase != SnifferDogPhaseError);
+    app->sniffer_dog_last_update_tick = furi_get_tick();
+    if(note && note[0] != '\0') {
+        strncpy(app->sniffer_dog_note, note, sizeof(app->sniffer_dog_note) - 1);
+        app->sniffer_dog_note[sizeof(app->sniffer_dog_note) - 1] = '\0';
+    } else if(note) {
+        app->sniffer_dog_note[0] = '\0';
+    }
+}
+
+static bool simple_app_blackout_parse_channel(const char* line, uint8_t* out_channel) {
+    if(!line || !out_channel) return false;
+    const char* found = strstr(line, "channel");
+    if(found) {
+        const char* digits = found + strlen("channel");
+        while(*digits && !isdigit((unsigned char)*digits)) {
+            digits++;
+        }
+        if(isdigit((unsigned char)*digits)) {
+            unsigned long value = strtoul(digits, NULL, 10);
+            if(value > 0 && value <= 255) {
+                *out_channel = (uint8_t)value;
+                return true;
+            }
+        }
+    }
+
+    const char* cursor = line;
+    while((found = strstr(cursor, "ch")) != NULL) {
+        char before = (found == line) ? ' ' : *(found - 1);
+        bool boundary = (before == ' ' || before == '[' || before == '(' || before == ':' || before == '#');
+        if(!boundary) {
+            cursor = found + 2;
+            continue;
+        }
+        const char* digits = found + 2;
+        while(*digits && !isdigit((unsigned char)*digits)) {
+            digits++;
+        }
+        if(!isdigit((unsigned char)*digits)) {
+            cursor = found + 2;
+            continue;
+        }
+        unsigned long value = strtoul(digits, NULL, 10);
+        if(value == 0 || value > 255) {
+            cursor = found + 2;
+            continue;
+        }
+        *out_channel = (uint8_t)value;
+        return true;
+    }
+    return false;
+}
+
+static bool simple_app_blackout_extract_networks(const char* line, uint32_t* out_count) {
+    if(!line || !out_count) return false;
+    if(strstr(line, "networks") == NULL) return false;
+    const char* digits = line;
+    while(*digits && !isdigit((unsigned char)*digits)) {
+        digits++;
+    }
+    if(!isdigit((unsigned char)*digits)) return false;
+    unsigned long value = strtoul(digits, NULL, 10);
+    *out_count = (uint32_t)value;
+    return true;
+}
+
+static void simple_app_process_sniffer_dog_line(SimpleApp* app, const char* line) {
+    if(!app || !line) return;
+
+    while(*line == '>' || *line == ' ') {
+        line++;
+    }
+    if(*line == '\0') return;
+
+    if(strstr(line, "Starting Sniffer Dog mode") != NULL) {
+        app->sniffer_dog_view_active = true;
+        simple_app_sniffer_dog_set_phase(app, SnifferDogPhaseStarting, "");
+        return;
+    }
+
+    if(strstr(line, "Sniffer Dog started") != NULL) {
+        app->sniffer_dog_view_active = true;
+        simple_app_sniffer_dog_set_phase(app, SnifferDogPhaseHunting, "");
+        return;
+    }
+
+    if(strstr(line, "Sniffer Dog already active") != NULL) {
+        app->sniffer_dog_view_active = true;
+        simple_app_sniffer_dog_set_phase(app, SnifferDogPhaseHunting, "Already active");
+        return;
+    }
+
+    if(strstr(line, "Regular sniffer is active") != NULL) {
+        app->sniffer_dog_view_active = true;
+        simple_app_sniffer_dog_set_phase(app, SnifferDogPhaseError, "Stop sniffer");
+        return;
+    }
+
+    if(strstr(line, "Failed to create Sniffer Dog channel hopping task") != NULL) {
+        app->sniffer_dog_view_active = true;
+        simple_app_sniffer_dog_set_phase(app, SnifferDogPhaseError, "Task failed");
+        return;
+    }
+
+    if(strstr(line, "Stopping Sniffer Dog task") != NULL ||
+       strstr(line, "Sniffer Dog task forcefully stopped") != NULL ||
+       strstr(line, "Sniffer Dog channel task ending") != NULL) {
+        app->sniffer_dog_view_active = true;
+        simple_app_sniffer_dog_set_phase(app, SnifferDogPhaseStopping, "Stopping");
+        return;
+    }
+
+    if(strstr(line, "Sniffer Dog stopped") != NULL) {
+        app->sniffer_dog_view_active = true;
+        simple_app_sniffer_dog_set_phase(app, SnifferDogPhaseFinished, "Stopped");
+        return;
+    }
+
+    unsigned long deauth_count = 0;
+    if(sscanf(line, "[SnifferDog #%lu]", &deauth_count) == 1) {
+        app->sniffer_dog_view_active = true;
+        app->sniffer_dog_deauth_count = (uint32_t)deauth_count;
+        app->sniffer_dog_running = true;
+        app->sniffer_dog_last_update_tick = furi_get_tick();
+
+        const char* ch_ptr = strstr(line, "Ch=");
+        if(ch_ptr) {
+            int channel = atoi(ch_ptr + 3);
+            if(channel > 0 && channel <= 255) {
+                app->sniffer_dog_channel = (uint8_t)channel;
+                app->sniffer_dog_has_channel = true;
+            }
+        }
+
+        const char* rssi_ptr = strstr(line, "RSSI=");
+        if(rssi_ptr) {
+            int rssi = atoi(rssi_ptr + 5);
+            app->sniffer_dog_rssi = rssi;
+            app->sniffer_dog_has_rssi = true;
+        }
+        simple_app_sniffer_dog_set_phase(app, SnifferDogPhaseHunting, "");
+        return;
+    }
+}
+
+static void simple_app_sniffer_dog_feed(SimpleApp* app, char ch) {
+    if(!app) return;
+    if(ch == '\r') return;
+    if(ch == '\n') {
+        if(app->sniffer_dog_line_length > 0) {
+            app->sniffer_dog_line_buffer[app->sniffer_dog_line_length] = '\0';
+            simple_app_process_sniffer_dog_line(app, app->sniffer_dog_line_buffer);
+        }
+        app->sniffer_dog_line_length = 0;
+        return;
+    }
+    if(app->sniffer_dog_line_length + 1 >= sizeof(app->sniffer_dog_line_buffer)) {
+        app->sniffer_dog_line_length = 0;
+        return;
+    }
+    app->sniffer_dog_line_buffer[app->sniffer_dog_line_length++] = ch;
+}
+
 static void simple_app_process_wardrive_line(SimpleApp* app, const char* line) {
     if(!app || !line || !app->wardrive_view_active) return;
 
@@ -2232,6 +2665,124 @@ static void simple_app_wardrive_feed(SimpleApp* app, char ch) {
     app->wardrive_line_buffer[app->wardrive_line_length++] = ch;
 }
 
+static void simple_app_process_blackout_line(SimpleApp* app, const char* line) {
+    if(!app || !line) return;
+
+    while(*line == '>' || *line == ' ') {
+        line++;
+    }
+    if(*line == '\0') return;
+
+    if(strstr(line, "Blackout attack task started") != NULL ||
+       strstr(line, "Starting blackout attack") != NULL) {
+        app->blackout_view_active = true;
+        if(app->blackout_cycle == 0) app->blackout_cycle = 1;
+        simple_app_blackout_set_phase(app, BlackoutPhaseStarting, "");
+        return;
+    }
+
+    if(strstr(line, "Starting blackout cycle") != NULL) {
+        app->blackout_view_active = true;
+        if(app->blackout_cycle == 0) {
+            app->blackout_cycle = 1;
+        }
+        simple_app_blackout_set_phase(app, BlackoutPhaseScanning, "");
+        return;
+    }
+
+    if(strstr(line, "Stopping blackout attack task") != NULL) {
+        app->blackout_view_active = true;
+        simple_app_blackout_set_phase(app, BlackoutPhaseStopping, "Stopping");
+        return;
+    }
+
+    if(strstr(line, "Blackout attack task finished") != NULL) {
+        app->blackout_view_active = true;
+        simple_app_blackout_set_phase(app, BlackoutPhaseFinished, "Done");
+        return;
+    }
+
+    if(!app->blackout_view_active) {
+        return;
+    }
+
+    if(strstr(line, "Found") != NULL && strstr(line, "networks") != NULL &&
+       strstr(line, "sorting by channel") != NULL) {
+        uint32_t networks = 0;
+        if(simple_app_blackout_extract_networks(line, &networks)) {
+            app->blackout_networks = networks;
+        }
+        app->blackout_view_active = true;
+        simple_app_blackout_set_phase(app, BlackoutPhaseSorting, "");
+        return;
+    }
+
+    if(strstr(line, "Starting deauth attack") != NULL) {
+        uint32_t networks = 0;
+        if(simple_app_blackout_extract_networks(line, &networks)) {
+            app->blackout_networks = networks;
+        }
+        app->blackout_view_active = true;
+        simple_app_blackout_set_phase(app, BlackoutPhaseAttacking, "");
+        return;
+    }
+
+    if(strstr(line, "3-minute attack cycle completed") != NULL) {
+        app->blackout_view_active = true;
+        app->blackout_cycle++;
+        simple_app_blackout_set_phase(app, BlackoutPhaseScanning, "");
+        return;
+    }
+
+    if(strstr(line, "Scan timeout") != NULL) {
+        app->blackout_view_active = true;
+        simple_app_blackout_set_phase(app, BlackoutPhaseScanning, "Scan timeout");
+        return;
+    }
+
+    if(strstr(line, "No scan results available") != NULL) {
+        app->blackout_view_active = true;
+        simple_app_blackout_set_phase(app, BlackoutPhaseScanning, "No results");
+        return;
+    }
+
+    if(strstr(line, "Failed to start scan") != NULL) {
+        app->blackout_view_active = true;
+        simple_app_blackout_set_phase(app, BlackoutPhaseScanning, "Scan failed");
+        return;
+    }
+
+    if(strstr(line, "Stop requested") != NULL || strstr(line, "Stopping blackout attack task") != NULL) {
+        app->blackout_view_active = true;
+        simple_app_blackout_set_phase(app, BlackoutPhaseStopping, "Stopping");
+        return;
+    }
+
+    uint8_t channel = 0;
+    if(simple_app_blackout_parse_channel(line, &channel)) {
+        app->blackout_channel = channel;
+        app->blackout_has_channel = true;
+    }
+}
+
+static void simple_app_blackout_feed(SimpleApp* app, char ch) {
+    if(!app) return;
+    if(ch == '\r') return;
+    if(ch == '\n') {
+        if(app->blackout_line_length > 0) {
+            app->blackout_line_buffer[app->blackout_line_length] = '\0';
+            simple_app_process_blackout_line(app, app->blackout_line_buffer);
+        }
+        app->blackout_line_length = 0;
+        return;
+    }
+    if(app->blackout_line_length + 1 >= sizeof(app->blackout_line_buffer)) {
+        app->blackout_line_length = 0;
+        return;
+    }
+    app->blackout_line_buffer[app->blackout_line_length++] = ch;
+}
+
 static void simple_app_reset_sniffer_status(SimpleApp* app) {
     if(!app) return;
     app->sniffer_running = false;
@@ -2284,6 +2835,32 @@ static void simple_app_sniffer_trim(char* text) {
     text[len] = '\0';
 }
 
+static bool simple_app_sniffer_extract_mac_token(const char* line, char* out_mac, size_t out_mac_size) {
+    if(!line || !out_mac || out_mac_size == 0) return false;
+
+    char buf[64];
+    strncpy(buf, line, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    simple_app_sniffer_trim(buf);
+
+    const char* start = buf;
+    while(*start != '\0' && !isxdigit((unsigned char)*start)) start++;
+    if(*start == '\0') return false;
+
+    const char* end = start;
+    while(*end != '\0' && !isspace((unsigned char)*end) && *end != ',' && *end != ')' && *end != '(') {
+        end++;
+    }
+
+    size_t len = (size_t)(end - start);
+    if(len == 0) return false;
+    if(len >= out_mac_size) len = out_mac_size - 1;
+    memcpy(out_mac, start, len);
+    out_mac[len] = '\0';
+    simple_app_sniffer_trim(out_mac);
+    return out_mac[0] != '\0';
+}
+
 static bool simple_app_sniffer_parse_header(
     SimpleApp* app,
     const char* line,
@@ -2308,14 +2885,18 @@ static bool simple_app_sniffer_parse_header(
 
     const char* comma = strchr(line, ',');
     size_t ssid_len = 0;
+    const char* ssid_end = NULL;
     if(comma && comma < ch_ptr) {
-        ssid_len = (size_t)(comma - line);
-        if(ssid_len >= sizeof(out_entry->ssid)) {
-            ssid_len = sizeof(out_entry->ssid) - 1;
+        ssid_end = comma;
+    } else {
+        ssid_end = ch_ptr;
+        while(ssid_end > line && isspace((unsigned char)*(ssid_end - 1))) {
+            ssid_end--;
         }
-        memcpy(out_entry->ssid, line, ssid_len);
-    } else if(line[0] != '\0' && line[0] != '>') {
-        ssid_len = strlen(line);
+    }
+
+    if(ssid_end && ssid_end > line) {
+        ssid_len = (size_t)(ssid_end - line);
         if(ssid_len >= sizeof(out_entry->ssid)) {
             ssid_len = sizeof(out_entry->ssid) - 1;
         }
@@ -2384,10 +2965,11 @@ static void simple_app_process_sniffer_line(SimpleApp* app, const char* line) {
 
         if(simple_app_sniffer_is_mac(line) && app->sniffer_ap_count > 0) {
             if(app->sniffer_client_count < SNIFFER_MAX_CLIENTS) {
-                SnifferClientEntry* client = &app->sniffer_clients[app->sniffer_client_count++];
-                strncpy(client->mac, line, sizeof(client->mac) - 1);
-                client->mac[sizeof(client->mac) - 1] = '\0';
-                simple_app_sniffer_trim(client->mac);
+                SnifferClientEntry* client = &app->sniffer_clients[app->sniffer_client_count];
+                if(!simple_app_sniffer_extract_mac_token(line, client->mac, sizeof(client->mac))) {
+                    return;
+                }
+                app->sniffer_client_count++;
                 SnifferApEntry* last_ap = &app->sniffer_aps[app->sniffer_ap_count - 1];
                 if(last_ap->client_count < UINT16_MAX) {
                     last_ap->client_count++;
@@ -3017,7 +3599,7 @@ static void simple_app_bt_locator_add(SimpleApp* app, const char* mac, int rssi,
                 char mac[18];
                 int rssi;
                 bool has_rssi;
-                char name[32];
+                char name[BT_LOCATOR_NAME_MAX_LEN];
             } tmp = {0};
             memcpy(tmp.mac, app->bt_locator_devices[i].mac, sizeof(tmp.mac));
             tmp.rssi = app->bt_locator_devices[i].rssi;
@@ -3201,28 +3783,6 @@ static void simple_app_bt_locator_begin_scan(SimpleApp* app) {
     app->bt_locator_mode = false;
 }
 
-static void simple_app_force_otg_for_wardrive(SimpleApp* app) {
-    if(!app) return;
-    if(!app->wardrive_otg_forced) {
-        app->wardrive_otg_forced = true;
-        app->wardrive_otg_previous_state = app->otg_power_enabled;
-    }
-    if(!app->otg_power_enabled) {
-        app->otg_power_enabled = true;
-    }
-    simple_app_apply_otg_power(app);
-}
-
-static void simple_app_restore_otg_after_wardrive(SimpleApp* app) {
-    if(!app || !app->wardrive_otg_forced) return;
-    app->wardrive_otg_forced = false;
-    bool desired_state = app->wardrive_otg_previous_state;
-    if(app->otg_power_enabled != desired_state) {
-        app->otg_power_enabled = desired_state;
-    }
-    simple_app_apply_otg_power(app);
-}
-
 static void simple_app_update_otg_label(SimpleApp* app) {
     if(!app) return;
     snprintf(
@@ -3235,23 +3795,9 @@ static void simple_app_update_otg_label(SimpleApp* app) {
 static void simple_app_apply_otg_power(SimpleApp* app) {
     if(!app) return;
     bool currently_enabled = furi_hal_power_is_otg_enabled();
-    if(app->otg_power_enabled) {
-        if(!currently_enabled) {
-            bool enabled = furi_hal_power_enable_otg();
-            currently_enabled = furi_hal_power_is_otg_enabled();
-            if(!enabled && !currently_enabled) {
-                float usb_voltage = furi_hal_power_get_usb_voltage();
-                app->otg_power_enabled = false;
-                simple_app_update_otg_label(app);
-                if(usb_voltage < 1.0f) {
-                    simple_app_show_status_message(app, "5V enable failed", 2000, false);
-                }
-                return;
-            }
-        } else {
-            app->otg_power_enabled = true;
-        }
-    } else if(currently_enabled) {
+    if(app->otg_power_enabled && !currently_enabled) {
+        furi_hal_power_enable_otg();
+    } else if(!app->otg_power_enabled && currently_enabled) {
         furi_hal_power_disable_otg();
     }
     simple_app_update_otg_label(app);
@@ -3262,6 +3808,222 @@ static void simple_app_toggle_otg_power(SimpleApp* app) {
     app->otg_power_enabled = !app->otg_power_enabled;
     simple_app_apply_otg_power(app);
     simple_app_mark_config_dirty(app);
+}
+
+static void simple_app_send_download(SimpleApp* app) {
+    if(!app) return;
+    simple_app_send_command_quiet(app, "download");
+    simple_app_show_status_message(app, "Download sent", 2000, true);
+}
+
+static bool simple_app_usb_profile_ok(void) {
+    const FuriHalUsbInterface* current = furi_hal_usb_get_config();
+    if(!current) return true;
+    return current == &usb_cdc_single;
+}
+
+static bool simple_app_sd_ok(void) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return true;
+    bool ok = (storage_sd_status(storage) == FSE_OK);
+    furi_record_close(RECORD_STORAGE);
+    return ok;
+}
+
+static void simple_app_show_sd_busy(void) {
+    DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
+    if(dialogs) {
+        DialogMessage* msg = dialog_message_alloc();
+        if(msg) {
+            dialog_message_set_header(msg, "SD busy", 64, 8, AlignCenter, AlignTop);
+            dialog_message_set_text(
+                msg,
+                "Close qFlipper/FileMgr\nor disable USB storage,\nthen relaunch.",
+                64,
+                32,
+                AlignCenter,
+                AlignCenter);
+            dialog_message_show(dialogs, msg);
+            dialog_message_free(msg);
+        }
+        furi_record_close(RECORD_DIALOGS);
+    }
+}
+
+static bool simple_app_scan_alloc_buffers(SimpleApp* app) {
+    if(!app) return false;
+    if(app->scan_results && app->scan_selected_numbers && app->visible_result_indices) {
+        return true;
+    }
+
+    simple_app_scan_free_buffers(app);
+
+    app->scan_results = calloc(MAX_SCAN_RESULTS, sizeof(ScanResult));
+    app->scan_selected_numbers = calloc(MAX_SCAN_RESULTS, sizeof(uint16_t));
+    app->visible_result_indices = calloc(MAX_SCAN_RESULTS, sizeof(uint16_t));
+
+    if(!app->scan_results || !app->scan_selected_numbers || !app->visible_result_indices) {
+        simple_app_scan_free_buffers(app);
+        return false;
+    }
+    return true;
+}
+
+static void simple_app_scan_free_buffers(SimpleApp* app) {
+    if(!app) return;
+    if(app->scan_results) {
+        free(app->scan_results);
+        app->scan_results = NULL;
+    }
+    if(app->scan_selected_numbers) {
+        free(app->scan_selected_numbers);
+        app->scan_selected_numbers = NULL;
+    }
+    if(app->visible_result_indices) {
+        free(app->visible_result_indices);
+        app->visible_result_indices = NULL;
+    }
+}
+
+static bool simple_app_portal_alloc_ssid_entries(SimpleApp* app) {
+    if(!app) return false;
+    if(app->portal_ssid_entries) return true;
+    app->portal_ssid_entries = calloc(PORTAL_MAX_SSID_PRESETS, sizeof(PortalSsidEntry));
+    return app->portal_ssid_entries != NULL;
+}
+
+static void simple_app_portal_free_ssid_entries(SimpleApp* app) {
+    if(!app) return;
+    if(app->portal_ssid_entries) {
+        free(app->portal_ssid_entries);
+        app->portal_ssid_entries = NULL;
+    }
+}
+
+static bool simple_app_sd_alloc_files(SimpleApp* app) {
+    if(!app) return false;
+    if(app->sd_files) return true;
+    app->sd_files = calloc(SD_MANAGER_MAX_FILES, sizeof(SdFileEntry));
+    return app->sd_files != NULL;
+}
+
+static void simple_app_sd_free_files(SimpleApp* app) {
+    if(!app) return;
+    if(app->sd_files) {
+        free(app->sd_files);
+        app->sd_files = NULL;
+    }
+}
+
+static bool simple_app_evil_twin_alloc_html_entries(SimpleApp* app) {
+    if(!app) return false;
+    if(app->evil_twin_html_entries) return true;
+    app->evil_twin_html_entries = calloc(EVIL_TWIN_MAX_HTML_FILES, sizeof(EvilTwinHtmlEntry));
+    return app->evil_twin_html_entries != NULL;
+}
+
+static void simple_app_evil_twin_free_html_entries(SimpleApp* app) {
+    if(!app) return;
+    if(app->evil_twin_html_entries) {
+        free(app->evil_twin_html_entries);
+        app->evil_twin_html_entries = NULL;
+    }
+}
+
+static bool simple_app_karma_alloc_probes(SimpleApp* app) {
+    if(!app) return false;
+    if(app->karma_probes) return true;
+    app->karma_probes = calloc(KARMA_MAX_PROBES, sizeof(KarmaProbeEntry));
+    return app->karma_probes != NULL;
+}
+
+static void simple_app_karma_free_probes(SimpleApp* app) {
+    if(!app) return;
+    if(app->karma_probes) {
+        free(app->karma_probes);
+        app->karma_probes = NULL;
+    }
+}
+
+static bool simple_app_karma_alloc_html_entries(SimpleApp* app) {
+    if(!app) return false;
+    if(app->karma_html_entries) return true;
+    app->karma_html_entries = calloc(KARMA_MAX_HTML_FILES, sizeof(KarmaHtmlEntry));
+    return app->karma_html_entries != NULL;
+}
+
+static void simple_app_karma_free_html_entries(SimpleApp* app) {
+    if(!app) return;
+    if(app->karma_html_entries) {
+        free(app->karma_html_entries);
+        app->karma_html_entries = NULL;
+    }
+}
+
+static void simple_app_show_low_memory(size_t free_heap, size_t needed) {
+    DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
+    if(dialogs) {
+        DialogMessage* msg = dialog_message_alloc();
+        if(msg) {
+            dialog_message_set_header(msg, "Low memory", 64, 8, AlignCenter, AlignTop);
+            char text[96];
+            snprintf(
+                text,
+                sizeof(text),
+                "Free: %lu B\nNeed: %lu B\nClose qFlipper/USB\nand relaunch.",
+                (unsigned long)free_heap,
+                (unsigned long)needed);
+            dialog_message_set_text(msg, text, 64, 32, AlignCenter, AlignCenter);
+            dialog_message_show(dialogs, msg);
+            dialog_message_free(msg);
+        }
+        furi_record_close(RECORD_DIALOGS);
+    }
+}
+
+static void simple_app_show_usb_blocker(void) {
+    DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
+    if(dialogs) {
+        DialogMessage* msg = dialog_message_alloc();
+        if(msg) {
+            dialog_message_set_header(msg, "USB busy", 64, 8, AlignCenter, AlignTop);
+            dialog_message_set_text(
+                msg,
+                "Switch USB to CDC/Serial\nthen relaunch.",
+                64,
+                32,
+                AlignCenter,
+                AlignCenter);
+            dialog_message_show(dialogs, msg);
+            dialog_message_free(msg);
+        }
+        furi_record_close(RECORD_DIALOGS);
+    }
+}
+
+static void simple_app_usb_runtime_guard(SimpleApp* app) {
+    if(!app) return;
+    uint32_t now = furi_get_tick();
+    if(app->usb_guard_last_tick != 0) {
+        uint32_t interval = furi_ms_to_ticks(USB_RUNTIME_GUARD_INTERVAL_MS);
+        if(interval == 0) interval = 1;
+        if((now - app->usb_guard_last_tick) < interval) {
+            return;
+        }
+    }
+    app->usb_guard_last_tick = now;
+
+    if(!simple_app_usb_profile_ok()) {
+        simple_app_show_usb_blocker();
+        app->exit_app = true;
+        return;
+    }
+
+    if(!simple_app_sd_ok()) {
+        simple_app_show_sd_busy();
+        app->exit_app = true;
+        return;
+    }
 }
 
 static void simple_app_update_result_layout(SimpleApp* app) {
@@ -3349,6 +4111,11 @@ static size_t simple_app_build_result_lines(
     if(char_limit == 0) char_limit = RESULT_DEFAULT_CHAR_LIMIT;
     if(char_limit >= 63) char_limit = 63;
 
+    char ssid_ascii[SCAN_SSID_MAX_LEN];
+    simple_app_utf8_to_ascii_pl(result->ssid, ssid_ascii, sizeof(ssid_ascii));
+    char vendor_ascii[SCAN_VENDOR_MAX_LEN];
+    simple_app_utf8_to_ascii_pl(result->vendor, vendor_ascii, sizeof(vendor_ascii));
+
     bool store_lines = (lines != NULL);
     if(max_lines > RESULT_DEFAULT_MAX_LINES) {
         max_lines = RESULT_DEFAULT_MAX_LINES;
@@ -3386,9 +4153,9 @@ static size_t simple_app_build_result_lines(
             size_t remaining = sizeof(first_line) - len - 1;
             if(remaining > 0) {
                 first_line[len++] = ' ';
-                size_t ssid_len = strlen(result->ssid);
+                size_t ssid_len = strlen(ssid_ascii);
                 if(ssid_len > remaining) ssid_len = remaining;
-                memcpy(first_line + len, result->ssid, ssid_len);
+                memcpy(first_line + len, ssid_ascii, ssid_len);
                 len += ssid_len;
                 first_line[len] = '\0';
             }
@@ -3398,12 +4165,12 @@ static size_t simple_app_build_result_lines(
             if(len_after_ssid < sizeof(first_line) - 1) {
                 size_t remaining = sizeof(first_line) - len_after_ssid - 1;
                 if(remaining > 3) {
-                    size_t vendor_len = strlen(result->vendor);
+                    size_t vendor_len = strlen(vendor_ascii);
                     if(vendor_len > remaining - 1) vendor_len = remaining - 1;
                     if(vendor_len > 0) {
                         first_line[len_after_ssid++] = ' ';
                         first_line[len_after_ssid++] = '(';
-                        memcpy(first_line + len_after_ssid, result->vendor, vendor_len);
+                        memcpy(first_line + len_after_ssid, vendor_ascii, vendor_len);
                         len_after_ssid += vendor_len;
                         if(len_after_ssid < sizeof(first_line) - 1) {
                             first_line[len_after_ssid++] = ')';
@@ -3477,9 +4244,9 @@ static size_t simple_app_build_result_lines(
         vendor_line[len++] = ' ';
         if(len < sizeof(vendor_line) - 1) {
             size_t remaining = sizeof(vendor_line) - len - 1;
-            size_t vendor_len = strlen(result->vendor);
+            size_t vendor_len = strlen(vendor_ascii);
             if(vendor_len > remaining) vendor_len = remaining;
-            memcpy(vendor_line + len, result->vendor, vendor_len);
+            memcpy(vendor_line + len, vendor_ascii, vendor_len);
             len += vendor_len;
             vendor_line[len] = '\0';
         } else {
@@ -3606,6 +4373,23 @@ static void simple_app_mark_config_dirty(SimpleApp* app) {
     app->config_dirty = true;
 }
 
+static bool __attribute__((unused)) simple_app_wait_for_sd(Storage* storage, uint32_t timeout_ms) {
+    if(!storage) return false;
+    uint32_t start = furi_get_tick();
+    while(true) {
+        if(storage_sd_status(storage) == FSE_OK) {
+            return true;
+        }
+        if(timeout_ms > 0) {
+            uint32_t elapsed = furi_get_tick() - start;
+            if(elapsed >= furi_ms_to_ticks(timeout_ms)) {
+                return false;
+            }
+        }
+        furi_delay_ms(50);
+    }
+}
+
 static bool simple_app_parse_bool_value(const char* value, bool current) {
     if(!value) return current;
     size_t len = strlen(value);
@@ -3717,11 +4501,10 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
     if(!app) return false;
     Storage* storage = furi_record_open(RECORD_STORAGE);
     if(!storage) return false;
-    storage_simply_mkdir(storage, EXT_PATH("apps_assets"));
-    storage_simply_mkdir(storage, EXT_PATH(LAB_C5_CONFIG_DIR_PATH));
+    storage_simply_mkdir(storage, LAB_C5_CONFIG_DIR_PATH);
     File* file = storage_file_alloc(storage);
     bool success = false;
-    if(storage_file_open(file, EXT_PATH(LAB_C5_CONFIG_FILE_PATH), FSAM_READ_WRITE, FSOM_CREATE_ALWAYS)) {
+    if(storage_file_open(file, LAB_C5_CONFIG_FILE_PATH, FSAM_READ_WRITE, FSOM_CREATE_ALWAYS)) {
         char buffer[512];
         uint8_t short_idx = (app->boot_short_command_index < BOOT_COMMAND_OPTION_COUNT)
                                 ? app->boot_short_command_index
@@ -3797,11 +4580,10 @@ static void simple_app_load_config(SimpleApp* app) {
     if(!app) return;
     Storage* storage = furi_record_open(RECORD_STORAGE);
     if(!storage) return;
-    storage_simply_mkdir(storage, EXT_PATH("apps_assets"));
-    storage_simply_mkdir(storage, EXT_PATH(LAB_C5_CONFIG_DIR_PATH));
+    storage_simply_mkdir(storage, LAB_C5_CONFIG_DIR_PATH);
     File* file = storage_file_alloc(storage);
     bool loaded = false;
-    if(storage_file_open(file, EXT_PATH(LAB_C5_CONFIG_FILE_PATH), FSAM_READ, FSOM_OPEN_EXISTING)) {
+    if(storage_file_open(file, LAB_C5_CONFIG_FILE_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
         char line[96];
         size_t pos = 0;
         uint8_t ch = 0;
@@ -3975,8 +4757,26 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
         return;
     }
 
+    if(strncmp(cursor, "No scan", 7) == 0 ||
+       strncmp(cursor, "No networks found", 17) == 0 ||
+       strncmp(cursor, "Scan still in progress", 22) == 0) {
+        app->scan_results_loading = false;
+        app->scanner_scan_running = false;
+        app->scanner_rescan_hint = false;
+        if(app->screen == ScreenResults) {
+            if(strncmp(cursor, "Scan still in progress", 22) == 0) {
+                simple_app_show_status_message(app, "Scan running\nTry again soon", 1500, true);
+            } else {
+                simple_app_show_status_message(app, "No scan results\nRun Scanner first", 1500, true);
+            }
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
     if(cursor[0] != '"') return;
     if(app->scan_result_count >= MAX_SCAN_RESULTS) return;
+    if(!app->scan_results) return;
 
     char fields[8][SCAN_FIELD_BUFFER_LEN];
     for(size_t i = 0; i < 8; i++) {
@@ -4068,6 +4868,15 @@ static void simple_app_reset_result_scroll(SimpleApp* app) {
     app->result_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
     app->result_scroll_last_tick = furi_get_tick();
     app->result_scroll_text[0] = '\0';
+}
+
+static void simple_app_reset_overlay_title_scroll(SimpleApp* app) {
+    if(!app) return;
+    app->overlay_title_scroll_offset = 0;
+    app->overlay_title_scroll_direction = 1;
+    app->overlay_title_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+    app->overlay_title_scroll_last_tick = furi_get_tick();
+    app->overlay_title_scroll_text[0] = '\0';
 }
 
 static void simple_app_reset_sd_scroll(SimpleApp* app) {
@@ -4194,6 +5003,174 @@ static void simple_app_update_result_scroll(SimpleApp* app) {
         } else {
             app->result_scroll_direction = 1;
             app->result_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        }
+    }
+
+    if(changed && app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_update_overlay_title_scroll(SimpleApp* app) {
+    if(!app) return;
+
+    bool overlay_active = (app->sniffer_results_active && !app->sniffer_full_console) ||
+                          (app->probe_results_active && !app->probe_full_console) ||
+                          (app->evil_twin_running && !app->evil_twin_full_console) ||
+                          (app->portal_running && !app->portal_full_console);
+
+    if(!overlay_active) {
+        if(app->overlay_title_scroll_text[0] != '\0' || app->overlay_title_scroll_offset != 0) {
+            simple_app_reset_overlay_title_scroll(app);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    char desired_title[64];
+    desired_title[0] = '\0';
+
+    if(app->sniffer_results_active && !app->sniffer_full_console) {
+        if(app->sniffer_ap_count == 0) {
+            if(app->overlay_title_scroll_text[0] != '\0' || app->overlay_title_scroll_offset != 0) {
+                simple_app_reset_overlay_title_scroll(app);
+                if(app->viewport) {
+                    view_port_update(app->viewport);
+                }
+            }
+            return;
+        }
+
+        size_t ap_index = app->sniffer_results_ap_index;
+        if(ap_index >= app->sniffer_ap_count) {
+            ap_index = app->sniffer_ap_count - 1;
+        }
+        const SnifferApEntry* ap = &app->sniffer_aps[ap_index];
+        const char* ssid = ap->ssid[0] ? ap->ssid : "<hidden>";
+        snprintf(desired_title, sizeof(desired_title), "%s", ssid);
+    } else if(app->probe_results_active && !app->probe_full_console) {
+        if(app->probe_ssid_count == 0) {
+            if(app->overlay_title_scroll_text[0] != '\0' || app->overlay_title_scroll_offset != 0) {
+                simple_app_reset_overlay_title_scroll(app);
+                if(app->viewport) {
+                    view_port_update(app->viewport);
+                }
+            }
+            return;
+        }
+
+        size_t ssid_index = app->probe_ssid_index;
+        if(ssid_index >= app->probe_ssid_count) {
+            ssid_index = app->probe_ssid_count - 1;
+        }
+        const ProbeSsidEntry* ssid = &app->probe_ssids[ssid_index];
+        const char* ssid_text = ssid->ssid[0] ? ssid->ssid : "<hidden>";
+        snprintf(desired_title, sizeof(desired_title), "%s", ssid_text);
+    } else if(app->evil_twin_running && !app->evil_twin_full_console) {
+        const char* ssid = app->evil_twin_status_ssid;
+        if(!ssid || ssid[0] == '\0') {
+            char selected_ssid[SCAN_SSID_MAX_LEN];
+            if(simple_app_get_first_selected_ssid(app, selected_ssid, sizeof(selected_ssid))) {
+                strncpy(desired_title, selected_ssid, sizeof(desired_title) - 1);
+                desired_title[sizeof(desired_title) - 1] = '\0';
+            } else {
+                snprintf(desired_title, sizeof(desired_title), "--");
+            }
+        } else {
+            snprintf(desired_title, sizeof(desired_title), "%s", ssid);
+        }
+    } else if(app->portal_running && !app->portal_full_console) {
+        const char* ssid = app->portal_status_ssid[0] != '\0' ? app->portal_status_ssid : app->portal_ssid;
+        if(!ssid || ssid[0] == '\0') {
+            snprintf(desired_title, sizeof(desired_title), "--");
+        } else {
+            snprintf(desired_title, sizeof(desired_title), "%s", ssid);
+        }
+    } else {
+        if(app->overlay_title_scroll_text[0] != '\0' || app->overlay_title_scroll_offset != 0) {
+            simple_app_reset_overlay_title_scroll(app);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    char desired_ascii[sizeof(desired_title)];
+    simple_app_utf8_to_ascii_pl(desired_title, desired_ascii, sizeof(desired_ascii));
+    strncpy(desired_title, desired_ascii, sizeof(desired_title) - 1);
+    desired_title[sizeof(desired_title) - 1] = '\0';
+
+    if(strncmp(desired_title, app->overlay_title_scroll_text, sizeof(app->overlay_title_scroll_text)) != 0) {
+        strncpy(app->overlay_title_scroll_text, desired_title, sizeof(app->overlay_title_scroll_text) - 1);
+        app->overlay_title_scroll_text[sizeof(app->overlay_title_scroll_text) - 1] = '\0';
+        app->overlay_title_scroll_offset = 0;
+        app->overlay_title_scroll_direction = 1;
+        app->overlay_title_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        app->overlay_title_scroll_last_tick = furi_get_tick();
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    size_t char_limit = OVERLAY_TITLE_CHAR_LIMIT;
+    if(char_limit >= sizeof(app->overlay_title_scroll_text)) {
+        char_limit = sizeof(app->overlay_title_scroll_text) - 1;
+    }
+    if(char_limit == 0) char_limit = 1;
+
+    size_t line_length = strlen(app->overlay_title_scroll_text);
+    if(line_length <= char_limit) {
+        if(app->overlay_title_scroll_offset != 0) {
+            app->overlay_title_scroll_offset = 0;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+        }
+        return;
+    }
+
+    size_t max_offset = line_length - char_limit;
+    uint32_t now = furi_get_tick();
+    uint32_t interval_ticks = furi_ms_to_ticks(RESULT_SCROLL_INTERVAL_MS);
+    if(interval_ticks == 0) interval_ticks = 1;
+    if((now - app->overlay_title_scroll_last_tick) < interval_ticks) {
+        return;
+    }
+    app->overlay_title_scroll_last_tick = now;
+
+    if(app->overlay_title_scroll_hold > 0) {
+        app->overlay_title_scroll_hold--;
+        return;
+    }
+
+    bool changed = false;
+    if(app->overlay_title_scroll_direction > 0) {
+        if(app->overlay_title_scroll_offset < max_offset) {
+            app->overlay_title_scroll_offset++;
+            changed = true;
+            if(app->overlay_title_scroll_offset >= max_offset) {
+                app->overlay_title_scroll_direction = -1;
+                app->overlay_title_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+            }
+        } else {
+            app->overlay_title_scroll_direction = -1;
+            app->overlay_title_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+        }
+    } else {
+        if(app->overlay_title_scroll_offset > 0) {
+            app->overlay_title_scroll_offset--;
+            changed = true;
+            if(app->overlay_title_scroll_offset == 0) {
+                app->overlay_title_scroll_direction = 1;
+                app->overlay_title_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
+            }
+        } else {
+            app->overlay_title_scroll_direction = 1;
+            app->overlay_title_scroll_hold = RESULT_SCROLL_EDGE_PAUSE_STEPS;
         }
     }
 
@@ -4541,6 +5518,9 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_package_monitor_feed(app, ch);
         simple_app_channel_view_feed(app, ch);
         simple_app_portal_ssid_feed(app, ch);
+        simple_app_portal_status_feed(app, ch);
+        simple_app_evil_twin_status_feed(app, ch);
+        simple_app_passwords_feed(app, ch);
         simple_app_sd_feed(app, ch);
         simple_app_evil_twin_feed(app, ch);
         simple_app_karma_probe_feed(app, ch);
@@ -4550,6 +5530,12 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_vendor_feed(app, ch);
         simple_app_scanner_timing_feed(app, ch);
         simple_app_deauth_guard_feed(app, ch);
+        if(app->blackout_view_active) {
+            simple_app_blackout_feed(app, ch);
+        }
+        if(app->sniffer_dog_view_active) {
+            simple_app_sniffer_dog_feed(app, ch);
+        }
         simple_app_bt_scan_feed(app, ch);
         simple_app_bt_locator_feed(app, ch);
         simple_app_wardrive_feed(app, ch);
@@ -4571,6 +5557,40 @@ static bool simple_app_is_start_sniffer_command(const char* command) {
     if(!command) return false;
     const char* cursor = command;
     const char* needle = "start_sniffer";
+    size_t needle_len = strlen(needle);
+    while(true) {
+        const char* found = strstr(cursor, needle);
+        if(!found) return false;
+        char before = (found == command) ? ' ' : *(found - 1);
+        char after = *(found + needle_len);
+        bool before_ok = (before == ' ' || before == '\n' || before == '\t');
+        bool after_ok = (after == '\0' || after == ' ' || after == '\n' || after == '\t');
+        if(before_ok && after_ok) return true;
+        cursor = found + needle_len;
+    }
+}
+
+static bool simple_app_is_start_blackout_command(const char* command) {
+    if(!command) return false;
+    const char* cursor = command;
+    const char* needle = "start_blackout";
+    size_t needle_len = strlen(needle);
+    while(true) {
+        const char* found = strstr(cursor, needle);
+        if(!found) return false;
+        char before = (found == command) ? ' ' : *(found - 1);
+        char after = *(found + needle_len);
+        bool before_ok = (before == ' ' || before == '\n' || before == '\t');
+        bool after_ok = (after == '\0' || after == ' ' || after == '\n' || after == '\t');
+        if(before_ok && after_ok) return true;
+        cursor = found + needle_len;
+    }
+}
+
+static bool simple_app_is_start_sniffer_dog_command(const char* command) {
+    if(!command) return false;
+    const char* cursor = command;
+    const char* needle = "start_sniffer_dog";
     size_t needle_len = strlen(needle);
     while(true) {
         const char* found = strstr(cursor, needle);
@@ -4628,7 +5648,11 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
 
     bool is_wardrive_command = strstr(command, "start_wardrive") != NULL;
     bool is_stop_command = strcmp(command, "stop") == 0;
+    bool is_start_evil_twin = strstr(command, "start_evil_twin") != NULL;
+    bool is_start_portal = strstr(command, "start_portal") != NULL;
     bool is_start_sniffer = simple_app_is_start_sniffer_command(command);
+    bool is_start_sniffer_dog = simple_app_is_start_sniffer_dog_command(command);
+    bool is_start_blackout = simple_app_is_start_blackout_command(command);
     bool is_sniffer_results_command = strstr(command, "show_sniffer_results") != NULL;
     bool is_probe_results_command = strstr(command, "show_probes") != NULL;
     bool is_airtag_scan_command = strstr(command, "scan_airtag") != NULL;
@@ -4636,6 +5660,15 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     bool is_wifi_scan_command = strstr(command, SCANNER_SCAN_COMMAND) != NULL;
     bool is_deauth_guard_command = strstr(command, "deauth_detector") != NULL;
     if(is_wifi_scan_command) {
+        if(!simple_app_scan_alloc_buffers(app)) {
+            app->scan_results_loading = false;
+            app->scanner_view_active = false;
+            app->scanner_full_console = false;
+            app->scanner_scan_running = false;
+            simple_app_show_status_message(app, "OOM: scan buffers", 2000, true);
+            if(app->viewport) view_port_update(app->viewport);
+            return;
+        }
         simple_app_reset_scan_results(app);
         app->scan_results_loading = true;
         app->scanner_view_active = true;
@@ -4650,7 +5683,6 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     if(is_wardrive_command) {
         app->wardrive_view_active = true;
         simple_app_reset_wardrive_status(app);
-        simple_app_force_otg_for_wardrive(app);
     } else if(app->wardrive_view_active) {
         app->wardrive_view_active = false;
         simple_app_reset_wardrive_status(app);
@@ -4686,9 +5718,6 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
         simple_app_start_deauth_guard(app);
     } else if(is_stop_command || app->deauth_guard_view_active) {
         simple_app_reset_deauth_guard(app);
-    }
-    if(is_stop_command) {
-        simple_app_restore_otg_after_wardrive(app);
     }
     if(is_start_sniffer) {
         simple_app_reset_sniffer_status(app);
@@ -4731,8 +5760,53 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     }
 
     app->serial_targets_hint = false;
-    if(strcmp(command, "start_blackout") != 0) {
+    if(is_start_blackout) {
+        app->blackout_view_active = true;
+        app->blackout_full_console = false;
+        simple_app_reset_blackout_status(app);
+        if(app->blackout_cycle == 0) app->blackout_cycle = 1;
+        simple_app_blackout_set_phase(app, BlackoutPhaseStarting, "");
+    } else if(is_stop_command) {
         app->blackout_view_active = false;
+        simple_app_reset_blackout_status(app);
+    } else {
+        app->blackout_view_active = false;
+        simple_app_reset_blackout_status(app);
+    }
+    if(is_start_sniffer_dog) {
+        app->sniffer_dog_view_active = true;
+        app->sniffer_dog_full_console = false;
+        simple_app_reset_sniffer_dog_status(app);
+        simple_app_sniffer_dog_set_phase(app, SnifferDogPhaseStarting, "");
+    } else if(is_stop_command) {
+        app->sniffer_dog_view_active = false;
+        simple_app_reset_sniffer_dog_status(app);
+    } else {
+        app->sniffer_dog_view_active = false;
+        simple_app_reset_sniffer_dog_status(app);
+    }
+    if(is_start_portal) {
+        app->portal_running = true;
+        app->portal_full_console = false;
+        simple_app_reset_portal_status(app);
+    } else if(is_stop_command || go_to_serial) {
+        app->portal_running = false;
+        app->portal_full_console = false;
+    }
+    if(is_start_evil_twin) {
+        app->evil_twin_running = true;
+        app->evil_twin_full_console = false;
+        simple_app_reset_evil_twin_status(app);
+        strncpy(app->evil_twin_status_note, "Starting", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        char ssid_hint[SCAN_SSID_MAX_LEN];
+        if(simple_app_get_first_selected_ssid(app, ssid_hint, sizeof(ssid_hint))) {
+            strncpy(app->evil_twin_status_ssid, ssid_hint, sizeof(app->evil_twin_status_ssid) - 1);
+            app->evil_twin_status_ssid[sizeof(app->evil_twin_status_ssid) - 1] = '\0';
+        }
+    } else if(is_stop_command || go_to_serial) {
+        app->evil_twin_running = false;
+        app->evil_twin_full_console = false;
     }
 
     char cmd[160];
@@ -4846,6 +5920,9 @@ static void simple_app_send_stop_if_needed(SimpleApp* app) {
     simple_app_send_command(app, "stop", false);
     app->last_command_sent = false;
     app->blackout_view_active = false;
+    simple_app_reset_blackout_status(app);
+    app->sniffer_dog_view_active = false;
+    simple_app_reset_sniffer_dog_status(app);
     app->bt_scan_running = false;
     app->scanner_scan_running = false;
     app->bt_scan_show_list = false;
@@ -4855,6 +5932,20 @@ static void simple_app_send_stop_if_needed(SimpleApp* app) {
     simple_app_reset_sniffer_status(app);
     simple_app_reset_sniffer_results(app);
     simple_app_reset_probe_results(app);
+}
+
+static void simple_app_send_stop_preserve_results(SimpleApp* app) {
+    if(!app) return;
+    simple_app_send_command_quiet(app, "stop");
+    app->last_command_sent = false;
+    app->sniffer_running = false;
+    app->sniffer_view_active = false;
+    app->blackout_view_active = false;
+    simple_app_reset_blackout_status(app);
+    app->sniffer_dog_view_active = false;
+    simple_app_reset_sniffer_dog_status(app);
+    app->bt_scan_running = false;
+    app->scanner_scan_running = false;
 }
 
 static void simple_app_prepare_exit(SimpleApp* app) {
@@ -4868,6 +5959,7 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     simple_app_reset_karma_probe_listing(app);
     simple_app_reset_karma_html_listing(app);
     simple_app_reset_scan_results(app);
+    simple_app_scan_free_buffers(app);
     simple_app_reset_deauth_guard(app);
     simple_app_clear_status_message(app);
 
@@ -4880,6 +5972,13 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     app->portal_input_requested = false;
     app->portal_input_active = false;
     app->portal_ssid_popup_active = false;
+    app->portal_running = false;
+    app->portal_full_console = false;
+    simple_app_reset_portal_status(app);
+    simple_app_reset_passwords_listing(app);
+    app->evil_twin_running = false;
+    app->evil_twin_full_console = false;
+    simple_app_reset_evil_twin_status(app);
     app->karma_probe_popup_active = false;
     app->karma_html_popup_active = false;
     app->sd_folder_popup_active = false;
@@ -4896,6 +5995,10 @@ static void simple_app_prepare_exit(SimpleApp* app) {
 
 static void simple_app_request_scan_results(SimpleApp* app, const char* command) {
     if(!app) return;
+    if(!simple_app_scan_alloc_buffers(app)) {
+        simple_app_show_status_message(app, "OOM: scan buffers", 2000, true);
+        return;
+    }
     simple_app_reset_scan_results(app);
     app->scan_results_loading = true;
     app->serial_targets_hint = false;
@@ -5144,6 +6247,9 @@ static void simple_app_handle_confirm_blackout_input(SimpleApp* app, InputKey ke
         if(app->confirm_blackout_yes) {
             app->confirm_blackout_yes = false;
             app->blackout_view_active = true;
+            simple_app_reset_blackout_status(app);
+            if(app->blackout_cycle == 0) app->blackout_cycle = 1;
+            simple_app_blackout_set_phase(app, BlackoutPhaseStarting, "");
             app->serial_targets_hint = false;
             simple_app_send_command(app, "start_blackout", true);
         } else {
@@ -5172,6 +6278,9 @@ static void simple_app_handle_confirm_sniffer_dos_input(SimpleApp* app, InputKey
     if(key == InputKeyOk) {
         if(app->confirm_sniffer_dos_yes) {
             app->confirm_sniffer_dos_yes = false;
+            app->sniffer_dog_view_active = true;
+            simple_app_reset_sniffer_dog_status(app);
+            simple_app_sniffer_dog_set_phase(app, SnifferDogPhaseStarting, "");
             simple_app_send_command(app, "start_sniffer_dog", true);
         } else {
             simple_app_focus_attacks_menu(app);
@@ -6159,7 +7268,7 @@ static void simple_app_draw_portal_menu(SimpleApp* app, Canvas* canvas) {
             simple_app_truncate_text(detail, 26);
             show_detail_line = true;
             break;
-        default:
+        case 2:
             label = "Start Portal";
             if(app->portal_ssid[0] == '\0') {
                 snprintf(detail, sizeof(detail), "Need SSID");
@@ -6169,6 +7278,11 @@ static void simple_app_draw_portal_menu(SimpleApp* app, Canvas* canvas) {
                 detail[0] = '\0';
             }
             simple_app_truncate_text(detail, 20);
+            break;
+        default:
+            label = "Show Passwords";
+            snprintf(detail, sizeof(detail), "portals.txt");
+            show_detail_line = true;
             break;
         }
 
@@ -6229,18 +7343,22 @@ static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key) {
     if(key == InputKeyUp) {
         if(app->portal_menu_index > 0) {
             app->portal_menu_index--;
-            simple_app_portal_sync_offset(app);
-            if(app->viewport) {
-                view_port_update(app->viewport);
-            }
+        } else {
+            app->portal_menu_index = PORTAL_MENU_OPTION_COUNT - 1;
+        }
+        simple_app_portal_sync_offset(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyDown) {
         if(app->portal_menu_index + 1 < PORTAL_MENU_OPTION_COUNT) {
             app->portal_menu_index++;
-            simple_app_portal_sync_offset(app);
-            if(app->viewport) {
-                view_port_update(app->viewport);
-            }
+        } else {
+            app->portal_menu_index = 0;
+        }
+        simple_app_portal_sync_offset(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyOk) {
         if(app->portal_menu_index == 0) {
@@ -6275,14 +7393,22 @@ static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key) {
                     view_port_update(app->viewport);
                 }
             }
-        } else {
+        } else if(app->portal_menu_index == 2) {
             simple_app_start_portal(app);
+        } else {
+            app->passwords_select_return_screen = ScreenPortalMenu;
+            app->passwords_select_index = 0;
+            app->screen = ScreenPasswordsSelect;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
         }
     }
 }
 
 static void simple_app_reset_portal_ssid_listing(SimpleApp* app) {
     if(!app) return;
+    simple_app_portal_free_ssid_entries(app);
     app->portal_ssid_listing_active = false;
     app->portal_ssid_list_header_seen = false;
     app->portal_ssid_list_length = 0;
@@ -6294,7 +7420,7 @@ static void simple_app_reset_portal_ssid_listing(SimpleApp* app) {
 }
 
 static void simple_app_open_portal_ssid_popup(SimpleApp* app) {
-    if(!app || app->portal_ssid_count == 0) return;
+    if(!app || app->portal_ssid_count == 0 || !app->portal_ssid_entries) return;
 
     size_t total_options = app->portal_ssid_count + 1; // +1 for manual entry
     size_t target_index = 0; // manual by default
@@ -6359,6 +7485,7 @@ static void simple_app_finish_portal_ssid_listing(SimpleApp* app) {
 
 static void simple_app_process_portal_ssid_line(SimpleApp* app, const char* line) {
     if(!app || !line || !app->portal_ssid_listing_active) return;
+    if(!app->portal_ssid_entries) return;
 
     const char* cursor = line;
     while(*cursor == ' ' || *cursor == '\t') {
@@ -6457,9 +7584,719 @@ static void simple_app_portal_ssid_feed(SimpleApp* app, char ch) {
     app->portal_ssid_list_buffer[app->portal_ssid_list_length++] = ch;
 }
 
+static void simple_app_reset_portal_status(SimpleApp* app) {
+    if(!app) return;
+    app->portal_status_ssid[0] = '\0';
+    app->portal_client_count = -1;
+    app->portal_password_count = 0;
+    app->portal_last_password[0] = '\0';
+    app->portal_username_count = 0;
+    app->portal_last_username[0] = '\0';
+    app->portal_line_length = 0;
+}
+
+static void simple_app_reset_evil_twin_status(SimpleApp* app) {
+    if(!app) return;
+    app->evil_twin_status_ssid[0] = '\0';
+    app->evil_twin_client_count = -1;
+    app->evil_twin_password_count = 0;
+    app->evil_twin_last_password[0] = '\0';
+    app->evil_twin_status_note[0] = '\0';
+    app->evil_twin_line_length = 0;
+}
+
+static bool simple_app_extract_query_param(
+    const char* query,
+    const char* key,
+    char* out,
+    size_t out_size) {
+    if(!query || !key || !out || out_size == 0) return false;
+
+    size_t key_len = strlen(key);
+    const char* cursor = query;
+    while((cursor = strstr(cursor, key)) != NULL) {
+        bool boundary_ok = (cursor == query) || (*(cursor - 1) == '&');
+        const char* after = cursor + key_len;
+        if(boundary_ok && *after == '=') {
+            after++;
+            size_t written = 0;
+            while(*after != '\0' && *after != '&') {
+                if(written + 1 < out_size) {
+                    char ch = *after;
+                    out[written++] = (ch == '+') ? ' ' : ch;
+                }
+                after++;
+            }
+            out[written] = '\0';
+            simple_app_trim(out);
+            return out[0] != '\0';
+        }
+        cursor += key_len;
+    }
+
+    return false;
+}
+
+static void simple_app_process_portal_status_line(SimpleApp* app, const char* line) {
+    if(!app || !line) return;
+
+    const char* cursor = line;
+    while(*cursor == ' ' || *cursor == '\t' || *cursor == '>') {
+        cursor++;
+    }
+    if(*cursor == '\0') return;
+
+    const char* ssid_marker = "Starting captive portal with SSID:";
+    const char* ap_name_marker = "AP Name:";
+    const char* client_marker = "Portal: Client count";
+    const char* password_marker = "Password:";
+    const char* portal_password_marker = "Portal password received:";
+    const char* post_marker = "Received POST data:";
+
+    const char* ssid_ptr = strstr(cursor, ssid_marker);
+    if(ssid_ptr) {
+        ssid_ptr += strlen(ssid_marker);
+        while(*ssid_ptr == ' ' || *ssid_ptr == '\t') {
+            ssid_ptr++;
+        }
+        if(*ssid_ptr != '\0') {
+            char ascii_ssid[SCAN_SSID_MAX_LEN];
+            simple_app_utf8_to_ascii_pl(ssid_ptr, ascii_ssid, sizeof(ascii_ssid));
+            strncpy(app->portal_status_ssid, ascii_ssid, sizeof(app->portal_status_ssid) - 1);
+            app->portal_status_ssid[sizeof(app->portal_status_ssid) - 1] = '\0';
+            simple_app_trim(app->portal_status_ssid);
+        }
+        return;
+    }
+
+    const char* ap_name_ptr = strstr(cursor, ap_name_marker);
+    if(ap_name_ptr) {
+        ap_name_ptr += strlen(ap_name_marker);
+        while(*ap_name_ptr == ' ' || *ap_name_ptr == '\t') {
+            ap_name_ptr++;
+        }
+        if(*ap_name_ptr != '\0') {
+            char ascii_ssid[SCAN_SSID_MAX_LEN];
+            simple_app_utf8_to_ascii_pl(ap_name_ptr, ascii_ssid, sizeof(ascii_ssid));
+            strncpy(app->portal_status_ssid, ascii_ssid, sizeof(app->portal_status_ssid) - 1);
+            app->portal_status_ssid[sizeof(app->portal_status_ssid) - 1] = '\0';
+            simple_app_trim(app->portal_status_ssid);
+        }
+        return;
+    }
+
+    const char* client_ptr = strstr(cursor, client_marker);
+    if(client_ptr) {
+        const char* eq = strchr(client_ptr, '=');
+        if(eq) {
+            eq++;
+            while(*eq == ' ' || *eq == '\t') {
+                eq++;
+            }
+            char* endptr = NULL;
+            long count = strtol(eq, &endptr, 10);
+            if(endptr && count >= 0) {
+                app->portal_client_count = (int32_t)count;
+            }
+        }
+        return;
+    }
+
+    const char* password_ptr = strstr(cursor, password_marker);
+    const char* portal_password_ptr = strstr(cursor, portal_password_marker);
+    if(password_ptr || portal_password_ptr) {
+        const char* pwd_source = portal_password_ptr ? portal_password_ptr : password_ptr;
+        pwd_source += portal_password_ptr ? strlen(portal_password_marker) : strlen(password_marker);
+        while(*pwd_source == ' ' || *pwd_source == '\t') {
+            pwd_source++;
+        }
+        if(*pwd_source != '\0') {
+            char ascii_pw[PORTAL_PASSWORD_MAX_LEN];
+            simple_app_utf8_to_ascii_pl(pwd_source, ascii_pw, sizeof(ascii_pw));
+            strncpy(
+                app->portal_last_password,
+                ascii_pw,
+                sizeof(app->portal_last_password) - 1);
+            app->portal_last_password[sizeof(app->portal_last_password) - 1] = '\0';
+            simple_app_trim(app->portal_last_password);
+            app->portal_password_count++;
+        }
+        return;
+    }
+
+    const char* post_ptr = strstr(cursor, post_marker);
+    if(post_ptr) {
+        post_ptr += strlen(post_marker);
+        while(*post_ptr == ' ' || *post_ptr == '\t') {
+            post_ptr++;
+        }
+        if(*post_ptr != '\0') {
+            char value[PORTAL_PASSWORD_MAX_LEN];
+            if(simple_app_extract_query_param(post_ptr, "google_user", value, sizeof(value)) ||
+               simple_app_extract_query_param(post_ptr, "username", value, sizeof(value)) ||
+               simple_app_extract_query_param(post_ptr, "user", value, sizeof(value)) ||
+               simple_app_extract_query_param(post_ptr, "login", value, sizeof(value)) ||
+               simple_app_extract_query_param(post_ptr, "email", value, sizeof(value))) {
+                strncpy(
+                    app->portal_last_username,
+                    value,
+                    sizeof(app->portal_last_username) - 1);
+                app->portal_last_username[sizeof(app->portal_last_username) - 1] = '\0';
+                app->portal_username_count++;
+            }
+        }
+        return;
+    }
+}
+
+static void simple_app_process_evil_twin_status_line(SimpleApp* app, const char* line) {
+    if(!app || !line) return;
+
+    const char* cursor = line;
+    while(*cursor == ' ' || *cursor == '\t' || *cursor == '>') {
+        cursor++;
+    }
+    if(*cursor == '\0') return;
+
+    const char* start_marker = "Starting captive portal for Evil Twin attack on:";
+    const char* portal_started_marker = "Captive portal started successfully";
+    const char* deauth_started_marker = "Deauth attack started.";
+    const char* ap_name_marker = "AP Name:";
+    const char* client_marker = "Portal: Client count";
+    const char* short_password_marker = "Password:";
+    const char* portal_password_marker = "Portal password received:";
+    const char* stop_deauth_marker = "Stopping deauth attack to attempt connection";
+    const char* resume_deauth_marker = "Resuming deauth attack - password was incorrect.";
+    const char* resume_ok_marker = "Deauth attack resumed successfully.";
+    const char* attempt_marker = "Attempting to connect to SSID=";
+    const char* attempt_count_marker = "Attempting to connect, connectAttemptCount=";
+    const char* verified_marker = "Password verified!";
+    const char* connected_marker = "Wi-Fi: connected to SSID=";
+    const char* wrong_marker = "Evil twin: connection failed";
+    const char* shutdown_marker = "Evil Twin portal shut down successfully!";
+    const char* saved_marker = "Password saved to eviltwin.txt";
+
+    const char* start_ptr = strstr(cursor, start_marker);
+    if(start_ptr) {
+        start_ptr += strlen(start_marker);
+        while(*start_ptr == ' ' || *start_ptr == '\t') {
+            start_ptr++;
+        }
+        if(*start_ptr != '\0') {
+            char ascii_ssid[SCAN_SSID_MAX_LEN];
+            simple_app_utf8_to_ascii_pl(start_ptr, ascii_ssid, sizeof(ascii_ssid));
+            strncpy(app->evil_twin_status_ssid, ascii_ssid, sizeof(app->evil_twin_status_ssid) - 1);
+            app->evil_twin_status_ssid[sizeof(app->evil_twin_status_ssid) - 1] = '\0';
+            simple_app_trim(app->evil_twin_status_ssid);
+        }
+        strncpy(app->evil_twin_status_note, "Portal", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    const char* ap_name_ptr = strstr(cursor, ap_name_marker);
+    if(ap_name_ptr) {
+        ap_name_ptr += strlen(ap_name_marker);
+        while(*ap_name_ptr == ' ' || *ap_name_ptr == '\t') {
+            ap_name_ptr++;
+        }
+        if(*ap_name_ptr != '\0') {
+            char ascii_ssid[SCAN_SSID_MAX_LEN];
+            simple_app_utf8_to_ascii_pl(ap_name_ptr, ascii_ssid, sizeof(ascii_ssid));
+            strncpy(app->evil_twin_status_ssid, ascii_ssid, sizeof(app->evil_twin_status_ssid) - 1);
+            app->evil_twin_status_ssid[sizeof(app->evil_twin_status_ssid) - 1] = '\0';
+            simple_app_trim(app->evil_twin_status_ssid);
+        }
+        return;
+    }
+
+    if(strstr(cursor, portal_started_marker)) {
+        strncpy(app->evil_twin_status_note, "Portal", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    if(strstr(cursor, deauth_started_marker)) {
+        strncpy(app->evil_twin_status_note, "Deauth", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    const char* client_ptr = strstr(cursor, client_marker);
+    if(client_ptr) {
+        const char* eq = strchr(client_ptr, '=');
+        if(eq) {
+            eq++;
+            while(*eq == ' ' || *eq == '\t') {
+                eq++;
+            }
+            char* endptr = NULL;
+            long count = strtol(eq, &endptr, 10);
+            if(endptr && count >= 0) {
+                app->evil_twin_client_count = (int32_t)count;
+            }
+        }
+        return;
+    }
+
+    const char* short_password_ptr = strstr(cursor, short_password_marker);
+    const char* portal_password_ptr = strstr(cursor, portal_password_marker);
+    if(short_password_ptr || portal_password_ptr) {
+        const char* pwd_source = short_password_ptr ? short_password_ptr : portal_password_ptr;
+        pwd_source += short_password_ptr ? strlen(short_password_marker) : strlen(portal_password_marker);
+        while(*pwd_source == ' ' || *pwd_source == '\t') {
+            pwd_source++;
+        }
+        if(*pwd_source != '\0') {
+            char ascii_pw[PORTAL_PASSWORD_MAX_LEN];
+            simple_app_utf8_to_ascii_pl(pwd_source, ascii_pw, sizeof(ascii_pw));
+            strncpy(
+                app->evil_twin_last_password,
+                ascii_pw,
+                sizeof(app->evil_twin_last_password) - 1);
+            app->evil_twin_last_password[sizeof(app->evil_twin_last_password) - 1] = '\0';
+            simple_app_trim(app->evil_twin_last_password);
+            app->evil_twin_password_count++;
+            strncpy(app->evil_twin_status_note, "Received", sizeof(app->evil_twin_status_note) - 1);
+            app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        }
+        return;
+    }
+
+    if(strstr(cursor, stop_deauth_marker)) {
+        strncpy(app->evil_twin_status_note, "Checking", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    if(strstr(cursor, resume_deauth_marker)) {
+        strncpy(app->evil_twin_status_note, "Wrong", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        app->evil_twin_last_password[0] = '\0';
+        app->evil_twin_password_count = 0;
+        simple_app_show_status_message(app, "Bad Password\nEvil ongoing", 1500, true);
+        return;
+    }
+
+    if(strstr(cursor, resume_ok_marker)) {
+        strncpy(app->evil_twin_status_note, "Deauth", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    const char* attempt_ptr = strstr(cursor, attempt_marker);
+    if(attempt_ptr) {
+        const char* ssid_ptr = strstr(attempt_ptr, "SSID='");
+        if(ssid_ptr) {
+            ssid_ptr += strlen("SSID='");
+            const char* end = strchr(ssid_ptr, '\'');
+            if(end && end > ssid_ptr) {
+                char ascii_ssid[SCAN_SSID_MAX_LEN];
+                size_t len = (size_t)(end - ssid_ptr);
+                if(len >= sizeof(ascii_ssid)) len = sizeof(ascii_ssid) - 1;
+                memcpy(ascii_ssid, ssid_ptr, len);
+                ascii_ssid[len] = '\0';
+                char ascii_clean[SCAN_SSID_MAX_LEN];
+                simple_app_utf8_to_ascii_pl(ascii_ssid, ascii_clean, sizeof(ascii_clean));
+                strncpy(app->evil_twin_status_ssid, ascii_clean, sizeof(app->evil_twin_status_ssid) - 1);
+                app->evil_twin_status_ssid[sizeof(app->evil_twin_status_ssid) - 1] = '\0';
+                simple_app_trim(app->evil_twin_status_ssid);
+            }
+        }
+        strncpy(app->evil_twin_status_note, "Checking", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    if(strstr(cursor, attempt_count_marker)) {
+        strncpy(app->evil_twin_status_note, "Checking", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    const char* connected_ptr = strstr(cursor, connected_marker);
+    if(connected_ptr) {
+        const char* ssid_ptr = strstr(connected_ptr, "SSID='");
+        if(ssid_ptr) {
+            ssid_ptr += strlen("SSID='");
+            const char* end = strchr(ssid_ptr, '\'');
+            if(end && end > ssid_ptr) {
+                char ascii_ssid[SCAN_SSID_MAX_LEN];
+                size_t len = (size_t)(end - ssid_ptr);
+                if(len >= sizeof(ascii_ssid)) len = sizeof(ascii_ssid) - 1;
+                memcpy(ascii_ssid, ssid_ptr, len);
+                ascii_ssid[len] = '\0';
+                char ascii_clean[SCAN_SSID_MAX_LEN];
+                simple_app_utf8_to_ascii_pl(ascii_ssid, ascii_clean, sizeof(ascii_clean));
+                strncpy(app->evil_twin_status_ssid, ascii_clean, sizeof(app->evil_twin_status_ssid) - 1);
+                app->evil_twin_status_ssid[sizeof(app->evil_twin_status_ssid) - 1] = '\0';
+                simple_app_trim(app->evil_twin_status_ssid);
+            }
+        }
+        strncpy(app->evil_twin_status_note, "Verified", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    if(strstr(cursor, verified_marker)) {
+        strncpy(app->evil_twin_status_note, "Verified", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    if(strstr(cursor, wrong_marker)) {
+        strncpy(app->evil_twin_status_note, "Wrong", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        app->evil_twin_last_password[0] = '\0';
+        app->evil_twin_password_count = 0;
+        return;
+    }
+
+    if(strstr(cursor, shutdown_marker)) {
+        strncpy(app->evil_twin_status_note, "Stopped", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        return;
+    }
+
+    if(strstr(cursor, saved_marker)) {
+        strncpy(app->evil_twin_status_note, "Verified", sizeof(app->evil_twin_status_note) - 1);
+        app->evil_twin_status_note[sizeof(app->evil_twin_status_note) - 1] = '\0';
+        simple_app_show_status_message(app, "Password OK\nClosing Evil", 2000, true);
+        return;
+    }
+}
+
+static void simple_app_portal_status_feed(SimpleApp* app, char ch) {
+    if(!app) return;
+    if(ch == '\r') return;
+
+    if(ch == '\n') {
+        if(app->portal_line_length > 0) {
+            app->portal_line_buffer[app->portal_line_length] = '\0';
+            simple_app_process_portal_status_line(app, app->portal_line_buffer);
+            app->portal_line_length = 0;
+        }
+        return;
+    }
+
+    if(app->portal_line_length + 1 >= sizeof(app->portal_line_buffer)) {
+        app->portal_line_length = 0;
+        return;
+    }
+
+    app->portal_line_buffer[app->portal_line_length++] = ch;
+}
+
+static void simple_app_evil_twin_status_feed(SimpleApp* app, char ch) {
+    if(!app) return;
+    if(ch == '\r') return;
+
+    if(ch == '\n') {
+        if(app->evil_twin_line_length > 0) {
+            app->evil_twin_line_buffer[app->evil_twin_line_length] = '\0';
+            simple_app_process_evil_twin_status_line(app, app->evil_twin_line_buffer);
+            app->evil_twin_line_length = 0;
+        }
+        return;
+    }
+
+    if(app->evil_twin_line_length + 1 >= sizeof(app->evil_twin_line_buffer)) {
+        app->evil_twin_line_length = 0;
+        return;
+    }
+
+    app->evil_twin_line_buffer[app->evil_twin_line_length++] = ch;
+}
+
+static void simple_app_reset_passwords_listing(SimpleApp* app) {
+    if(!app) return;
+    app->passwords_listing_active = false;
+    app->passwords_line_count = 0;
+    app->passwords_scroll = 0;
+    app->passwords_scroll_x = 0;
+    app->passwords_max_line_len = 0;
+    app->passwords_line_length = 0;
+    app->passwords_title[0] = '\0';
+    app->passwords_source = PasswordsSourcePortal;
+    app->passwords_select_index = 0;
+    app->passwords_select_return_screen = ScreenMenu;
+    for(size_t i = 0; i < PASSWORDS_MAX_LINES; i++) {
+        app->passwords_lines[i][0] = '\0';
+    }
+}
+
+static void simple_app_request_passwords(
+    SimpleApp* app,
+    AppScreen return_screen,
+    PasswordsSource source) {
+    if(!app) return;
+    simple_app_reset_passwords_listing(app);
+    app->passwords_listing_active = true;
+    app->passwords_return_screen = return_screen;
+    app->passwords_source = source;
+    const char* title =
+        (source == PasswordsSourceEvilTwin) ? "Evil Twin" : "Portal";
+    strncpy(app->passwords_title, title, sizeof(app->passwords_title) - 1);
+    app->passwords_title[sizeof(app->passwords_title) - 1] = '\0';
+    app->screen = ScreenPasswords;
+    if(source == PasswordsSourceEvilTwin) {
+        simple_app_send_command_quiet(app, "show_pass evil");
+    } else {
+        simple_app_send_command_quiet(app, "show_pass portal");
+    }
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_process_passwords_line(SimpleApp* app, const char* line) {
+    if(!app || !line) return;
+    if(app->passwords_line_count >= PASSWORDS_MAX_LINES) return;
+
+    char ascii_line[PASSWORDS_LINE_CHAR_LIMIT];
+    simple_app_utf8_to_ascii_pl(line, ascii_line, sizeof(ascii_line));
+    simple_app_trim(ascii_line);
+    if(strncmp(ascii_line, "TX:", 3) == 0) return;
+    if(ascii_line[0] == '\0') {
+        if(app->passwords_line_count < PASSWORDS_MAX_LINES) {
+            app->passwords_lines[app->passwords_line_count][0] = '\0';
+            app->passwords_line_count++;
+        }
+        return;
+    }
+
+    strncpy(
+        app->passwords_lines[app->passwords_line_count],
+        ascii_line,
+        PASSWORDS_LINE_CHAR_LIMIT - 1);
+    app->passwords_lines[app->passwords_line_count][PASSWORDS_LINE_CHAR_LIMIT - 1] = '\0';
+    app->passwords_line_count++;
+    size_t line_len = strlen(app->passwords_lines[app->passwords_line_count - 1]);
+    if(line_len > app->passwords_max_line_len) {
+        app->passwords_max_line_len = line_len;
+    }
+}
+
+static void simple_app_passwords_feed(SimpleApp* app, char ch) {
+    if(!app || !app->passwords_listing_active) return;
+    if(ch == '\r') return;
+
+    bool updated = false;
+
+    if(ch == '>') {
+        if(app->passwords_line_length > 0) {
+            app->passwords_line_buffer[app->passwords_line_length] = '\0';
+            simple_app_process_passwords_line(app, app->passwords_line_buffer);
+            app->passwords_line_length = 0;
+            updated = true;
+        }
+        app->passwords_listing_active = false;
+        updated = true;
+        if(updated && app->screen == ScreenPasswords && app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(ch == '\n') {
+        if(app->passwords_line_length > 0) {
+            app->passwords_line_buffer[app->passwords_line_length] = '\0';
+            simple_app_process_passwords_line(app, app->passwords_line_buffer);
+            updated = true;
+        }
+        app->passwords_line_length = 0;
+        if(updated && app->screen == ScreenPasswords && app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(app->passwords_line_length + 1 >= sizeof(app->passwords_line_buffer)) {
+        app->passwords_line_length = 0;
+        return;
+    }
+
+    app->passwords_line_buffer[app->passwords_line_length++] = ch;
+}
+
+static void simple_app_draw_passwords(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+
+    char header[32];
+    if(app->passwords_title[0] != '\0') {
+        snprintf(header, sizeof(header), "%s Pass", app->passwords_title);
+    } else {
+        snprintf(header, sizeof(header), "Passwords");
+    }
+    canvas_draw_str(canvas, 4, 12, header);
+    canvas_draw_str_aligned(
+        canvas, DISPLAY_WIDTH - 2, 12, AlignRight, AlignBottom, "Back");
+
+    if(app->passwords_listing_active && app->passwords_line_count == 0) {
+        canvas_draw_str_aligned(
+            canvas, DISPLAY_WIDTH / 2, 36, AlignCenter, AlignCenter, "Loading...");
+        return;
+    }
+
+    if(app->passwords_line_count == 0) {
+        canvas_draw_str_aligned(
+            canvas, DISPLAY_WIDTH / 2, 36, AlignCenter, AlignCenter, "No passwords");
+        return;
+    }
+
+    size_t max_scroll =
+        (app->passwords_line_count > PASSWORDS_VISIBLE_LINES)
+            ? (app->passwords_line_count - PASSWORDS_VISIBLE_LINES)
+            : 0;
+    if(app->passwords_scroll > max_scroll) {
+        app->passwords_scroll = max_scroll;
+    }
+    size_t max_scroll_x =
+        (app->passwords_max_line_len > PASSWORDS_LINE_VISIBLE_CHARS)
+            ? (app->passwords_max_line_len - PASSWORDS_LINE_VISIBLE_CHARS)
+            : 0;
+    if(app->passwords_scroll_x > max_scroll_x) {
+        app->passwords_scroll_x = max_scroll_x;
+    }
+
+    uint8_t y = 26;
+    for(size_t i = 0; i < PASSWORDS_VISIBLE_LINES; i++) {
+        size_t idx = app->passwords_scroll + i;
+        if(idx >= app->passwords_line_count) break;
+        const char* line = app->passwords_lines[idx];
+        size_t line_len = strlen(line);
+        size_t offset = app->passwords_scroll_x;
+        if(offset > line_len) offset = line_len;
+        char window[PASSWORDS_LINE_VISIBLE_CHARS + 1];
+        size_t copy_len = line_len - offset;
+        if(copy_len > PASSWORDS_LINE_VISIBLE_CHARS) {
+            copy_len = PASSWORDS_LINE_VISIBLE_CHARS;
+        }
+        memcpy(window, line + offset, copy_len);
+        window[copy_len] = '\0';
+        canvas_draw_str(canvas, 2, y, window);
+        y += HINT_LINE_HEIGHT;
+    }
+
+    if(app->passwords_line_count > PASSWORDS_VISIBLE_LINES) {
+        bool show_up = (app->passwords_scroll > 0);
+        bool show_down = (app->passwords_scroll < max_scroll);
+        if(show_up || show_down) {
+            uint8_t arrow_x = DISPLAY_WIDTH - 6;
+            int16_t content_top = 26;
+            int16_t content_bottom =
+                26 +
+                (int16_t)((PASSWORDS_VISIBLE_LINES - 1) * HINT_LINE_HEIGHT);
+            simple_app_draw_scroll_hints(
+                canvas, arrow_x, content_top, content_bottom, show_up, show_down);
+        }
+    }
+}
+
+static void simple_app_handle_passwords_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+    if(key == InputKeyBack) {
+        app->passwords_listing_active = false;
+        app->screen = app->passwords_return_screen;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(app->passwords_line_count == 0) return;
+
+    size_t max_scroll =
+        (app->passwords_line_count > PASSWORDS_VISIBLE_LINES)
+            ? (app->passwords_line_count - PASSWORDS_VISIBLE_LINES)
+            : 0;
+    size_t max_scroll_x =
+        (app->passwords_max_line_len > PASSWORDS_LINE_VISIBLE_CHARS)
+            ? (app->passwords_max_line_len - PASSWORDS_LINE_VISIBLE_CHARS)
+            : 0;
+
+    if(key == InputKeyUp) {
+        if(app->passwords_scroll > 0) {
+            app->passwords_scroll--;
+        }
+    } else if(key == InputKeyDown) {
+        if(app->passwords_scroll < max_scroll) {
+            app->passwords_scroll++;
+        }
+    } else if(key == InputKeyLeft) {
+        if(app->passwords_scroll_x > 0) {
+            app->passwords_scroll_x--;
+        }
+    } else if(key == InputKeyRight) {
+        if(app->passwords_scroll_x < max_scroll_x) {
+            app->passwords_scroll_x++;
+        }
+    } else {
+        return;
+    }
+
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_draw_passwords_select(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 4, 14, "Show Passwords");
+
+    canvas_set_font(canvas, FontSecondary);
+    const char* options[2] = {"Portal (portals.txt)", "Evil Twin (eviltwin.txt)"};
+    uint8_t y = 34;
+    for(size_t idx = 0; idx < 2; idx++) {
+        if(app->passwords_select_index == idx) {
+            canvas_draw_str(canvas, 2, y, ">");
+        }
+        canvas_draw_str(canvas, 14, y, options[idx]);
+        y += 12;
+    }
+    canvas_draw_str(canvas, 2, 62, "OK select, Back");
+}
+
+static void simple_app_handle_passwords_select_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+
+    if(key == InputKeyBack) {
+        app->screen = app->passwords_select_return_screen;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(key == InputKeyUp || key == InputKeyDown) {
+        app->passwords_select_index = (app->passwords_select_index == 0) ? 1 : 0;
+    } else if(key == InputKeyOk) {
+        PasswordsSource source =
+            (app->passwords_select_index == 1) ? PasswordsSourceEvilTwin : PasswordsSourcePortal;
+        simple_app_request_passwords(app, app->passwords_select_return_screen, source);
+        return;
+    } else {
+        return;
+    }
+
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
 static void simple_app_request_portal_ssid_list(SimpleApp* app) {
     if(!app) return;
     simple_app_reset_portal_ssid_listing(app);
+    if(!simple_app_portal_alloc_ssid_entries(app)) {
+        simple_app_show_status_message(app, "OOM: SSID list", 2000, true);
+        return;
+    }
     app->portal_ssid_listing_active = true;
     simple_app_show_status_message(app, "Listing SSID...", 0, false);
     simple_app_send_command(app, "list_ssid", false);
@@ -6554,6 +8391,9 @@ static bool simple_app_portal_run_text_input(SimpleApp* app) {
     char buffer[SCAN_SSID_MAX_LEN];
     strncpy(buffer, app->portal_ssid, sizeof(buffer));
     buffer[sizeof(buffer) - 1] = '\0';
+    char previous_ssid[SCAN_SSID_MAX_LEN];
+    strncpy(previous_ssid, app->portal_ssid, sizeof(previous_ssid));
+    previous_ssid[sizeof(previous_ssid) - 1] = '\0';
 
     ViewDispatcher* dispatcher = view_dispatcher_alloc();
     if(!dispatcher) return false;
@@ -6604,6 +8444,12 @@ static bool simple_app_portal_run_text_input(SimpleApp* app) {
 
     if(ctx.accepted) {
         simple_app_copy_portal_ssid(app, buffer);
+        if(strlen(app->portal_ssid) > 32) {
+            strncpy(app->portal_ssid, previous_ssid, sizeof(app->portal_ssid) - 1);
+            app->portal_ssid[sizeof(app->portal_ssid) - 1] = '\0';
+            simple_app_show_status_message(app, "SSID too long\nMax 32 chars", 1500, true);
+            return false;
+        }
         accepted = true;
     }
 
@@ -6612,6 +8458,7 @@ static bool simple_app_portal_run_text_input(SimpleApp* app) {
 
 static void simple_app_draw_portal_ssid_popup(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas || !app->portal_ssid_popup_active) return;
+    if(!app->portal_ssid_entries) return;
 
     const uint8_t bubble_x = 4;
     const uint8_t bubble_y = 4;
@@ -6684,6 +8531,7 @@ static void simple_app_draw_portal_ssid_popup(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_handle_portal_ssid_popup_event(SimpleApp* app, const InputEvent* event) {
     if(!app || !event || !app->portal_ssid_popup_active) return;
+    if(!app->portal_ssid_entries) return;
     if(event->type != InputTypeShort && event->type != InputTypeRepeat && event->type != InputTypeLong) return;
 
     InputKey key = event->key;
@@ -6800,6 +8648,31 @@ static void simple_app_start_portal(SimpleApp* app) {
     simple_app_send_command(app, command, true);
 }
 
+static void simple_app_evil_twin_sync_offset(SimpleApp* app) {
+    if(!app) return;
+    size_t visible = EVIL_TWIN_VISIBLE_COUNT;
+    if(visible == 0) visible = 1;
+    if(visible > EVIL_TWIN_MENU_OPTION_COUNT) {
+        visible = EVIL_TWIN_MENU_OPTION_COUNT;
+    }
+    if(app->evil_twin_menu_index >= EVIL_TWIN_MENU_OPTION_COUNT) {
+        app->evil_twin_menu_index = EVIL_TWIN_MENU_OPTION_COUNT - 1;
+    }
+    size_t max_offset =
+        (EVIL_TWIN_MENU_OPTION_COUNT > visible) ? (EVIL_TWIN_MENU_OPTION_COUNT - visible) : 0;
+    if(app->evil_twin_menu_offset > max_offset) {
+        app->evil_twin_menu_offset = max_offset;
+    }
+    if(app->evil_twin_menu_index < app->evil_twin_menu_offset) {
+        app->evil_twin_menu_offset = app->evil_twin_menu_index;
+    } else if(app->evil_twin_menu_index >= app->evil_twin_menu_offset + visible) {
+        app->evil_twin_menu_offset = app->evil_twin_menu_index - visible + 1;
+    }
+    if(app->evil_twin_menu_offset > max_offset) {
+        app->evil_twin_menu_offset = max_offset;
+    }
+}
+
 static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas) return;
 
@@ -6808,32 +8681,113 @@ static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str(canvas, 4, 14, "Evil Twin");
 
     canvas_set_font(canvas, FontSecondary);
-    uint8_t y = 30;
+    simple_app_evil_twin_sync_offset(app);
 
-    for(size_t idx = 0; idx < EVIL_TWIN_MENU_OPTION_COUNT; idx++) {
-        const char* label = (idx == 0) ? "Select HTML" : "Start Evil Twin";
+    size_t offset = app->evil_twin_menu_offset;
+    size_t visible = EVIL_TWIN_VISIBLE_COUNT;
+    if(visible == 0) visible = 1;
+    if(visible > EVIL_TWIN_MENU_OPTION_COUNT) {
+        visible = EVIL_TWIN_MENU_OPTION_COUNT;
+    }
+
+    uint8_t base_y = 30;
+    uint8_t y = base_y;
+    uint8_t list_bottom_y = base_y;
+
+    for(size_t pos = 0; pos < visible; pos++) {
+        size_t idx = offset + pos;
+        if(idx >= EVIL_TWIN_MENU_OPTION_COUNT) break;
+
+        const char* label = "Start Evil Twin";
+        char detail[48];
+        char detail_extra[48];
+        detail[0] = '\0';
+        detail_extra[0] = '\0';
+        bool show_detail_line = false;
+        bool show_detail_extra = false;
+
+        switch(idx) {
+        case 0: {
+            label = "Target";
+            if(app->scan_selected_count == 0) {
+                snprintf(detail, sizeof(detail), "Select in Targets");
+                show_detail_line = true;
+            } else {
+                snprintf(detail, sizeof(detail), "Selected: %u", (unsigned)app->scan_selected_count);
+                show_detail_line = true;
+                if(simple_app_get_first_selected_ssid(app, detail_extra, sizeof(detail_extra))) {
+                    simple_app_truncate_text(detail_extra, 28);
+                } else {
+                    snprintf(detail_extra, sizeof(detail_extra), "<unknown>");
+                }
+                show_detail_extra = true;
+            }
+            break;
+        }
+        case 1:
+            label = "Select HTML";
+            if(app->evil_twin_selected_html_id > 0 &&
+               app->evil_twin_selected_html_name[0] != '\0') {
+                snprintf(detail, sizeof(detail), "Current: %s", app->evil_twin_selected_html_name);
+            } else {
+                snprintf(detail, sizeof(detail), "Current: <none>");
+            }
+            simple_app_truncate_text(detail, 26);
+            show_detail_line = true;
+            break;
+        case 2:
+            label = "Start Evil Twin";
+            if(app->scan_selected_count == 0) {
+                snprintf(detail, sizeof(detail), "Need target");
+            } else if(app->evil_twin_selected_html_id == 0) {
+                snprintf(detail, sizeof(detail), "Need HTML");
+            } else {
+                detail[0] = '\0';
+            }
+            simple_app_truncate_text(detail, 20);
+            break;
+        default:
+            label = "Show Passwords";
+            snprintf(detail, sizeof(detail), "eviltwin.txt");
+            show_detail_line = true;
+            break;
+        }
+
         if(app->evil_twin_menu_index == idx) {
             canvas_draw_str(canvas, 2, y, ">");
         }
         canvas_draw_str(canvas, 14, y, label);
-        if(idx == 0) {
-            char status[48];
-            if(app->evil_twin_selected_html_id > 0 &&
-               app->evil_twin_selected_html_name[0] != '\0') {
-                snprintf(status, sizeof(status), "Current: %s", app->evil_twin_selected_html_name);
-            } else {
-                snprintf(status, sizeof(status), "Current: <none>");
-            }
-            simple_app_truncate_text(status, 26);
-            canvas_draw_str(canvas, 14, y + 10, status);
-            y += 10;
+
+        uint8_t item_height = 12;
+        if(show_detail_line || detail[0] != '\0') {
+            canvas_draw_str(canvas, 14, (uint8_t)(y + 10), detail);
+            item_height += 10;
         }
-        y += 12;
+        if(show_detail_extra) {
+            canvas_draw_str(canvas, 14, (uint8_t)(y + item_height), detail_extra);
+            item_height += 10;
+        }
+        y = (uint8_t)(y + item_height);
+        list_bottom_y = y;
+    }
+
+    uint8_t arrow_x = DISPLAY_WIDTH - 6;
+    if(offset > 0) {
+        int16_t arrow_y = (int16_t)(base_y - 6);
+        if(arrow_y < 12) arrow_y = 12;
+        simple_app_draw_scroll_arrow(canvas, arrow_x, arrow_y, true);
+    }
+    if(offset + visible < EVIL_TWIN_MENU_OPTION_COUNT) {
+        int16_t arrow_y = (int16_t)(list_bottom_y - 6);
+        if(arrow_y > 60) arrow_y = 60;
+        if(arrow_y < 16) arrow_y = 16;
+        simple_app_draw_scroll_arrow(canvas, arrow_x, arrow_y, false);
     }
 }
 
 static void simple_app_draw_evil_twin_popup(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas || !app->evil_twin_popup_active) return;
+    if(!app->evil_twin_html_entries) return;
 
     const uint8_t bubble_x = 4;
     const uint8_t bubble_y = 4;
@@ -7254,6 +9208,146 @@ static void simple_app_draw_deauth_guard(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 58, AlignCenter, AlignCenter, ssid_line);
 }
 
+static void simple_app_draw_blackout_overlay(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+    app->serial_targets_hint = false;
+
+    const char* status = "Idle";
+    switch(app->blackout_phase) {
+    case BlackoutPhaseStarting:
+        status = "Starting";
+        break;
+    case BlackoutPhaseScanning:
+        status = "Scanning";
+        break;
+    case BlackoutPhaseSorting:
+        status = "Sorting";
+        break;
+    case BlackoutPhaseAttacking:
+        status = "Attacking";
+        break;
+    case BlackoutPhaseStopping:
+        status = "Stopping";
+        break;
+    case BlackoutPhaseFinished:
+        status = "Done";
+        break;
+    case BlackoutPhaseIdle:
+    default:
+        status = "Idle";
+        break;
+    }
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 2, 12, "Blackout");
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 2, 12, AlignRight, AlignBottom, status);
+
+    canvas_set_font(canvas, FontPrimary);
+    char targets_line[32];
+    if(app->blackout_networks > 0) {
+        snprintf(targets_line, sizeof(targets_line), "Targets: %lu", (unsigned long)app->blackout_networks);
+    } else {
+        snprintf(targets_line, sizeof(targets_line), "Targets: --");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 28, AlignCenter, AlignCenter, targets_line);
+
+    canvas_set_font(canvas, FontSecondary);
+    char mid_line[32];
+    if(app->blackout_note[0] != '\0') {
+        const int note_limit = 20;
+        snprintf(mid_line, sizeof(mid_line), "Note: %.*s", note_limit, app->blackout_note);
+    } else if(app->blackout_cycle > 0) {
+        snprintf(mid_line, sizeof(mid_line), "Cycle: %lu", (unsigned long)app->blackout_cycle);
+    } else {
+        snprintf(mid_line, sizeof(mid_line), "Cycle: --");
+    }
+    simple_app_truncate_text(mid_line, SERIAL_LINE_CHAR_LIMIT);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 42, AlignCenter, AlignCenter, mid_line);
+
+    char channel_line[32];
+    if(app->blackout_has_channel && app->blackout_channel > 0) {
+        snprintf(channel_line, sizeof(channel_line), "Channel: %u", app->blackout_channel);
+    } else {
+        snprintf(channel_line, sizeof(channel_line), "Channel: --");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 54, AlignCenter, AlignCenter, channel_line);
+}
+
+static void simple_app_draw_sniffer_dog_overlay(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+    app->serial_targets_hint = false;
+
+    const char* status = "Idle";
+    switch(app->sniffer_dog_phase) {
+    case SnifferDogPhaseStarting:
+        status = "Starting";
+        break;
+    case SnifferDogPhaseHunting:
+        status = "Hunting";
+        break;
+    case SnifferDogPhaseStopping:
+        status = "Stopping";
+        break;
+    case SnifferDogPhaseError:
+        status = "Error";
+        break;
+    case SnifferDogPhaseFinished:
+        status = "Done";
+        break;
+    case SnifferDogPhaseIdle:
+    default:
+        status = "Idle";
+        break;
+    }
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 2, 12, "Sniffer Dog");
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 2, 12, AlignRight, AlignBottom, status);
+
+    canvas_set_font(canvas, FontPrimary);
+    char deauth_line[32];
+    if(app->sniffer_dog_deauth_count > 0) {
+        snprintf(deauth_line, sizeof(deauth_line), "Deauth: %lu", (unsigned long)app->sniffer_dog_deauth_count);
+    } else {
+        snprintf(deauth_line, sizeof(deauth_line), "Deauth: --");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 28, AlignCenter, AlignCenter, deauth_line);
+
+    canvas_set_font(canvas, FontSecondary);
+    char mid_line[32];
+    if(app->sniffer_dog_note[0] != '\0') {
+        const int note_limit = 20;
+        snprintf(mid_line, sizeof(mid_line), "Note: %.*s", note_limit, app->sniffer_dog_note);
+    } else if(app->sniffer_dog_has_channel) {
+        if(app->sniffer_dog_has_rssi) {
+            snprintf(
+                mid_line,
+                sizeof(mid_line),
+                "CH %u | RSSI %d",
+                app->sniffer_dog_channel,
+                app->sniffer_dog_rssi);
+        } else {
+            snprintf(mid_line, sizeof(mid_line), "CH %u", app->sniffer_dog_channel);
+        }
+    } else {
+        snprintf(mid_line, sizeof(mid_line), "Channel: --");
+    }
+    simple_app_truncate_text(mid_line, SERIAL_LINE_CHAR_LIMIT);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 42, AlignCenter, AlignCenter, mid_line);
+
+    char phase_line[32];
+    if(app->sniffer_dog_running) {
+        snprintf(phase_line, sizeof(phase_line), "Ongoing");
+    } else if(app->sniffer_dog_phase == SnifferDogPhaseFinished) {
+        snprintf(phase_line, sizeof(phase_line), "Stopped");
+    } else {
+        snprintf(phase_line, sizeof(phase_line), "--");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 54, AlignCenter, AlignCenter, phase_line);
+}
+
 static void simple_app_draw_scanner_status(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas) return;
 
@@ -7305,6 +9399,143 @@ static void simple_app_draw_scanner_status(SimpleApp* app, Canvas* canvas) {
     if(!app->scan_results_loading && !app->scanner_scan_running && app->scanner_total > 0) {
         canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 4, DISPLAY_HEIGHT - 2, AlignRight, AlignBottom, "->");
     }
+}
+
+static void simple_app_draw_portal_overlay(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+
+    canvas_draw_str(canvas, 2, 12, "Portal On");
+
+    const char* ssid_value = app->portal_status_ssid[0] != '\0' ? app->portal_status_ssid : app->portal_ssid;
+    if(!ssid_value || ssid_value[0] == '\0') {
+        ssid_value = "--";
+    }
+
+    canvas_set_font(canvas, FontPrimary);
+    const char* full_title =
+        (app->overlay_title_scroll_text[0] != '\0') ? app->overlay_title_scroll_text : ssid_value;
+    size_t title_len = strlen(full_title);
+    size_t char_limit = OVERLAY_TITLE_CHAR_LIMIT;
+    if(char_limit >= sizeof(app->overlay_title_scroll_text)) {
+        char_limit = sizeof(app->overlay_title_scroll_text) - 1;
+    }
+    if(char_limit == 0) char_limit = 1;
+    if(title_len <= char_limit) {
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 24, AlignCenter, AlignCenter, full_title);
+    } else {
+        size_t offset = app->overlay_title_scroll_offset;
+        size_t max_offset = title_len - char_limit;
+        if(offset > max_offset) offset = max_offset;
+        size_t copy_len = char_limit;
+        if(offset + copy_len > title_len) copy_len = title_len - offset;
+        char title_window[64];
+        if(copy_len >= sizeof(title_window)) copy_len = sizeof(title_window) - 1;
+        memcpy(title_window, full_title + offset, copy_len);
+        title_window[copy_len] = '\0';
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 24, AlignCenter, AlignCenter, title_window);
+    }
+
+    canvas_set_font(canvas, FontSecondary);
+    char clients_line[32];
+    if(app->portal_client_count >= 0) {
+        snprintf(clients_line, sizeof(clients_line), "Clients: %ld", (long)app->portal_client_count);
+    } else {
+        snprintf(clients_line, sizeof(clients_line), "Clients: --");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 36, AlignCenter, AlignCenter, clients_line);
+
+    char passwords_line[32];
+    snprintf(passwords_line, sizeof(passwords_line), "Passwords: %lu", (unsigned long)app->portal_password_count);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 48, AlignCenter, AlignCenter, passwords_line);
+
+    char users_line[32];
+    snprintf(users_line, sizeof(users_line), "Usernames: %lu", (unsigned long)app->portal_username_count);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 60, AlignCenter, AlignCenter, users_line);
+}
+
+static void simple_app_draw_evil_twin_overlay(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+
+    canvas_draw_str(canvas, 2, 12, "Evil Twin");
+
+    char ssid_buffer[SCAN_SSID_MAX_LEN];
+    const char* ssid_value = app->evil_twin_status_ssid;
+    if(!ssid_value || ssid_value[0] == '\0') {
+        if(simple_app_get_first_selected_ssid(app, ssid_buffer, sizeof(ssid_buffer))) {
+            ssid_value = ssid_buffer;
+        } else {
+            ssid_value = "--";
+        }
+    }
+
+    canvas_set_font(canvas, FontPrimary);
+    const char* full_title =
+        (app->overlay_title_scroll_text[0] != '\0') ? app->overlay_title_scroll_text : ssid_value;
+    size_t title_len = strlen(full_title);
+    size_t char_limit = OVERLAY_TITLE_CHAR_LIMIT;
+    if(char_limit >= sizeof(app->overlay_title_scroll_text)) {
+        char_limit = sizeof(app->overlay_title_scroll_text) - 1;
+    }
+    if(char_limit == 0) char_limit = 1;
+    if(title_len <= char_limit) {
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 24, AlignCenter, AlignCenter, full_title);
+    } else {
+        size_t offset = app->overlay_title_scroll_offset;
+        size_t max_offset = title_len - char_limit;
+        if(offset > max_offset) offset = max_offset;
+        size_t copy_len = char_limit;
+        if(offset + copy_len > title_len) copy_len = title_len - offset;
+        char title_window[64];
+        if(copy_len >= sizeof(title_window)) copy_len = sizeof(title_window) - 1;
+        memcpy(title_window, full_title + offset, copy_len);
+        title_window[copy_len] = '\0';
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 24, AlignCenter, AlignCenter, title_window);
+    }
+
+    canvas_set_font(canvas, FontSecondary);
+    char clients_line[32];
+    if(app->evil_twin_client_count >= 0) {
+        snprintf(clients_line, sizeof(clients_line), "Clients: %ld", (long)app->evil_twin_client_count);
+    } else {
+        snprintf(clients_line, sizeof(clients_line), "Clients: --");
+    }
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 36, AlignCenter, AlignCenter, clients_line);
+
+    const char* note_value =
+        (app->evil_twin_status_note[0] != '\0') ? app->evil_twin_status_note : "--";
+    char stage_line[32];
+    snprintf(stage_line, sizeof(stage_line), "Stage: %s", note_value);
+    simple_app_truncate_text(stage_line, 21);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 48, AlignCenter, AlignCenter, stage_line);
+
+    char passwords_line[64];
+    const int pass_limit = 16;
+    if(app->evil_twin_password_count == 0 || app->evil_twin_last_password[0] == '\0') {
+        snprintf(passwords_line, sizeof(passwords_line), "Pass: --");
+    } else if(app->evil_twin_password_count == 1) {
+        snprintf(
+            passwords_line,
+            sizeof(passwords_line),
+            "Pass: %.*s",
+            pass_limit,
+            app->evil_twin_last_password);
+    } else {
+        snprintf(
+            passwords_line,
+            sizeof(passwords_line),
+            "Pass: %.*s (%lu)",
+            pass_limit,
+            app->evil_twin_last_password,
+            (unsigned long)app->evil_twin_password_count);
+    }
+    simple_app_truncate_text(passwords_line, 21);
+    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 60, AlignCenter, AlignCenter, passwords_line);
 }
 
 static void simple_app_draw_sniffer_overlay(SimpleApp* app, Canvas* canvas) {
@@ -7381,11 +9612,34 @@ static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canv
     }
 
     const SnifferApEntry* ap = &app->sniffer_aps[app->sniffer_results_ap_index];
-    char title[32];
     canvas_set_font(canvas, FontPrimary);
-    snprintf(title, sizeof(title), "%s", ap->ssid[0] ? ap->ssid : "<hidden>");
-    simple_app_truncate_text(title, 14);
-    canvas_draw_str(canvas, 2, 30, title);
+    char computed_title[64];
+    snprintf(computed_title, sizeof(computed_title), "%s", ap->ssid[0] ? ap->ssid : "<hidden>");
+    char computed_title_ascii[sizeof(computed_title)];
+    simple_app_utf8_to_ascii_pl(computed_title, computed_title_ascii, sizeof(computed_title_ascii));
+    strncpy(computed_title, computed_title_ascii, sizeof(computed_title) - 1);
+    computed_title[sizeof(computed_title) - 1] = '\0';
+
+    const char* full_title =
+        (app->overlay_title_scroll_text[0] != '\0') ? app->overlay_title_scroll_text : computed_title;
+    size_t title_len = strlen(full_title);
+    size_t char_limit = OVERLAY_TITLE_CHAR_LIMIT;
+    if(char_limit >= sizeof(computed_title)) char_limit = sizeof(computed_title) - 1;
+    if(char_limit == 0) char_limit = 1;
+    if(title_len <= char_limit) {
+        canvas_draw_str(canvas, 2, 30, full_title);
+    } else {
+        size_t offset = app->overlay_title_scroll_offset;
+        size_t max_offset = title_len - char_limit;
+        if(offset > max_offset) offset = max_offset;
+        size_t copy_len = char_limit;
+        if(offset + copy_len > title_len) copy_len = title_len - offset;
+        char title_window[64];
+        if(copy_len >= sizeof(title_window)) copy_len = sizeof(title_window) - 1;
+        memcpy(title_window, full_title + offset, copy_len);
+        title_window[copy_len] = '\0';
+        canvas_draw_str(canvas, 2, 30, title_window);
+    }
 
     canvas_set_font(canvas, FontSecondary);
     uint16_t current_client =
@@ -7505,11 +9759,34 @@ static void simple_app_draw_probe_results_overlay(SimpleApp* app, Canvas* canvas
     }
 
     const ProbeSsidEntry* ssid = &app->probe_ssids[app->probe_ssid_index];
-    char title[32];
     canvas_set_font(canvas, FontPrimary);
-    snprintf(title, sizeof(title), "%s", ssid->ssid[0] ? ssid->ssid : "<hidden>");
-    simple_app_truncate_text(title, 14);
-    canvas_draw_str(canvas, 2, 30, title);
+    char computed_title[64];
+    snprintf(computed_title, sizeof(computed_title), "%s", ssid->ssid[0] ? ssid->ssid : "<hidden>");
+    char computed_title_ascii[sizeof(computed_title)];
+    simple_app_utf8_to_ascii_pl(computed_title, computed_title_ascii, sizeof(computed_title_ascii));
+    strncpy(computed_title, computed_title_ascii, sizeof(computed_title) - 1);
+    computed_title[sizeof(computed_title) - 1] = '\0';
+
+    const char* full_title =
+        (app->overlay_title_scroll_text[0] != '\0') ? app->overlay_title_scroll_text : computed_title;
+    size_t title_len = strlen(full_title);
+    size_t char_limit = OVERLAY_TITLE_CHAR_LIMIT;
+    if(char_limit >= sizeof(computed_title)) char_limit = sizeof(computed_title) - 1;
+    if(char_limit == 0) char_limit = 1;
+    if(title_len <= char_limit) {
+        canvas_draw_str(canvas, 2, 30, full_title);
+    } else {
+        size_t offset = app->overlay_title_scroll_offset;
+        size_t max_offset = title_len - char_limit;
+        if(offset > max_offset) offset = max_offset;
+        size_t copy_len = char_limit;
+        if(offset + copy_len > title_len) copy_len = title_len - offset;
+        char title_window[64];
+        if(copy_len >= sizeof(title_window)) copy_len = sizeof(title_window) - 1;
+        memcpy(title_window, full_title + offset, copy_len);
+        title_window[copy_len] = '\0';
+        canvas_draw_str(canvas, 2, 30, title_window);
+    }
 
     canvas_set_font(canvas, FontSecondary);
     uint16_t current_client =
@@ -8025,8 +10302,28 @@ static void simple_app_draw_serial(SimpleApp* app, Canvas* canvas) {
         return;
     }
 
+    if(app && app->blackout_view_active && !app->blackout_full_console) {
+        simple_app_draw_blackout_overlay(app, canvas);
+        return;
+    }
+
+    if(app && app->sniffer_dog_view_active && !app->sniffer_dog_full_console) {
+        simple_app_draw_sniffer_dog_overlay(app, canvas);
+        return;
+    }
+
     if(app && app->scanner_view_active && !app->scanner_full_console) {
         simple_app_draw_scanner_status(app, canvas);
+        return;
+    }
+
+    if(app && app->evil_twin_running && !app->evil_twin_full_console) {
+        simple_app_draw_evil_twin_overlay(app, canvas);
+        return;
+    }
+
+    if(app && app->portal_running && !app->portal_full_console) {
+        simple_app_draw_portal_overlay(app, canvas);
         return;
     }
 
@@ -8335,6 +10632,7 @@ static void simple_app_draw_setup_boot(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_reset_sd_listing(SimpleApp* app) {
     if(!app) return;
+    simple_app_sd_free_files(app);
     app->sd_listing_active = false;
     app->sd_list_header_seen = false;
     app->sd_list_length = 0;
@@ -8396,6 +10694,10 @@ static void simple_app_request_sd_listing(SimpleApp* app, const SdFolderOption* 
 
     app->sd_folder_popup_active = false;
     simple_app_reset_sd_listing(app);
+    if(!simple_app_sd_alloc_files(app)) {
+        simple_app_show_status_message(app, "OOM: SD list", 2000, true);
+        return;
+    }
     simple_app_copy_sd_folder(app, folder);
     app->sd_listing_active = true;
     app->sd_refresh_pending = false;
@@ -8486,6 +10788,7 @@ static void simple_app_sd_scroll_buffer(
 
 static void simple_app_process_sd_line(SimpleApp* app, const char* line) {
     if(!app || !line || !app->sd_listing_active) return;
+    if(!app->sd_files) return;
 
     const char* cursor = line;
     while(*cursor == ' ' || *cursor == '\t') {
@@ -8668,6 +10971,7 @@ static void simple_app_draw_sd_folder_popup(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_draw_sd_file_popup(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas || !app->sd_file_popup_active) return;
+    if(!app->sd_files) return;
 
     const uint8_t bubble_x = 4;
     const uint8_t bubble_y = 4;
@@ -8891,6 +11195,7 @@ static void simple_app_handle_sd_folder_popup_event(SimpleApp* app, const InputE
 
 static void simple_app_handle_sd_file_popup_event(SimpleApp* app, const InputEvent* event) {
     if(!app || !event || !app->sd_file_popup_active) return;
+    if(!app->sd_files) return;
     if(event->type != InputTypeShort && event->type != InputTypeRepeat) return;
 
     InputKey key = event->key;
@@ -9310,11 +11615,14 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenPortalMenu:
         simple_app_draw_portal_menu(app, canvas);
         break;
-    case ScreenDownloadBridge:
-        simple_app_draw_download_bridge(app, canvas);
-        break;
     case ScreenBtLocatorList:
         simple_app_draw_bt_locator_list(app, canvas);
+        break;
+    case ScreenPasswords:
+        simple_app_draw_passwords(app, canvas);
+        break;
+    case ScreenPasswordsSelect:
+        simple_app_draw_passwords_select(app, canvas);
         break;
     default:
         simple_app_draw_results(app, canvas);
@@ -9477,6 +11785,8 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
         } else if(entry->action == MenuActionOpenEvilTwinMenu) {
             app->screen = ScreenEvilTwinMenu;
             app->evil_twin_menu_index = 0;
+            app->evil_twin_menu_offset = 0;
+            simple_app_evil_twin_sync_offset(app);
             view_port_update(app->viewport);
         } else if(entry->action == MenuActionOpenPortalMenu) {
             app->screen = ScreenPortalMenu;
@@ -9501,7 +11811,7 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             simple_app_open_sd_manager(app);
             return;
         } else if(entry->action == MenuActionOpenDownload) {
-            simple_app_download_bridge_start(app);
+            simple_app_send_download(app);
         } else if(entry->action == MenuActionOpenScannerTiming) {
             app->screen = ScreenSetupScannerTiming;
             app->scanner_timing_index = 0;
@@ -9559,6 +11869,7 @@ static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key)
             simple_app_clear_status_message(app);
         }
         simple_app_close_evil_twin_popup(app);
+        app->evil_twin_menu_offset = 0;
         simple_app_focus_attacks_menu(app);
         if(app->viewport) {
             view_port_update(app->viewport);
@@ -9569,26 +11880,42 @@ static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key)
     if(key == InputKeyUp) {
         if(app->evil_twin_menu_index > 0) {
             app->evil_twin_menu_index--;
-            if(app->viewport) {
-                view_port_update(app->viewport);
-            }
+        } else {
+            app->evil_twin_menu_index = EVIL_TWIN_MENU_OPTION_COUNT - 1;
+        }
+        simple_app_evil_twin_sync_offset(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyDown) {
         if(app->evil_twin_menu_index + 1 < EVIL_TWIN_MENU_OPTION_COUNT) {
             app->evil_twin_menu_index++;
-            if(app->viewport) {
-                view_port_update(app->viewport);
-            }
+        } else {
+            app->evil_twin_menu_index = 0;
+        }
+        simple_app_evil_twin_sync_offset(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyOk) {
         if(app->evil_twin_menu_index == 0) {
+            simple_app_request_scan_results(app, TARGETS_RESULTS_COMMAND);
+            return;
+        } else if(app->evil_twin_menu_index == 1) {
             if(app->evil_twin_listing_active) {
                 simple_app_show_status_message(app, "Listing already\nin progress", 1200, true);
                 return;
             }
             simple_app_request_evil_twin_html_list(app);
-        } else {
+        } else if(app->evil_twin_menu_index == 2) {
             simple_app_start_evil_portal(app);
+        } else {
+            app->passwords_select_return_screen = ScreenEvilTwinMenu;
+            app->passwords_select_index = 1;
+            app->screen = ScreenPasswordsSelect;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
         }
     }
 }
@@ -9597,6 +11924,10 @@ static void simple_app_request_evil_twin_html_list(SimpleApp* app) {
     if(!app) return;
     simple_app_close_evil_twin_popup(app);
     simple_app_reset_evil_twin_listing(app);
+    if(!simple_app_evil_twin_alloc_html_entries(app)) {
+        simple_app_show_status_message(app, "OOM: HTML list", 2000, true);
+        return;
+    }
     app->evil_twin_listing_active = true;
     simple_app_show_status_message(app, "Listing HTML...", 0, false);
     simple_app_send_command(app, "list_sd", true);
@@ -9633,6 +11964,7 @@ static void simple_app_close_evil_twin_popup(SimpleApp* app) {
 
 static void simple_app_reset_evil_twin_listing(SimpleApp* app) {
     if(!app) return;
+    simple_app_evil_twin_free_html_entries(app);
     app->evil_twin_listing_active = false;
     app->evil_twin_list_header_seen = false;
     app->evil_twin_list_length = 0;
@@ -9695,6 +12027,7 @@ static void simple_app_finish_evil_twin_listing(SimpleApp* app) {
 
 static void simple_app_process_evil_twin_line(SimpleApp* app, const char* line) {
     if(!app || !line || !app->evil_twin_listing_active) return;
+    if(!app->evil_twin_html_entries) return;
 
     const char* cursor = line;
     while(*cursor == ' ' || *cursor == '\t') {
@@ -9792,6 +12125,7 @@ static void simple_app_evil_twin_feed(SimpleApp* app, char ch) {
 
 static void simple_app_handle_evil_twin_popup_event(SimpleApp* app, const InputEvent* event) {
     if(!app || !event || !app->evil_twin_popup_active) return;
+    if(!app->evil_twin_html_entries) return;
 
     if(event->type != InputTypeShort && event->type != InputTypeRepeat) return;
 
@@ -9909,6 +12243,7 @@ static void simple_app_modify_karma_duration(SimpleApp* app, int32_t delta) {
 
 static void simple_app_reset_karma_probe_listing(SimpleApp* app) {
     if(!app) return;
+    simple_app_karma_free_probes(app);
     app->karma_probe_listing_active = false;
     app->karma_probe_list_header_seen = false;
     app->karma_probe_list_length = 0;
@@ -9985,6 +12320,7 @@ static void simple_app_finish_karma_probe_listing(SimpleApp* app) {
 
 static void simple_app_process_karma_probe_line(SimpleApp* app, const char* line) {
     if(!app || !line || !app->karma_probe_listing_active) return;
+    if(!app->karma_probes) return;
 
     const char* cursor = line;
     while(*cursor == ' ' || *cursor == '\t') {
@@ -10084,6 +12420,7 @@ static void simple_app_karma_probe_feed(SimpleApp* app, char ch) {
 
 static void simple_app_draw_karma_probe_popup(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas || !app->karma_probe_popup_active) return;
+    if(!app->karma_probes) return;
 
     const uint8_t bubble_x = 4;
     const uint8_t bubble_y = 4;
@@ -10151,6 +12488,7 @@ static void simple_app_draw_karma_probe_popup(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_handle_karma_probe_popup_event(SimpleApp* app, const InputEvent* event) {
     if(!app || !event || !app->karma_probe_popup_active) return;
+    if(!app->karma_probes) return;
     if(event->type != InputTypeShort && event->type != InputTypeRepeat) return;
 
     InputKey key = event->key;
@@ -10229,6 +12567,10 @@ static void simple_app_handle_karma_probe_popup_event(SimpleApp* app, const Inpu
 static void simple_app_request_karma_probe_list(SimpleApp* app) {
     if(!app) return;
     simple_app_reset_karma_probe_listing(app);
+    if(!simple_app_karma_alloc_probes(app)) {
+        simple_app_show_status_message(app, "OOM: probe list", 2000, true);
+        return;
+    }
     app->karma_probe_listing_active = true;
     app->karma_pending_probe_refresh = false;
     bool show_status = (app->screen == ScreenKarmaMenu);
@@ -10246,6 +12588,7 @@ static void simple_app_request_karma_probe_list(SimpleApp* app) {
 
 static void simple_app_reset_karma_html_listing(SimpleApp* app) {
     if(!app) return;
+    simple_app_karma_free_html_entries(app);
     app->karma_html_listing_active = false;
     app->karma_html_list_header_seen = false;
     app->karma_html_list_length = 0;
@@ -10322,6 +12665,7 @@ static void simple_app_finish_karma_html_listing(SimpleApp* app) {
 
 static void simple_app_process_karma_html_line(SimpleApp* app, const char* line) {
     if(!app || !line || !app->karma_html_listing_active) return;
+    if(!app->karma_html_entries) return;
 
     const char* cursor = line;
     while(*cursor == ' ' || *cursor == '\t') {
@@ -10420,6 +12764,7 @@ static void simple_app_karma_html_feed(SimpleApp* app, char ch) {
 
 static void simple_app_draw_karma_html_popup(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas || !app->karma_html_popup_active) return;
+    if(!app->karma_html_entries) return;
 
     const uint8_t bubble_x = 4;
     const uint8_t bubble_y = 4;
@@ -10487,6 +12832,7 @@ static void simple_app_draw_karma_html_popup(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const InputEvent* event) {
     if(!app || !event || !app->karma_html_popup_active) return;
+    if(!app->karma_html_entries) return;
     if(event->type != InputTypeShort && event->type != InputTypeRepeat && event->type != InputTypeLong) return;
 
     InputKey key = event->key;
@@ -10569,7 +12915,7 @@ static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const Input
             simple_app_show_status_message(app, message, 1500, true);
 
             if(app->screen == ScreenPortalMenu) {
-                app->portal_menu_index = PORTAL_MENU_OPTION_COUNT - 1;
+                app->portal_menu_index = 2;
                 simple_app_portal_sync_offset(app);
             }
 
@@ -10584,6 +12930,10 @@ static void simple_app_handle_karma_html_popup_event(SimpleApp* app, const Input
 static void simple_app_request_karma_html_list(SimpleApp* app) {
     if(!app) return;
     simple_app_reset_karma_html_listing(app);
+    if(!simple_app_karma_alloc_html_entries(app)) {
+        simple_app_show_status_message(app, "OOM: HTML list", 2000, true);
+        return;
+    }
     app->karma_html_listing_active = true;
     bool show_status = (app->screen == ScreenKarmaMenu) || (app->screen == ScreenPortalMenu);
     if(show_status) {
@@ -10800,23 +13150,29 @@ static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key) {
     if(key == InputKeyUp) {
         if(app->karma_menu_index > 0) {
             app->karma_menu_index--;
-            if(app->karma_menu_index < app->karma_menu_offset) {
-                app->karma_menu_offset = app->karma_menu_index;
-            }
-            if(app->viewport) {
-                view_port_update(app->viewport);
-            }
+        } else {
+            app->karma_menu_index = KARMA_MENU_OPTION_COUNT - 1;
+        }
+        if(app->karma_menu_index < app->karma_menu_offset) {
+            app->karma_menu_offset = app->karma_menu_index;
+        }
+        if(app->viewport) {
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyDown) {
         if(app->karma_menu_index + 1 < KARMA_MENU_OPTION_COUNT) {
             app->karma_menu_index++;
-            size_t visible = 3;
-            if(app->karma_menu_index >= app->karma_menu_offset + visible) {
-                app->karma_menu_offset = app->karma_menu_index - visible + 1;
-            }
-            if(app->viewport) {
-                view_port_update(app->viewport);
-            }
+        } else {
+            app->karma_menu_index = 0;
+        }
+        size_t visible = 3;
+        if(app->karma_menu_index < app->karma_menu_offset) {
+            app->karma_menu_offset = app->karma_menu_index;
+        } else if(app->karma_menu_index >= app->karma_menu_offset + visible) {
+            app->karma_menu_offset = app->karma_menu_index - visible + 1;
+        }
+        if(app->viewport) {
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyOk) {
         switch(app->karma_menu_index) {
@@ -11251,7 +13607,12 @@ static void simple_app_handle_setup_boot_input(SimpleApp* app, InputKey key) {
 
 static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
     if(!app) return;
-    if(app->blackout_view_active && key != InputKeyBack && key != InputKeyUp && key != InputKeyDown) {
+    if(app->blackout_view_active && !app->blackout_full_console && key != InputKeyBack &&
+       key != InputKeyUp && key != InputKeyDown) {
+        return;
+    }
+    if(app->sniffer_dog_view_active && !app->sniffer_dog_full_console && key != InputKeyBack &&
+       key != InputKeyUp && key != InputKeyDown) {
         return;
     }
     if(app->deauth_guard_view_active && !app->deauth_guard_full_console) {
@@ -11267,8 +13628,17 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
         return;
     }
 
+    if(app->evil_twin_running && !app->evil_twin_full_console && key != InputKeyBack) {
+        return;
+    }
+
+    if(app->portal_running && !app->portal_full_console && key != InputKeyBack) {
+        return;
+    }
+
     if(app->probe_results_active) {
         if(key == InputKeyBack) {
+            simple_app_send_stop_preserve_results(app);
             app->probe_results_active = false;
             app->probe_full_console = false;
             app->screen = ScreenMenu;
@@ -11345,6 +13715,7 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
             ap_count > 0 || app->sniffer_client_count > 0;
 
         if(key == InputKeyBack) {
+            simple_app_send_stop_preserve_results(app);
             app->sniffer_results_active = false;
             app->sniffer_full_console = false;
             app->sniffer_view_active = false;
@@ -11405,11 +13776,25 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
     }
 
     if(key == InputKeyBack) {
+        bool return_to_portal = app->portal_running;
+        bool return_to_evil_twin = app->evil_twin_running;
         simple_app_send_stop_if_needed(app);
         app->serial_targets_hint = false;
         if(app->blackout_view_active) {
             app->blackout_view_active = false;
+            simple_app_reset_blackout_status(app);
             simple_app_focus_attacks_menu(app);
+        } else if(app->sniffer_dog_view_active) {
+            app->sniffer_dog_view_active = false;
+            simple_app_reset_sniffer_dog_status(app);
+            simple_app_focus_attacks_menu(app);
+        } else if(return_to_evil_twin) {
+            app->evil_twin_popup_active = false;
+            app->screen = ScreenEvilTwinMenu;
+        } else if(return_to_portal) {
+            app->portal_ssid_popup_active = false;
+            app->portal_full_console = false;
+            app->screen = ScreenPortalMenu;
         } else {
             app->screen = ScreenMenu;
         }
@@ -11501,6 +13886,15 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
 
 static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
     if(key == InputKeyBack || key == InputKeyLeft) {
+        if(app->visible_result_count == 0 && !app->scan_results_loading) {
+            simple_app_clear_status_message(app);
+            app->screen = ScreenMenu;
+            app->menu_state = MenuStateSections;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
         // Restart scanner when exiting targets/results: clear stale rows and redraw scan state.
         simple_app_reset_scan_results(app);
         app->scan_results_loading = true;
@@ -11655,6 +14049,9 @@ static void simple_app_input(InputEvent* event, void* context) {
         app->bt_scan_view_active = false;
         app->bt_locator_mode = false;
         app->blackout_view_active = false;
+        simple_app_reset_blackout_status(app);
+        app->sniffer_dog_view_active = false;
+        simple_app_reset_sniffer_dog_status(app);
         app->deauth_guard_view_active = false;
         app->screen = ScreenMenu;
         app->menu_state = MenuStateSections;
@@ -11762,6 +14159,24 @@ static void simple_app_input(InputEvent* event, void* context) {
     }
 
     if(event->type == InputTypeLong && event->key == InputKeyOk) {
+        if(app->blackout_view_active && app->screen == ScreenSerial) {
+            app->blackout_full_console = !app->blackout_full_console;
+            app->serial_follow_tail = true;
+            app->serial_targets_hint = false;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
+        if(app->sniffer_dog_view_active && app->screen == ScreenSerial) {
+            app->sniffer_dog_full_console = !app->sniffer_dog_full_console;
+            app->serial_follow_tail = true;
+            app->serial_targets_hint = false;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
         if(app->scanner_view_active) {
             app->scanner_full_console = !app->scanner_full_console;
             app->serial_follow_tail = true;
@@ -11805,6 +14220,22 @@ static void simple_app_input(InputEvent* event, void* context) {
             if(app->bt_scan_full_console) {
                 app->bt_scan_show_list = false;
             }
+            app->serial_follow_tail = true;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
+        if(app->evil_twin_running && app->screen == ScreenSerial) {
+            app->evil_twin_full_console = !app->evil_twin_full_console;
+            app->serial_follow_tail = true;
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
+        if(app->portal_running && app->screen == ScreenSerial) {
+            app->portal_full_console = !app->portal_full_console;
             app->serial_follow_tail = true;
             if(app->viewport) {
                 view_port_update(app->viewport);
@@ -11885,13 +14316,14 @@ static void simple_app_input(InputEvent* event, void* context) {
     case ScreenPortalMenu:
         simple_app_handle_portal_menu_input(app, event->key);
         break;
-    case ScreenDownloadBridge:
-        if(event->key == InputKeyBack) {
-            simple_app_download_bridge_stop(app);
-        }
-        break;
     case ScreenBtLocatorList:
         simple_app_handle_bt_locator_input(app, event->key);
+        break;
+    case ScreenPasswords:
+        simple_app_handle_passwords_input(app, event->key);
+        break;
+    case ScreenPasswordsSelect:
+        simple_app_handle_passwords_select_input(app, event->key);
         break;
     default:
         simple_app_handle_results_input(app, event->key);
@@ -11932,43 +14364,6 @@ static void simple_app_process_stream(SimpleApp* app) {
     }
 }
 
-static bool simple_app_download_bridge_start(SimpleApp* app) {
-    if(!app) return false;
-    simple_app_send_command_quiet(app, "download");
-    simple_app_show_status_message(app, "Download sent.\nStart UART bridge\nand reconnect USB.", 5000, true);
-    return true;
-}
-
-static void simple_app_download_bridge_stop(SimpleApp* app) {
-    (void)app;
-}
-
-static bool simple_app_usb_profile_ok(void) {
-    const FuriHalUsbInterface* current = furi_hal_usb_get_config();
-    if(!current) return true;
-    return current == &usb_cdc_single;
-}
-
-static void simple_app_show_usb_blocker(void) {
-    DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
-    if(dialogs) {
-        DialogMessage* msg = dialog_message_alloc();
-        if(msg) {
-            dialog_message_set_header(msg, "USB in use", 64, 8, AlignCenter, AlignTop);
-            dialog_message_set_text(
-                msg,
-                "Close qFlipper/mass\nstorage.\nSet USB to CDC/Serial\nthen relaunch.",
-                64,
-                32,
-                AlignCenter,
-                AlignCenter);
-            dialog_message_show(dialogs, msg);
-            dialog_message_free(msg);
-        }
-        furi_record_close(RECORD_DIALOGS);
-    }
-}
-
 static void simple_app_serial_irq(FuriHalSerialHandle* handle, FuriHalSerialRxEvent event, void* context) {
     SimpleApp* app = context;
     if(!app || !app->rx_stream || !(event & FuriHalSerialRxEventData)) return;
@@ -11980,35 +14375,34 @@ static void simple_app_serial_irq(FuriHalSerialHandle* handle, FuriHalSerialRxEv
     } while(furi_hal_serial_async_rx_available(handle));
 }
 
-static void simple_app_draw_download_bridge(SimpleApp* app, Canvas* canvas) {
-    if(!app) return;
-    canvas_set_color(canvas, ColorBlack);
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 14, AlignCenter, AlignCenter, "Download mode");
-    canvas_set_font(canvas, FontSecondary);
-    char line1[32];
-    char line2[32];
-    snprintf(line1, sizeof(line1), "Baud: %lu", (unsigned long)app->download_baud);
-    snprintf(
-        line2,
-        sizeof(line2),
-        "TX:%lu RX:%lu",
-        (unsigned long)app->download_uart_to_usb,
-        (unsigned long)app->download_usb_to_uart);
-    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 28, AlignCenter, AlignCenter, line1);
-    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 40, AlignCenter, AlignCenter, line2);
-    canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 52, AlignCenter, AlignCenter, "Back = exit bridge");
-}
-
 int32_t Lab_C5_app(void* p) {
     UNUSED(p);
 
     if(!simple_app_usb_profile_ok()) {
         simple_app_show_usb_blocker();
+        return 0;
+    }
+
+    // If SD is busy (e.g., mounted via qFlipper), exit immediately
+    Storage* early_storage = furi_record_open(RECORD_STORAGE);
+    if(early_storage) {
+        if(storage_sd_status(early_storage) != FSE_OK) {
+            furi_record_close(RECORD_STORAGE);
+            return 0;
+        }
+        furi_record_close(RECORD_STORAGE);
+    }
+
+    const size_t free_heap = memmgr_get_free_heap();
+    const size_t needed_heap = sizeof(SimpleApp) + 4096;
+    if(free_heap < needed_heap) {
+        simple_app_show_low_memory(free_heap, needed_heap);
+        return 0;
     }
 
     SimpleApp* app = malloc(sizeof(SimpleApp));
     if(!app) {
+        simple_app_show_low_memory(free_heap, needed_heap);
         return 0;
     }
     memset(app, 0, sizeof(SimpleApp));
@@ -12074,16 +14468,19 @@ int32_t Lab_C5_app(void* p) {
     if(sd_folder_option_count > 0) {
         simple_app_copy_sd_folder(app, &sd_folder_options[0]);
     }
-    simple_app_update_otg_label(app);
-    simple_app_apply_otg_power(app);
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
     app->menu_state = MenuStateSections;
     app->screen = ScreenMenu;
     app->serial_follow_tail = true;
     simple_app_reset_scan_results(app);
+    simple_app_reset_blackout_status(app);
+    simple_app_reset_sniffer_dog_status(app);
     simple_app_reset_sniffer_status(app);
     simple_app_reset_sniffer_results(app);
     simple_app_reset_probe_results(app);
+    simple_app_reset_portal_status(app);
+    simple_app_reset_evil_twin_status(app);
+    simple_app_reset_passwords_listing(app);
     app->last_input_tick = furi_get_tick();
     app->help_hint_visible = false;
 
@@ -12115,6 +14512,18 @@ int32_t Lab_C5_app(void* p) {
     furi_stream_buffer_reset(app->rx_stream);
     simple_app_reset_serial_log(app, "READY");
 
+    {
+        char line[96];
+        snprintf(
+            line,
+            sizeof(line),
+            "Heap start free:%lu min:%lu SimpleApp:%lu\n",
+            (unsigned long)memmgr_get_free_heap(),
+            (unsigned long)memmgr_get_minimum_free_heap(),
+            (unsigned long)sizeof(SimpleApp));
+        simple_app_append_serial_data(app, (const uint8_t*)line, strlen(line));
+    }
+
     furi_hal_serial_async_rx_start(app->serial, simple_app_serial_irq, app, false);
 
     app->gui = furi_record_open(RECORD_GUI);
@@ -12129,7 +14538,7 @@ int32_t Lab_C5_app(void* p) {
     simple_app_update_led_label(app);
     simple_app_update_boot_labels(app);
     simple_app_apply_backlight(app);
-    simple_app_update_otg_label(app);
+    // Respect config value (loaded by simple_app_load_config) and apply it to HW
     simple_app_apply_otg_power(app);
     if(app->viewport) {
         view_port_update(app->viewport);
@@ -12143,17 +14552,17 @@ int32_t Lab_C5_app(void* p) {
         view_port_update(app->viewport);
     }
 
-    while(!app->exit_app) {
-        if(!app->download_bridge_active) {
+        while(!app->exit_app) {
             simple_app_process_stream(app);
             simple_app_update_karma_sniffer(app);
             simple_app_update_result_scroll(app);
+            simple_app_update_overlay_title_scroll(app);
             simple_app_update_sd_scroll(app);
             simple_app_update_deauth_guard(app);
             simple_app_ping_watchdog(app);
-        }
+            simple_app_usb_runtime_guard(app);
 
-        if(!app->download_bridge_active && app->portal_input_requested && !app->portal_input_active) {
+        if(app->portal_input_requested && !app->portal_input_active) {
             app->portal_input_requested = false;
             bool accepted = simple_app_portal_run_text_input(app);
             if(accepted) {
@@ -12208,14 +14617,10 @@ int32_t Lab_C5_app(void* p) {
             view_port_update(app->viewport);
         }
 
-        furi_delay_ms(app->download_bridge_active ? 1 : 20);
+        furi_delay_ms(20);
     }
 
     simple_app_prepare_exit(app);
-
-    if(app->download_bridge_active) {
-        simple_app_download_bridge_stop(app);
-    }
 
     simple_app_save_config_if_dirty(app, NULL, false);
 
@@ -12240,14 +14645,7 @@ int32_t Lab_C5_app(void* p) {
         furi_hal_power_insomnia_exit();
         app->backlight_insomnia = false;
     }
-    bool current_otg_state = furi_hal_power_is_otg_enabled();
-    if(current_otg_state != app->otg_power_initial_state) {
-        if(app->otg_power_initial_state) {
-            furi_hal_power_enable_otg();
-        } else {
-            furi_hal_power_disable_otg();
-        }
-    }
+    // Do not restore OTG state on exit: 5V setting is user-configurable and persisted via config.
     furi_hal_light_set(LightBacklight, BACKLIGHT_ON_LEVEL);
     free(app);
 

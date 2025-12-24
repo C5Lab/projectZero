@@ -1,5 +1,9 @@
 # projectZero
 
+## Web flasher (Flipper + LAB C5)
+- Web flasher for Flipper Zero FAP and LAB C5 firmware: https://c5lab.github.io/projectZero/
+- Latest releases and changelog: https://github.com/C5Lab/projectZero/releases
+
 projectZero is a LAB C5 board add-on firmware that layers blackout, Sniffer Dog, wardriving, and captive portal tools on top of ESP32-C5 dual-band (2.4/5 GHz) radios—and is the first to ship working WPA handshake capture on ESP32-C5 using ESP-IDF.
 - **ESP32-C5-WROOM-1** (USB CLI) scans, runs the embedded evil-twin portal, captures credentials, and verifies WPA2/WPA3 passwords—everything lives on the same board now.  
 - **Flipper Zero companion app** mirrors the CLI features and keeps the handheld navigation lightweight.
@@ -24,7 +28,7 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 - Attack suite: `start_deauth`, `start_blackout`, `start_sniffer_dog`, `start_evil_twin`, `start_handshake`, `sae_overflow`, `start_karma`, `start_portal`, and `start_wardrive`.
 - Bluetooth toolkit: `scan_bt` runs a 10s BLE sweep or tracks a specific MAC for locator duty; `scan_airtag` keeps hunting AirTags/SmartTags with periodic rollups.
 - Defensive watch: `deauth_detector` (Deauth Guard) passively flags nearby deauth floods before they disrupt your targets.
-- SD and vendor helpers: `list_sd`, `list_dir`, `file_delete`, `select_html`, `list_ssid`, plus OUI lookups via `vendor set/read`.
+- SD and vendor helpers: `list_sd`, `list_dir`, `file_delete`, `select_html`, `list_ssid`, `show_pass`, plus OUI lookups via `vendor set/read`.
 - Controls and safety: `boot_button`, `channel_time`, `led`, `stop`, `reboot`, `download`, `ping`, and `save_handshake` to map buttons, tune scan dwell, reboot to UART flash, or flush captured handshakes.
 
 ## Core Capabilities
@@ -43,6 +47,7 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 - `start_evil_twin` - spins up the ESP-NOW link to the secondary ESP32 so that deauth + portal orchestration happens automatically; once a password is validated, ESP32-C5 stops the attack.
 - `start_portal <ssid>` - launches the captive portal locally on the C5, adds DNS redirection, and stores submissions inside `/sdcard/lab/portals.txt`.
 - `list_sd` / `select_html <index>` - browse `/sdcard/lab/htmls/` for custom captive-portal templates (limited to 800 KB each) and push them into RAM.
+- `show_pass` - prints the contents of `/sdcard/lab/portals.txt` for quick review of captured submissions.
 - `start_karma <probe_index>` - re-broadcasts one of the sniffed probe SSIDs so the portal can masquerade as whatever nearby phones expect.
 - `start_handshake` - exclusive LAB feature that spins up a dedicated WPA handshake capture task (shown as **Handshaker** inside the Flipper UI). More details: https://github.com/C5Lab/projectZero/wiki/Handshaker
 - `save_handshake` - manual flush of a completed 4-way handshake to the SD card when you want to preserve it before stopping attacks.
@@ -64,11 +69,12 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 - `channel_time set <min|max> <ms>` / `channel_time read <min|max>` - tune how long scans dwell on each channel for faster or deeper recon runs.
 - `vendor set <on|off>` / `vendor read` - toggles OUI lookup backed by `/lab/oui_wifi.bin` on the SD card.
 - `led set <on|off>` / `led level <1-100>` - controls the WS2812 status LED (purple for portal, other colors for attacks).
+- GPS helpers: `gps_set <m5|atgm>` switches between M5Stack GPS v1.1 (115200 bps) and ATGM336H (9600 bps, default); `start_gps_raw [baud]` streams NMEA for quick validation without rebooting (baud optional, overrides module default).
 - `download` - reboot straight into ROM download mode for UART flashing.
 - `ping` - quick CLI connectivity check (prints pong).
 - `stop` - flips the global stop flag so every running task can wind down gracefully.
 - `reboot` - clean restart without USB re-plug.
-- SD helpers: `list_sd` (HTMLs), `list_dir [path]`, `file_delete <path>`, `select_html <index>`, and `list_ssid` for the SSID hint file.
+- SD helpers: `list_sd` (HTMLs), `list_dir [path]`, `file_delete <path>`, `select_html <index>`, `list_ssid`, and `show_pass` for the portal log.
 
 ## Flipper App Navigation
 
@@ -130,6 +136,9 @@ We're regular tinkerers who got bored and decided to design the full stack ourse
 - Join the LAB Discord server to discuss ESP32-C5 builds and projectZero workflows: https://discord.gg/57wmJzzR8C
 
 ## Last Changes
+- 2025-12-23 JanOS 1.0.1 - fix evil rerun fail on bad pass / portal restart fix + new `show_pass` CLI / Fix boot_button fail to launch; FAP 0.38 - Portal /Evil twin / Blackout and Snifferdog GUI + Show Password for Evil and Portal
+- 2025-12-18 JanOS 1.0.1 - New GPS support for M5Stack GPS 1.1 / FAP 0.37 - Fix not full ssid and mac in Sniffer
+- 2025-12-17 FAP 0.36 - Fix Out of memory on flipper when using qfliper
 - 2025-12-11 FAP 0.35 - fixed qFlipper-connected crash; Sniffer flow adds 200+ pkt right-jump to Results then Probes, left/back returns; Probes label corrected for 2-digit SSID counts; haptics on Sniffer edge; hold Back to root, double Back opens Exit; Deauth Guard LED hit indicator removed; Wi-Fi Targets left re-runs Scanner and resets results; restored Scanner arrow after returning from console; build via `FLIPPER/build_fap.py`, deploy via `FLIPPER/dist/deploy_fap.py`.
 - 2025-12-10 FAP 0.34 Sniffer - new GUI for all 3 options
 - 2025-12-08 JanOS 1.0.0 fix BT name scan / FAP 0.33 Wifi Scanner new GUI / BT all GUI rework, BT scan show name of device / Exit from FAP small heptic.
