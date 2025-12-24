@@ -366,7 +366,7 @@
       } catch {}
       let cleaned = path.startsWith("/") ? path.slice(1) : path;
       const branch = getBranch();
-      if (branch !== "main" && cleaned.startsWith("firmware/")) {
+      if (cleaned.startsWith("firmware/")) {
         cleaned = cleaned.replace(/^firmware\//, "ESP32C5/binaries-esp32c5/");
       }
       return `https://raw.githubusercontent.com/C5Lab/projectZero/${branch}/${cleaned}`;
