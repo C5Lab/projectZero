@@ -225,6 +225,11 @@ static const char* boot_command_options[BOOT_COMMAND_OPTION_COUNT] = {
 #define EVIL_TWIN_QR_MAX_VERSION 10
 #define EVIL_TWIN_QR_BUFFER_LEN qrcodegen_BUFFER_LEN_FOR_VERSION(EVIL_TWIN_QR_MAX_VERSION)
 #define EVIL_TWIN_QR_TEXT_MAX 256
+
+static uint8_t g_evil_twin_qr[EVIL_TWIN_QR_BUFFER_LEN];
+static uint8_t g_evil_twin_qr_temp[EVIL_TWIN_QR_BUFFER_LEN];
+static uint8_t g_help_qr[EVIL_TWIN_QR_BUFFER_LEN];
+static uint8_t g_help_qr_temp[EVIL_TWIN_QR_BUFFER_LEN];
 #define KARMA_MAX_PROBES 32
 #define KARMA_PROBE_NAME_MAX 48
 #define KARMA_POPUP_VISIBLE_LINES 3
@@ -579,11 +584,9 @@ typedef struct {
     char evil_twin_qr_error[24];
     char evil_twin_qr_ssid[SCAN_SSID_MAX_LEN];
     char evil_twin_qr_pass[EVIL_TWIN_PASS_MAX_LEN];
-    uint8_t evil_twin_qr[EVIL_TWIN_QR_BUFFER_LEN];
     bool help_qr_ready;
     bool help_qr_valid;
     char help_qr_error[24];
-    uint8_t help_qr[EVIL_TWIN_QR_BUFFER_LEN];
     size_t portal_menu_index;
     char portal_ssid[SCAN_SSID_MAX_LEN];
     size_t portal_menu_offset;
@@ -8324,11 +8327,10 @@ static bool simple_app_build_evil_twin_qr(SimpleApp* app, const char* ssid, cons
         return false;
     }
 
-    uint8_t temp[EVIL_TWIN_QR_BUFFER_LEN];
     bool ok = qrcodegen_encodeText(
         qr_text,
-        temp,
-        app->evil_twin_qr,
+        g_evil_twin_qr_temp,
+        g_evil_twin_qr,
         qrcodegen_Ecc_MEDIUM,
         1,
         EVIL_TWIN_QR_MAX_VERSION,
@@ -8469,7 +8471,7 @@ static void simple_app_draw_evil_twin_pass_qr(SimpleApp* app, Canvas* canvas) {
     canvas_set_color(canvas, ColorBlack);
 
     if(app->evil_twin_qr_valid) {
-        int size = qrcodegen_getSize(app->evil_twin_qr);
+        int size = qrcodegen_getSize(g_evil_twin_qr);
         int scale_x = qr_w / size;
         int scale_y = qr_h / size;
         int scale = (scale_x < scale_y) ? scale_x : scale_y;
@@ -8483,7 +8485,7 @@ static void simple_app_draw_evil_twin_pass_qr(SimpleApp* app, Canvas* canvas) {
             int offset_y = qr_y + (qr_h - qr_size) / 2;
             for(int y = 0; y < size; y++) {
                 for(int x = 0; x < size; x++) {
-                    if(qrcodegen_getModule(app->evil_twin_qr, x, y)) {
+                    if(qrcodegen_getModule(g_evil_twin_qr, x, y)) {
                         canvas_draw_box(
                             canvas,
                             offset_x + x * scale,
@@ -12568,12 +12570,11 @@ static void simple_app_prepare_help_qr(SimpleApp* app) {
     if(!app) return;
     if(app->help_qr_ready) return;
 
-    static uint8_t help_qr_temp[EVIL_TWIN_QR_BUFFER_LEN];
     const char* url = "https://github.com/C5Lab/projectZero/wiki";
     bool ok = qrcodegen_encodeText(
         url,
-        help_qr_temp,
-        app->help_qr,
+        g_help_qr_temp,
+        g_help_qr,
         qrcodegen_Ecc_MEDIUM,
         1,
         EVIL_TWIN_QR_MAX_VERSION,
@@ -12607,7 +12608,7 @@ static void simple_app_draw_help_qr(SimpleApp* app, Canvas* canvas) {
 
     bool ok = app->help_qr_valid;
     if(ok) {
-        int size = qrcodegen_getSize(app->help_qr);
+        int size = qrcodegen_getSize(g_help_qr);
         int scale_x = qr_w / size;
         int scale_y = qr_h / size;
         int scale = (scale_x < scale_y) ? scale_x : scale_y;
@@ -12617,7 +12618,7 @@ static void simple_app_draw_help_qr(SimpleApp* app, Canvas* canvas) {
             int offset_y = qr_y + (qr_h - qr_size) / 2;
             for(int y = 0; y < size; y++) {
                 for(int x = 0; x < size; x++) {
-                    if(qrcodegen_getModule(app->help_qr, x, y)) {
+                    if(qrcodegen_getModule(g_help_qr, x, y)) {
                         canvas_draw_box(
                             canvas,
                             offset_x + x * scale,
