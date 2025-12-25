@@ -22,6 +22,7 @@
 #include <usb_cdc.h>
 #include <furi_hal_vibro.h>
 #include <dialogs/dialogs.h>
+#include "qrcodegen.h"
 
 #define TAG "Lab_C5"
 
@@ -45,6 +46,7 @@ typedef enum {
     ScreenSetupLed,
     ScreenSetupBoot,
     ScreenSetupSdManager,
+    ScreenHelpQr,
     ScreenConsole,
     ScreenPackageMonitor,
     ScreenChannelView,
@@ -53,6 +55,8 @@ typedef enum {
     ScreenConfirmExit,
     ScreenKarmaMenu,
     ScreenEvilTwinMenu,
+    ScreenEvilTwinPassList,
+    ScreenEvilTwinPassQr,
     ScreenPortalMenu,
     ScreenBtLocatorList,
     ScreenPasswords,
@@ -82,7 +86,7 @@ typedef enum {
     SnifferDogPhaseError,
     SnifferDogPhaseFinished,
 } SnifferDogPhase;
-#define LAB_C5_VERSION_TEXT "0.39"
+#define LAB_C5_VERSION_TEXT "0.40"
 
 #define MAX_SCAN_RESULTS 48
 #define SCAN_LINE_BUFFER_SIZE 192
@@ -211,10 +215,16 @@ static const char* boot_command_options[BOOT_COMMAND_OPTION_COUNT] = {
 #define EVIL_TWIN_MAX_HTML_FILES 16
 #define EVIL_TWIN_HTML_NAME_MAX 32
 #define EVIL_TWIN_POPUP_VISIBLE_LINES 3
-#define EVIL_TWIN_MENU_OPTION_COUNT 4
+#define EVIL_TWIN_MENU_OPTION_COUNT 5
 #define EVIL_TWIN_VISIBLE_COUNT 2
 #define EVIL_TWIN_STATUS_LINE_BUFFER 160
 #define EVIL_TWIN_STATUS_NOTE_MAX 16
+#define EVIL_TWIN_PASS_MAX_ENTRIES 64
+#define EVIL_TWIN_PASS_MAX_LEN 64
+#define EVIL_TWIN_PASS_VISIBLE_LINES 4
+#define EVIL_TWIN_QR_MAX_VERSION 10
+#define EVIL_TWIN_QR_BUFFER_LEN qrcodegen_BUFFER_LEN_FOR_VERSION(EVIL_TWIN_QR_MAX_VERSION)
+#define EVIL_TWIN_QR_TEXT_MAX 256
 #define KARMA_MAX_PROBES 32
 #define KARMA_PROBE_NAME_MAX 48
 #define KARMA_POPUP_VISIBLE_LINES 3
@@ -256,6 +266,7 @@ typedef enum {
     MenuActionOpenBootSetup,
     MenuActionOpenDownload,
     MenuActionOpenSdManager,
+    MenuActionOpenHelp,
 
     MenuActionOpenConsole,
     MenuActionOpenPackageMonitor,
@@ -321,6 +332,12 @@ typedef struct {
     uint8_t id;
     char name[EVIL_TWIN_HTML_NAME_MAX];
 } EvilTwinHtmlEntry;
+
+typedef struct {
+    uint16_t id;
+    char ssid[SCAN_SSID_MAX_LEN];
+    char pass[EVIL_TWIN_PASS_MAX_LEN];
+} EvilTwinPassEntry;
 
 typedef struct {
     uint8_t id;
@@ -551,6 +568,22 @@ typedef struct {
     uint8_t evil_twin_selected_html_id;
     char evil_twin_selected_html_name[EVIL_TWIN_HTML_NAME_MAX];
     EvilTwinStatus* evil_twin_status;
+    EvilTwinPassEntry* evil_twin_pass_entries;
+    size_t evil_twin_pass_count;
+    size_t evil_twin_pass_index;
+    size_t evil_twin_pass_offset;
+    bool evil_twin_pass_listing_active;
+    char evil_twin_pass_list_buffer[160];
+    size_t evil_twin_pass_list_length;
+    bool evil_twin_qr_valid;
+    char evil_twin_qr_error[24];
+    char evil_twin_qr_ssid[SCAN_SSID_MAX_LEN];
+    char evil_twin_qr_pass[EVIL_TWIN_PASS_MAX_LEN];
+    uint8_t evil_twin_qr[EVIL_TWIN_QR_BUFFER_LEN];
+    bool help_qr_ready;
+    bool help_qr_valid;
+    char help_qr_error[24];
+    uint8_t help_qr[EVIL_TWIN_QR_BUFFER_LEN];
     size_t portal_menu_index;
     char portal_ssid[SCAN_SSID_MAX_LEN];
     size_t portal_menu_offset;
@@ -913,6 +946,15 @@ static void simple_app_evil_twin_status_feed(SimpleApp* app, char ch);
 static void simple_app_draw_evil_twin_overlay(SimpleApp* app, Canvas* canvas);
 static bool simple_app_evil_twin_status_ensure(SimpleApp* app);
 static void simple_app_evil_twin_status_free(SimpleApp* app);
+static void simple_app_request_evil_twin_pass_list(SimpleApp* app);
+static void simple_app_reset_evil_twin_pass_listing(SimpleApp* app);
+static void simple_app_process_evil_twin_pass_line(SimpleApp* app, const char* line);
+static void simple_app_evil_twin_pass_feed(SimpleApp* app, char ch);
+static void simple_app_draw_evil_twin_pass_list(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_evil_twin_pass_list_input(SimpleApp* app, InputKey key);
+static void simple_app_draw_evil_twin_pass_qr(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_evil_twin_pass_qr_input(SimpleApp* app, InputKey key);
+static bool simple_app_build_evil_twin_qr(SimpleApp* app, const char* ssid, const char* pass);
 static void simple_app_reset_passwords_listing(SimpleApp* app);
 static bool simple_app_passwords_alloc_lines(SimpleApp* app);
 static void simple_app_passwords_free_lines(SimpleApp* app);
@@ -936,6 +978,9 @@ static void simple_app_open_sd_manager(SimpleApp* app);
 static void simple_app_copy_sd_folder(SimpleApp* app, const SdFolderOption* folder);
 static void simple_app_draw_setup_sd_manager(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_setup_sd_manager_input(SimpleApp* app, InputKey key);
+static void simple_app_prepare_help_qr(SimpleApp* app);
+static void simple_app_draw_help_qr(SimpleApp* app, Canvas* canvas);
+static void simple_app_handle_help_qr_input(SimpleApp* app, InputKey key);
 static void simple_app_draw_sd_folder_popup(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_sd_folder_popup_event(SimpleApp* app, const InputEvent* event);
 static void simple_app_request_sd_listing(SimpleApp* app, const SdFolderOption* folder);
@@ -1114,6 +1159,8 @@ static const char hint_setup_scanner_timing[] =
     "Channel dwell times\nLeft/Right adjusts\nMin/Max per channel\nSync with board\nStored in config.";
 static const char hint_setup_console[] =
     "Open live console\nStream UART output\nWatch commands\nDebug operations\nClose with Back.";
+static const char hint_setup_help[] =
+    "QR link to Wiki\nScan to open\nBack returns";
 static const char hint_setup_sd_manager[] =
     "Browse SD folders\nPick lab captures\nDelete safely\nDefault: handshakes.";
 
@@ -1177,6 +1224,7 @@ static const MenuEntry menu_entries_setup[] = {
     {"Scanner Filters", NULL, MenuActionOpenScannerSetup, hint_setup_filters},
     {"Scanner Timing", NULL, MenuActionOpenScannerTiming, hint_setup_scanner_timing},
     {"SD Manager", NULL, MenuActionOpenSdManager, hint_setup_sd_manager},
+    {"Help", NULL, MenuActionOpenHelp, hint_setup_help},
     {"Download Mode", NULL, MenuActionOpenDownload, hint_setup_download},
     {"Console", NULL, MenuActionOpenConsole, hint_setup_console},
 };
@@ -5540,6 +5588,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_portal_ssid_feed(app, ch);
         simple_app_portal_status_feed(app, ch);
         simple_app_evil_twin_status_feed(app, ch);
+        simple_app_evil_twin_pass_feed(app, ch);
         simple_app_passwords_feed(app, ch);
         simple_app_sd_feed(app, ch);
         simple_app_evil_twin_feed(app, ch);
@@ -5992,6 +6041,7 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     simple_app_send_stop_if_needed(app);
     simple_app_close_evil_twin_popup(app);
     simple_app_reset_evil_twin_listing(app);
+    simple_app_reset_evil_twin_pass_listing(app);
     simple_app_reset_portal_ssid_listing(app);
     simple_app_reset_sd_listing(app);
     simple_app_reset_karma_probe_listing(app);
@@ -8067,6 +8117,452 @@ static void simple_app_evil_twin_status_feed(SimpleApp* app, char ch) {
     app->evil_twin_status->line_buffer[app->evil_twin_status->line_length++] = ch;
 }
 
+static bool simple_app_evil_twin_pass_alloc_entries(SimpleApp* app) {
+    if(!app) return false;
+    if(app->evil_twin_pass_entries) return true;
+    app->evil_twin_pass_entries =
+        calloc(EVIL_TWIN_PASS_MAX_ENTRIES, sizeof(EvilTwinPassEntry));
+    return app->evil_twin_pass_entries != NULL;
+}
+
+static void simple_app_evil_twin_pass_free_entries(SimpleApp* app) {
+    if(!app || !app->evil_twin_pass_entries) return;
+    free(app->evil_twin_pass_entries);
+    app->evil_twin_pass_entries = NULL;
+}
+
+static void simple_app_reset_evil_twin_pass_listing(SimpleApp* app) {
+    if(!app) return;
+    simple_app_evil_twin_pass_free_entries(app);
+    app->evil_twin_pass_listing_active = false;
+    app->evil_twin_pass_count = 0;
+    app->evil_twin_pass_index = 0;
+    app->evil_twin_pass_offset = 0;
+    app->evil_twin_pass_list_length = 0;
+    app->evil_twin_qr_valid = false;
+    app->evil_twin_qr_error[0] = '\0';
+    app->evil_twin_qr_ssid[0] = '\0';
+    app->evil_twin_qr_pass[0] = '\0';
+}
+
+static void simple_app_request_evil_twin_pass_list(SimpleApp* app) {
+    if(!app) return;
+    simple_app_reset_evil_twin_pass_listing(app);
+    if(!simple_app_evil_twin_pass_alloc_entries(app)) {
+        simple_app_show_status_message(app, "OOM: WiFi list", 2000, true);
+        return;
+    }
+    app->evil_twin_pass_listing_active = true;
+    app->screen = ScreenEvilTwinPassList;
+    simple_app_send_command_quiet(app, "show_pass evil");
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_process_evil_twin_pass_line(SimpleApp* app, const char* line) {
+    if(!app || !line || !app->evil_twin_pass_entries) return;
+    if(app->evil_twin_pass_count >= EVIL_TWIN_PASS_MAX_ENTRIES) return;
+
+    const char* cursor = line;
+    while(*cursor == ' ' || *cursor == '\t') {
+        cursor++;
+    }
+    if(*cursor != '"') return;
+
+    const char* ssid_start = strchr(cursor, '"');
+    if(!ssid_start) return;
+    ssid_start++;
+    const char* ssid_end = strchr(ssid_start, '"');
+    if(!ssid_end) return;
+    const char* pass_start = strchr(ssid_end + 1, '"');
+    if(!pass_start) return;
+    pass_start++;
+    const char* pass_end = strchr(pass_start, '"');
+    if(!pass_end) return;
+
+    char raw_ssid[SCAN_SSID_MAX_LEN];
+    char raw_pass[EVIL_TWIN_PASS_MAX_LEN];
+    size_t ssid_len = (size_t)(ssid_end - ssid_start);
+    if(ssid_len >= sizeof(raw_ssid)) ssid_len = sizeof(raw_ssid) - 1;
+    memcpy(raw_ssid, ssid_start, ssid_len);
+    raw_ssid[ssid_len] = '\0';
+    size_t pass_len = (size_t)(pass_end - pass_start);
+    if(pass_len >= sizeof(raw_pass)) pass_len = sizeof(raw_pass) - 1;
+    memcpy(raw_pass, pass_start, pass_len);
+    raw_pass[pass_len] = '\0';
+
+    char ascii_ssid[SCAN_SSID_MAX_LEN];
+    char ascii_pass[EVIL_TWIN_PASS_MAX_LEN];
+    simple_app_utf8_to_ascii_pl(raw_ssid, ascii_ssid, sizeof(ascii_ssid));
+    simple_app_utf8_to_ascii_pl(raw_pass, ascii_pass, sizeof(ascii_pass));
+    simple_app_trim(ascii_ssid);
+    simple_app_trim(ascii_pass);
+
+    EvilTwinPassEntry* entry = &app->evil_twin_pass_entries[app->evil_twin_pass_count];
+    entry->id = (uint16_t)(app->evil_twin_pass_count + 1);
+    simple_app_copy_field(entry->ssid, sizeof(entry->ssid), ascii_ssid, "<hidden>");
+    simple_app_copy_field(entry->pass, sizeof(entry->pass), ascii_pass, "");
+    app->evil_twin_pass_count++;
+}
+
+static void simple_app_evil_twin_pass_feed(SimpleApp* app, char ch) {
+    if(!app || !app->evil_twin_pass_listing_active) return;
+    if(ch == '\r') return;
+
+    bool updated = false;
+
+    if(ch == '>') {
+        if(app->evil_twin_pass_list_length > 0) {
+            app->evil_twin_pass_list_buffer[app->evil_twin_pass_list_length] = '\0';
+            simple_app_process_evil_twin_pass_line(app, app->evil_twin_pass_list_buffer);
+            app->evil_twin_pass_list_length = 0;
+            updated = true;
+        }
+        app->evil_twin_pass_listing_active = false;
+        app->last_command_sent = false;
+        updated = true;
+        if(updated && app->screen == ScreenEvilTwinPassList && app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(ch == '\n') {
+        if(app->evil_twin_pass_list_length > 0) {
+            app->evil_twin_pass_list_buffer[app->evil_twin_pass_list_length] = '\0';
+            simple_app_process_evil_twin_pass_line(app, app->evil_twin_pass_list_buffer);
+            updated = true;
+        }
+        app->evil_twin_pass_list_length = 0;
+        if(updated && app->screen == ScreenEvilTwinPassList && app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(app->evil_twin_pass_list_length + 1 >= sizeof(app->evil_twin_pass_list_buffer)) {
+        app->evil_twin_pass_list_length = 0;
+        return;
+    }
+
+    app->evil_twin_pass_list_buffer[app->evil_twin_pass_list_length++] = ch;
+}
+
+static void simple_app_evil_twin_pass_sync_offset(SimpleApp* app) {
+    if(!app) return;
+    if(app->evil_twin_pass_count == 0) {
+        app->evil_twin_pass_index = 0;
+        app->evil_twin_pass_offset = 0;
+        return;
+    }
+    if(app->evil_twin_pass_index >= app->evil_twin_pass_count) {
+        app->evil_twin_pass_index = app->evil_twin_pass_count - 1;
+    }
+    size_t visible = EVIL_TWIN_PASS_VISIBLE_LINES;
+    if(visible == 0) visible = 1;
+    if(visible > app->evil_twin_pass_count) {
+        visible = app->evil_twin_pass_count;
+    }
+    size_t max_offset =
+        (app->evil_twin_pass_count > visible) ? (app->evil_twin_pass_count - visible) : 0;
+    if(app->evil_twin_pass_offset > max_offset) {
+        app->evil_twin_pass_offset = max_offset;
+    }
+    if(app->evil_twin_pass_index < app->evil_twin_pass_offset) {
+        app->evil_twin_pass_offset = app->evil_twin_pass_index;
+    } else if(app->evil_twin_pass_index >= app->evil_twin_pass_offset + visible) {
+        app->evil_twin_pass_offset = app->evil_twin_pass_index - visible + 1;
+    }
+    if(app->evil_twin_pass_offset > max_offset) {
+        app->evil_twin_pass_offset = max_offset;
+    }
+}
+
+static size_t simple_app_escape_wifi_field(const char* src, char* dst, size_t dst_size) {
+    if(!dst || dst_size == 0) return 0;
+    size_t out = 0;
+    if(!src) {
+        dst[0] = '\0';
+        return 0;
+    }
+    for(size_t i = 0; src[i] != '\0' && out + 1 < dst_size; i++) {
+        char ch = src[i];
+        bool needs_escape = (ch == '\\' || ch == ';' || ch == ',' || ch == ':');
+        if(needs_escape) {
+            if(out + 2 >= dst_size) break;
+            dst[out++] = '\\';
+        }
+        dst[out++] = ch;
+    }
+    dst[out] = '\0';
+    return out;
+}
+
+static bool simple_app_build_evil_twin_qr(SimpleApp* app, const char* ssid, const char* pass) {
+    if(!app || !ssid) return false;
+
+    simple_app_copy_field(app->evil_twin_qr_ssid, sizeof(app->evil_twin_qr_ssid), ssid, "");
+    simple_app_copy_field(app->evil_twin_qr_pass, sizeof(app->evil_twin_qr_pass), pass, "");
+
+    char ssid_esc[SCAN_SSID_MAX_LEN * 2];
+    char pass_esc[EVIL_TWIN_PASS_MAX_LEN * 2];
+    simple_app_escape_wifi_field(ssid, ssid_esc, sizeof(ssid_esc));
+    simple_app_escape_wifi_field(pass ? pass : "", pass_esc, sizeof(pass_esc));
+
+    char qr_text[EVIL_TWIN_QR_TEXT_MAX];
+    int needed = 0;
+    if(pass_esc[0] == '\0') {
+        needed = snprintf(qr_text, sizeof(qr_text), "WIFI:T:nopass;S:%s;;", ssid_esc);
+    } else {
+        needed = snprintf(qr_text, sizeof(qr_text), "WIFI:T:WPA;S:%s;P:%s;;", ssid_esc, pass_esc);
+    }
+    if(needed < 0 || (size_t)needed >= sizeof(qr_text)) {
+        app->evil_twin_qr_valid = false;
+        strncpy(app->evil_twin_qr_error, "SSID/pass too long", sizeof(app->evil_twin_qr_error) - 1);
+        app->evil_twin_qr_error[sizeof(app->evil_twin_qr_error) - 1] = '\0';
+        return false;
+    }
+
+    uint8_t temp[EVIL_TWIN_QR_BUFFER_LEN];
+    bool ok = qrcodegen_encodeText(
+        qr_text,
+        temp,
+        app->evil_twin_qr,
+        qrcodegen_Ecc_MEDIUM,
+        1,
+        EVIL_TWIN_QR_MAX_VERSION,
+        -1,
+        true);
+
+    if(!ok) {
+        app->evil_twin_qr_valid = false;
+        strncpy(app->evil_twin_qr_error, "QR too long", sizeof(app->evil_twin_qr_error) - 1);
+        app->evil_twin_qr_error[sizeof(app->evil_twin_qr_error) - 1] = '\0';
+        return false;
+    }
+
+    app->evil_twin_qr_valid = true;
+    app->evil_twin_qr_error[0] = '\0';
+    return true;
+}
+
+static void simple_app_draw_evil_twin_pass_list(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 12, "Evil Twin QR");
+    canvas_set_font(canvas, FontSecondary);
+
+    if(app->evil_twin_pass_listing_active && app->evil_twin_pass_count == 0) {
+        canvas_draw_str_aligned(
+            canvas, DISPLAY_WIDTH / 2, 38, AlignCenter, AlignCenter, "Loading...");
+        return;
+    }
+
+    if(app->evil_twin_pass_count == 0) {
+        canvas_draw_str_aligned(
+            canvas, DISPLAY_WIDTH / 2, 38, AlignCenter, AlignCenter, "No entries");
+        return;
+    }
+
+    simple_app_evil_twin_pass_sync_offset(app);
+
+    uint8_t y = 24;
+    size_t visible = 4;
+    if(visible == 0) visible = 1;
+    if(visible > app->evil_twin_pass_count) {
+        visible = app->evil_twin_pass_count;
+    }
+
+    for(size_t i = 0; i < visible; i++) {
+        size_t idx = app->evil_twin_pass_offset + i;
+        if(idx >= app->evil_twin_pass_count) break;
+        EvilTwinPassEntry* entry = &app->evil_twin_pass_entries[idx];
+        char line[48];
+        snprintf(line, sizeof(line), "%u %s", (unsigned)entry->id, entry->ssid);
+        simple_app_truncate_text(line, 24);
+        if(idx == app->evil_twin_pass_index) {
+            canvas_draw_str(canvas, 2, y, ">");
+        }
+        canvas_draw_str(canvas, 12, y, line);
+        y += HINT_LINE_HEIGHT;
+    }
+
+    if(app->evil_twin_pass_count > visible) {
+        bool show_up = (app->evil_twin_pass_offset > 0);
+        bool show_down =
+            (app->evil_twin_pass_offset + visible < app->evil_twin_pass_count);
+        if(show_up || show_down) {
+            uint8_t arrow_x = DISPLAY_WIDTH - 6;
+            int16_t content_top = 24;
+            int16_t content_bottom =
+                26 + (int16_t)((visible > 0 ? (visible - 1) : 0) * HINT_LINE_HEIGHT);
+            simple_app_draw_scroll_hints(canvas, arrow_x, content_top, content_bottom, show_up, show_down);
+        }
+    }
+}
+
+static void simple_app_handle_evil_twin_pass_list_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+
+    if(key == InputKeyBack || key == InputKeyLeft) {
+        simple_app_reset_evil_twin_pass_listing(app);
+        app->screen = ScreenEvilTwinMenu;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+
+    if(app->evil_twin_pass_count == 0) {
+        if(key == InputKeyOk && app->evil_twin_pass_listing_active) {
+            simple_app_show_status_message(app, "Wait for list\ncompletion", 1200, true);
+        }
+        return;
+    }
+
+    if(key == InputKeyUp) {
+        if(app->evil_twin_pass_index > 0) {
+            app->evil_twin_pass_index--;
+        } else {
+            app->evil_twin_pass_index = app->evil_twin_pass_count - 1;
+        }
+        simple_app_evil_twin_pass_sync_offset(app);
+    } else if(key == InputKeyDown) {
+        if(app->evil_twin_pass_index + 1 < app->evil_twin_pass_count) {
+            app->evil_twin_pass_index++;
+        } else {
+            app->evil_twin_pass_index = 0;
+        }
+        simple_app_evil_twin_pass_sync_offset(app);
+    } else if(key == InputKeyOk) {
+        if(app->evil_twin_pass_listing_active) {
+            simple_app_show_status_message(app, "Wait for list\ncompletion", 1200, true);
+            return;
+        }
+        if(app->evil_twin_pass_index < app->evil_twin_pass_count) {
+            EvilTwinPassEntry* entry = &app->evil_twin_pass_entries[app->evil_twin_pass_index];
+            simple_app_build_evil_twin_qr(app, entry->ssid, entry->pass);
+            app->screen = ScreenEvilTwinPassQr;
+        }
+    } else {
+        return;
+    }
+
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_draw_evil_twin_pass_qr(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+
+    const uint8_t qr_x = 0;
+    const uint8_t qr_y = 8;
+    const uint8_t qr_w = 32;
+    const uint8_t qr_h = 32;
+
+    canvas_set_color(canvas, ColorWhite);
+    canvas_draw_box(canvas, qr_x, qr_y, qr_w, qr_h);
+    canvas_set_color(canvas, ColorBlack);
+
+    if(app->evil_twin_qr_valid) {
+        int size = qrcodegen_getSize(app->evil_twin_qr);
+        int scale_x = qr_w / size;
+        int scale_y = qr_h / size;
+        int scale = (scale_x < scale_y) ? scale_x : scale_y;
+        if(scale < 1) {
+            app->evil_twin_qr_valid = false;
+            strncpy(app->evil_twin_qr_error, "QR too big", sizeof(app->evil_twin_qr_error) - 1);
+            app->evil_twin_qr_error[sizeof(app->evil_twin_qr_error) - 1] = '\0';
+        } else {
+            int qr_size = size * scale;
+            int offset_x = qr_x + (qr_w - qr_size) / 2;
+            int offset_y = qr_y + (qr_h - qr_size) / 2;
+            for(int y = 0; y < size; y++) {
+                for(int x = 0; x < size; x++) {
+                    if(qrcodegen_getModule(app->evil_twin_qr, x, y)) {
+                        canvas_draw_box(
+                            canvas,
+                            offset_x + x * scale,
+                            offset_y + y * scale,
+                            scale,
+                            scale);
+                    }
+                }
+            }
+        }
+    }
+
+    if(!app->evil_twin_qr_valid) {
+        canvas_set_color(canvas, ColorBlack);
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(canvas, qr_w / 2, 28, AlignCenter, AlignCenter, "QR error");
+        if(app->evil_twin_qr_error[0] != '\0') {
+            canvas_draw_str_aligned(
+                canvas, qr_w / 2, 40, AlignCenter, AlignCenter, app->evil_twin_qr_error);
+        }
+    }
+
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontSecondary);
+
+    char ssid_line1[20];
+    char ssid_line2[20];
+    char pass_line1[20];
+    char pass_line2[20];
+    ssid_line1[0] = '\0';
+    ssid_line2[0] = '\0';
+    pass_line1[0] = '\0';
+    pass_line2[0] = '\0';
+
+    const size_t wrap_len = 18;
+    size_t ssid_len = strlen(app->evil_twin_qr_ssid);
+    size_t pass_len = strlen(app->evil_twin_qr_pass);
+    size_t ssid_copy = (ssid_len > wrap_len) ? wrap_len : ssid_len;
+    size_t pass_copy = (pass_len > wrap_len) ? wrap_len : pass_len;
+    memcpy(ssid_line1, app->evil_twin_qr_ssid, ssid_copy);
+    ssid_line1[ssid_copy] = '\0';
+    if(ssid_len > wrap_len) {
+        size_t ssid_copy2 = ssid_len - wrap_len;
+        if(ssid_copy2 >= sizeof(ssid_line2)) ssid_copy2 = sizeof(ssid_line2) - 1;
+        memcpy(ssid_line2, app->evil_twin_qr_ssid + wrap_len, ssid_copy2);
+        ssid_line2[ssid_copy2] = '\0';
+    }
+
+    memcpy(pass_line1, app->evil_twin_qr_pass, pass_copy);
+    pass_line1[pass_copy] = '\0';
+    if(pass_len > wrap_len) {
+        size_t pass_copy2 = pass_len - wrap_len;
+        if(pass_copy2 >= sizeof(pass_line2)) pass_copy2 = sizeof(pass_line2) - 1;
+        memcpy(pass_line2, app->evil_twin_qr_pass + wrap_len, pass_copy2);
+        pass_line2[pass_copy2] = '\0';
+    }
+
+    canvas_draw_str(canvas, 36, 10, "SSID");
+    canvas_draw_str(canvas, 36, 20, ssid_line1);
+    if(ssid_line2[0] != '\0') {
+        canvas_draw_str(canvas, 36, 30, ssid_line2);
+    }
+    canvas_draw_str(canvas, 36, 42, "PASS");
+    canvas_draw_str(canvas, 36, 52, pass_line1);
+    if(pass_line2[0] != '\0') {
+        canvas_draw_str(canvas, 36, 62, pass_line2);
+    }
+}
+
+static void simple_app_handle_evil_twin_pass_qr_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+    if(key == InputKeyBack || key == InputKeyLeft || key == InputKeyOk) {
+        app->screen = ScreenEvilTwinPassList;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+    }
+}
+
 static void simple_app_reset_passwords_listing(SimpleApp* app) {
     if(!app) return;
     app->passwords_listing_active = false;
@@ -8826,6 +9322,11 @@ static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas) {
                 detail[0] = '\0';
             }
             simple_app_truncate_text(detail, 20);
+            break;
+        case 3:
+            label = "WiFi QR";
+            snprintf(detail, sizeof(detail), "eviltwin.txt");
+            show_detail_line = true;
             break;
         default:
             label = "Show Passwords";
@@ -11677,6 +12178,9 @@ static void simple_app_draw(Canvas* canvas, void* context) {
     case ScreenSetupSdManager:
         simple_app_draw_setup_sd_manager(app, canvas);
         break;
+    case ScreenHelpQr:
+        simple_app_draw_help_qr(app, canvas);
+        break;
     case ScreenSetupKarma:
         simple_app_draw_setup_karma(app, canvas);
         break;
@@ -11703,6 +12207,12 @@ static void simple_app_draw(Canvas* canvas, void* context) {
         break;
     case ScreenEvilTwinMenu:
         simple_app_draw_evil_twin_menu(app, canvas);
+        break;
+    case ScreenEvilTwinPassList:
+        simple_app_draw_evil_twin_pass_list(app, canvas);
+        break;
+    case ScreenEvilTwinPassQr:
+        simple_app_draw_evil_twin_pass_qr(app, canvas);
         break;
     case ScreenPortalMenu:
         simple_app_draw_portal_menu(app, canvas);
@@ -11902,6 +12412,9 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
         } else if(entry->action == MenuActionOpenSdManager) {
             simple_app_open_sd_manager(app);
             return;
+        } else if(entry->action == MenuActionOpenHelp) {
+            simple_app_prepare_help_qr(app);
+            app->screen = ScreenHelpQr;
         } else if(entry->action == MenuActionOpenDownload) {
             simple_app_send_download(app);
         } else if(entry->action == MenuActionOpenScannerTiming) {
@@ -12001,6 +12514,8 @@ static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key)
             simple_app_request_evil_twin_html_list(app);
         } else if(app->evil_twin_menu_index == 2) {
             simple_app_start_evil_portal(app);
+        } else if(app->evil_twin_menu_index == 3) {
+            simple_app_request_evil_twin_pass_list(app);
         } else {
             app->passwords_select_return_screen = ScreenEvilTwinMenu;
             app->passwords_select_index = 1;
@@ -12046,6 +12561,98 @@ static void simple_app_start_evil_portal(SimpleApp* app) {
     simple_app_send_command_with_targets(app, "start_evil_twin");
     if(app->viewport) {
         view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_prepare_help_qr(SimpleApp* app) {
+    if(!app) return;
+    if(app->help_qr_ready) return;
+
+    static uint8_t help_qr_temp[EVIL_TWIN_QR_BUFFER_LEN];
+    const char* url = "https://github.com/C5Lab/projectZero/wiki";
+    bool ok = qrcodegen_encodeText(
+        url,
+        help_qr_temp,
+        app->help_qr,
+        qrcodegen_Ecc_MEDIUM,
+        1,
+        EVIL_TWIN_QR_MAX_VERSION,
+        -1,
+        true);
+
+    app->help_qr_valid = ok;
+    if(!ok) {
+        strncpy(app->help_qr_error, "QR too long", sizeof(app->help_qr_error) - 1);
+        app->help_qr_error[sizeof(app->help_qr_error) - 1] = '\0';
+    } else {
+        app->help_qr_error[0] = '\0';
+    }
+    app->help_qr_ready = true;
+}
+
+static void simple_app_draw_help_qr(SimpleApp* app, Canvas* canvas) {
+    if(!app || !canvas) return;
+    if(!app->help_qr_ready) {
+        simple_app_prepare_help_qr(app);
+    }
+
+    const uint8_t qr_x = 0;
+    const uint8_t qr_y = 0;
+    const uint8_t qr_w = 64;
+    const uint8_t qr_h = 64;
+
+    canvas_set_color(canvas, ColorWhite);
+    canvas_draw_box(canvas, qr_x, qr_y, qr_w, qr_h);
+    canvas_set_color(canvas, ColorBlack);
+
+    bool ok = app->help_qr_valid;
+    if(ok) {
+        int size = qrcodegen_getSize(app->help_qr);
+        int scale_x = qr_w / size;
+        int scale_y = qr_h / size;
+        int scale = (scale_x < scale_y) ? scale_x : scale_y;
+        if(scale >= 1) {
+            int qr_size = size * scale;
+            int offset_x = qr_x + (qr_w - qr_size) / 2;
+            int offset_y = qr_y + (qr_h - qr_size) / 2;
+            for(int y = 0; y < size; y++) {
+                for(int x = 0; x < size; x++) {
+                    if(qrcodegen_getModule(app->help_qr, x, y)) {
+                        canvas_draw_box(
+                            canvas,
+                            offset_x + x * scale,
+                            offset_y + y * scale,
+                            scale,
+                            scale);
+                    }
+                }
+            }
+        } else {
+            ok = false;
+        }
+    }
+
+    canvas_set_font(canvas, FontSecondary);
+    if(!ok) {
+        canvas_draw_str_aligned(canvas, qr_w / 2, 32, AlignCenter, AlignCenter, "QR error");
+        if(app->help_qr_error[0] != '\0') {
+            canvas_draw_str_aligned(
+                canvas, qr_w / 2, 44, AlignCenter, AlignCenter, app->help_qr_error);
+        }
+    }
+
+    canvas_draw_str(canvas, 68, 20, "Scan to");
+    canvas_draw_str(canvas, 68, 32, "open wiki");
+    canvas_draw_str(canvas, 68, 62, "Back");
+}
+
+static void simple_app_handle_help_qr_input(SimpleApp* app, InputKey key) {
+    if(!app) return;
+    if(key == InputKeyBack || key == InputKeyLeft || key == InputKeyOk) {
+        app->screen = ScreenMenu;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
     }
 }
 
@@ -14378,6 +14985,9 @@ static void simple_app_input(InputEvent* event, void* context) {
     case ScreenSetupSdManager:
         simple_app_handle_setup_sd_manager_input(app, event->key);
         break;
+    case ScreenHelpQr:
+        simple_app_handle_help_qr_input(app, event->key);
+        break;
     case ScreenSetupKarma:
         simple_app_handle_setup_karma_input(app, event->key);
         break;
@@ -14401,6 +15011,12 @@ static void simple_app_input(InputEvent* event, void* context) {
         break;
     case ScreenEvilTwinMenu:
         simple_app_handle_evil_twin_menu_input(app, event->key);
+        break;
+    case ScreenEvilTwinPassList:
+        simple_app_handle_evil_twin_pass_list_input(app, event->key);
+        break;
+    case ScreenEvilTwinPassQr:
+        simple_app_handle_evil_twin_pass_qr_input(app, event->key);
         break;
     case ScreenKarmaMenu:
         simple_app_handle_karma_menu_input(app, event->key);

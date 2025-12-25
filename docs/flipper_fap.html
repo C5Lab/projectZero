@@ -182,7 +182,7 @@
               <label for="trackSelect">Firmware track</label>
               <select id="trackSelect">
                 <option value="momentum" selected>Momentum</option>
-                <option value="momentum dev">Momentum Dev</option>
+                <option value="momentum_dev">Momentum Dev</option>
                 <option value="unleashed">Unleashed</option>
               </select>
             </div>
@@ -267,8 +267,8 @@
         const normalized = fapParam.trim().toLowerCase();
         if(normalized === "momentum") {
           ui.trackSelect.value = "momentum";
-        } else if(normalized === "momentumdev" || normalized === "momentum dev" || normalized === "momentum-dev") {
-          ui.trackSelect.value = "momentum dev";
+        } else if(normalized === "momentumdev" || normalized === "momentum dev" || normalized === "momentum-dev" || normalized === "momentum_dev") {
+          ui.trackSelect.value = "momentum_dev";
         } else if(normalized === "unleashed") {
           ui.trackSelect.value = "unleashed";
         }
@@ -466,7 +466,7 @@
 
     const trackMatchesName = (name, track) => {
       const lower = name.toLowerCase();
-      if (track === "momentum dev") {
+      if (track === "momentum_dev") {
         return /momentum[-_ ]dev/.test(lower);
       }
       if (track === "momentum") {

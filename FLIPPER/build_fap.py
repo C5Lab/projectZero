@@ -31,7 +31,7 @@ DIST_FAP = DIST_DIR / "lab_c5.fap"
 SOURCE_FILE = ROOT / "Lab_C5.c"
 
 VARIANTS = (
-    ("momentum dev", ("mntm-dev", "momentum dev", "momentum-dev"), ()),
+    ("momentum_dev", ("mntm-dev", "momentum dev", "momentum-dev", "momentum_dev"), ()),
     ("momentum", ("mntm", "momentum"), ("mntm-dev",)),
     ("unleashed", ("unlsh", "unlshed", "unleashed"), ()),
 )
