@@ -115,6 +115,7 @@ jobs:
           cd FLIPPER/sdk
           [ -f flipper-z-f7-sdk-unlshd-083.zip ] || curl -L -o flipper-z-f7-sdk-unlshd-083.zip https://github.com/DarkFlippers/unleashed-firmware/releases/download/unlshd-083/flipper-z-f7-sdk-unlshd-083.zip
           [ -f flipper-z-f7-sdk-mntm-011.zip ] || curl -L -o flipper-z-f7-sdk-mntm-011.zip https://github.com/Next-Flip/Momentum-Firmware/releases/download/mntm-011/flipper-z-f7-sdk-mntm-011.zip
+          [ -f flipper-z-f7-sdk-mntm-dev-22408e4c.zip ] || curl -L -o flipper-z-f7-sdk-mntm-dev-22408e4c.zip https://up.momentum-fw.dev/builds/firmware/dev/flipper-z-f7-sdk-mntm-dev-22408e4c.zip
 
       - name: Build Flipper FAP
         run: |
