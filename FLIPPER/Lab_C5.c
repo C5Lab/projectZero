@@ -15108,6 +15108,10 @@ static void simple_app_start_karma_sniffer(SimpleApp* app) {
 
 static void simple_app_start_karma_attack(SimpleApp* app) {
     if(!app) return;
+    if(app->karma_sniffer_running) {
+        simple_app_show_status_message(app, "Sniffer running\nwait for idle", 1500, true);
+        return;
+    }
     if(app->karma_probe_listing_active || app->karma_html_listing_active || app->evil_twin_listing_active) {
         simple_app_show_status_message(app, "Wait for list\ncompletion", 1500, true);
         return;
@@ -15317,6 +15321,10 @@ static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key) {
             }
             break;
         case 2:
+            if(app->karma_sniffer_running) {
+                simple_app_show_status_message(app, "Sniffer running\nwait for idle", 1500, true);
+                break;
+            }
             if(app->karma_probe_listing_active || app->karma_probe_count == 0) {
                 simple_app_request_karma_probe_list(app);
             } else {
@@ -15353,6 +15361,10 @@ static void simple_app_handle_karma_menu_input(SimpleApp* app, InputKey key) {
             }
             break;
         default:
+            if(app->karma_sniffer_running) {
+                simple_app_show_status_message(app, "Sniffer running\nwait for idle", 1500, true);
+                break;
+            }
             simple_app_start_karma_attack(app);
             break;
         }
