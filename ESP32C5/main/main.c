@@ -5016,20 +5016,45 @@ static int cmd_start_karma(int argc, char **argv)
     }
     
     // Parse the index argument
-    int index = atoi(argv[1]);
+    int target_index = atoi(argv[1]);
     
-    // Validate index (1-based for user, 0-based internally)
-    if (index < 1 || index > probe_request_count) {
-        MY_LOG_INFO(TAG, "Invalid index %d. Valid range: 1-%d", index, probe_request_count);
+    if (target_index < 1) {
+        MY_LOG_INFO(TAG, "Invalid index %d. Must be >= 1", target_index);
         MY_LOG_INFO(TAG, "Use 'list_probes' to see available indexes");
         return 1;
     }
     
-    // Convert to 0-based index
-    int probe_index = index - 1;
+    // Find the N-th unique SSID (same logic as list_probes)
+    int unique_count = 0;
+    char *selected_ssid = NULL;
     
-    // Get the SSID from the probe request
-    char *selected_ssid = probe_requests[probe_index].ssid;
+    for (int i = 0; i < probe_request_count; i++) {
+        probe_request_t *probe = &probe_requests[i];
+        
+        // Check if this SSID has already been seen
+        bool already_seen = false;
+        for (int j = 0; j < i; j++) {
+            if (strcmp(probe->ssid, probe_requests[j].ssid) == 0) {
+                already_seen = true;
+                break;
+            }
+        }
+        
+        // If not seen yet, it's a unique SSID
+        if (!already_seen) {
+            unique_count++;
+            if (unique_count == target_index) {
+                selected_ssid = probe->ssid;
+                break;
+            }
+        }
+    }
+    
+    if (selected_ssid == NULL) {
+        MY_LOG_INFO(TAG, "Invalid index %d. Valid range: 1-%d", target_index, unique_count);
+        MY_LOG_INFO(TAG, "Use 'list_probes' to see available indexes");
+        return 1;
+    }
     
     MY_LOG_INFO(TAG, "Starting Karma attack with SSID: %s", selected_ssid);
     
