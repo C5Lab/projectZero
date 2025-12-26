@@ -3703,24 +3703,24 @@ static int cmd_stop(int argc, char **argv) {
             esp_netif_dhcps_stop(ap_netif);
         }
         
-        // Stop AP mode
+        // Stop AP mode - full reset for clean state on next portal start
         esp_wifi_stop();
+        esp_wifi_deinit();
         MY_LOG_INFO(TAG, "Portal stopped.");
 
         // Destroy AP netif so next portal start recreates AP mode cleanly
         ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
         if (ap_netif) {
             esp_netif_destroy(ap_netif);
-            if (ap_netif_handle == ap_netif) {
-                ap_netif_handle = NULL;
-            }
         }
-        
-        // Restart WiFi in STA mode so it's ready for next command
-        wifi_config_t wifi_config = { 0 };
-        esp_wifi_set_mode(WIFI_MODE_STA);
-        esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-        esp_wifi_start();
+        ap_netif_handle = NULL;
+
+        // Re-initialize WiFi fresh (STA mode)
+        wifi_initialized = false;
+        current_radio_mode = RADIO_MODE_NONE;
+        if (!ensure_wifi_mode()) {
+            MY_LOG_INFO(TAG, "Warning: Failed to reinitialize WiFi after portal stop");
+        }
         
         // Clean up portal SSID
         if (portalSSID != NULL) {
