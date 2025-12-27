@@ -88,7 +88,12 @@ typedef enum {
 } SnifferDogPhase;
 #define LAB_C5_VERSION_TEXT "0.40"
 
-#define MAX_SCAN_RESULTS 32
+#define SCAN_SSID_HIDDEN_LABEL "Hidden"
+#define SCAN_RESULTS_DEFAULT_CAPACITY 64
+#define SCAN_RESULTS_MAX_CAPACITY 64
+#define SCAN_BAND_24 0
+#define SCAN_BAND_5 1
+#define SCAN_BAND_UNKNOWN 0xFF
 #define SCAN_LINE_BUFFER_SIZE 192
 #define SCAN_SSID_MAX_LEN 33
 #define SCAN_CHANNEL_MAX_LEN 8
@@ -156,14 +161,13 @@ typedef enum {
 #define CONSOLE_VISIBLE_LINES 4
 #define MENU_SECTION_SCANNER 0
 #define MENU_SECTION_SNIFFERS 1
-#define MENU_SECTION_TARGETS 2
-#define MENU_SECTION_ATTACKS 3
-#define MENU_SECTION_MONITORING 4
-#define MENU_SECTION_BLUETOOTH 5
-#define MENU_SECTION_SETUP 6
+#define MENU_SECTION_ATTACKS 2
+#define MENU_SECTION_MONITORING 3
+#define MENU_SECTION_BLUETOOTH 4
+#define MENU_SECTION_SETUP 5
 #define SCANNER_FILTER_VISIBLE_COUNT 3
 #define SCANNER_SCAN_COMMAND "scan_networks"
-#define TARGETS_RESULTS_COMMAND "show_scan_results"
+#define SCAN_RESULTS_COMMAND "show_scan_results"
 #define LAB_C5_CONFIG_DIR_PATH "apps_assets/labC5"
 #define LAB_C5_CONFIG_FILE_PATH LAB_C5_CONFIG_DIR_PATH "/config.txt"
 
@@ -321,8 +325,8 @@ typedef struct {
     char channel[SCAN_CHANNEL_MAX_LEN];
     char security[SCAN_TYPE_MAX_LEN];
     char power_display[SCAN_FIELD_BUFFER_LEN];
-    char band[SCAN_TYPE_MAX_LEN];
     int16_t power_dbm;
+    uint8_t band;
     bool power_valid;
     bool selected;
 } ScanResult;
@@ -726,6 +730,7 @@ typedef struct {
     uint32_t karma_pending_probe_tick;
     bool karma_status_active;
     ScanResult* scan_results;
+    size_t scan_results_capacity;
     size_t scan_result_count;
     size_t scan_result_index;
     size_t scan_result_offset;
@@ -860,6 +865,10 @@ static ScanResult* simple_app_visible_result(SimpleApp* app, size_t visible_inde
 static const ScanResult* simple_app_visible_result_const(const SimpleApp* app, size_t visible_index);
 static void simple_app_update_result_layout(SimpleApp* app);
 static void simple_app_update_karma_duration_label(SimpleApp* app);
+static void simple_app_update_selected_numbers(SimpleApp* app, const ScanResult* result);
+static uint8_t simple_app_parse_band_value(const char* band_field);
+static const char* simple_app_band_label(uint8_t band);
+static size_t simple_app_parse_scan_count(const char* line);
 static bool simple_app_parse_bool_value(const char* value, bool current);
 static void simple_app_apply_backlight(SimpleApp* app);
 static void simple_app_toggle_backlight(SimpleApp* app);
@@ -969,7 +978,7 @@ static void simple_app_bt_locator_tick_scroll(SimpleApp* app, size_t char_limit)
 static void simple_app_usb_runtime_guard(SimpleApp* app);
 static bool simple_app_sd_ok(void);
 static void simple_app_show_sd_busy(void);
-static bool simple_app_scan_alloc_buffers(SimpleApp* app);
+static bool simple_app_scan_alloc_buffers(SimpleApp* app, size_t capacity);
 static void simple_app_scan_free_buffers(SimpleApp* app);
 static void simple_app_prepare_scan_buffers(SimpleApp* app);
 static void simple_app_prepare_password_buffers(SimpleApp* app);
@@ -1172,10 +1181,8 @@ static const char hint_section_scanner[] =
     "Passively listens \nto network events collecting \ninfo about APs, STAs associated \nand Probe Requests.";
 static const char hint_section_sniffers[] =
     "Passive Wi-Fi tools\nMonitor live clients\nAuto channel hopping\nReview captured data\nFrom the results tab.";
-static const char hint_section_targets[] =
-    "Selects targets \nfor Deauth, Evil Twin \nand SAE Overflow attacks.";
 static const char hint_section_attacks[] =
-    "Test features here\nUse only on own lab\nTargets come from\nSelected networks\nFollow local laws.";
+    "Test features here\nUse only on own lab\nTargets come from\nScanner selection\nFollow local laws.";
 static const char hint_section_monitoring[] =
     "Monitoring tools\nPacket rates +\nChannel analyzer\nSwitch views with\nUp/Down buttons.";
 static const char hint_section_bluetooth[] =
@@ -1312,11 +1319,10 @@ static const MenuEntry menu_entries_setup[] = {
 static const MenuSection menu_sections[] = {
     {"Scanner", hint_section_scanner, NULL, 0, 10, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
     {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 18, MENU_VISIBLE_COUNT_SNIFFERS * MENU_ITEM_SPACING},
-    {"Targets", hint_section_targets, NULL, 0, 26, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 34, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
-    {"Monitoring", hint_section_monitoring, menu_entries_monitoring, sizeof(menu_entries_monitoring) / sizeof(menu_entries_monitoring[0]), 42, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Bluetooth", hint_section_bluetooth, menu_entries_bluetooth, sizeof(menu_entries_bluetooth) / sizeof(menu_entries_bluetooth[0]), 50, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 58, MENU_VISIBLE_COUNT_SETUP * MENU_ITEM_SPACING},
+    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 26, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
+    {"Monitoring", hint_section_monitoring, menu_entries_monitoring, sizeof(menu_entries_monitoring) / sizeof(menu_entries_monitoring[0]), 34, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Bluetooth", hint_section_bluetooth, menu_entries_bluetooth, sizeof(menu_entries_bluetooth) / sizeof(menu_entries_bluetooth[0]), 42, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 50, MENU_VISIBLE_COUNT_SETUP * MENU_ITEM_SPACING},
 };
 
 static const size_t menu_section_count = sizeof(menu_sections) / sizeof(menu_sections[0]);
@@ -1692,16 +1698,13 @@ static void simple_app_update_scanner_stats(SimpleApp* app, const ScanResult* re
 
     app->scanner_total = (uint16_t)app->scan_result_count;
 
-    const char* band = result->band;
-    if(band) {
-        if(strncmp(band, "2.4", 3) == 0) {
-            app->scanner_band_24++;
-        } else if(band[0] == '5' || strstr(band, "5G") != NULL) {
-            app->scanner_band_5++;
-        }
+    if(result->band == SCAN_BAND_24) {
+        app->scanner_band_24++;
+    } else if(result->band == SCAN_BAND_5) {
+        app->scanner_band_5++;
     }
 
-    if(ssid_hidden || strcmp(result->ssid, "<hidden>") == 0) {
+    if(ssid_hidden || strcmp(result->ssid, SCAN_SSID_HIDDEN_LABEL) == 0) {
         app->scanner_hidden_count++;
     }
 
@@ -1723,14 +1726,14 @@ static void simple_app_update_scanner_stats(SimpleApp* app, const ScanResult* re
 static void simple_app_reset_scan_results(SimpleApp* app) {
     if(!app) return;
     if(app->scan_results) {
-        memset(app->scan_results, 0, sizeof(ScanResult) * MAX_SCAN_RESULTS);
+        memset(app->scan_results, 0, sizeof(ScanResult) * app->scan_results_capacity);
     }
     if(app->scan_selected_numbers) {
-        memset(app->scan_selected_numbers, 0, sizeof(uint16_t) * MAX_SCAN_RESULTS);
+        memset(app->scan_selected_numbers, 0, sizeof(uint16_t) * app->scan_results_capacity);
     }
     memset(app->scan_line_buffer, 0, sizeof(app->scan_line_buffer));
     if(app->visible_result_indices) {
-        memset(app->visible_result_indices, 0, sizeof(uint16_t) * MAX_SCAN_RESULTS);
+        memset(app->visible_result_indices, 0, sizeof(uint16_t) * app->scan_results_capacity);
     }
     app->scan_result_count = 0;
     app->scan_result_index = 0;
@@ -1755,7 +1758,7 @@ static void simple_app_rebuild_visible_results(SimpleApp* app) {
     if(!app) return;
     if(!app->scan_results || !app->visible_result_indices) return;
     app->visible_result_count = 0;
-    for(size_t i = 0; i < app->scan_result_count && i < MAX_SCAN_RESULTS; i++) {
+    for(size_t i = 0; i < app->scan_result_count && i < app->scan_results_capacity; i++) {
         if(simple_app_result_is_visible(app, &app->scan_results[i])) {
             app->visible_result_indices[app->visible_result_count++] = (uint16_t)i;
         }
@@ -1829,7 +1832,7 @@ static ScanResult* simple_app_visible_result(SimpleApp* app, size_t visible_inde
     if(!app || !app->scan_results || !app->visible_result_indices) return NULL;
     if(visible_index >= app->visible_result_count) return NULL;
     uint16_t actual_index = app->visible_result_indices[visible_index];
-    if(actual_index >= MAX_SCAN_RESULTS) return NULL;
+    if(actual_index >= app->scan_results_capacity) return NULL;
     return &app->scan_results[actual_index];
 }
 
@@ -1837,7 +1840,7 @@ static const ScanResult* simple_app_visible_result_const(const SimpleApp* app, s
     if(!app || !app->scan_results || !app->visible_result_indices) return NULL;
     if(visible_index >= app->visible_result_count) return NULL;
     uint16_t actual_index = app->visible_result_indices[visible_index];
-    if(actual_index >= MAX_SCAN_RESULTS) return NULL;
+    if(actual_index >= app->scan_results_capacity) return NULL;
     return &app->scan_results[actual_index];
 }
 
@@ -1861,6 +1864,51 @@ static bool simple_app_get_first_selected_ssid(SimpleApp* app, char* out, size_t
     simple_app_utf8_to_ascii_pl(result->ssid, out, out_size);
     simple_app_trim(out);
     return out[0] != '\0';
+}
+
+static void simple_app_compact_scan_results(SimpleApp* app) {
+    if(!app || app->scan_selected_count == 0 || !app->scan_selected_numbers || !app->scan_results) {
+        return;
+    }
+
+    size_t new_count = app->scan_selected_count;
+    ScanResult* compact = malloc(sizeof(ScanResult) * new_count);
+    uint16_t* numbers = malloc(sizeof(uint16_t) * new_count);
+    if(!compact || !numbers) {
+        if(compact) free(compact);
+        if(numbers) free(numbers);
+        return;
+    }
+
+    for(size_t i = 0; i < new_count; i++) {
+        uint16_t number = app->scan_selected_numbers[i];
+        numbers[i] = number;
+        const ScanResult* src = simple_app_find_scan_result_by_number(app, number);
+        if(src) {
+            compact[i] = *src;
+            compact[i].selected = true;
+        } else {
+            memset(&compact[i], 0, sizeof(ScanResult));
+            compact[i].number = number;
+            compact[i].selected = true;
+        }
+    }
+
+    free(app->scan_results);
+    free(app->scan_selected_numbers);
+    if(app->visible_result_indices) {
+        free(app->visible_result_indices);
+        app->visible_result_indices = NULL;
+    }
+
+    app->scan_results = compact;
+    app->scan_selected_numbers = numbers;
+    app->scan_results_capacity = new_count;
+    app->scan_result_count = new_count;
+    app->scan_result_index = 0;
+    app->scan_result_offset = 0;
+    app->visible_result_count = 0;
+    app->scan_results_loading = false;
 }
 
 static void simple_app_update_backlight_label(SimpleApp* app) {
@@ -4635,22 +4683,35 @@ static void simple_app_show_sd_busy(void) {
     }
 }
 
-static bool simple_app_scan_alloc_buffers(SimpleApp* app) {
+static bool simple_app_scan_alloc_buffers(SimpleApp* app, size_t capacity) {
     if(!app) return false;
-    if(app->scan_results && app->scan_selected_numbers && app->visible_result_indices) {
+    if(capacity > SCAN_RESULTS_MAX_CAPACITY) {
+        capacity = SCAN_RESULTS_MAX_CAPACITY;
+    }
+    if(capacity == 0) {
+        simple_app_scan_free_buffers(app);
+        return true;
+    }
+    if(app->scan_results && app->scan_selected_numbers && app->visible_result_indices &&
+       app->scan_results_capacity == capacity) {
         return true;
     }
 
     simple_app_scan_free_buffers(app);
 
-    app->scan_results = calloc(MAX_SCAN_RESULTS, sizeof(ScanResult));
-    app->scan_selected_numbers = calloc(MAX_SCAN_RESULTS, sizeof(uint16_t));
-    app->visible_result_indices = calloc(MAX_SCAN_RESULTS, sizeof(uint16_t));
+    app->scan_results = malloc(sizeof(ScanResult) * capacity);
+    app->scan_selected_numbers = malloc(sizeof(uint16_t) * capacity);
+    app->visible_result_indices = malloc(sizeof(uint16_t) * capacity);
 
     if(!app->scan_results || !app->scan_selected_numbers || !app->visible_result_indices) {
         simple_app_scan_free_buffers(app);
         return false;
     }
+
+    memset(app->scan_results, 0, sizeof(ScanResult) * capacity);
+    memset(app->scan_selected_numbers, 0, sizeof(uint16_t) * capacity);
+    memset(app->visible_result_indices, 0, sizeof(uint16_t) * capacity);
+    app->scan_results_capacity = capacity;
     return true;
 }
 
@@ -4668,6 +4729,7 @@ static void simple_app_scan_free_buffers(SimpleApp* app) {
         free(app->visible_result_indices);
         app->visible_result_indices = NULL;
     }
+    app->scan_results_capacity = 0;
 }
 
 static bool simple_app_alloc_package_monitor_buffers(SimpleApp* app) {
@@ -5148,8 +5210,11 @@ static size_t simple_app_build_result_lines(
         if(app->scanner_show_channel && result->channel[0] != '\0') {
             simple_app_line_append_token(info_line, sizeof(info_line), NULL, result->channel);
         }
-        if(app->scanner_show_band && result->band[0] != '\0') {
-            simple_app_line_append_token(info_line, sizeof(info_line), NULL, result->band);
+        if(app->scanner_show_band) {
+            const char* band_label = simple_app_band_label(result->band);
+            if(band_label[0] != '\0') {
+                simple_app_line_append_token(info_line, sizeof(info_line), NULL, band_label);
+            }
         }
         if(info_line[0] != '\0') {
             SIMPLE_APP_EMIT_LINE(info_line, true);
@@ -5640,12 +5705,62 @@ static size_t simple_app_parse_quoted_fields(const char* line, char fields[][SCA
     return count;
 }
 
+static uint8_t simple_app_parse_band_value(const char* band_field) {
+    if(!band_field || band_field[0] == '\0') return SCAN_BAND_UNKNOWN;
+    if(strncmp(band_field, "2.4", 3) == 0) return SCAN_BAND_24;
+    if(band_field[0] == '5') return SCAN_BAND_5;
+    if(strstr(band_field, "5G") != NULL || strstr(band_field, "5g") != NULL) return SCAN_BAND_5;
+    return SCAN_BAND_UNKNOWN;
+}
+
+static const char* simple_app_band_label(uint8_t band) {
+    if(band == SCAN_BAND_24) return "2.4G";
+    if(band == SCAN_BAND_5) return "5G";
+    return "";
+}
+
+static size_t simple_app_parse_scan_count(const char* line) {
+    if(!line) return 0;
+
+    const char* found = strstr(line, "Found ");
+    const char* retrieved = strstr(line, "Retrieved ");
+    const char* start = found ? (found + strlen("Found ")) :
+                        retrieved ? (retrieved + strlen("Retrieved ")) :
+                        NULL;
+    if(!start) return 0;
+
+    char* end = NULL;
+    unsigned long value = strtoul(start, &end, 10);
+    if(end == start || value == 0) return 0;
+
+    if(found && strstr(end, "networks") == NULL) return 0;
+    if(retrieved && strstr(end, "network records") == NULL) return 0;
+
+    return (size_t)value;
+}
+
 static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
     if(!app || !line) return;
 
     const char* cursor = line;
     while(*cursor == ' ' || *cursor == '\t') {
         cursor++;
+    }
+
+    size_t expected_count = simple_app_parse_scan_count(cursor);
+    if(expected_count > SCAN_RESULTS_MAX_CAPACITY) {
+        expected_count = SCAN_RESULTS_MAX_CAPACITY;
+    }
+    if(expected_count > 0 && app->scan_result_count == 0 &&
+       app->scan_results_capacity != expected_count) {
+        if(!simple_app_scan_alloc_buffers(app, expected_count)) {
+            app->scan_results_loading = false;
+            app->scanner_scan_running = false;
+            app->scanner_rescan_hint = false;
+            simple_app_show_status_message(app, "OOM: scan buffers", 2000, true);
+            if(app->viewport) view_port_update(app->viewport);
+            return;
+        }
     }
 
     if(strncmp(cursor, "Scan results", 12) == 0) {
@@ -5679,8 +5794,8 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
     }
 
     if(cursor[0] != '"') return;
-    if(app->scan_result_count >= MAX_SCAN_RESULTS) return;
-    if(!app->scan_results) return;
+    if(!app->scan_results || app->scan_results_capacity == 0) return;
+    if(app->scan_result_count >= app->scan_results_capacity) return;
 
     char fields[8][SCAN_FIELD_BUFFER_LEN];
     for(size_t i = 0; i < 8; i++) {
@@ -5695,13 +5810,13 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
     ScanResult* result = &app->scan_results[app->scan_result_count];
     memset(result, 0, sizeof(ScanResult));
     result->number = (uint16_t)strtoul(fields[0], NULL, 10);
-    simple_app_copy_field(result->ssid, sizeof(result->ssid), fields[1], "<hidden>");
+    simple_app_copy_field(result->ssid, sizeof(result->ssid), fields[1], SCAN_SSID_HIDDEN_LABEL);
     simple_app_copy_field(result->vendor, sizeof(result->vendor), fields[2], "");
     simple_app_copy_field(result->bssid, sizeof(result->bssid), fields[3], "??:??:??:??:??:??");
     simple_app_copy_field(result->channel, sizeof(result->channel), fields[4], "?");
     simple_app_copy_field(result->security, sizeof(result->security), fields[5], "Unknown");
     simple_app_copy_field(result->power_display, sizeof(result->power_display), fields[6], "?");
-    simple_app_copy_field(result->band, sizeof(result->band), fields[7], "?");
+    result->band = simple_app_parse_band_value(fields[7]);
 
     const char* power_str = fields[6];
     char* power_end = NULL;
@@ -6224,7 +6339,7 @@ static void simple_app_update_selected_numbers(SimpleApp* app, const ScanResult*
                 return;
             }
         }
-        if(app->scan_selected_count < MAX_SCAN_RESULTS) {
+        if(app->scan_selected_count < app->scan_results_capacity) {
             app->scan_selected_numbers[app->scan_selected_count++] = result->number;
         }
     } else {
@@ -6663,7 +6778,8 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     bool is_deauth_guard_command = strstr(command, "deauth_detector") != NULL;
     if(is_wifi_scan_command) {
         simple_app_prepare_scan_buffers(app);
-        if(!simple_app_scan_alloc_buffers(app)) {
+        simple_app_scan_free_buffers(app);
+        if(!simple_app_scan_alloc_buffers(app, SCAN_RESULTS_DEFAULT_CAPACITY)) {
             app->scan_results_loading = false;
             app->scanner_view_active = false;
             app->scanner_full_console = false;
@@ -7096,7 +7212,8 @@ static void simple_app_prepare_exit(SimpleApp* app) {
 
 static void simple_app_request_scan_results(SimpleApp* app, const char* command) {
     if(!app) return;
-    if(!simple_app_scan_alloc_buffers(app)) {
+    simple_app_scan_free_buffers(app);
+    if(!simple_app_scan_alloc_buffers(app, SCAN_RESULTS_DEFAULT_CAPACITY)) {
         simple_app_show_status_message(app, "OOM: scan buffers", 2000, true);
         return;
     }
@@ -10379,7 +10496,7 @@ static void simple_app_draw_evil_twin_menu(SimpleApp* app, Canvas* canvas) {
         case 0: {
             label = "Target";
             if(app->scan_selected_count == 0) {
-                snprintf(detail, sizeof(detail), "Select in Targets");
+                snprintf(detail, sizeof(detail), "Select in Scanner");
                 show_detail_line = true;
             } else {
                 snprintf(detail, sizeof(detail), "Selected: %u", (unsigned)app->scan_selected_count);
@@ -10615,8 +10732,6 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
         const char* hint = "No options";
         if(app->section_index == MENU_SECTION_SCANNER) {
             hint = "OK: Scan networks";
-        } else if(app->section_index == MENU_SECTION_TARGETS) {
-            hint = "OK: Show results";
         }
         canvas_draw_str(canvas, 3, MENU_ITEM_BASE_Y + (MENU_ITEM_SPACING / 2), hint);
         return;
@@ -13726,9 +13841,6 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
                 simple_app_send_command(app, SCANNER_SCAN_COMMAND, true);
                 view_port_update(app->viewport);
                 return;
-            } else if(app->section_index == MENU_SECTION_TARGETS) {
-                simple_app_request_scan_results(app, TARGETS_RESULTS_COMMAND);
-                return;
             }
             app->exit_confirm_active = false;
             app->menu_state = MenuStateItems;
@@ -13907,7 +14019,9 @@ static void simple_app_handle_evil_twin_menu_input(SimpleApp* app, InputKey key)
         }
     } else if(key == InputKeyOk) {
         if(app->evil_twin_menu_index == 0) {
-            simple_app_request_scan_results(app, TARGETS_RESULTS_COMMAND);
+            if(app->scan_selected_count == 0) {
+                simple_app_show_status_message(app, "Select in Scanner", 1200, true);
+            }
             return;
         } else if(app->evil_twin_menu_index == 1) {
             if(app->evil_twin_listing_active) {
@@ -16038,7 +16152,7 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
     } else if(key == InputKeyRight) {
         if(app->serial_targets_hint) {
             app->serial_targets_hint = false;
-            simple_app_request_scan_results(app, TARGETS_RESULTS_COMMAND);
+            simple_app_request_scan_results(app, SCAN_RESULTS_COMMAND);
             return;
         }
 
@@ -16089,15 +16203,10 @@ static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
             }
             return;
         }
-        // Restart scanner when exiting targets/results: clear stale rows and redraw scan state.
-        simple_app_reset_scan_results(app);
-        app->scan_results_loading = true;
-        app->serial_targets_hint = false;
-        app->scanner_rescan_hint = true;
-        simple_app_send_command(app, SCANNER_SCAN_COMMAND, true);
-        if(app->viewport) {
-            view_port_update(app->viewport);
-        }
+        // Scanner results flow is one-way; no return to the scanner.
+        furi_hal_vibro_on(true);
+        furi_delay_ms(40);
+        furi_hal_vibro_on(false);
         return;
     }
 
@@ -16128,12 +16237,14 @@ static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
         }
     } else if(key == InputKeyRight) {
         if(app->scan_selected_count > 0) {
+            simple_app_compact_scan_results(app);
             app->screen = ScreenMenu;
             app->menu_state = MenuStateItems;
             app->section_index = MENU_SECTION_ATTACKS;
             app->item_index = 0;
             app->item_offset = 0;
             app->last_attack_index = 0;
+            app->serial_targets_hint = false;
             view_port_update(app->viewport);
         }
     }
