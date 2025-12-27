@@ -519,6 +519,7 @@ typedef struct {
     bool gps_has_date;
     int gps_satellites;
     bool gps_console_mode;
+    bool gps_time_24h;
     char gps_lat[16];
     char gps_lon[16];
     char gps_time[16];
@@ -2697,6 +2698,26 @@ static bool simple_app_gps_format_coord(const char* raw, const char* hemi, char*
     char h = (char)toupper((unsigned char)hemi[0]);
     if(h == 'S' || h == 'W') decimal = -decimal;
     snprintf(out, out_len, "%.5f", decimal);
+    return true;
+}
+
+static bool simple_app_gps_format_time_display(const SimpleApp* app, char* out, size_t out_len) {
+    if(!app || !out || out_len == 0) return false;
+    if(strlen(app->gps_time) < 8) return false;
+    int hh = 0;
+    int mm = 0;
+    int ss = 0;
+    if(sscanf(app->gps_time, "%2d:%2d:%2d", &hh, &mm, &ss) != 3) return false;
+
+    if(app->gps_time_24h) {
+        snprintf(out, out_len, "%02d:%02d:%02d", hh, mm, ss);
+        return true;
+    }
+
+    const char* suffix = (hh >= 12) ? "PM" : "AM";
+    int hh12 = hh % 12;
+    if(hh12 == 0) hh12 = 12;
+    snprintf(out, out_len, "%02d:%02d:%02d %s", hh12, mm, ss, suffix);
     return true;
 }
 
@@ -7642,6 +7663,13 @@ static void simple_app_handle_console_input(SimpleApp* app, InputKey key) {
 
 static void simple_app_handle_gps_input(SimpleApp* app, InputKey key) {
     if(!app) return;
+    if(key == InputKeyOk) {
+        app->gps_time_24h = !app->gps_time_24h;
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
     if(key == InputKeyBack) {
         simple_app_send_stop_if_needed(app);
         app->screen = ScreenMenu;
@@ -11197,8 +11225,13 @@ static void simple_app_draw_gps(SimpleApp* app, Canvas* canvas) {
         canvas_draw_str_aligned(
             canvas, DISPLAY_WIDTH / 2, 32, AlignCenter, AlignCenter, "Waiting for GPS fix");
         if(app->gps_has_time) {
-            char time_line[24];
-            snprintf(time_line, sizeof(time_line), "Time: %s", app->gps_time);
+            char time_text[16];
+            char time_line[28];
+            if(simple_app_gps_format_time_display(app, time_text, sizeof(time_text))) {
+                snprintf(time_line, sizeof(time_line), "Time: %s", time_text);
+            } else {
+                snprintf(time_line, sizeof(time_line), "Time: --");
+            }
             canvas_draw_str_aligned(
                 canvas, DISPLAY_WIDTH / 2, 44, AlignCenter, AlignCenter, time_line);
         }
@@ -11217,7 +11250,12 @@ static void simple_app_draw_gps(SimpleApp* app, Canvas* canvas) {
     snprintf(line, sizeof(line), "Lon: %s", app->gps_lon);
     canvas_draw_str(canvas, 2, 34, line);
     if(app->gps_has_time) {
-        snprintf(line, sizeof(line), "Time: %s", app->gps_time);
+        char time_text[16];
+        if(simple_app_gps_format_time_display(app, time_text, sizeof(time_text))) {
+            snprintf(line, sizeof(line), "Time: %s", time_text);
+        } else {
+            snprintf(line, sizeof(line), "Time: --");
+        }
     } else {
         snprintf(line, sizeof(line), "Time: --");
     }
@@ -17106,6 +17144,7 @@ int32_t Lab_C5_app(void* p) {
     app->otg_power_initial_state = furi_hal_power_is_otg_enabled();
     app->otg_power_enabled = app->otg_power_initial_state;
     app->backlight_enabled = true;
+    app->gps_time_24h = true;
     app->show_ram_overlay = false;
     app->led_enabled = true;
     app->led_level = 10;
