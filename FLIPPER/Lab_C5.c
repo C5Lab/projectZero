@@ -106,6 +106,8 @@ typedef enum {
 #define SCAN_POWER_STEP 1
 #define BACKLIGHT_ON_LEVEL 255
 #define BACKLIGHT_OFF_LEVEL 0
+#define GPS_UTC_OFFSET_MIN_MINUTES (-12 * 60)
+#define GPS_UTC_OFFSET_MAX_MINUTES (14 * 60)
 
 #define SERIAL_BUFFER_SIZE 1024
 #define UART_STREAM_SIZE 512
@@ -407,6 +409,32 @@ typedef struct {
 } SnifferClientEntry;
 
 typedef struct {
+    bool has_fix;
+    bool has_coords;
+    bool has_time;
+    bool has_date;
+    int satellites;
+    char lat[16];
+    char lon[16];
+    char time[16];
+    char date[16];
+    char time_text[16];
+    char time_line[40];
+    char line[40];
+    char offset_text[16];
+    char sats_line[20];
+    char line_buffer[128];
+    size_t line_length;
+} SimpleAppGpsState;
+
+typedef struct {
+    bool status_is_numeric;
+    char status_text[32];
+    char line_buffer[96];
+    size_t line_length;
+} SimpleAppWardriveState;
+
+typedef struct {
     char ssid[SCAN_SSID_MAX_LEN];
     uint16_t client_start;
     uint16_t client_count;
@@ -508,24 +536,14 @@ typedef struct {
     size_t sae_line_length;
     uint32_t deauth_last_update_tick;
     bool wardrive_view_active;
-    bool wardrive_status_is_numeric;
-    char wardrive_status_text[32];
-    char wardrive_line_buffer[96];
-    size_t wardrive_line_length;
+    SimpleAppWardriveState* wardrive_state;
     bool gps_view_active;
-    bool gps_has_fix;
-    bool gps_has_coords;
-    bool gps_has_time;
-    bool gps_has_date;
-    int gps_satellites;
     bool gps_console_mode;
     bool gps_time_24h;
-    char gps_lat[16];
-    char gps_lon[16];
-    char gps_time[16];
-    char gps_date[16];
-    char gps_line_buffer[128];
-    size_t gps_line_length;
+    int16_t gps_utc_offset_minutes;
+    bool gps_dst_enabled;
+    bool gps_zda_tz_enabled;
+    SimpleAppGpsState* gps_state;
     bool otg_power_enabled;
     bool otg_power_initial_state;
     bool bt_scan_view_active;
@@ -1265,7 +1283,7 @@ static const char hint_setup_scanner_timing[] =
 static const char hint_setup_console[] =
     "Open live console\nStream UART output\nWatch commands\nDebug operations\nClose with Back.";
 static const char hint_setup_gps[] =
-    "Live GPS status\nShows coords/time\nSats when available\nWaits for fix\nBack stops stream.";
+    "Live GPS status\nShows coords/time\nLeft/Right UTC offset\nUp/Down DST +1h\nBack stops stream.";
 static const char hint_setup_help[] =
     "QR link to Wiki\nScan to open\nBack returns";
 static const char hint_setup_sd_manager[] =
@@ -2625,38 +2643,70 @@ static void simple_app_modify_channel_time(SimpleApp* app, bool is_min, int32_t 
     }
 }
 
+static SimpleAppWardriveState* simple_app_wardrive_state_ensure(SimpleApp* app) {
+    if(!app) return NULL;
+    if(app->wardrive_state) return app->wardrive_state;
+    app->wardrive_state = malloc(sizeof(SimpleAppWardriveState));
+    if(!app->wardrive_state) return NULL;
+    memset(app->wardrive_state, 0, sizeof(SimpleAppWardriveState));
+    return app->wardrive_state;
+}
+
+static void simple_app_wardrive_state_free(SimpleApp* app) {
+    if(!app || !app->wardrive_state) return;
+    free(app->wardrive_state);
+    app->wardrive_state = NULL;
+}
+
+static SimpleAppGpsState* simple_app_gps_state_ensure(SimpleApp* app) {
+    if(!app) return NULL;
+    if(app->gps_state) return app->gps_state;
+    app->gps_state = malloc(sizeof(SimpleAppGpsState));
+    if(!app->gps_state) return NULL;
+    memset(app->gps_state, 0, sizeof(SimpleAppGpsState));
+    app->gps_state->satellites = -1;
+    return app->gps_state;
+}
+
+static void simple_app_gps_state_free(SimpleApp* app) {
+    if(!app || !app->gps_state) return;
+    free(app->gps_state);
+    app->gps_state = NULL;
+}
+
 static void simple_app_set_wardrive_status(SimpleApp* app, const char* text, bool numeric) {
-    if(!app || !text) return;
-    snprintf(app->wardrive_status_text, sizeof(app->wardrive_status_text), "%s", text);
-    app->wardrive_status_is_numeric = numeric;
+    if(!app || !text || !app->wardrive_state) return;
+    snprintf(app->wardrive_state->status_text, sizeof(app->wardrive_state->status_text), "%s", text);
+    app->wardrive_state->status_is_numeric = numeric;
 }
 
 static void simple_app_reset_wardrive_status(SimpleApp* app) {
-    if(!app) return;
+    if(!app || !app->wardrive_state) return;
     simple_app_set_wardrive_status(app, "0", true);
-    app->wardrive_line_length = 0;
+    app->wardrive_state->line_length = 0;
 }
 
 static void simple_app_reset_gps_status(SimpleApp* app) {
     if(!app) return;
-    app->gps_has_fix = false;
-    app->gps_has_coords = false;
-    app->gps_has_time = false;
-    app->gps_has_date = false;
-    app->gps_satellites = -1;
     app->gps_console_mode = false;
-    app->gps_lat[0] = '\0';
-    app->gps_lon[0] = '\0';
-    app->gps_time[0] = '\0';
-    app->gps_date[0] = '\0';
-    app->gps_line_length = 0;
+    if(!app->gps_state) return;
+    app->gps_state->has_fix = false;
+    app->gps_state->has_coords = false;
+    app->gps_state->has_time = false;
+    app->gps_state->has_date = false;
+    app->gps_state->satellites = -1;
+    app->gps_state->lat[0] = '\0';
+    app->gps_state->lon[0] = '\0';
+    app->gps_state->time[0] = '\0';
+    app->gps_state->date[0] = '\0';
+    app->gps_state->line_length = 0;
 }
 
 static void simple_app_gps_clear_coords(SimpleApp* app) {
-    if(!app) return;
-    app->gps_has_coords = false;
-    app->gps_lat[0] = '\0';
-    app->gps_lon[0] = '\0';
+    if(!app || !app->gps_state) return;
+    app->gps_state->has_coords = false;
+    app->gps_state->lat[0] = '\0';
+    app->gps_state->lon[0] = '\0';
 }
 
 static bool simple_app_gps_format_time(const char* raw, char* out, size_t out_len) {
@@ -2672,6 +2722,37 @@ static bool simple_app_gps_format_time(const char* raw, char* out, size_t out_le
     int ss = (raw[4] - '0') * 10 + (raw[5] - '0');
     snprintf(out, out_len, "%02d:%02d:%02d", hh, mm, ss);
     return true;
+}
+
+static int16_t simple_app_clamp_gps_utc_offset(int32_t minutes) {
+    if(minutes < GPS_UTC_OFFSET_MIN_MINUTES) {
+        return GPS_UTC_OFFSET_MIN_MINUTES;
+    }
+    if(minutes > GPS_UTC_OFFSET_MAX_MINUTES) {
+        return GPS_UTC_OFFSET_MAX_MINUTES;
+    }
+    return (int16_t)minutes;
+}
+
+static void simple_app_gps_format_offset(const SimpleApp* app, char* out, size_t out_len) {
+    if(!out || out_len == 0) return;
+    int minutes = app ? app->gps_utc_offset_minutes : 0;
+    if(app && app->gps_dst_enabled) {
+        minutes += 60;
+    }
+    char sign = '+';
+    if(minutes < 0) {
+        sign = '-';
+        minutes = -minutes;
+    }
+    int hh = minutes / 60;
+    int mm = minutes % 60;
+    if(mm == 0) {
+        snprintf(out, out_len, "UTC%c%d%s", sign, hh, app && app->gps_dst_enabled ? " DST" : "");
+    } else {
+        snprintf(
+            out, out_len, "UTC%c%d:%02d%s", sign, hh, mm, app && app->gps_dst_enabled ? " DST" : "");
+    }
 }
 
 static bool simple_app_gps_format_date(const char* raw, char* out, size_t out_len) {
@@ -2703,11 +2784,23 @@ static bool simple_app_gps_format_coord(const char* raw, const char* hemi, char*
 
 static bool simple_app_gps_format_time_display(const SimpleApp* app, char* out, size_t out_len) {
     if(!app || !out || out_len == 0) return false;
-    if(strlen(app->gps_time) < 8) return false;
+    if(!app->gps_state || strlen(app->gps_state->time) < 8) return false;
     int hh = 0;
     int mm = 0;
     int ss = 0;
-    if(sscanf(app->gps_time, "%2d:%2d:%2d", &hh, &mm, &ss) != 3) return false;
+    if(sscanf(app->gps_state->time, "%2d:%2d:%2d", &hh, &mm, &ss) != 3) return false;
+
+    int dst_minutes = app->gps_dst_enabled ? 60 : 0;
+    int total_seconds =
+        hh * 3600 + mm * 60 + ss + (app->gps_utc_offset_minutes + dst_minutes) * 60;
+    const int day_seconds = 24 * 3600;
+    total_seconds %= day_seconds;
+    if(total_seconds < 0) {
+        total_seconds += day_seconds;
+    }
+    hh = total_seconds / 3600;
+    mm = (total_seconds % 3600) / 60;
+    ss = total_seconds % 60;
 
     if(app->gps_time_24h) {
         snprintf(out, out_len, "%02d:%02d:%02d", hh, mm, ss);
@@ -2722,7 +2815,7 @@ static bool simple_app_gps_format_time_display(const SimpleApp* app, char* out, 
 }
 
 static void simple_app_process_gps_line(SimpleApp* app, const char* line) {
-    if(!app || !line || !app->gps_view_active) return;
+    if(!app || !line || !app->gps_view_active || !app->gps_state) return;
 
     const char* nmea = NULL;
     if(strncmp(line, "[GPS RAW]", 9) == 0) {
@@ -2749,75 +2842,98 @@ static void simple_app_process_gps_line(SimpleApp* app, const char* line) {
     }
     if(token_count == 0) return;
 
+    SimpleAppGpsState* gps = app->gps_state;
+
     if(strcmp(tokens[0], "$GNGGA") == 0 || strcmp(tokens[0], "$GPGGA") == 0) {
         if(token_count > 7) {
             if(tokens[6][0] != '\0') {
                 int fix_quality = atoi(tokens[6]);
-                app->gps_has_fix = fix_quality > 0;
-                if(!app->gps_has_fix) {
+                gps->has_fix = fix_quality > 0;
+                if(!gps->has_fix) {
                     simple_app_gps_clear_coords(app);
                 }
             }
             if(tokens[7][0] != '\0') {
-                app->gps_satellites = atoi(tokens[7]);
+                gps->satellites = atoi(tokens[7]);
             } else {
-                app->gps_satellites = -1;
+                gps->satellites = -1;
             }
         }
         if(token_count > 1 && tokens[1][0] != '\0') {
-            if(simple_app_gps_format_time(tokens[1], app->gps_time, sizeof(app->gps_time))) {
-                app->gps_has_time = true;
+            if(simple_app_gps_format_time(tokens[1], gps->time, sizeof(gps->time))) {
+                gps->has_time = true;
             }
         }
         if(token_count > 5 && tokens[2][0] != '\0' && tokens[3][0] != '\0' && tokens[4][0] != '\0' &&
            tokens[5][0] != '\0') {
-            bool ok_lat = simple_app_gps_format_coord(
-                tokens[2], tokens[3], app->gps_lat, sizeof(app->gps_lat));
-            bool ok_lon = simple_app_gps_format_coord(
-                tokens[4], tokens[5], app->gps_lon, sizeof(app->gps_lon));
-            app->gps_has_coords = ok_lat && ok_lon;
+            bool ok_lat =
+                simple_app_gps_format_coord(tokens[2], tokens[3], gps->lat, sizeof(gps->lat));
+            bool ok_lon =
+                simple_app_gps_format_coord(tokens[4], tokens[5], gps->lon, sizeof(gps->lon));
+            gps->has_coords = ok_lat && ok_lon;
         }
     } else if(strcmp(tokens[0], "$GNRMC") == 0 || strcmp(tokens[0], "$GPRMC") == 0) {
         if(token_count > 2 && tokens[2][0] != '\0') {
-            app->gps_has_fix = (tokens[2][0] == 'A');
-            if(!app->gps_has_fix) {
+            gps->has_fix = (tokens[2][0] == 'A');
+            if(!gps->has_fix) {
                 simple_app_gps_clear_coords(app);
             }
         }
         if(token_count > 1 && tokens[1][0] != '\0') {
-            if(simple_app_gps_format_time(tokens[1], app->gps_time, sizeof(app->gps_time))) {
-                app->gps_has_time = true;
+            if(simple_app_gps_format_time(tokens[1], gps->time, sizeof(gps->time))) {
+                gps->has_time = true;
             }
         }
         if(token_count > 9 && tokens[9][0] != '\0') {
-            if(simple_app_gps_format_date(tokens[9], app->gps_date, sizeof(app->gps_date))) {
-                app->gps_has_date = true;
+            if(simple_app_gps_format_date(tokens[9], gps->date, sizeof(gps->date))) {
+                gps->has_date = true;
             }
         }
         if(token_count > 6 && tokens[3][0] != '\0' && tokens[4][0] != '\0' && tokens[5][0] != '\0' &&
-           tokens[6][0] != '\0' && app->gps_has_fix) {
-            bool ok_lat = simple_app_gps_format_coord(
-                tokens[3], tokens[4], app->gps_lat, sizeof(app->gps_lat));
-            bool ok_lon = simple_app_gps_format_coord(
-                tokens[5], tokens[6], app->gps_lon, sizeof(app->gps_lon));
-            app->gps_has_coords = ok_lat && ok_lon;
+           tokens[6][0] != '\0' && gps->has_fix) {
+            bool ok_lat =
+                simple_app_gps_format_coord(tokens[3], tokens[4], gps->lat, sizeof(gps->lat));
+            bool ok_lon =
+                simple_app_gps_format_coord(tokens[5], tokens[6], gps->lon, sizeof(gps->lon));
+            gps->has_coords = ok_lat && ok_lon;
         }
-    } else if(strcmp(tokens[0], "$GNZDA") == 0 || strcmp(tokens[0], "$GPZDA") == 0) {
-        if(token_count > 1 && tokens[1][0] != '\0') {
-            if(simple_app_gps_format_time(tokens[1], app->gps_time, sizeof(app->gps_time))) {
-                app->gps_has_time = true;
-            }
-        }
-        if(token_count > 4 && tokens[2][0] != '\0' && tokens[3][0] != '\0' && tokens[4][0] != '\0') {
-            char date_raw[7];
-            snprintf(date_raw, sizeof(date_raw), "%s%s%s", tokens[2], tokens[3], tokens[4]);
-            if(simple_app_gps_format_date(date_raw, app->gps_date, sizeof(app->gps_date))) {
-                app->gps_has_date = true;
-            }
-        }
-    } else if(strcmp(tokens[0], "$GPGSV") == 0 || strcmp(tokens[0], "$GNGSV") == 0) {
+      } else if(strcmp(tokens[0], "$GNZDA") == 0 || strcmp(tokens[0], "$GPZDA") == 0) {
+          if(token_count > 1 && tokens[1][0] != '\0') {
+              if(simple_app_gps_format_time(tokens[1], gps->time, sizeof(gps->time))) {
+                  gps->has_time = true;
+              }
+          }
+          if(token_count > 4 && tokens[2][0] != '\0' && tokens[3][0] != '\0' && tokens[4][0] != '\0') {
+              char date_raw[7];
+              snprintf(date_raw, sizeof(date_raw), "%s%s%s", tokens[2], tokens[3], tokens[4]);
+              if(simple_app_gps_format_date(date_raw, gps->date, sizeof(gps->date))) {
+                  gps->has_date = true;
+              }
+          }
+          if(app->gps_zda_tz_enabled && token_count > 5 && tokens[5][0] != '\0') {
+              long zone_hours = strtol(tokens[5], NULL, 10);
+              long zone_minutes = 0;
+              if(token_count > 6 && tokens[6][0] != '\0') {
+                  zone_minutes = strtol(tokens[6], NULL, 10);
+              }
+              if(zone_minutes < 0) {
+                  zone_minutes = -zone_minutes;
+              }
+              int32_t offset_minutes = (int32_t)zone_hours * 60;
+              if(zone_hours < 0) {
+                  offset_minutes -= (int32_t)zone_minutes;
+              } else {
+                  offset_minutes += (int32_t)zone_minutes;
+              }
+              int16_t clamped = simple_app_clamp_gps_utc_offset(offset_minutes);
+              if(clamped != app->gps_utc_offset_minutes) {
+                  app->gps_utc_offset_minutes = clamped;
+                  simple_app_mark_config_dirty(app);
+              }
+          }
+      } else if(strcmp(tokens[0], "$GPGSV") == 0 || strcmp(tokens[0], "$GNGSV") == 0) {
         if(token_count > 3 && tokens[3][0] != '\0') {
-            app->gps_satellites = atoi(tokens[3]);
+            gps->satellites = atoi(tokens[3]);
         }
     }
 
@@ -2828,24 +2944,26 @@ static void simple_app_process_gps_line(SimpleApp* app, const char* line) {
 
 static void simple_app_gps_feed(SimpleApp* app, char ch) {
     if(!app) return;
-    if(!app->gps_view_active) {
-        app->gps_line_length = 0;
+    if(!app->gps_view_active || !app->gps_state) {
+        if(app->gps_state) {
+            app->gps_state->line_length = 0;
+        }
         return;
     }
     if(ch == '\r') return;
     if(ch == '\n') {
-        if(app->gps_line_length > 0) {
-            app->gps_line_buffer[app->gps_line_length] = '\0';
-            simple_app_process_gps_line(app, app->gps_line_buffer);
+        if(app->gps_state->line_length > 0) {
+            app->gps_state->line_buffer[app->gps_state->line_length] = '\0';
+            simple_app_process_gps_line(app, app->gps_state->line_buffer);
         }
-        app->gps_line_length = 0;
+        app->gps_state->line_length = 0;
         return;
     }
-    if(app->gps_line_length + 1 >= sizeof(app->gps_line_buffer)) {
-        app->gps_line_length = 0;
+    if(app->gps_state->line_length + 1 >= sizeof(app->gps_state->line_buffer)) {
+        app->gps_state->line_length = 0;
         return;
     }
-    app->gps_line_buffer[app->gps_line_length++] = ch;
+    app->gps_state->line_buffer[app->gps_state->line_length++] = ch;
 }
 
 static void simple_app_reset_blackout_status(SimpleApp* app) {
@@ -3661,7 +3779,7 @@ static void simple_app_handshake_feed(SimpleApp* app, char ch) {
 }
 
 static void simple_app_process_wardrive_line(SimpleApp* app, const char* line) {
-    if(!app || !line || !app->wardrive_view_active) return;
+    if(!app || !line || !app->wardrive_view_active || !app->wardrive_state) return;
 
     if(strstr(line, "Wardrive task started") != NULL) {
         simple_app_set_wardrive_status(app, "Starting", false);
@@ -3696,24 +3814,26 @@ static void simple_app_process_wardrive_line(SimpleApp* app, const char* line) {
 
 static void simple_app_wardrive_feed(SimpleApp* app, char ch) {
     if(!app) return;
-    if(!app->wardrive_view_active) {
-        app->wardrive_line_length = 0;
+    if(!app->wardrive_view_active || !app->wardrive_state) {
+        if(app->wardrive_state) {
+            app->wardrive_state->line_length = 0;
+        }
         return;
     }
     if(ch == '\r') return;
     if(ch == '\n') {
-        if(app->wardrive_line_length > 0) {
-            app->wardrive_line_buffer[app->wardrive_line_length] = '\0';
-            simple_app_process_wardrive_line(app, app->wardrive_line_buffer);
+        if(app->wardrive_state->line_length > 0) {
+            app->wardrive_state->line_buffer[app->wardrive_state->line_length] = '\0';
+            simple_app_process_wardrive_line(app, app->wardrive_state->line_buffer);
         }
-        app->wardrive_line_length = 0;
+        app->wardrive_state->line_length = 0;
         return;
     }
-    if(app->wardrive_line_length + 1 >= sizeof(app->wardrive_line_buffer)) {
-        app->wardrive_line_length = 0;
+    if(app->wardrive_state->line_length + 1 >= sizeof(app->wardrive_state->line_buffer)) {
+        app->wardrive_state->line_length = 0;
         return;
     }
-    app->wardrive_line_buffer[app->wardrive_line_length++] = ch;
+    app->wardrive_state->line_buffer[app->wardrive_state->line_length++] = ch;
 }
 
 static void simple_app_process_blackout_line(SimpleApp* app, const char* line) {
@@ -5664,6 +5784,12 @@ static void simple_app_parse_config_line(SimpleApp* app, char* line) {
             }
             app->led_level = (uint8_t)parsed;
         }
+    } else if(strcmp(key, "gps_utc_offset_min") == 0) {
+        app->gps_utc_offset_minutes = simple_app_clamp_gps_utc_offset(strtol(value, NULL, 10));
+    } else if(strcmp(key, "gps_dst") == 0) {
+        app->gps_dst_enabled = simple_app_parse_bool_value(value, app->gps_dst_enabled);
+    } else if(strcmp(key, "gps_zda_tz") == 0) {
+        app->gps_zda_tz_enabled = simple_app_parse_bool_value(value, app->gps_zda_tz_enabled);
     } else if(strcmp(key, "boot_short_status") == 0) {
         app->boot_short_enabled = simple_app_parse_bool_value(value, app->boot_short_enabled);
     } else if(strcmp(key, "boot_long_status") == 0) {
@@ -5715,13 +5841,16 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             "min_power=%d\n"
             "min_channel_time=%u\n"
             "max_channel_time=%u\n"
-            "backlight_enabled=%d\n"
-            "otg_power_enabled=%d\n"
-            "show_ram_overlay=%d\n"
-            "karma_duration=%lu\n"
-            "boot_short_status=%d\n"
-            "boot_short=%s\n"
-            "boot_long_status=%d\n"
+              "backlight_enabled=%d\n"
+              "otg_power_enabled=%d\n"
+              "show_ram_overlay=%d\n"
+              "karma_duration=%lu\n"
+              "gps_utc_offset_min=%d\n"
+              "gps_dst=%d\n"
+              "gps_zda_tz=%d\n"
+              "boot_short_status=%d\n"
+              "boot_short=%s\n"
+              "boot_long_status=%d\n"
             "boot_long=%s\n",
             app->scanner_show_ssid ? 1 : 0,
             app->scanner_show_bssid ? 1 : 0,
@@ -5735,11 +5864,14 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
             (unsigned)app->scanner_max_channel_time,
             app->backlight_enabled ? 1 : 0,
             app->otg_power_enabled ? 1 : 0,
-            app->show_ram_overlay ? 1 : 0,
-            (unsigned long)app->karma_sniffer_duration_sec,
-            app->boot_short_enabled ? 1 : 0,
-            boot_command_options[short_idx],
-            app->boot_long_enabled ? 1 : 0,
+              app->show_ram_overlay ? 1 : 0,
+              (unsigned long)app->karma_sniffer_duration_sec,
+              (int)app->gps_utc_offset_minutes,
+              app->gps_dst_enabled ? 1 : 0,
+              app->gps_zda_tz_enabled ? 1 : 0,
+              app->boot_short_enabled ? 1 : 0,
+              boot_command_options[short_idx],
+              app->boot_long_enabled ? 1 : 0,
             boot_command_options[long_idx]);
         if(len > 0 && len < (int)sizeof(buffer)) {
             size_t written = storage_file_write(file, buffer, (size_t)len);
@@ -5842,6 +5974,7 @@ static void simple_app_load_config(SimpleApp* app) {
     } else if(app->led_level > 100) {
         app->led_level = 100;
     }
+    app->gps_utc_offset_minutes = simple_app_clamp_gps_utc_offset(app->gps_utc_offset_minutes);
     if(app->boot_short_command_index >= BOOT_COMMAND_OPTION_COUNT) {
         app->boot_short_command_index = 1;
     }
@@ -7037,6 +7170,11 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     }
     if(is_wardrive_command) {
         app->wardrive_view_active = true;
+        if(!simple_app_wardrive_state_ensure(app)) {
+            simple_app_show_status_message(app, "OOM: wardrive", 1500, true);
+            app->wardrive_view_active = false;
+            return;
+        }
         simple_app_reset_wardrive_status(app);
     } else if(app->wardrive_view_active) {
         app->wardrive_view_active = false;
@@ -7044,6 +7182,11 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     }
     if(is_start_gps_raw) {
         app->gps_view_active = true;
+        if(!simple_app_gps_state_ensure(app)) {
+            simple_app_show_status_message(app, "OOM: GPS", 1500, true);
+            app->gps_view_active = false;
+            return;
+        }
         simple_app_reset_gps_status(app);
     } else if(is_stop_command) {
         app->gps_view_active = false;
@@ -7667,6 +7810,27 @@ static void simple_app_handle_gps_input(SimpleApp* app, InputKey key) {
         app->gps_time_24h = !app->gps_time_24h;
         if(app->viewport) {
             view_port_update(app->viewport);
+        }
+        return;
+    }
+    if(key == InputKeyUp || key == InputKeyDown) {
+        app->gps_dst_enabled = !app->gps_dst_enabled;
+        simple_app_mark_config_dirty(app);
+        if(app->viewport) {
+            view_port_update(app->viewport);
+        }
+        return;
+    }
+    if(key == InputKeyLeft || key == InputKeyRight) {
+        int delta = (key == InputKeyRight) ? 60 : -60;
+        int16_t updated =
+            simple_app_clamp_gps_utc_offset(app->gps_utc_offset_minutes + delta);
+        if(updated != app->gps_utc_offset_minutes) {
+            app->gps_utc_offset_minutes = updated;
+            simple_app_mark_config_dirty(app);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
         }
         return;
     }
@@ -11143,8 +11307,12 @@ static void simple_app_draw_wardrive_serial(SimpleApp* app, Canvas* canvas) {
     }
     canvas_draw_line(canvas, 0, divider_y, DISPLAY_WIDTH - 1, divider_y);
 
-    const char* status = app->wardrive_status_text[0] ? app->wardrive_status_text : "0";
-    bool numeric = app->wardrive_status_is_numeric;
+    const char* status = "0";
+    bool numeric = true;
+    if(app->wardrive_state) {
+        status = app->wardrive_state->status_text[0] ? app->wardrive_state->status_text : "0";
+        numeric = app->wardrive_state->status_is_numeric;
+    }
     int16_t bottom_center = divider_y + ((DISPLAY_HEIGHT - divider_y) / 2);
     if(bottom_center >= DISPLAY_HEIGHT) {
         bottom_center = DISPLAY_HEIGHT - 2;
@@ -11221,51 +11389,56 @@ static void simple_app_draw_gps(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str(canvas, 4, 12, "GPS");
 
     canvas_set_font(canvas, FontSecondary);
-    if(!app->gps_has_coords) {
+    if(!app->gps_state || !app->gps_state->has_coords) {
+        SimpleAppGpsState* gps = app->gps_state;
         canvas_draw_str_aligned(
             canvas, DISPLAY_WIDTH / 2, 32, AlignCenter, AlignCenter, "Waiting for GPS fix");
-        if(app->gps_has_time) {
-            char time_text[16];
-            char time_line[28];
-            if(simple_app_gps_format_time_display(app, time_text, sizeof(time_text))) {
-                snprintf(time_line, sizeof(time_line), "Time: %s", time_text);
+        if(gps && gps->has_time) {
+            if(simple_app_gps_format_time_display(app, gps->time_text, sizeof(gps->time_text))) {
+                simple_app_gps_format_offset(app, gps->offset_text, sizeof(gps->offset_text));
+                snprintf(
+                    gps->time_line,
+                    sizeof(gps->time_line),
+                    "Time: %s %s",
+                    gps->time_text,
+                    gps->offset_text);
             } else {
-                snprintf(time_line, sizeof(time_line), "Time: --");
+                snprintf(gps->time_line, sizeof(gps->time_line), "Time: --");
             }
             canvas_draw_str_aligned(
-                canvas, DISPLAY_WIDTH / 2, 44, AlignCenter, AlignCenter, time_line);
+                canvas, DISPLAY_WIDTH / 2, 44, AlignCenter, AlignCenter, gps->time_line);
         }
-        if(app->gps_satellites >= 0) {
-            char sats_line[20];
-            snprintf(sats_line, sizeof(sats_line), "Sats: %d", app->gps_satellites);
+        if(gps && gps->satellites >= 0) {
+            snprintf(gps->sats_line, sizeof(gps->sats_line), "Sats: %d", gps->satellites);
             canvas_draw_str_aligned(
-                canvas, DISPLAY_WIDTH / 2, 56, AlignCenter, AlignCenter, sats_line);
+                canvas, DISPLAY_WIDTH / 2, 56, AlignCenter, AlignCenter, gps->sats_line);
         }
         return;
     }
 
-    char line[32];
-    snprintf(line, sizeof(line), "Lat: %s", app->gps_lat);
-    canvas_draw_str(canvas, 2, 24, line);
-    snprintf(line, sizeof(line), "Lon: %s", app->gps_lon);
-    canvas_draw_str(canvas, 2, 34, line);
-    if(app->gps_has_time) {
-        char time_text[16];
-        if(simple_app_gps_format_time_display(app, time_text, sizeof(time_text))) {
-            snprintf(line, sizeof(line), "Time: %s", time_text);
+    SimpleAppGpsState* gps = app->gps_state;
+    snprintf(gps->line, sizeof(gps->line), "Lat: %s", gps->lat);
+    canvas_draw_str(canvas, 2, 24, gps->line);
+    snprintf(gps->line, sizeof(gps->line), "Lon: %s", gps->lon);
+    canvas_draw_str(canvas, 2, 34, gps->line);
+    if(app->gps_state->has_time) {
+        if(simple_app_gps_format_time_display(app, gps->time_text, sizeof(gps->time_text))) {
+            simple_app_gps_format_offset(app, gps->offset_text, sizeof(gps->offset_text));
+            snprintf(
+                gps->line, sizeof(gps->line), "Time: %s %s", gps->time_text, gps->offset_text);
         } else {
-            snprintf(line, sizeof(line), "Time: --");
+            snprintf(gps->line, sizeof(gps->line), "Time: --");
         }
     } else {
-        snprintf(line, sizeof(line), "Time: --");
+        snprintf(gps->line, sizeof(gps->line), "Time: --");
     }
-    canvas_draw_str(canvas, 2, 44, line);
-    if(app->gps_satellites >= 0) {
-        snprintf(line, sizeof(line), "Sats: %d", app->gps_satellites);
+    canvas_draw_str(canvas, 2, 44, gps->line);
+    if(gps->satellites >= 0) {
+        snprintf(gps->line, sizeof(gps->line), "Sats: %d", gps->satellites);
     } else {
-        snprintf(line, sizeof(line), "Sats: --");
+        snprintf(gps->line, sizeof(gps->line), "Sats: --");
     }
-    canvas_draw_str(canvas, 2, 54, line);
+    canvas_draw_str(canvas, 2, 54, gps->line);
 }
 
 static void simple_app_draw_deauth_guard(SimpleApp* app, Canvas* canvas) {
@@ -14275,6 +14448,10 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
         } else if(entry->action == MenuActionOpenConsole) {
             simple_app_console_enter(app);
         } else if(entry->action == MenuActionOpenGps) {
+            if(!simple_app_gps_state_ensure(app)) {
+                simple_app_show_status_message(app, "OOM: GPS", 1500, true);
+                return;
+            }
             app->screen = ScreenGps;
             app->gps_view_active = true;
             app->gps_console_mode = false;
@@ -17145,6 +17322,9 @@ int32_t Lab_C5_app(void* p) {
     app->otg_power_enabled = app->otg_power_initial_state;
     app->backlight_enabled = true;
     app->gps_time_24h = true;
+    app->gps_utc_offset_minutes = 0;
+    app->gps_dst_enabled = false;
+    app->gps_zda_tz_enabled = false;
     app->show_ram_overlay = false;
     app->led_enabled = true;
     app->led_level = 10;
@@ -17366,6 +17546,8 @@ int32_t Lab_C5_app(void* p) {
     }
     // Do not restore OTG state on exit: 5V setting is user-configurable and persisted via config.
     furi_hal_light_set(LightBacklight, BACKLIGHT_ON_LEVEL);
+    simple_app_gps_state_free(app);
+    simple_app_wardrive_state_free(app);
     free(app);
 
     return 0;

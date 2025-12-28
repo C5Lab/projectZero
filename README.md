@@ -70,6 +70,7 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 - `vendor set <on|off>` / `vendor read` - toggles OUI lookup backed by `/lab/oui_wifi.bin` on the SD card.
 - `led set <on|off>` / `led level <1-100>` - controls the WS2812 status LED (purple for portal, other colors for attacks).
 - GPS helpers: `gps_set <m5|atgm>` switches between M5Stack GPS v1.1 (115200 bps) and ATGM336H (9600 bps, default); `start_gps_raw [baud]` streams NMEA for quick validation without rebooting (baud optional, overrides module default).
+  - GPS screen (FAP): shows UTC time from NMEA plus your manual offset. Use Left/Right to change the UTC offset in hours, Up/Down toggles DST (+1h), and OK switches 24h/12h display. Optional config key `gps_zda_tz=1` enables reading time-zone offsets from ZDA; default is off because many modules report `00,00` (UTC).
 - `download` - reboot straight into ROM download mode for UART flashing.
 - `ping` - quick CLI connectivity check (prints pong).
 - `stop` - flips the global stop flag so every running task can wind down gracefully.
