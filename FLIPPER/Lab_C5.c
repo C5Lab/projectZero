@@ -408,12 +408,19 @@ typedef struct {
     char mac[18];
 } SnifferClientEntry;
 
+typedef enum {
+    GpsAntennaUnknown = 0,
+    GpsAntennaOk,
+    GpsAntennaOpen,
+} GpsAntennaStatus;
+
 typedef struct {
     bool has_fix;
     bool has_coords;
     bool has_time;
     bool has_date;
     int satellites;
+    GpsAntennaStatus antenna_status;
     char lat[16];
     char lon[16];
     char time[16];
@@ -2695,6 +2702,7 @@ static void simple_app_reset_gps_status(SimpleApp* app) {
     app->gps_state->has_time = false;
     app->gps_state->has_date = false;
     app->gps_state->satellites = -1;
+    app->gps_state->antenna_status = GpsAntennaUnknown;
     app->gps_state->lat[0] = '\0';
     app->gps_state->lon[0] = '\0';
     app->gps_state->time[0] = '\0';
@@ -2812,6 +2820,20 @@ static bool simple_app_gps_format_time_display(const SimpleApp* app, char* out, 
     if(hh12 == 0) hh12 = 12;
     snprintf(out, out_len, "%02d:%02d:%02d %s", hh12, mm, ss, suffix);
     return true;
+}
+
+static bool simple_app_strcasestr(const char* haystack, const char* needle) {
+    if(!haystack || !needle || needle[0] == '\0') return false;
+    size_t needle_len = strlen(needle);
+    for(const char* h = haystack; *h != '\0'; h++) {
+        size_t i = 0;
+        while(i < needle_len && h[i] != '\0' &&
+              tolower((unsigned char)h[i]) == tolower((unsigned char)needle[i])) {
+            i++;
+        }
+        if(i == needle_len) return true;
+    }
+    return false;
 }
 
 static void simple_app_process_gps_line(SimpleApp* app, const char* line) {
@@ -2934,6 +2956,14 @@ static void simple_app_process_gps_line(SimpleApp* app, const char* line) {
       } else if(strcmp(tokens[0], "$GPGSV") == 0 || strcmp(tokens[0], "$GNGSV") == 0) {
         if(token_count > 3 && tokens[3][0] != '\0') {
             gps->satellites = atoi(tokens[3]);
+        }
+    } else if(strcmp(tokens[0], "$GPTXT") == 0 || strcmp(tokens[0], "$GNTXT") == 0) {
+        if(token_count > 4 && tokens[4][0] != '\0') {
+            if(simple_app_strcasestr(tokens[4], "ANTENNA OPEN")) {
+                gps->antenna_status = GpsAntennaOpen;
+            } else if(simple_app_strcasestr(tokens[4], "ANTENNA OK")) {
+                gps->antenna_status = GpsAntennaOk;
+            }
         }
     }
 
@@ -11408,7 +11438,10 @@ static void simple_app_draw_gps(SimpleApp* app, Canvas* canvas) {
             canvas_draw_str_aligned(
                 canvas, DISPLAY_WIDTH / 2, 44, AlignCenter, AlignCenter, gps->time_line);
         }
-        if(gps && gps->satellites >= 0) {
+        if(gps && gps->antenna_status == GpsAntennaOpen) {
+            canvas_draw_str_aligned(
+                canvas, DISPLAY_WIDTH / 2, 56, AlignCenter, AlignCenter, "Antena not detected");
+        } else if(gps && gps->satellites >= 0) {
             snprintf(gps->sats_line, sizeof(gps->sats_line), "Sats: %d", gps->satellites);
             canvas_draw_str_aligned(
                 canvas, DISPLAY_WIDTH / 2, 56, AlignCenter, AlignCenter, gps->sats_line);
@@ -11433,7 +11466,9 @@ static void simple_app_draw_gps(SimpleApp* app, Canvas* canvas) {
         snprintf(gps->line, sizeof(gps->line), "Time: --");
     }
     canvas_draw_str(canvas, 2, 44, gps->line);
-    if(gps->satellites >= 0) {
+    if(gps->antenna_status == GpsAntennaOpen) {
+        snprintf(gps->line, sizeof(gps->line), "Antena not detected");
+    } else if(gps->satellites >= 0) {
         snprintf(gps->line, sizeof(gps->line), "Sats: %d", gps->satellites);
     } else {
         snprintf(gps->line, sizeof(gps->line), "Sats: --");
