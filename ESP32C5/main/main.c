@@ -805,6 +805,7 @@ static size_t vendor_record_count = 0;
 static int cmd_scan_networks(int argc, char **argv);
 static int cmd_show_scan_results(int argc, char **argv);
 static int cmd_select_networks(int argc, char **argv);
+static int cmd_unselect_networks(int argc, char **argv);
 static int cmd_start_evil_twin(int argc, char **argv);
 static int cmd_start_handshake(int argc, char **argv);
 static int cmd_save_handshake(int argc, char **argv);
@@ -812,6 +813,7 @@ static int cmd_start_gps_raw(int argc, char **argv);
 static int cmd_gps_set(int argc, char **argv);
 static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_start_sniffer(int argc, char **argv);
+static int cmd_start_sniffer_noscan(int argc, char **argv);
 static int cmd_packet_monitor(int argc, char **argv);
 static int cmd_channel_view(int argc, char **argv);
 static int cmd_show_sniffer_results(int argc, char **argv);
@@ -2331,6 +2333,19 @@ static int cmd_select_networks(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_unselect_networks(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    // Stop all running operations
+    cmd_stop(0, NULL);
+    
+    // Clear network selection (but keep scan results)
+    g_selected_count = 0;
+    memset(g_selected_indices, 0, sizeof(g_selected_indices));
+    
+    MY_LOG_INFO(TAG, "Network selection cleared. Scan results preserved.");
+    return 0;
+}
 
 int onlyDeauth = 0;
 
@@ -4227,6 +4242,79 @@ static int cmd_start_sniffer(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Sniffer started - scanning networks...");
         MY_LOG_INFO(TAG, "Use 'show_sniffer_results' to see captured clients or 'stop' to stop.");
     }
+    
+    return 0;
+}
+
+static int cmd_start_sniffer_noscan(int argc, char **argv) {
+    (void)argc; (void)argv;
+    log_memory_info("start_sniffer_noscan");
+    
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+    
+    // Reset stop flag
+    operation_stop_requested = false;
+    
+    if (sniffer_active) {
+        MY_LOG_INFO(TAG, "Sniffer already active. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    // Check if scan was previously performed
+    if (!g_scan_done || g_scan_count == 0) {
+        MY_LOG_INFO(TAG, "Please scan_networks first.");
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "Starting sniffer using existing scan results (%u networks)...", g_scan_count);
+    
+    // Clear previous sniffer data
+    sniffer_ap_count = 0;
+    memset(sniffer_aps, 0, MAX_SNIFFER_APS * sizeof(sniffer_ap_t));
+    probe_request_count = 0;
+    memset(probe_requests, 0, MAX_PROBE_REQUESTS * sizeof(probe_request_t));
+    sniffer_selected_channels_count = 0;
+    memset(sniffer_selected_channels, 0, sizeof(sniffer_selected_channels));
+    sniffer_packet_counter = 0;
+    sniffer_last_debug_packet = 0;
+    
+    sniffer_active = true;
+    sniffer_scan_phase = false;
+    sniffer_selected_mode = false;
+    
+    // Process existing scan results
+    sniffer_process_scan_results();
+    
+    // Set promiscuous filter
+    esp_wifi_set_promiscuous_filter(&sniffer_filter);
+    
+    // Enable promiscuous mode
+    esp_wifi_set_promiscuous_rx_cb(sniffer_promiscuous_callback);
+    esp_wifi_set_promiscuous(true);
+    
+    // Initialize dual-band channel hopping
+    sniffer_channel_index = 0;
+    sniffer_current_channel = dual_band_channels[sniffer_channel_index];
+    sniffer_last_channel_hop = esp_timer_get_time() / 1000;
+    esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE);
+    
+    // Start channel hopping task
+    if (sniffer_channel_task_handle == NULL) {
+        xTaskCreate(sniffer_channel_task, "sniffer_channel", 2048, NULL, 5, &sniffer_channel_task_handle);
+        MY_LOG_INFO(TAG, "Started sniffer channel hopping task");
+    }
+    
+    // Set LED to green for active sniffing
+    esp_err_t led_err = led_set_color(0, 255, 0);
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for sniffer: %s", esp_err_to_name(led_err));
+    }
+    
+    MY_LOG_INFO(TAG, "Sniffer: Now monitoring %d networks (no scan performed)", sniffer_ap_count);
+    MY_LOG_INFO(TAG, "Use 'show_sniffer_results' to see captured clients or 'stop' to stop.");
     
     return 0;
 }
@@ -7456,6 +7544,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_cmd));
 
+    const esp_console_cmd_t sniffer_noscan_cmd = {
+        .command = "start_sniffer_noscan",
+        .help = "Starts sniffer using existing scan results (requires prior scan_networks)",
+        .hint = NULL,
+        .func = &cmd_start_sniffer_noscan,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_noscan_cmd));
+
     const esp_console_cmd_t packet_monitor_cmd = {
         .command = "packet_monitor",
         .help = "Monitor packets per second on a channel: packet_monitor <channel>",
@@ -7537,6 +7634,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&select_cmd));
+
+    const esp_console_cmd_t unselect_cmd = {
+        .command = "unselect_networks",
+        .help = "Stops operations and clears network selection (keeps scan results)",
+        .hint = NULL,
+        .func = &cmd_unselect_networks,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&unselect_cmd));
 
     const esp_console_cmd_t start_cmd = {
         .command = "start_evil_twin",
@@ -7929,6 +8035,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  scan_networks");
       MY_LOG_INFO(TAG,"  select_html <index>");
       MY_LOG_INFO(TAG,"  select_networks <index1> [index2] ...");
+      MY_LOG_INFO(TAG,"  unselect_networks");
       MY_LOG_INFO(TAG,"  show_probes");
       MY_LOG_INFO(TAG,"  show_scan_results");
       MY_LOG_INFO(TAG,"  show_sniffer_results");
@@ -7938,6 +8045,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  start_evil_twin");
       MY_LOG_INFO(TAG,"  start_portal <SSID>");
       MY_LOG_INFO(TAG,"  start_sniffer");
+      MY_LOG_INFO(TAG,"  start_sniffer_noscan");
       MY_LOG_INFO(TAG,"  start_sniffer_dog");
       MY_LOG_INFO(TAG,"  start_gps_raw");
       MY_LOG_INFO(TAG,"  gps_set <m5|atgm>");
