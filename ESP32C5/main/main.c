@@ -87,7 +87,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.0.3"
+#define JANOS_VERSION "1.0.2"
 
 
 #define NEOPIXEL_GPIO      27
@@ -437,6 +437,12 @@ static uint32_t g_scan_max_channel_time = 300;
 #define SCAN_TIME_NVS_KEY_MIN   "min_time"
 #define SCAN_TIME_NVS_KEY_MAX   "max_time"
 
+#define CHANNEL_TIME_MIN_LIMIT 1500   // max allowed value for min_channel_time
+#define CHANNEL_TIME_MAX_LIMIT 2000   // max allowed value for max_channel_time
+
+#define FAST_SCAN_MIN_TIME 100   // Fast scan min channel time (ms) - used by blackout/handshake
+#define FAST_SCAN_MAX_TIME 300   // Fast scan max channel time (ms) - used by blackout/handshake
+
 static void channel_time_persist_state(void) {
     nvs_handle_t handle;
     esp_err_t err = nvs_open(SCAN_TIME_NVS_NAMESPACE, NVS_READWRITE, &handle);
@@ -469,14 +475,21 @@ static void channel_time_load_state_from_nvs(void) {
     }
     uint32_t min_val = 0, max_val = 0;
     err = nvs_get_u32(handle, SCAN_TIME_NVS_KEY_MIN, &min_val);
-    if (err == ESP_OK && min_val >= 1 && min_val <= 10000) {
+    if (err == ESP_OK && min_val >= 1 && min_val <= CHANNEL_TIME_MIN_LIMIT) {
         g_scan_min_channel_time = min_val;
     }
     err = nvs_get_u32(handle, SCAN_TIME_NVS_KEY_MAX, &max_val);
-    if (err == ESP_OK && max_val >= 1 && max_val <= 10000) {
+    if (err == ESP_OK && max_val >= 1 && max_val <= CHANNEL_TIME_MAX_LIMIT) {
         g_scan_max_channel_time = max_val;
     }
     nvs_close(handle);
+}
+
+// Calculate dynamic scan timeout based on channel times
+// 14 channels (2.4 GHz) + 5 second buffer for overhead
+static int get_scan_timeout_iterations(void) {
+    int max_scan_duration_ms = (14 * g_scan_max_channel_time) + 5000;
+    return max_scan_duration_ms / 100; // 100ms per iteration
 }
 
 /**
@@ -851,7 +864,7 @@ static int cmd_led(int argc, char **argv);
 static int cmd_vendor(int argc, char **argv);
 static int cmd_download(int argc, char **argv);
 static int cmd_channel_time(int argc, char **argv);
-static esp_err_t start_background_scan(void);
+static esp_err_t start_background_scan(uint32_t min_time, uint32_t max_time);
 static void print_scan_results(void);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
 // Target BSSID management functions
@@ -1547,7 +1560,7 @@ static esp_netif_t *ensure_ap_mode(void)
 // ============================================================================
 
 // --- Start background scan ---
-static esp_err_t start_background_scan(void) {
+static esp_err_t start_background_scan(uint32_t min_time, uint32_t max_time) {
     if (wardrive_active || wardrive_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Cannot start background scan: wardrive is active. Use 'stop' first.");
         return ESP_ERR_INVALID_STATE;
@@ -1564,8 +1577,8 @@ static esp_err_t start_background_scan(void) {
         .channel = 0,
         .show_hidden = true,
         .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active.min = g_scan_min_channel_time,
-        .scan_time.active.max = g_scan_max_channel_time,
+        .scan_time.active.min = min_time,
+        .scan_time.active.max = max_time,
     };
     
     g_scan_in_progress = true;
@@ -1627,7 +1640,7 @@ static esp_err_t quick_channel_scan(void) {
     }
     
     // Use the main scanning function instead of quick scan
-    esp_err_t err = start_background_scan();
+    esp_err_t err = start_background_scan(FAST_SCAN_MIN_TIME, FAST_SCAN_MAX_TIME);
     if (err != ESP_OK) {
         if (!periodic_rescan_in_progress) {
             MY_LOG_INFO(TAG, "Quick scan failed: %s", esp_err_to_name(err));
@@ -1635,18 +1648,33 @@ static esp_err_t quick_channel_scan(void) {
         return err;
     }
     
-    // Wait for scan to complete
+    // Wait for scan to complete (dynamic timeout based on channel times)
     int timeout = 0;
-    while (g_scan_in_progress && timeout < 200) { // 20 seconds timeout
+    int timeout_limit = get_scan_timeout_iterations();
+    while (g_scan_in_progress && timeout < timeout_limit) {
         vTaskDelay(pdMS_TO_TICKS(100));
         timeout++;
     }
     
     if (g_scan_in_progress) {
         if (!periodic_rescan_in_progress) {
-            MY_LOG_INFO(TAG, "Quick scan timeout");
+            MY_LOG_INFO(TAG, "Scan taking longer than expected, waiting for completion...");
         }
-        return ESP_ERR_TIMEOUT;
+        // Wait additional time for scan to complete naturally
+        int extra_wait = 0;
+        while (g_scan_in_progress && extra_wait < 100) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            extra_wait++;
+        }
+        // If still in progress after extra wait, then stop
+        if (g_scan_in_progress) {
+            if (!periodic_rescan_in_progress) {
+                MY_LOG_INFO(TAG, "Scan still in progress, forcing stop...");
+            }
+            esp_wifi_scan_stop();
+            g_scan_in_progress = false;
+            return ESP_ERR_TIMEOUT;
+        }
     }
     
     if (!g_scan_done || g_scan_count == 0) {
@@ -2238,7 +2266,7 @@ static int cmd_scan_networks(int argc, char **argv) {
         ESP_LOGW(TAG, "Failed to set LED for scan: %s", esp_err_to_name(led_err));
     }
 
-    esp_err_t err = start_background_scan();
+    esp_err_t err = start_background_scan(g_scan_min_channel_time, g_scan_max_channel_time);
     
     if (err != ESP_OK) {
         // Return LED to idle when scan failed
@@ -2505,17 +2533,18 @@ static void blackout_attack_task(void *pvParameters) {
     while (blackout_attack_active && !operation_stop_requested) {
         MY_LOG_INFO(TAG, "Starting blackout cycle: scanning all networks...");
         
-        // Start background scan
-        esp_err_t scan_result = start_background_scan();
+        // Start background scan with fast timings
+        esp_err_t scan_result = start_background_scan(FAST_SCAN_MIN_TIME, FAST_SCAN_MAX_TIME);
         if (scan_result != ESP_OK) {
             MY_LOG_INFO(TAG, "Failed to start scan: %s", esp_err_to_name(scan_result));
             vTaskDelay(pdMS_TO_TICKS(1000)); // Wait 1 second before retry
             continue;
         }
         
-        // Wait for scan to complete
+        // Wait for scan to complete (dynamic timeout based on channel times)
         int timeout = 0;
-        while (g_scan_in_progress && timeout < 200 && blackout_attack_active && !operation_stop_requested) {
+        int timeout_limit = get_scan_timeout_iterations();
+        while (g_scan_in_progress && timeout < timeout_limit && blackout_attack_active && !operation_stop_requested) {
             vTaskDelay(pdMS_TO_TICKS(100));
             timeout++;
         }
@@ -2526,9 +2555,21 @@ static void blackout_attack_task(void *pvParameters) {
         }
         
         if (g_scan_in_progress) {
-            MY_LOG_INFO(TAG, "Scan timeout, retrying...");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
+            MY_LOG_INFO(TAG, "Scan taking longer than expected, waiting for completion...");
+            // Wait additional time for scan to complete naturally
+            int extra_wait = 0;
+            while (g_scan_in_progress && extra_wait < 100 && blackout_attack_active && !operation_stop_requested) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                extra_wait++;
+            }
+            // If still in progress after extra wait, then stop
+            if (g_scan_in_progress) {
+                MY_LOG_INFO(TAG, "Scan still in progress, forcing stop...");
+                esp_wifi_scan_stop();
+                g_scan_in_progress = false;
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
         }
         
         if (!g_scan_done || g_scan_count == 0) {
@@ -2756,17 +2797,18 @@ static void handshake_attack_task(void *pvParameters) {
             if (current_time - last_scan_time >= SCAN_INTERVAL_US || handshake_target_count == 0) {
                 MY_LOG_INFO(TAG, "Performing periodic scan for networks...");
                 
-                // Start background scan
-                esp_err_t scan_result = start_background_scan();
+                // Start background scan with fast timings
+                esp_err_t scan_result = start_background_scan(FAST_SCAN_MIN_TIME, FAST_SCAN_MAX_TIME);
                 if (scan_result != ESP_OK) {
                     MY_LOG_INFO(TAG, "Failed to start scan: %s", esp_err_to_name(scan_result));
                     vTaskDelay(pdMS_TO_TICKS(5000));
                     continue;
                 }
                 
-                // Wait for scan to complete
+                // Wait for scan to complete (dynamic timeout based on channel times)
                 int timeout = 0;
-                while (g_scan_in_progress && timeout < 200 && handshake_attack_active && !operation_stop_requested) {
+                int timeout_limit = get_scan_timeout_iterations();
+                while (g_scan_in_progress && timeout < timeout_limit && handshake_attack_active && !operation_stop_requested) {
                     vTaskDelay(pdMS_TO_TICKS(100));
                     timeout++;
                 }
@@ -2776,7 +2818,25 @@ static void handshake_attack_task(void *pvParameters) {
                     break;
                 }
                 
-                if (g_scan_in_progress || !g_scan_done || g_scan_count == 0) {
+                if (g_scan_in_progress) {
+                    MY_LOG_INFO(TAG, "Scan taking longer than expected, waiting for completion...");
+                    // Wait additional time for scan to complete naturally
+                    int extra_wait = 0;
+                    while (g_scan_in_progress && extra_wait < 100 && handshake_attack_active && !operation_stop_requested) {
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                        extra_wait++;
+                    }
+                    // If still in progress after extra wait, then stop
+                    if (g_scan_in_progress) {
+                        MY_LOG_INFO(TAG, "Scan still in progress, forcing stop...");
+                        esp_wifi_scan_stop();
+                        g_scan_in_progress = false;
+                        vTaskDelay(pdMS_TO_TICKS(500));
+                        continue;
+                    }
+                }
+                
+                if (!g_scan_done || g_scan_count == 0) {
                     MY_LOG_INFO(TAG, "Scan failed or no results, retrying in 5 seconds...");
                     vTaskDelay(pdMS_TO_TICKS(5000));
                     continue;
@@ -4060,7 +4120,7 @@ static void channel_view_task(void *pvParameters) {
     const TickType_t wait_slice = pdMS_TO_TICKS(100);
 
     while (channel_view_active && !operation_stop_requested) {
-        esp_err_t err = start_background_scan();
+        esp_err_t err = start_background_scan(FAST_SCAN_MIN_TIME, FAST_SCAN_MAX_TIME);
         if (err != ESP_OK) {
             MY_LOG_INFO(TAG, "channel_view_error:scan_start %s", esp_err_to_name(err));
             break;
@@ -4282,7 +4342,7 @@ static int cmd_start_sniffer(int argc, char **argv) {
             ESP_LOGW(TAG, "Failed to set LED for sniffer: %s", esp_err_to_name(led_err));
         }
         
-        esp_err_t err = start_background_scan();
+        esp_err_t err = start_background_scan(FAST_SCAN_MIN_TIME, FAST_SCAN_MAX_TIME);
         if (err != ESP_OK) {
             sniffer_active = false;
             sniffer_scan_phase = false;
@@ -4707,8 +4767,8 @@ static int cmd_deauth_detector(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Starting Deauth Detector in SCAN mode...");
         MY_LOG_INFO(TAG, "Scanning networks first...");
         
-        // Start WiFi scan
-        esp_err_t err = start_background_scan();
+        // Start WiFi scan with configurable timings
+        esp_err_t err = start_background_scan(g_scan_min_channel_time, g_scan_max_channel_time);
         if (err != ESP_OK) {
             if (err == ESP_ERR_INVALID_STATE) {
                 MY_LOG_INFO(TAG, "Scan already in progress. Please wait or use 'stop'.");
@@ -4955,12 +5015,16 @@ static int cmd_channel_time(int argc, char **argv) {
         }
         
         int value = atoi(argv[3]);
-        if (value < 1 || value > 10000) {
-            MY_LOG_INFO(TAG, "Invalid value: %d. Valid range: 1-10000 ms", value);
+        if (value < 1) {
+            MY_LOG_INFO(TAG, "Value must be at least 1 ms");
             return 1;
         }
 
         if (strcasecmp(argv[2], "min") == 0) {
+            if (value > CHANNEL_TIME_MIN_LIMIT) {
+                MY_LOG_INFO(TAG, "Value %d exceeds limit, setting to max allowed %d ms", value, CHANNEL_TIME_MIN_LIMIT);
+                value = CHANNEL_TIME_MIN_LIMIT;
+            }
             g_scan_min_channel_time = (uint32_t)value;
             if (g_scan_min_channel_time > g_scan_max_channel_time) {
                 g_scan_max_channel_time = g_scan_min_channel_time;
@@ -4972,6 +5036,10 @@ static int cmd_channel_time(int argc, char **argv) {
             channel_time_persist_state();
             return 0;
         } else if (strcasecmp(argv[2], "max") == 0) {
+            if (value > CHANNEL_TIME_MAX_LIMIT) {
+                MY_LOG_INFO(TAG, "Value %d exceeds limit, setting to max allowed %d ms", value, CHANNEL_TIME_MAX_LIMIT);
+                value = CHANNEL_TIME_MAX_LIMIT;
+            }
             g_scan_max_channel_time = (uint32_t)value;
             if (g_scan_max_channel_time < g_scan_min_channel_time) {
                 g_scan_min_channel_time = g_scan_max_channel_time;
