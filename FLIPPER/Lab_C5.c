@@ -8501,11 +8501,15 @@ static void simple_app_package_monitor_start(SimpleApp* app, uint8_t channel, bo
         channel = PACKAGE_MONITOR_TOTAL_CHANNELS;
     }
 
+    simple_app_send_stop_if_needed(app);
+    if(!simple_app_alloc_package_monitor_buffers(app)) {
+        simple_app_show_status_message(app, "OOM: monitor", 1500, true);
+        if(app->viewport) view_port_update(app->viewport);
+        return;
+    }
     if(reset_history) {
         simple_app_package_monitor_reset(app);
     }
-
-    simple_app_send_stop_if_needed(app);
 
     char command[32];
     snprintf(command, sizeof(command), "%s %u", PACKAGE_MONITOR_COMMAND, (unsigned)channel);
