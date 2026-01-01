@@ -7681,7 +7681,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t sniffer_cmd = {
         .command = "start_sniffer",
-        .help = "Starts network client sniffer",
+        .help = "If no networks selected, starts network client sniffer with full scan, otherwise sniffs just selected networks without rescan",
         .hint = NULL,
         .func = &cmd_start_sniffer,
         .argtable = NULL
