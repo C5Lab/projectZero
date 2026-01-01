@@ -8223,6 +8223,10 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     if(!app) return;
 
     simple_app_send_stop_if_needed(app);
+    simple_app_send_command_quiet(app, "unselect_networks");
+    simple_app_send_command_quiet(app, "unselect_stations");
+    simple_app_send_command_quiet(app, "clear_sniffer_results");
+    simple_app_send_command_quiet(app, "reboot");
     simple_app_close_evil_twin_popup(app);
     simple_app_reset_evil_twin_listing(app);
     simple_app_reset_evil_twin_pass_listing(app);
