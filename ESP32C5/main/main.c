@@ -897,6 +897,7 @@ static esp_err_t captive_detection_handler(httpd_req_t *req);
 // Sniffer functions
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_process_scan_results(void);
+static void sniffer_merge_scan_results(void);
 static void sniffer_init_selected_networks(void);
 static void sniffer_channel_hop(void);
 static void channel_view_task(void *pvParameters);
@@ -4395,13 +4396,18 @@ static int cmd_start_sniffer_noscan(int argc, char **argv) {
     MY_LOG_INFO(TAG, "Starting sniffer using existing scan results (%u networks)...", g_scan_count);
     
     // Note: Sniffer results are preserved between sessions. Use 'clear_sniffer_results' to clear them.
+    bool had_sniffer_data = (sniffer_ap_count > 0 || probe_request_count > 0);
     
     sniffer_active = true;
     sniffer_scan_phase = false;
     sniffer_selected_mode = false;
     
-    // Process existing scan results
-    sniffer_process_scan_results();
+    // Process existing scan results while preserving sniffer data when possible
+    if (had_sniffer_data) {
+        sniffer_merge_scan_results();
+    } else {
+        sniffer_process_scan_results();
+    }
     
     // Set promiscuous filter
     esp_wifi_set_promiscuous_filter(&sniffer_filter);
@@ -8818,6 +8824,54 @@ static void sniffer_process_scan_results(void) {
     }
     
     MY_LOG_INFO(TAG, "Sniffer: added %d new APs, total %d APs in database", added_count, sniffer_ap_count);
+}
+
+static void sniffer_merge_scan_results(void) {
+    if (!g_scan_done || g_scan_count == 0) {
+        return;
+    }
+
+    MY_LOG_INFO(TAG, "Merging %u scan results into sniffer list...", g_scan_count);
+
+    for (int i = 0; i < g_scan_count; i++) {
+        wifi_ap_record_t *scan_ap = &g_scan_results[i];
+        int existing = -1;
+
+        for (int j = 0; j < sniffer_ap_count; j++) {
+            if (memcmp(sniffer_aps[j].bssid, scan_ap->bssid, 6) == 0) {
+                existing = j;
+                break;
+            }
+        }
+
+        if (existing >= 0) {
+            sniffer_ap_t *sniffer_ap = &sniffer_aps[existing];
+            strncpy(sniffer_ap->ssid, (char*)scan_ap->ssid, sizeof(sniffer_ap->ssid) - 1);
+            sniffer_ap->ssid[sizeof(sniffer_ap->ssid) - 1] = '\0';
+            sniffer_ap->channel = scan_ap->primary;
+            sniffer_ap->authmode = scan_ap->authmode;
+            sniffer_ap->rssi = scan_ap->rssi;
+            sniffer_ap->last_seen = esp_timer_get_time() / 1000; // ms
+            continue;
+        }
+
+        if (sniffer_ap_count >= MAX_SNIFFER_APS) {
+            continue;
+        }
+
+        sniffer_ap_t *sniffer_ap = &sniffer_aps[sniffer_ap_count++];
+        memset(sniffer_ap, 0, sizeof(*sniffer_ap));
+        memcpy(sniffer_ap->bssid, scan_ap->bssid, 6);
+        strncpy(sniffer_ap->ssid, (char*)scan_ap->ssid, sizeof(sniffer_ap->ssid) - 1);
+        sniffer_ap->ssid[sizeof(sniffer_ap->ssid) - 1] = '\0';
+        sniffer_ap->channel = scan_ap->primary;
+        sniffer_ap->authmode = scan_ap->authmode;
+        sniffer_ap->rssi = scan_ap->rssi;
+        sniffer_ap->client_count = 0;
+        sniffer_ap->last_seen = esp_timer_get_time() / 1000; // ms
+    }
+
+    MY_LOG_INFO(TAG, "Sniffer list now has %d APs", sniffer_ap_count);
 }
 
 static void sniffer_init_selected_networks(void) {
