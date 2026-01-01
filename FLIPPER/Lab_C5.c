@@ -1010,7 +1010,9 @@ static void simple_app_send_download(SimpleApp* app);
 static bool simple_app_usb_profile_ok(void);
 static void simple_app_show_usb_blocker(void);
 static bool simple_app_is_start_sniffer_command(const char* command);
+static bool simple_app_is_start_sniffer_noscan_command(const char* command);
 static void simple_app_send_start_sniffer(SimpleApp* app);
+static void simple_app_send_resume_sniffer(SimpleApp* app);
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial);
 static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, size_t length);
 static void simple_app_draw_wardrive_serial(SimpleApp* app, Canvas* canvas);
@@ -1279,6 +1281,8 @@ static const char hint_sniffer_results[] =
     "Display sniffer list\nAccess points sorted\nBy client activity\nUse to inspect who\nWas seen on air.";
 static const char hint_sniffer_probes[] =
     "View probe requests\nSee devices searching\nFor nearby SSIDs\nGreat for finding\nHidden networks.";
+static const char hint_sniffer_resume[] =
+    "Resume sniffer\nUse last scan data\nSkip new scan\nKeeps old results\nKismet style.";
 static const char hint_sniffer_debug[] =
     "Enable verbose logs\nPrints frame details\nDecision reasoning\nHelpful diagnostics\nBut very noisy.";
 
@@ -1348,6 +1352,7 @@ static const MenuEntry menu_entries_sniffers[] = {
     {"Start Sniffer", "start_sniffer", MenuActionCommand, hint_sniffer_start},
     {"Show Sniffer Results", "show_sniffer_results", MenuActionCommand, hint_sniffer_results},
     {"Show Probes", "show_probes", MenuActionCommand, hint_sniffer_probes},
+    {"Resume Sniffer", "start_sniffer_noscan", MenuActionCommand, hint_sniffer_resume},
     {"Sniffer Debug", "sniffer_debug 1", MenuActionCommand, hint_sniffer_debug},
 };
 
@@ -4454,6 +4459,15 @@ static void simple_app_process_sniffer_line(SimpleApp* app, const char* line) {
         return;
     }
 
+    if(strstr(line, "Starting sniffer using existing scan results") != NULL) {
+        strncpy(app->sniffer_mode, "NOSCAN", sizeof(app->sniffer_mode) - 1);
+        app->sniffer_mode[sizeof(app->sniffer_mode) - 1] = '\0';
+        app->sniffer_running = true;
+        app->sniffer_scan_done = true;
+        app->sniffer_last_update_tick = furi_get_tick();
+        return;
+    }
+
     const char* start_prefix = "Starting sniffer in ";
     const char* start_ptr = strstr(line, start_prefix);
     if(start_ptr) {
@@ -4479,6 +4493,13 @@ static void simple_app_process_sniffer_line(SimpleApp* app, const char* line) {
     }
 
     if(strstr(line, "Sniffer started") != NULL || strstr(line, "Starting background WiFi scan") != NULL) {
+        app->sniffer_running = true;
+        app->sniffer_last_update_tick = furi_get_tick();
+        return;
+    }
+
+    if(strstr(line, "Sniffer: Now monitoring") != NULL) {
+        app->sniffer_scan_done = true;
         app->sniffer_running = true;
         app->sniffer_last_update_tick = furi_get_tick();
         return;
@@ -7569,6 +7590,23 @@ static bool simple_app_is_start_blackout_command(const char* command) {
     }
 }
 
+static bool simple_app_is_start_sniffer_noscan_command(const char* command) {
+    if(!command) return false;
+    const char* cursor = command;
+    const char* needle = "start_sniffer_noscan";
+    size_t needle_len = strlen(needle);
+    while(true) {
+        const char* found = strstr(cursor, needle);
+        if(!found) return false;
+        char before = (found == command) ? ' ' : *(found - 1);
+        char after = *(found + needle_len);
+        bool before_ok = (before == ' ' || before == '\n' || before == '\t');
+        bool after_ok = (after == '\0' || after == ' ' || after == '\n' || after == '\t');
+        if(before_ok && after_ok) return true;
+        cursor = found + needle_len;
+    }
+}
+
 static bool simple_app_is_start_sniffer_dog_command(const char* command) {
     if(!command) return false;
     const char* cursor = command;
@@ -7676,6 +7714,45 @@ static void simple_app_send_start_sniffer(SimpleApp* app) {
     }
 }
 
+static void simple_app_send_resume_sniffer(SimpleApp* app) {
+    if(!app) return;
+    if(app->scan_selected_count == 0) {
+        simple_app_send_command(app, "start_sniffer_noscan", true);
+        return;
+    }
+
+    char select_command[160];
+    size_t written = snprintf(select_command, sizeof(select_command), "select_networks");
+    if(written >= sizeof(select_command)) written = sizeof(select_command) - 1;
+
+    for(size_t i = 0; i < app->scan_selected_count && written < sizeof(select_command) - 1; i++) {
+        int added = snprintf(
+            select_command + written,
+            sizeof(select_command) - written,
+            " %u",
+            (unsigned)app->scan_selected_numbers[i]);
+        if(added < 0) break;
+        written += (size_t)added;
+        if(written >= sizeof(select_command)) {
+            written = sizeof(select_command) - 1;
+            select_command[written] = '\0';
+            break;
+        }
+    }
+
+    char combined_command[256];
+    int combined_written =
+        snprintf(combined_command, sizeof(combined_command), "%s\n%s", select_command, "start_sniffer_noscan");
+    if(combined_written < 0) {
+        simple_app_send_command(app, "start_sniffer_noscan", true);
+    } else {
+        if((size_t)combined_written >= sizeof(combined_command)) {
+            combined_command[sizeof(combined_command) - 1] = '\0';
+        }
+        simple_app_send_command(app, combined_command, true);
+    }
+}
+
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial) {
     if(!app || !command || command[0] == '\0') return;
 
@@ -7684,6 +7761,7 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     bool is_start_evil_twin = strstr(command, "start_evil_twin") != NULL;
     bool is_start_portal = strstr(command, "start_portal") != NULL;
     bool is_start_sniffer = simple_app_is_start_sniffer_command(command);
+    bool is_start_sniffer_noscan = simple_app_is_start_sniffer_noscan_command(command);
     bool is_start_sniffer_dog = simple_app_is_start_sniffer_dog_command(command);
     bool is_start_blackout = simple_app_is_start_blackout_command(command);
     bool is_start_deauth = simple_app_is_start_deauth_command(command);
@@ -7780,7 +7858,7 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     } else if(is_stop_command || app->deauth_guard_view_active) {
         simple_app_reset_deauth_guard(app);
     }
-    if(is_start_sniffer) {
+    if(is_start_sniffer || is_start_sniffer_noscan) {
         if(!simple_app_alloc_sniffer_buffers(app)) {
             simple_app_show_status_message(app, "OOM: sniffer\nbuffers", 1500, true);
             return;
@@ -12781,7 +12859,7 @@ static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canv
         (unsigned)ap_count,
         (unsigned)client_count,
         (unsigned)app->sniffer_selected_count);
-    canvas_draw_str(canvas, 2, 12, "Sniffer Results");
+    canvas_draw_str(canvas, 2, 12, "Sniffer");
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 2, 12, AlignRight, AlignBottom, header);
 
     if(app->sniffer_results_loading && ap_count == 0 && client_count == 0) {
@@ -15006,6 +15084,8 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
             if(entry->command && entry->command[0] != '\0') {
                 if(strcmp(entry->command, "start_sniffer") == 0) {
                     simple_app_send_start_sniffer(app);
+                } else if(strcmp(entry->command, "start_sniffer_noscan") == 0) {
+                    simple_app_send_resume_sniffer(app);
                 } else {
                     simple_app_send_command(app, entry->command, true);
                 }
