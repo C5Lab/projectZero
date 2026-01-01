@@ -8311,8 +8311,8 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
             vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
         }
 
-        // If stations are selected, send targeted deauth to each station
-        if (selected_stations_count > 0) {
+        // If stations are selected AND we're in regular DEAUTH mode (not evil_twin/blackout), send targeted deauth
+        if (selected_stations_count > 0 && applicationState == DEAUTH) {
             for (int s = 0; s < selected_stations_count; s++) {
                 if (!selected_stations[s].active) continue;
                 
