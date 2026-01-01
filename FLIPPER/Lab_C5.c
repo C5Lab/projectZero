@@ -133,6 +133,7 @@ typedef enum {
 #define SNIFFER_CONSOLE_LINES 3
 #define SNIFFER_MAX_APS 32
 #define SNIFFER_MAX_CLIENTS 64
+#define SNIFFER_MAX_SELECTED_STATIONS 32
 #define SNIFFER_RESULTS_ARROW_THRESHOLD 200
 #define PROBE_MAX_SSIDS 32
 #define PROBE_MAX_CLIENTS 64
@@ -644,6 +645,8 @@ typedef struct {
     size_t sniffer_client_count;
     size_t sniffer_results_ap_index;
     size_t sniffer_results_client_offset;
+    char sniffer_selected_macs[SNIFFER_MAX_SELECTED_STATIONS][18];
+    size_t sniffer_selected_count;
     bool probe_results_active;
     bool probe_full_console;
     bool probe_results_loading;
@@ -4127,6 +4130,8 @@ static void simple_app_reset_sniffer_results(SimpleApp* app) {
     app->sniffer_results_ap_index = 0;
     app->sniffer_results_client_offset = 0;
     app->sniffer_results_loading = false;
+    app->sniffer_selected_count = 0;
+    memset(app->sniffer_selected_macs, 0, sizeof(app->sniffer_selected_macs));
 }
 
 static void simple_app_reset_probe_results(SimpleApp* app) {
@@ -4144,6 +4149,122 @@ static void simple_app_reset_probe_results(SimpleApp* app) {
     app->probe_total = 0;
     app->probe_results_loading = false;
     app->probe_full_console = false;
+}
+
+static void simple_app_clear_sniffer_data(SimpleApp* app) {
+    if(!app) return;
+    app->sniffer_view_active = false;
+    app->sniffer_results_active = false;
+    app->probe_results_active = false;
+    app->sniffer_full_console = false;
+    app->probe_full_console = false;
+    simple_app_reset_sniffer_status(app);
+    app->sniffer_ap_count = 0;
+    app->sniffer_client_count = 0;
+    app->sniffer_results_ap_index = 0;
+    app->sniffer_results_client_offset = 0;
+    app->sniffer_results_loading = false;
+    app->probe_ssid_count = 0;
+    app->probe_client_count = 0;
+    app->probe_ssid_index = 0;
+    app->probe_client_offset = 0;
+    app->probe_total = 0;
+    app->probe_results_loading = false;
+    simple_app_free_sniffer_buffers(app);
+    simple_app_free_probe_buffers(app);
+}
+
+static int simple_app_find_sniffer_selected(const SimpleApp* app, const char* mac) {
+    if(!app || !mac || mac[0] == '\0') return -1;
+    for(size_t i = 0; i < app->sniffer_selected_count; i++) {
+        if(strcmp(app->sniffer_selected_macs[i], mac) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static bool simple_app_sniffer_station_is_selected(const SimpleApp* app, const char* mac) {
+    return simple_app_find_sniffer_selected(app, mac) >= 0;
+}
+
+static void simple_app_toggle_sniffer_selected(SimpleApp* app, const char* mac) {
+    if(!app || !mac || mac[0] == '\0' || !strchr(mac, ':')) return;
+    int existing = simple_app_find_sniffer_selected(app, mac);
+    if(existing >= 0) {
+        for(size_t i = (size_t)existing; i + 1 < app->sniffer_selected_count; i++) {
+            strncpy(
+                app->sniffer_selected_macs[i],
+                app->sniffer_selected_macs[i + 1],
+                sizeof(app->sniffer_selected_macs[i]) - 1);
+            app->sniffer_selected_macs[i][sizeof(app->sniffer_selected_macs[i]) - 1] = '\0';
+        }
+        if(app->sniffer_selected_count > 0) {
+            app->sniffer_selected_count--;
+            app->sniffer_selected_macs[app->sniffer_selected_count][0] = '\0';
+        }
+        return;
+    }
+    if(app->sniffer_selected_count >= SNIFFER_MAX_SELECTED_STATIONS) {
+        simple_app_show_status_message(app, "Selection full", 1200, true);
+        return;
+    }
+    strncpy(
+        app->sniffer_selected_macs[app->sniffer_selected_count],
+        mac,
+        sizeof(app->sniffer_selected_macs[app->sniffer_selected_count]) - 1);
+    app->sniffer_selected_macs[app->sniffer_selected_count]
+        [sizeof(app->sniffer_selected_macs[app->sniffer_selected_count]) - 1] = '\0';
+    app->sniffer_selected_count++;
+}
+
+static void simple_app_clear_station_selection(SimpleApp* app) {
+    if(!app) return;
+    if(app->sniffer_selected_count == 0) return;
+    app->sniffer_selected_count = 0;
+    memset(app->sniffer_selected_macs, 0, sizeof(app->sniffer_selected_macs));
+    simple_app_send_command_quiet(app, "unselect_stations");
+}
+
+static void simple_app_send_select_stations(SimpleApp* app) {
+    if(!app) return;
+    char command[256];
+    size_t written = snprintf(command, sizeof(command), "select_stations");
+    if(written >= sizeof(command)) {
+        command[sizeof(command) - 1] = '\0';
+        written = strlen(command);
+    }
+
+    size_t added_count = 0;
+    for(size_t i = 0; i < app->sniffer_selected_count && written < sizeof(command) - 1; i++) {
+        const char* mac = app->sniffer_selected_macs[i];
+        if(!mac || mac[0] == '\0' || !strchr(mac, ':')) continue;
+        int added = snprintf(
+            command + written,
+            sizeof(command) - written,
+            " %s",
+            mac);
+        if(added < 0) break;
+        written += (size_t)added;
+        if(written >= sizeof(command)) {
+            written = sizeof(command) - 1;
+            command[written] = '\0';
+            break;
+        }
+        added_count++;
+    }
+
+    if(added_count == 0) {
+        simple_app_show_status_message(app, "No stations\nselected", 1200, true);
+        return;
+    }
+
+    simple_app_send_command(app, command, false);
+    app->last_attack_index = 1; // Deauth entry
+    simple_app_focus_attacks_menu(app);
+    if(app->viewport) {
+        view_port_update(app->viewport);
+    }
 }
 
 static void simple_app_sniffer_trim(char* text) {
@@ -5584,7 +5705,7 @@ static void simple_app_show_low_memory(size_t free_heap, size_t needed) {
     if(dialogs) {
         DialogMessage* msg = dialog_message_alloc();
         if(msg) {
-            dialog_message_set_header(msg, "Low memory", 64, 8, AlignCenter, AlignTop);
+            dialog_message_set_header(msg, "Low memory", 64, 2, AlignCenter, AlignTop);
             char text[96];
             snprintf(
                 text,
@@ -12653,7 +12774,13 @@ static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canv
     canvas_set_font(canvas, FontSecondary);
 
     char header[32];
-    snprintf(header, sizeof(header), "APs:%u Cli:%u", (unsigned)ap_count, (unsigned)client_count);
+    snprintf(
+        header,
+        sizeof(header),
+        "APs:%u Cli:%u Sel:%u",
+        (unsigned)ap_count,
+        (unsigned)client_count,
+        (unsigned)app->sniffer_selected_count);
     canvas_draw_str(canvas, 2, 12, "Sniffer Results");
     canvas_draw_str_aligned(canvas, DISPLAY_WIDTH - 2, 12, AlignRight, AlignBottom, header);
 
@@ -12731,7 +12858,10 @@ static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canv
     for(size_t idx = first; idx < last_possible && lines_drawn < max_lines; idx++) {
         if(idx >= SNIFFER_MAX_CLIENTS) break;
         const SnifferClientEntry* client = &app->sniffer_clients[idx];
-        canvas_draw_str(canvas, 6, y, client->mac);
+        char line[24];
+        bool selected = simple_app_sniffer_station_is_selected(app, client->mac);
+        snprintf(line, sizeof(line), "%c %s", selected ? '*' : ' ', client->mac);
+        canvas_draw_str(canvas, 2, y, line);
         y += SERIAL_TEXT_LINE_HEIGHT;
         lines_drawn++;
     }
@@ -12744,7 +12874,7 @@ static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canv
         simple_app_draw_scroll_hints(canvas, arrow_x, list_top, y - 2, show_up, show_down);
     }
 
-    if(app->sniffer_has_data || ap_count > 0 || client_count > 0) {
+    if(app->sniffer_selected_count > 0 && app->scan_selected_count > 0) {
         canvas_draw_str(canvas, 2, DISPLAY_HEIGHT - 2, "->");
     }
 }
@@ -17026,9 +17156,13 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
         uint8_t max_lines =
             (uint8_t)((list_bottom - list_top + SERIAL_TEXT_LINE_HEIGHT) / SERIAL_TEXT_LINE_HEIGHT);
         if(max_lines == 0) max_lines = 1;
-        bool can_jump_to_probes =
-            (app->sniffer_has_data && app->sniffer_packet_count >= SNIFFER_RESULTS_ARROW_THRESHOLD) ||
-            ap_count > 0 || app->sniffer_client_count > 0;
+        const char* current_mac = NULL;
+        if(ap->client_count > 0) {
+            size_t idx = ap->client_start + app->sniffer_results_client_offset;
+            if(idx < ap->client_start + ap->client_count && idx < SNIFFER_MAX_CLIENTS) {
+                current_mac = app->sniffer_clients[idx].mac;
+            }
+        }
 
         if(key == InputKeyBack) {
             simple_app_send_stop_preserve_results(app);
@@ -17046,8 +17180,25 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
         } else if(key == InputKeyLeft) {
             simple_app_send_start_sniffer(app);
             return;
-        } else if(key == InputKeyRight && can_jump_to_probes) {
-            simple_app_send_command(app, "show_probes", true);
+        } else if(key == InputKeyRight) {
+            if(app->scan_selected_count == 0) {
+                simple_app_show_status_message(app, "Select network\nfirst", 1200, true);
+                return;
+            }
+            if(app->sniffer_selected_count == 0) {
+                simple_app_show_status_message(app, "Pick a client\nfirst", 1200, true);
+                return;
+            }
+            simple_app_send_select_stations(app);
+            simple_app_clear_sniffer_data(app);
+            return;
+        } else if(key == InputKeyOk) {
+            if(current_mac) {
+                simple_app_toggle_sniffer_selected(app, current_mac);
+                if(app->viewport) {
+                    view_port_update(app->viewport);
+                }
+            }
             return;
         } else if(key == InputKeyUp) {
             if(app->sniffer_results_client_offset > 0) {
@@ -17099,6 +17250,7 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
         bool return_to_portal = app->portal_running;
         bool return_to_evil_twin = app->evil_twin_running;
         simple_app_send_stop_if_needed(app);
+        simple_app_clear_station_selection(app);
         app->serial_targets_hint = false;
         if(app->blackout_view_active) {
             app->blackout_view_active = false;
@@ -17372,6 +17524,7 @@ static void simple_app_input(InputEvent* event, void* context) {
     // Global long Back: stop and return to main menu regardless of current state.
     if(event->type == InputTypeLong && event->key == InputKeyBack) {
         simple_app_send_stop_if_needed(app);
+        simple_app_clear_station_selection(app);
         app->serial_targets_hint = false;
         app->scanner_view_active = false;
         app->sniffer_view_active = false;
@@ -17407,6 +17560,7 @@ static void simple_app_input(InputEvent* event, void* context) {
         app->last_back_tick = now;
         if(last != 0 && (now - last) <= furi_ms_to_ticks(DOUBLE_BACK_EXIT_MS)) {
             simple_app_send_stop_if_needed(app);
+            simple_app_clear_station_selection(app);
             app->serial_targets_hint = false;
             app->confirm_exit_yes = false;
             app->exit_confirm_active = true;
