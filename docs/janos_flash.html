@@ -299,7 +299,8 @@
     </div>
   </div>
   <footer>
-    Product of <a href="https://github.com/C5Lab/projectZero/">C5Lab/projectZero</a>.
+    Product of <a href="https://github.com/C5Lab/projectZero/">C5Lab/projectZero</a> -
+    <span id="pageVersion" class="mono">Web flasher v1.0.0</span>.
   </footer>
 
   <script type="module">
@@ -316,6 +317,7 @@
       baud: document.getElementById("baudSelect"),
       branch: document.getElementById("branchSelect"),
       releaseInfo: document.getElementById("releaseInfo"),
+      pageVersion: document.getElementById("pageVersion"),
     };
 
     const state = {
@@ -331,6 +333,20 @@
       isFlashing: false,
       autoFlash: false,
       autoFlashTriggered: false,
+    };
+
+    const PAGE_VERSION = "1.0.0";
+
+    const setFooterVersion = (manifest) => {
+      if (!ui.pageVersion) return;
+      if (!manifest) {
+        ui.pageVersion.textContent = `Web flasher v${PAGE_VERSION}`;
+        return;
+      }
+      const build = manifest.build || "n/a";
+      const label = manifest.version || "n/a";
+      const branch = getBranch();
+      ui.pageVersion.textContent = `Web flasher v${PAGE_VERSION} - Build ${build} - ${label} - ${branch}`;
     };
 
     const applyQueryParams = () => {
@@ -447,6 +463,7 @@
         }
         ui.manifest.style.display = "inline-flex";
         ui.manifest.textContent = `Build ${manifest.build || "n/a"} - ${releaseLabel} - ${getBranch()}`;
+        setFooterVersion({ ...manifest, version: releaseLabel });
         const files = (manifest.parts || []).length;
         const releaseText = state.latestRelease ? ` - latest ${releaseLabel}` : "";
         ui.releaseInfo.innerHTML = `<span class="badge">Manifest</span> ${manifest.name || "projectZero"}${releaseText} - ${files} file(s) - chip ${manifest.chipFamily || "ESP32-C5"} - ${getBranch()}`;
@@ -454,6 +471,7 @@
       } catch (err) {
         setStatus("Manifest not found. Publish a release first.", "error");
         ui.releaseInfo.textContent = "No manifest available.";
+        setFooterVersion(null);
         throw err;
       }
     };
