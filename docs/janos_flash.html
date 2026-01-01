@@ -323,9 +323,11 @@
       latestRelease: null,
       files: [],
       port: null,
+      onDisconnect: null,
       transport: null,
       esploader: null,
       chip: null,
+      connected: false,
       isFlashing: false,
       autoFlash: false,
       autoFlashTriggered: false,
@@ -465,12 +467,24 @@
 
     const connect = async () => {
       ensureSupport();
+      if (state.connected) {
+        await disconnect();
+        return;
+      }
       ui.connectBtn.disabled = true;
       ui.flashBtn.disabled = true;
       setStatus("Requesting serial port");
       log("Requesting port access");
       try {
         state.port = await navigator.serial.requestPort({});
+        state.onDisconnect = () => {
+          log("Device disconnected.");
+          disconnect().catch(() => {});
+          setStatus("Device disconnected. Reconnect to flash.", "error");
+        };
+        try {
+          state.port.addEventListener("disconnect", state.onDisconnect);
+        } catch {}
         const baud = parseInt(ui.baud.value, 10);
         state.transport = new Transport(state.port, true);
         const loaderOptions = {
@@ -487,8 +501,10 @@
         setStatus("Syncing with chip (hold BOOT + RESET to enter ROM)");
         log("Syncing with chip");
         state.chip = await state.esploader.main();
+        state.connected = true;
         ui.chip.style.display = "inline-flex";
         ui.chip.textContent = `Chip ${state.chip}`;
+        ui.connectBtn.textContent = "Disconnect";
         setStatus(`Connected to ${state.chip}. Ready to flash.`);
         log(`Connected: ${state.chip}`);
         ui.flashBtn.disabled = false;
@@ -603,6 +619,9 @@ const flash = async () => {
     };
 
     const disconnect = async () => {
+      if (state.port && state.onDisconnect) {
+        try { state.port.removeEventListener("disconnect", state.onDisconnect); } catch {}
+      }
       try {
         if (state.transport) {
           await state.transport.disconnect();
@@ -611,11 +630,14 @@ const flash = async () => {
         }
       } catch {}
       state.port = null;
+      state.onDisconnect = null;
       state.transport = null;
       state.esploader = null;
       state.chip = null;
+      state.connected = false;
       ui.chip.style.display = "none";
       ui.flashBtn.disabled = true;
+      ui.connectBtn.textContent = "Connect";
       setStatus("Disconnected.");
     };
 
