@@ -4287,6 +4287,39 @@ static void simple_app_sniffer_trim(char* text) {
     text[len] = '\0';
 }
 
+static int simple_app_hex_value(char value) {
+    if(value >= '0' && value <= '9') return value - '0';
+    if(value >= 'a' && value <= 'f') return 10 + (value - 'a');
+    if(value >= 'A' && value <= 'F') return 10 + (value - 'A');
+    return -1;
+}
+
+static bool simple_app_parse_mac_bytes(const char* mac, uint8_t out[6]) {
+    if(!mac || !out) return false;
+    size_t out_idx = 0;
+    int nibble = -1;
+    for(size_t i = 0; mac[i] != '\0'; i++) {
+        char c = mac[i];
+        if(c == ':' || isspace((unsigned char)c)) {
+            continue;
+        }
+        int value = simple_app_hex_value(c);
+        if(value < 0) {
+            return false;
+        }
+        if(nibble < 0) {
+            nibble = value;
+        } else {
+            if(out_idx >= 6) {
+                return false;
+            }
+            out[out_idx++] = (uint8_t)((nibble << 4) | value);
+            nibble = -1;
+        }
+    }
+    return (out_idx == 6 && nibble < 0);
+}
+
 static bool simple_app_sniffer_extract_mac_token(const char* line, char* out_mac, size_t out_mac_size) {
     if(!line || !out_mac || out_mac_size == 0) return false;
 
@@ -12907,14 +12940,34 @@ static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canv
         (ap->client_count == 0) ? 0 : (uint16_t)(app->sniffer_results_client_offset + 1);
     if(current_client > ap->client_count) current_client = ap->client_count;
 
-    char info[32];
-    snprintf(
+    const char* vendor_name = NULL;
+    bool vendor_visible = false;
+    if(app->scanner_show_vendor && ap->client_count > 0) {
+        size_t idx = ap->client_start + app->sniffer_results_client_offset;
+        if(idx < ap->client_start + ap->client_count && idx < SNIFFER_MAX_CLIENTS) {
+            const SnifferClientEntry* client = &app->sniffer_clients[idx];
+            uint8_t mac_bytes[6];
+            if(simple_app_parse_mac_bytes(client->mac, mac_bytes)) {
+                vendor_name = simple_app_vendor_cache_lookup(app, mac_bytes);
+                vendor_visible = (vendor_name && vendor_name[0] != '\0');
+            }
+        }
+    }
+
+    char info[48];
+    int info_written = snprintf(
         info,
         sizeof(info),
         "CH%u  Client: %u/%u",
         (unsigned)ap->channel,
         (unsigned)current_client,
         (unsigned)ap->client_count);
+    if(vendor_visible && info_written > 0 && (size_t)info_written < sizeof(info) - 2) {
+        size_t offset = (size_t)info_written;
+        info[offset++] = ' ';
+        info[offset] = '\0';
+        snprintf(info + offset, sizeof(info) - offset, "%s", vendor_name);
+    }
     simple_app_truncate_text(info, 21);
     canvas_draw_str(canvas, 2, 44, info);
 
@@ -15086,6 +15139,12 @@ static void simple_app_handle_menu_input(SimpleApp* app, InputKey key) {
                     simple_app_send_start_sniffer(app);
                 } else if(strcmp(entry->command, "start_sniffer_noscan") == 0) {
                     simple_app_send_resume_sniffer(app);
+                } else if(strcmp(entry->command, "show_sniffer_results") == 0) {
+                    if(!app->sniffer_has_data) {
+                        simple_app_show_status_message(app, "No sniffer data", 1200, true);
+                        return;
+                    }
+                    simple_app_send_command(app, entry->command, true);
                 } else {
                     simple_app_send_command(app, entry->command, true);
                 }
@@ -17246,6 +17305,8 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
 
         if(key == InputKeyBack) {
             simple_app_send_stop_preserve_results(app);
+            simple_app_clear_station_selection(app);
+            simple_app_send_command_quiet(app, "clear_sniffer_results");
             app->sniffer_results_active = false;
             app->sniffer_full_console = false;
             app->sniffer_view_active = false;
@@ -17331,6 +17392,9 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
         bool return_to_evil_twin = app->evil_twin_running;
         simple_app_send_stop_if_needed(app);
         simple_app_clear_station_selection(app);
+        if(had_sniffer) {
+            simple_app_send_command_quiet(app, "clear_sniffer_results");
+        }
         app->serial_targets_hint = false;
         if(app->blackout_view_active) {
             app->blackout_view_active = false;
