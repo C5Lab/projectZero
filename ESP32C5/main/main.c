@@ -6706,7 +6706,7 @@ static int cmd_start_portal(int argc, char **argv) {
     // Check for SSID argument
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: start_portal <SSID>");
-        MY_LOG_INFO(TAG, "Example: start_portal MyWiFi");
+        MY_LOG_INFO(TAG, "Example: start_portal My WiFi Network");
         return 1;
     }
     
@@ -6716,14 +6716,32 @@ static int cmd_start_portal(int argc, char **argv) {
         return 0;
     }
     
-    const char *ssid = argv[1];
-    size_t ssid_len = strlen(ssid);
+    // Concatenate all arguments (SSID may contain spaces)
+    size_t total_len = 0;
+    for (int i = 1; i < argc; i++) {
+        total_len += strlen(argv[i]);
+        if (i < argc - 1) {
+            total_len++; // for space
+        }
+    }
     
     // Validate SSID length (WiFi SSID max is 32 characters)
-    if (ssid_len == 0 || ssid_len > 32) {
+    if (total_len == 0 || total_len > 32) {
         MY_LOG_INFO(TAG, "SSID length must be between 1 and 32 characters");
         return 1;
     }
+    
+    // Build SSID string from all arguments
+    char ssid_buf[33]; // 32 chars + null terminator
+    ssid_buf[0] = '\0';
+    for (int i = 1; i < argc; i++) {
+        strcat(ssid_buf, argv[i]);
+        if (i < argc - 1) {
+            strcat(ssid_buf, " ");
+        }
+    }
+    const char *ssid = ssid_buf;
+    size_t ssid_len = total_len;
     
     // Store portal SSID for logging purposes
     if (portalSSID != NULL) {
