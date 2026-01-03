@@ -286,6 +286,9 @@ static int64_t deauth_detector_last_channel_hop = 0;
 static bool deauth_detector_selected_mode = false;
 static int deauth_detector_selected_channels[MAX_AP_CNT];
 static int deauth_detector_selected_channels_count = 0;
+// Deauth detector duplicate filtering (alarm only on 2 consecutive same BSSID)
+static uint8_t deauth_detector_last_bssid[6] = {0};
+static bool deauth_detector_has_previous = false;
 
 // Wardrive task
 static TaskHandle_t gps_raw_task_handle = NULL;
@@ -3769,6 +3772,10 @@ static int cmd_stop(int argc, char **argv) {
         deauth_detector_selected_channels_count = 0;
         memset(deauth_detector_selected_channels, 0, sizeof(deauth_detector_selected_channels));
         
+        // Reset duplicate filtering state
+        deauth_detector_has_previous = false;
+        memset(deauth_detector_last_bssid, 0, sizeof(deauth_detector_last_bssid));
+        
         // Return LED to idle
         esp_err_t led_err = led_set_idle();
         if (led_err != ESP_OK) {
@@ -4722,6 +4729,10 @@ static int cmd_deauth_detector(int argc, char **argv) {
     deauth_detector_selected_mode = false;
     deauth_detector_selected_channels_count = 0;
     memset(deauth_detector_selected_channels, 0, sizeof(deauth_detector_selected_channels));
+    
+    // Reset duplicate filtering state
+    deauth_detector_has_previous = false;
+    memset(deauth_detector_last_bssid, 0, sizeof(deauth_detector_last_bssid));
     
     // MODE B: With network indices (e.g., deauth_detector 1 3)
     if (argc > 1) {
@@ -9687,6 +9698,21 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
     // 802.11 header: FC(2) + Duration(2) + Addr1(6) + Addr2(6) + Addr3(6) + SeqCtl(2)
     // Addr3 is at offset 16
     const uint8_t *bssid_mac = &frame[16];
+    
+    // Check if this BSSID matches the previous one (require 2 consecutive same BSSID to alarm)
+    bool should_alarm = false;
+    if (deauth_detector_has_previous && memcmp(bssid_mac, deauth_detector_last_bssid, 6) == 0) {
+        should_alarm = true;
+    }
+    
+    // Update last BSSID for next comparison
+    memcpy(deauth_detector_last_bssid, bssid_mac, 6);
+    deauth_detector_has_previous = true;
+    
+    // Only alarm if 2 consecutive deauth frames from same BSSID
+    if (!should_alarm) {
+        return;
+    }
     
     // Get RSSI from rx_ctrl
     int rssi = pkt->rx_ctrl.rssi;
