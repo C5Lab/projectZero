@@ -36,6 +36,21 @@ static size_t simple_app_bounded_strlen(const char* s, size_t max_len) {
     return len;
 }
 
+static bool simple_app_alloc_char_buffer(char** buffer, size_t size) {
+    if(!buffer) return false;
+    if(*buffer) return true;
+    *buffer = malloc(size);
+    if(!*buffer) return false;
+    memset(*buffer, 0, size);
+    return true;
+}
+
+static void simple_app_free_char_buffer(char** buffer) {
+    if(!buffer || !*buffer) return;
+    free(*buffer);
+    *buffer = NULL;
+}
+
 typedef enum {
     ScreenMenu,
     ScreenSerial,
@@ -145,6 +160,21 @@ typedef enum {
 #define BT_SCAN_LINE_BUFFER_LEN 96
 #define BT_LOCATOR_SCAN_LINE_LEN 128
 #define BT_LOCATOR_SCROLL_TEXT_LEN 64
+#define BLACKOUT_LINE_BUFFER_LEN 96
+#define SNIFFER_DOG_LINE_BUFFER_LEN 128
+#define HANDSHAKE_LINE_BUFFER_LEN 160
+#define DEAUTH_LINE_BUFFER_LEN 128
+#define SAE_LINE_BUFFER_LEN 128
+#define SNIFFER_LINE_BUFFER_LEN 96
+#define EVIL_TWIN_LIST_BUFFER_LEN 64
+#define EVIL_TWIN_PASS_LIST_BUFFER_LEN 160
+#define PORTAL_SSID_LIST_BUFFER_LEN 64
+#define VENDOR_READ_BUFFER_LEN 32
+#define SCANNER_TIMING_READ_BUFFER_LEN 32
+#define LED_READ_BUFFER_LEN 64
+#define PACKAGE_MONITOR_LINE_BUFFER_LEN 64
+#define KARMA_PROBE_LIST_BUFFER_LEN 64
+#define KARMA_HTML_LIST_BUFFER_LEN 64
 #define RESULT_DEFAULT_MAX_LINES 4
 #define RESULT_DEFAULT_LINE_HEIGHT 12
 #define RESULT_DEFAULT_CHAR_LIMIT (SERIAL_LINE_CHAR_LIMIT - 3)
@@ -497,7 +527,7 @@ typedef struct {
     uint8_t blackout_channel;
     bool blackout_has_channel;
     char blackout_note[32];
-    char blackout_line_buffer[96];
+    char* blackout_line_buffer;
     size_t blackout_line_length;
     uint32_t blackout_last_update_tick;
     bool sniffer_dog_view_active;
@@ -510,7 +540,7 @@ typedef struct {
     int sniffer_dog_rssi;
     bool sniffer_dog_has_rssi;
     char sniffer_dog_note[32];
-    char sniffer_dog_line_buffer[128];
+    char* sniffer_dog_line_buffer;
     size_t sniffer_dog_line_length;
     uint32_t sniffer_dog_last_update_tick;
     bool deauth_view_active;
@@ -548,11 +578,11 @@ typedef struct {
     uint8_t sae_channel;
     bool sae_has_channel;
     char sae_note[16];
-    char handshake_line_buffer[160];
+    char* handshake_line_buffer;
     size_t handshake_line_length;
-    char deauth_line_buffer[128];
+    char* deauth_line_buffer;
     size_t deauth_line_length;
-    char sae_line_buffer[128];
+    char* sae_line_buffer;
     size_t sae_line_length;
     uint32_t deauth_last_update_tick;
     bool wardrive_view_active;
@@ -621,7 +651,7 @@ typedef struct {
     uint32_t deauth_guard_vibro_until;
     bool deauth_guard_vibro_on;
     char deauth_guard_last_ssid[SCAN_SSID_MAX_LEN];
-    char deauth_guard_line_buffer[SCAN_LINE_BUFFER_SIZE];
+    char* deauth_guard_line_buffer;
     size_t deauth_guard_line_length;
     bool deauth_guard_monitoring;
     uint32_t deauth_guard_detection_count;
@@ -637,7 +667,7 @@ typedef struct {
     uint32_t sniffer_networks;
     uint32_t sniffer_last_update_tick;
     char sniffer_mode[12];
-    char sniffer_line_buffer[96];
+    char* sniffer_line_buffer;
     size_t sniffer_line_length;
     SnifferApEntry* sniffer_aps;
     SnifferClientEntry* sniffer_clients;
@@ -673,7 +703,7 @@ typedef struct {
     bool evil_twin_popup_active;
     bool evil_twin_listing_active;
     bool evil_twin_list_header_seen;
-    char evil_twin_list_buffer[64];
+    char* evil_twin_list_buffer;
     size_t evil_twin_list_length;
     uint8_t evil_twin_selected_html_id;
     char evil_twin_selected_html_name[EVIL_TWIN_HTML_NAME_MAX];
@@ -683,7 +713,7 @@ typedef struct {
     size_t evil_twin_pass_index;
     size_t evil_twin_pass_offset;
     bool evil_twin_pass_listing_active;
-    char evil_twin_pass_list_buffer[160];
+    char* evil_twin_pass_list_buffer;
     size_t evil_twin_pass_list_length;
     bool evil_twin_qr_valid;
     char evil_twin_qr_error[24];
@@ -708,7 +738,7 @@ typedef struct {
     bool portal_ssid_popup_active;
     bool portal_ssid_listing_active;
     bool portal_ssid_list_header_seen;
-    char portal_ssid_list_buffer[64];
+    char* portal_ssid_list_buffer;
     size_t portal_ssid_list_length;
     bool portal_ssid_missing;
     bool portal_running;
@@ -725,7 +755,7 @@ typedef struct {
     size_t passwords_scroll;
     size_t passwords_scroll_x;
     size_t passwords_max_line_len;
-    char passwords_line_buffer[PORTAL_STATUS_LINE_BUFFER];
+    char* passwords_line_buffer;
     size_t passwords_line_length;
     bool evil_twin_running;
     bool evil_twin_full_console;
@@ -739,7 +769,7 @@ typedef struct {
     bool sd_file_popup_active;
     bool sd_listing_active;
     bool sd_list_header_seen;
-    char sd_list_buffer[SD_LIST_BUFFER_LEN];
+    char* sd_list_buffer;
     size_t sd_list_length;
     char sd_current_folder_label[SD_MANAGER_FOLDER_LABEL_MAX];
     char sd_current_folder_path[SD_MANAGER_PATH_MAX];
@@ -764,7 +794,7 @@ typedef struct {
     bool karma_probe_popup_active;
     bool karma_probe_listing_active;
     bool karma_probe_list_header_seen;
-    char karma_probe_list_buffer[64];
+    char* karma_probe_list_buffer;
     size_t karma_probe_list_length;
     uint8_t karma_selected_probe_id;
     char karma_selected_probe_name[KARMA_PROBE_NAME_MAX];
@@ -775,7 +805,7 @@ typedef struct {
     bool karma_html_popup_active;
     bool karma_html_listing_active;
     bool karma_html_list_header_seen;
-    char karma_html_list_buffer[64];
+    char* karma_html_list_buffer;
     size_t karma_html_list_length;
     uint8_t karma_selected_html_id;
     char karma_selected_html_name[KARMA_HTML_NAME_MAX];
@@ -793,7 +823,7 @@ typedef struct {
     uint16_t* scan_selected_numbers;
     size_t scan_selected_count;
     bool scan_results_loading;
-    char scan_line_buffer[SCAN_LINE_BUFFER_SIZE];
+    char* scan_line_buffer;
     size_t scan_line_len;
     uint16_t* visible_result_indices;
     size_t visible_result_count;
@@ -820,7 +850,7 @@ typedef struct {
     bool scanner_show_vendor;
     bool vendor_scan_enabled;
     bool vendor_read_pending;
-    char vendor_read_buffer[32];
+    char* vendor_read_buffer;
     size_t vendor_read_length;
     int16_t scanner_min_power;
     uint16_t scanner_min_channel_time;
@@ -828,7 +858,7 @@ typedef struct {
     size_t scanner_timing_index;
     bool scanner_timing_min_pending;
     bool scanner_timing_max_pending;
-    char scanner_timing_read_buffer[32];
+    char* scanner_timing_read_buffer;
     size_t scanner_timing_read_length;
     size_t scanner_setup_index;
     bool scanner_adjusting_power;
@@ -848,7 +878,7 @@ typedef struct {
     bool boot_setup_long;
     size_t boot_setup_index;
     bool led_read_pending;
-    char led_read_buffer[64];
+    char* led_read_buffer;
     size_t led_read_length;
     size_t scanner_view_offset;
     uint8_t result_line_height;
@@ -894,7 +924,7 @@ typedef struct {
     size_t package_monitor_history_count;
     uint16_t package_monitor_last_value;
     bool package_monitor_dirty;
-    char package_monitor_line_buffer[64];
+    char* package_monitor_line_buffer;
     size_t package_monitor_line_length;
     uint32_t package_monitor_last_channel_tick;
     bool channel_view_active;
@@ -908,7 +938,7 @@ typedef struct {
     uint16_t* channel_view_counts_5;
     uint16_t* channel_view_working_counts_24;
     uint16_t* channel_view_working_counts_5;
-    char channel_view_line_buffer[CHANNEL_VIEW_LINE_BUFFER];
+    char* channel_view_line_buffer;
     size_t channel_view_line_length;
     char channel_view_status_text[32];
     uint8_t channel_view_offset_24;
@@ -938,6 +968,7 @@ static bool simple_app_alloc_probe_buffers(SimpleApp* app);
 static void simple_app_free_probe_buffers(SimpleApp* app);
 static bool simple_app_alloc_hint_lines(SimpleApp* app);
 static void simple_app_free_hint_lines(SimpleApp* app);
+static void simple_app_free_line_buffers(SimpleApp* app);
 static uint8_t simple_app_parse_band_value(const char* band_field);
 static const char* simple_app_band_label(uint8_t band);
 static size_t simple_app_parse_scan_count(const char* line);
@@ -1826,7 +1857,9 @@ static void simple_app_reset_scan_results(SimpleApp* app) {
     if(app->scan_selected_numbers) {
         memset(app->scan_selected_numbers, 0, sizeof(uint16_t) * app->scan_results_capacity);
     }
-    memset(app->scan_line_buffer, 0, sizeof(app->scan_line_buffer));
+    if(app->scan_line_buffer) {
+        memset(app->scan_line_buffer, 0, SCAN_LINE_BUFFER_SIZE);
+    }
     if(app->visible_result_indices) {
         memset(app->visible_result_indices, 0, sizeof(uint16_t) * app->scan_results_capacity);
     }
@@ -2377,6 +2410,7 @@ static void simple_app_send_command_quiet(SimpleApp* app, const char* command) {
 
 static void simple_app_request_led_status(SimpleApp* app) {
     if(!app || !app->serial) return;
+    if(!simple_app_alloc_char_buffer(&app->led_read_buffer, LED_READ_BUFFER_LEN)) return;
     app->led_read_pending = true;
     app->led_read_length = 0;
     app->led_read_buffer[0] = '\0';
@@ -2449,6 +2483,9 @@ static bool simple_app_handle_led_status_line(SimpleApp* app, const char* line) 
 
 static void simple_app_led_feed(SimpleApp* app, char ch) {
     if(!app || !app->led_read_pending) return;
+    if(!simple_app_alloc_char_buffer(&app->led_read_buffer, LED_READ_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
     if(ch == '\n') {
         app->led_read_buffer[app->led_read_length] = '\0';
@@ -2458,7 +2495,7 @@ static void simple_app_led_feed(SimpleApp* app, char ch) {
         app->led_read_length = 0;
         return;
     }
-    if(app->led_read_length + 1 >= sizeof(app->led_read_buffer)) {
+    if(app->led_read_length + 1 >= LED_READ_BUFFER_LEN) {
         app->led_read_length = 0;
         return;
     }
@@ -2467,6 +2504,7 @@ static void simple_app_led_feed(SimpleApp* app, char ch) {
 
 static void simple_app_send_vendor_command(SimpleApp* app, bool enable) {
     if(!app || !app->serial) return;
+    if(!simple_app_alloc_char_buffer(&app->vendor_read_buffer, VENDOR_READ_BUFFER_LEN)) return;
     app->vendor_read_pending = true;
     app->vendor_read_length = 0;
     app->vendor_read_buffer[0] = '\0';
@@ -2477,6 +2515,7 @@ static void simple_app_send_vendor_command(SimpleApp* app, bool enable) {
 
 static void simple_app_request_vendor_status(SimpleApp* app) {
     if(!app || !app->serial) return;
+    if(!simple_app_alloc_char_buffer(&app->vendor_read_buffer, VENDOR_READ_BUFFER_LEN)) return;
     app->vendor_read_pending = true;
     app->vendor_read_length = 0;
     app->vendor_read_buffer[0] = '\0';
@@ -2525,6 +2564,9 @@ static bool simple_app_handle_vendor_status_line(SimpleApp* app, const char* lin
 
 static void simple_app_vendor_feed(SimpleApp* app, char ch) {
     if(!app || !app->vendor_read_pending) return;
+    if(!simple_app_alloc_char_buffer(&app->vendor_read_buffer, VENDOR_READ_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
     if(ch == '\n') {
         if(app->vendor_read_length > 0) {
@@ -2536,7 +2578,7 @@ static void simple_app_vendor_feed(SimpleApp* app, char ch) {
         app->vendor_read_length = 0;
         return;
     }
-    if(app->vendor_read_length + 1 >= sizeof(app->vendor_read_buffer)) {
+    if(app->vendor_read_length + 1 >= VENDOR_READ_BUFFER_LEN) {
         app->vendor_read_length = 0;
         return;
     }
@@ -2600,6 +2642,9 @@ static bool simple_app_set_channel_time(SimpleApp* app, bool is_min, uint16_t va
 
 static void simple_app_request_channel_time(SimpleApp* app, bool request_min) {
     if(!app || !app->serial) return;
+    if(!simple_app_alloc_char_buffer(&app->scanner_timing_read_buffer, SCANNER_TIMING_READ_BUFFER_LEN)) {
+        return;
+    }
     if(request_min) {
         app->scanner_timing_min_pending = true;
     } else {
@@ -2676,6 +2721,9 @@ static bool simple_app_handle_scanner_timing_line(SimpleApp* app, const char* li
 
 static void simple_app_scanner_timing_feed(SimpleApp* app, char ch) {
     if(!app || (!app->scanner_timing_min_pending && !app->scanner_timing_max_pending)) return;
+    if(!simple_app_alloc_char_buffer(&app->scanner_timing_read_buffer, SCANNER_TIMING_READ_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
     if(ch == '\n') {
         if(app->scanner_timing_read_length > 0) {
@@ -2685,7 +2733,7 @@ static void simple_app_scanner_timing_feed(SimpleApp* app, char ch) {
         app->scanner_timing_read_length = 0;
         return;
     }
-    if(app->scanner_timing_read_length + 1 >= sizeof(app->scanner_timing_read_buffer)) {
+    if(app->scanner_timing_read_length + 1 >= SCANNER_TIMING_READ_BUFFER_LEN) {
         app->scanner_timing_read_length = 0;
         return;
     }
@@ -3252,6 +3300,9 @@ static void simple_app_process_sniffer_dog_line(SimpleApp* app, const char* line
 
 static void simple_app_sniffer_dog_feed(SimpleApp* app, char ch) {
     if(!app) return;
+    if(!simple_app_alloc_char_buffer(&app->sniffer_dog_line_buffer, SNIFFER_DOG_LINE_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
     if(ch == '\n') {
         if(app->sniffer_dog_line_length > 0) {
@@ -3261,7 +3312,7 @@ static void simple_app_sniffer_dog_feed(SimpleApp* app, char ch) {
         app->sniffer_dog_line_length = 0;
         return;
     }
-    if(app->sniffer_dog_line_length + 1 >= sizeof(app->sniffer_dog_line_buffer)) {
+    if(app->sniffer_dog_line_length + 1 >= SNIFFER_DOG_LINE_BUFFER_LEN) {
         app->sniffer_dog_line_length = 0;
         return;
     }
@@ -3451,6 +3502,9 @@ static void simple_app_process_deauth_line(SimpleApp* app, const char* line) {
 
 static void simple_app_deauth_feed(SimpleApp* app, char ch) {
     if(!app) return;
+    if(!simple_app_alloc_char_buffer(&app->deauth_line_buffer, DEAUTH_LINE_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
     if(ch == '\n') {
         if(app->deauth_line_length > 0) {
@@ -3460,7 +3514,7 @@ static void simple_app_deauth_feed(SimpleApp* app, char ch) {
         app->deauth_line_length = 0;
         return;
     }
-    if(app->deauth_line_length + 1 >= sizeof(app->deauth_line_buffer)) {
+    if(app->deauth_line_length + 1 >= DEAUTH_LINE_BUFFER_LEN) {
         app->deauth_line_length = 0;
         return;
     }
@@ -3713,6 +3767,30 @@ static void simple_app_free_hint_lines(SimpleApp* app) {
     }
 }
 
+static void simple_app_free_line_buffers(SimpleApp* app) {
+    if(!app) return;
+    simple_app_free_char_buffer(&app->blackout_line_buffer);
+    simple_app_free_char_buffer(&app->sniffer_dog_line_buffer);
+    simple_app_free_char_buffer(&app->handshake_line_buffer);
+    simple_app_free_char_buffer(&app->deauth_line_buffer);
+    simple_app_free_char_buffer(&app->sae_line_buffer);
+    simple_app_free_char_buffer(&app->deauth_guard_line_buffer);
+    simple_app_free_char_buffer(&app->sniffer_line_buffer);
+    simple_app_free_char_buffer(&app->evil_twin_list_buffer);
+    simple_app_free_char_buffer(&app->evil_twin_pass_list_buffer);
+    simple_app_free_char_buffer(&app->portal_ssid_list_buffer);
+    simple_app_free_char_buffer(&app->passwords_line_buffer);
+    simple_app_free_char_buffer(&app->sd_list_buffer);
+    simple_app_free_char_buffer(&app->karma_probe_list_buffer);
+    simple_app_free_char_buffer(&app->karma_html_list_buffer);
+    simple_app_free_char_buffer(&app->scan_line_buffer);
+    simple_app_free_char_buffer(&app->vendor_read_buffer);
+    simple_app_free_char_buffer(&app->scanner_timing_read_buffer);
+    simple_app_free_char_buffer(&app->led_read_buffer);
+    simple_app_free_char_buffer(&app->package_monitor_line_buffer);
+    simple_app_free_char_buffer(&app->channel_view_line_buffer);
+}
+
 static void simple_app_sae_set_note(SimpleApp* app, const char* note) {
     if(!app) return;
     if(note) {
@@ -3772,6 +3850,9 @@ static void simple_app_sae_feed(SimpleApp* app, char ch) {
         app->sae_line_length = 0;
         return;
     }
+    if(!simple_app_alloc_char_buffer(&app->sae_line_buffer, SAE_LINE_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
     if(ch == '\n') {
         if(app->sae_line_length > 0) {
@@ -3781,7 +3862,7 @@ static void simple_app_sae_feed(SimpleApp* app, char ch) {
         app->sae_line_length = 0;
         return;
     }
-    if(app->sae_line_length + 1 >= sizeof(app->sae_line_buffer)) {
+    if(app->sae_line_length + 1 >= SAE_LINE_BUFFER_LEN) {
         app->sae_line_length = 0;
         return;
     }
@@ -3917,6 +3998,9 @@ static void simple_app_process_handshake_line(SimpleApp* app, const char* line) 
 
 static void simple_app_handshake_feed(SimpleApp* app, char ch) {
     if(!app) return;
+    if(!simple_app_alloc_char_buffer(&app->handshake_line_buffer, HANDSHAKE_LINE_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
     if(ch == '\n') {
         if(app->handshake_line_length > 0) {
@@ -3926,7 +4010,7 @@ static void simple_app_handshake_feed(SimpleApp* app, char ch) {
         app->handshake_line_length = 0;
         return;
     }
-    if(app->handshake_line_length + 1 >= sizeof(app->handshake_line_buffer)) {
+    if(app->handshake_line_length + 1 >= HANDSHAKE_LINE_BUFFER_LEN) {
         app->handshake_line_length = 0;
         return;
     }
@@ -4093,6 +4177,9 @@ static void simple_app_process_blackout_line(SimpleApp* app, const char* line) {
 
 static void simple_app_blackout_feed(SimpleApp* app, char ch) {
     if(!app) return;
+    if(!simple_app_alloc_char_buffer(&app->blackout_line_buffer, BLACKOUT_LINE_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
     if(ch == '\n') {
         if(app->blackout_line_length > 0) {
@@ -4102,7 +4189,7 @@ static void simple_app_blackout_feed(SimpleApp* app, char ch) {
         app->blackout_line_length = 0;
         return;
     }
-    if(app->blackout_line_length + 1 >= sizeof(app->blackout_line_buffer)) {
+    if(app->blackout_line_length + 1 >= BLACKOUT_LINE_BUFFER_LEN) {
         app->blackout_line_length = 0;
         return;
     }
@@ -4558,6 +4645,9 @@ static void simple_app_sniffer_feed(SimpleApp* app, char ch) {
         app->sniffer_line_length = 0;
         return;
     }
+    if(!simple_app_alloc_char_buffer(&app->sniffer_line_buffer, SNIFFER_LINE_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
     if(ch == '\n') {
         if(app->sniffer_line_length > 0) {
@@ -4567,7 +4657,7 @@ static void simple_app_sniffer_feed(SimpleApp* app, char ch) {
         app->sniffer_line_length = 0;
         return;
     }
-    if(app->sniffer_line_length + 1 >= sizeof(app->sniffer_line_buffer)) {
+    if(app->sniffer_line_length + 1 >= SNIFFER_LINE_BUFFER_LEN) {
         app->sniffer_line_length = 0;
         return;
     }
@@ -4866,7 +4956,9 @@ static void simple_app_reset_deauth_guard(SimpleApp* app) {
     app->deauth_guard_detection_count = 0;
     app->deauth_guard_line_length = 0;
     memset(app->deauth_guard_last_ssid, 0, sizeof(app->deauth_guard_last_ssid));
-    memset(app->deauth_guard_line_buffer, 0, sizeof(app->deauth_guard_line_buffer));
+    if(app->deauth_guard_line_buffer) {
+        memset(app->deauth_guard_line_buffer, 0, SCAN_LINE_BUFFER_SIZE);
+    }
     if(was_blinking) {
         simple_app_apply_backlight(app);
     }
@@ -4969,6 +5061,9 @@ static void simple_app_deauth_guard_feed(SimpleApp* app, char ch) {
         app->deauth_guard_line_length = 0;
         return;
     }
+    if(!simple_app_alloc_char_buffer(&app->deauth_guard_line_buffer, SCAN_LINE_BUFFER_SIZE)) {
+        return;
+    }
     if(ch == '\r') return;
     if(ch == '\n') {
         if(app->deauth_guard_line_length > 0) {
@@ -4978,7 +5073,7 @@ static void simple_app_deauth_guard_feed(SimpleApp* app, char ch) {
         app->deauth_guard_line_length = 0;
         return;
     }
-    if(app->deauth_guard_line_length + 1 >= sizeof(app->deauth_guard_line_buffer)) {
+    if(app->deauth_guard_line_length + 1 >= SCAN_LINE_BUFFER_SIZE) {
         app->deauth_guard_line_length = 0;
         return;
     }
@@ -7283,6 +7378,9 @@ static void simple_app_update_handshake_blink(SimpleApp* app) {
 
 static void simple_app_scan_feed(SimpleApp* app, char ch) {
     if(!app || !app->scan_results_loading) return;
+    if(!simple_app_alloc_char_buffer(&app->scan_line_buffer, SCAN_LINE_BUFFER_SIZE)) {
+        return;
+    }
 
     if(ch == '\r') return;
 
@@ -7295,7 +7393,7 @@ static void simple_app_scan_feed(SimpleApp* app, char ch) {
         return;
     }
 
-    if(app->scan_line_len + 1 >= sizeof(app->scan_line_buffer)) {
+    if(app->scan_line_len + 1 >= SCAN_LINE_BUFFER_SIZE) {
         app->scan_line_len = 0;
         return;
     }
@@ -8285,6 +8383,7 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     app->help_hint_visible = false;
     app->evil_twin_popup_active = false;
     simple_app_free_hint_lines(app);
+    simple_app_free_line_buffers(app);
 
     if(app->rx_stream) {
         furi_stream_buffer_reset(app->rx_stream);
@@ -8707,6 +8806,9 @@ static void simple_app_package_monitor_process_line(SimpleApp* app, const char* 
 
 static void simple_app_package_monitor_feed(SimpleApp* app, char ch) {
     if(!app) return;
+    if(!simple_app_alloc_char_buffer(&app->package_monitor_line_buffer, PACKAGE_MONITOR_LINE_BUFFER_LEN)) {
+        return;
+    }
 
     if(ch == '\r') return;
 
@@ -8719,7 +8821,7 @@ static void simple_app_package_monitor_feed(SimpleApp* app, char ch) {
         return;
     }
 
-    if(app->package_monitor_line_length + 1 >= sizeof(app->package_monitor_line_buffer)) {
+    if(app->package_monitor_line_length + 1 >= PACKAGE_MONITOR_LINE_BUFFER_LEN) {
         app->package_monitor_line_length = 0;
         return;
     }
@@ -9187,6 +9289,9 @@ static void simple_app_channel_view_process_line(SimpleApp* app, const char* lin
 
 static void simple_app_channel_view_feed(SimpleApp* app, char ch) {
     if(!app) return;
+    if(!simple_app_alloc_char_buffer(&app->channel_view_line_buffer, CHANNEL_VIEW_LINE_BUFFER)) {
+        return;
+    }
 
     if(ch == '\r') return;
 
@@ -9199,7 +9304,7 @@ static void simple_app_channel_view_feed(SimpleApp* app, char ch) {
         return;
     }
 
-    if(app->channel_view_line_length + 1 >= sizeof(app->channel_view_line_buffer)) {
+    if(app->channel_view_line_length + 1 >= CHANNEL_VIEW_LINE_BUFFER) {
         app->channel_view_line_length = 0;
         return;
     }
@@ -9969,6 +10074,9 @@ static void simple_app_process_portal_ssid_line(SimpleApp* app, const char* line
 
 static void simple_app_portal_ssid_feed(SimpleApp* app, char ch) {
     if(!app || !app->portal_ssid_listing_active) return;
+    if(!simple_app_alloc_char_buffer(&app->portal_ssid_list_buffer, PORTAL_SSID_LIST_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
 
     if(ch == '>') {
@@ -9992,7 +10100,7 @@ static void simple_app_portal_ssid_feed(SimpleApp* app, char ch) {
         return;
     }
 
-    if(app->portal_ssid_list_length + 1 >= sizeof(app->portal_ssid_list_buffer)) {
+    if(app->portal_ssid_list_length + 1 >= PORTAL_SSID_LIST_BUFFER_LEN) {
         app->portal_ssid_list_length = 0;
         return;
     }
@@ -10535,6 +10643,9 @@ static void simple_app_process_evil_twin_pass_line(SimpleApp* app, const char* l
 
 static void simple_app_evil_twin_pass_feed(SimpleApp* app, char ch) {
     if(!app || !app->evil_twin_pass_listing_active) return;
+    if(!simple_app_alloc_char_buffer(&app->evil_twin_pass_list_buffer, EVIL_TWIN_PASS_LIST_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
 
     bool updated = false;
@@ -10568,7 +10679,7 @@ static void simple_app_evil_twin_pass_feed(SimpleApp* app, char ch) {
         return;
     }
 
-    if(app->evil_twin_pass_list_length + 1 >= sizeof(app->evil_twin_pass_list_buffer)) {
+    if(app->evil_twin_pass_list_length + 1 >= EVIL_TWIN_PASS_LIST_BUFFER_LEN) {
         app->evil_twin_pass_list_length = 0;
         return;
     }
@@ -10992,6 +11103,9 @@ static void simple_app_process_passwords_line(SimpleApp* app, const char* line) 
 
 static void simple_app_passwords_feed(SimpleApp* app, char ch) {
     if(!app || !app->passwords_listing_active) return;
+    if(!simple_app_alloc_char_buffer(&app->passwords_line_buffer, PORTAL_STATUS_LINE_BUFFER)) {
+        return;
+    }
     if(ch == '\r') return;
 
     bool updated = false;
@@ -11024,7 +11138,7 @@ static void simple_app_passwords_feed(SimpleApp* app, char ch) {
         return;
     }
 
-    if(app->passwords_line_length + 1 >= sizeof(app->passwords_line_buffer)) {
+    if(app->passwords_line_length + 1 >= PORTAL_STATUS_LINE_BUFFER) {
         app->passwords_line_length = 0;
         return;
     }
@@ -14214,6 +14328,9 @@ static void simple_app_process_sd_line(SimpleApp* app, const char* line) {
 
 static void simple_app_sd_feed(SimpleApp* app, char ch) {
     if(!app || !app->sd_listing_active) return;
+    if(!simple_app_alloc_char_buffer(&app->sd_list_buffer, SD_LIST_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
 
     if(ch == '>') {
@@ -14239,7 +14356,7 @@ static void simple_app_sd_feed(SimpleApp* app, char ch) {
         return;
     }
 
-    if(app->sd_list_length + 1 >= sizeof(app->sd_list_buffer)) {
+    if(app->sd_list_length + 1 >= SD_LIST_BUFFER_LEN) {
         app->sd_list_length = 0;
         return;
     }
@@ -15589,6 +15706,9 @@ static void simple_app_process_evil_twin_line(SimpleApp* app, const char* line) 
 
 static void simple_app_evil_twin_feed(SimpleApp* app, char ch) {
     if(!app || !app->evil_twin_listing_active) return;
+    if(!simple_app_alloc_char_buffer(&app->evil_twin_list_buffer, EVIL_TWIN_LIST_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
 
     if(ch == '>') {
@@ -15614,7 +15734,7 @@ static void simple_app_evil_twin_feed(SimpleApp* app, char ch) {
         return;
     }
 
-    if(app->evil_twin_list_length + 1 >= sizeof(app->evil_twin_list_buffer)) {
+    if(app->evil_twin_list_length + 1 >= EVIL_TWIN_LIST_BUFFER_LEN) {
         app->evil_twin_list_length = 0;
         return;
     }
@@ -15904,6 +16024,9 @@ static void simple_app_process_karma_probe_line(SimpleApp* app, const char* line
 
 static void simple_app_karma_probe_feed(SimpleApp* app, char ch) {
     if(!app || !app->karma_probe_listing_active) return;
+    if(!simple_app_alloc_char_buffer(&app->karma_probe_list_buffer, KARMA_PROBE_LIST_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
 
     if(ch == '>') {
@@ -15929,7 +16052,7 @@ static void simple_app_karma_probe_feed(SimpleApp* app, char ch) {
         return;
     }
 
-    if(app->karma_probe_list_length + 1 >= sizeof(app->karma_probe_list_buffer)) {
+    if(app->karma_probe_list_length + 1 >= KARMA_PROBE_LIST_BUFFER_LEN) {
         app->karma_probe_list_length = 0;
         return;
     }
@@ -16248,6 +16371,9 @@ static void simple_app_process_karma_html_line(SimpleApp* app, const char* line)
 
 static void simple_app_karma_html_feed(SimpleApp* app, char ch) {
     if(!app || !app->karma_html_listing_active) return;
+    if(!simple_app_alloc_char_buffer(&app->karma_html_list_buffer, KARMA_HTML_LIST_BUFFER_LEN)) {
+        return;
+    }
     if(ch == '\r') return;
 
     if(ch == '>') {
@@ -16273,7 +16399,7 @@ static void simple_app_karma_html_feed(SimpleApp* app, char ch) {
         return;
     }
 
-    if(app->karma_html_list_length + 1 >= sizeof(app->karma_html_list_buffer)) {
+    if(app->karma_html_list_length + 1 >= KARMA_HTML_LIST_BUFFER_LEN) {
         app->karma_html_list_length = 0;
         return;
     }
@@ -18126,7 +18252,9 @@ int32_t Lab_C5_app(void* p) {
     app->vendor_scan_enabled = false;
     app->vendor_read_pending = false;
     app->vendor_read_length = 0;
-    app->vendor_read_buffer[0] = '\0';
+    if(app->vendor_read_buffer) {
+        app->vendor_read_buffer[0] = '\0';
+    }
     app->scanner_min_power = SCAN_POWER_MIN_DBM;
     app->scanner_min_channel_time = SCANNER_CHANNEL_TIME_DEFAULT_MIN;
     app->scanner_max_channel_time = SCANNER_CHANNEL_TIME_DEFAULT_MAX;
@@ -18134,7 +18262,9 @@ int32_t Lab_C5_app(void* p) {
     app->scanner_timing_min_pending = false;
     app->scanner_timing_max_pending = false;
     app->scanner_timing_read_length = 0;
-    app->scanner_timing_read_buffer[0] = '\0';
+    if(app->scanner_timing_read_buffer) {
+        app->scanner_timing_read_buffer[0] = '\0';
+    }
     app->scanner_setup_index = 0;
     app->scanner_adjusting_power = false;
     app->otg_power_initial_state = furi_hal_power_is_otg_enabled();
