@@ -124,7 +124,7 @@ typedef enum {
 #define GPS_UTC_OFFSET_MIN_MINUTES (-12 * 60)
 #define GPS_UTC_OFFSET_MAX_MINUTES (14 * 60)
 
-#define SERIAL_BUFFER_SIZE 1024
+#define SERIAL_BUFFER_SIZE 256
 #define UART_STREAM_SIZE 512
 #define MENU_VISIBLE_COUNT 6
 #define MENU_VISIBLE_COUNT_SNIFFERS 4
@@ -203,8 +203,10 @@ typedef enum {
 #define SCANNER_SCAN_COMMAND "scan_networks"
 #define SCAN_RESULTS_COMMAND "show_scan_results"
 #define LAB_C5_CONFIG_DIR_PATH "apps_assets/labC5"
+#define LAB_C5_TMP_DIR_PATH LAB_C5_CONFIG_DIR_PATH "/tmp"
 #define LAB_C5_CONFIG_FILE_PATH LAB_C5_CONFIG_DIR_PATH "/config.txt"
 #define FLIPPER_SD_BASE_PATH EXT_PATH(LAB_C5_CONFIG_DIR_PATH)
+#define FLIPPER_SD_TMP_PATH EXT_PATH(LAB_C5_TMP_DIR_PATH)
 #define FLIPPER_SD_DEBUG_PATH FLIPPER_SD_BASE_PATH "/debug_last.txt"
 #define FLIPPER_SD_DEBUG_LOG_PATH FLIPPER_SD_BASE_PATH "/debug_cli.txt"
 
@@ -368,6 +370,30 @@ typedef struct {
     bool selected;
 } ScanResult;
 
+#define SCAN_STORE_MAGIC 0x53434e52u
+
+typedef struct {
+    uint32_t magic;
+    uint16_t capacity;
+    uint16_t count;
+} ScanStoreHeader;
+
+#define SNIFFER_STORE_MAGIC 0x534e4646u
+
+typedef struct {
+    uint32_t magic;
+    uint16_t ap_count;
+    uint16_t client_count;
+} SnifferStoreHeader;
+
+#define PROBE_STORE_MAGIC 0x50524f42u
+
+typedef struct {
+    uint32_t magic;
+    uint16_t ssid_count;
+    uint16_t client_count;
+} ProbeStoreHeader;
+
 #define VENDOR_CACHE_SIZE 16
 #define VENDOR_CACHE_NAME_MAX 24
 
@@ -510,10 +536,11 @@ typedef struct {
     AppScreen screen;
     FuriHalSerialHandle* serial;
     FuriMutex* serial_mutex;
+    FuriMutex* sd_mutex;
     FuriStreamBuffer* rx_stream;
     ViewPort* viewport;
     Gui* gui;
-    char serial_buffer[SERIAL_BUFFER_SIZE];
+    char* serial_buffer;
     size_t serial_len;
     size_t serial_scroll;
     bool serial_follow_tail;
@@ -663,6 +690,7 @@ typedef struct {
     bool sniffer_scan_done;
     bool sniffer_results_active;
     bool sniffer_results_loading;
+    bool sniffer_results_on_sd;
     uint32_t sniffer_packet_count;
     uint32_t sniffer_networks;
     uint32_t sniffer_last_update_tick;
@@ -675,11 +703,18 @@ typedef struct {
     size_t sniffer_client_count;
     size_t sniffer_results_ap_index;
     size_t sniffer_results_client_offset;
-    char sniffer_selected_macs[SNIFFER_MAX_SELECTED_STATIONS][18];
+    SnifferApEntry sniffer_ap_cache;
+    size_t sniffer_ap_cache_index;
+    bool sniffer_ap_cache_valid;
+    SnifferClientEntry sniffer_client_cache;
+    size_t sniffer_client_cache_index;
+    bool sniffer_client_cache_valid;
+    char (*sniffer_selected_macs)[18];
     size_t sniffer_selected_count;
     bool probe_results_active;
     bool probe_full_console;
     bool probe_results_loading;
+    bool probe_results_on_sd;
     ProbeSsidEntry* probe_ssids;
     SnifferClientEntry* probe_clients;
     size_t probe_ssid_count;
@@ -687,6 +722,12 @@ typedef struct {
     size_t probe_ssid_index;
     size_t probe_client_offset;
     uint32_t probe_total;
+    ProbeSsidEntry probe_ssid_cache;
+    size_t probe_ssid_cache_index;
+    bool probe_ssid_cache_valid;
+    SnifferClientEntry probe_client_cache;
+    size_t probe_client_cache_index;
+    bool probe_client_cache_valid;
     bool confirm_blackout_yes;
     bool confirm_sniffer_dos_yes;
     bool confirm_exit_yes;
@@ -823,6 +864,10 @@ typedef struct {
     uint16_t* scan_selected_numbers;
     size_t scan_selected_count;
     bool scan_results_loading;
+    bool scan_results_on_sd;
+    ScanResult scan_result_cache;
+    size_t scan_result_cache_index;
+    bool scan_result_cache_valid;
     char* scan_line_buffer;
     size_t scan_line_len;
     uint16_t* visible_result_indices;
@@ -839,7 +884,7 @@ typedef struct {
     bool scanner_best_rssi_valid;
     int16_t scanner_best_rssi;
     char scanner_best_ssid[SCAN_SSID_MAX_LEN];
-    VendorCacheEntry vendor_cache[VENDOR_CACHE_SIZE];
+    VendorCacheEntry* vendor_cache;
     uint32_t scanner_last_update_tick;
     bool scanner_show_ssid;
     bool scanner_show_bssid;
@@ -944,6 +989,32 @@ typedef struct {
     uint8_t channel_view_offset_24;
     uint8_t channel_view_offset_5;
 } SimpleApp;
+
+static bool simple_app_ensure_serial_buffer(SimpleApp* app) {
+    if(!app) return false;
+    if(app->serial_buffer) return true;
+    app->serial_buffer = calloc(SERIAL_BUFFER_SIZE, 1);
+    return app->serial_buffer != NULL;
+}
+
+static bool simple_app_ensure_vendor_cache(SimpleApp* app) {
+    if(!app) return false;
+    if(app->vendor_cache) return true;
+    app->vendor_cache = calloc(VENDOR_CACHE_SIZE, sizeof(VendorCacheEntry));
+    return app->vendor_cache != NULL;
+}
+
+static void simple_app_free_vendor_cache(SimpleApp* app) {
+    if(!app || !app->vendor_cache) return;
+    free(app->vendor_cache);
+    app->vendor_cache = NULL;
+}
+
+static void simple_app_free_serial_buffer(SimpleApp* app) {
+    if(!app || !app->serial_buffer) return;
+    free(app->serial_buffer);
+    app->serial_buffer = NULL;
+}
 static void simple_app_reset_result_scroll(SimpleApp* app);
 static void simple_app_update_result_scroll(SimpleApp* app);
 static void simple_app_reset_overlay_title_scroll(SimpleApp* app);
@@ -1022,6 +1093,7 @@ static void simple_app_reset_sniffer_dog_status(SimpleApp* app);
 static void simple_app_process_sniffer_dog_line(SimpleApp* app, const char* line);
 static void simple_app_sniffer_dog_feed(SimpleApp* app, char ch);
 static void simple_app_draw_sniffer_dog_overlay(SimpleApp* app, Canvas* canvas);
+static void simple_app_free_sniffer_selected(SimpleApp* app);
 static void simple_app_reset_handshake_status(SimpleApp* app);
 static void simple_app_process_handshake_line(SimpleApp* app, const char* line);
 static void simple_app_handshake_feed(SimpleApp* app, char ch);
@@ -1258,6 +1330,27 @@ static void simple_app_show_status_message(SimpleApp* app, const char* message, 
 static void simple_app_clear_status_message(SimpleApp* app);
 static bool simple_app_status_message_is_active(SimpleApp* app);
 static void simple_app_send_command_with_targets(SimpleApp* app, const char* base_command);
+static bool simple_app_scan_store(SimpleApp* app);
+static void simple_app_scan_drop_store(SimpleApp* app);
+static bool simple_app_scan_store_begin(SimpleApp* app, size_t capacity);
+static bool simple_app_scan_write_result(SimpleApp* app, size_t index, const ScanResult* result);
+static bool simple_app_scan_read_result(SimpleApp* app, size_t index, ScanResult* out);
+static bool simple_app_sniffer_store_begin(SimpleApp* app);
+static bool simple_app_sniffer_write_ap(SimpleApp* app, size_t index, const SnifferApEntry* entry);
+static bool simple_app_sniffer_write_client(SimpleApp* app, size_t index, const SnifferClientEntry* entry);
+static bool simple_app_sniffer_read_ap(SimpleApp* app, size_t index, SnifferApEntry* out);
+static bool simple_app_sniffer_read_client(SimpleApp* app, size_t index, SnifferClientEntry* out);
+static void simple_app_sniffer_drop_store(SimpleApp* app);
+static const SnifferApEntry* simple_app_sniffer_get_ap(SimpleApp* app, size_t index);
+static const SnifferClientEntry* simple_app_sniffer_get_client(SimpleApp* app, size_t index);
+static bool simple_app_probe_store_begin(SimpleApp* app);
+static bool simple_app_probe_write_ssid(SimpleApp* app, size_t index, const ProbeSsidEntry* entry);
+static bool simple_app_probe_write_client(SimpleApp* app, size_t index, const SnifferClientEntry* entry);
+static bool simple_app_probe_read_ssid(SimpleApp* app, size_t index, ProbeSsidEntry* out);
+static bool simple_app_probe_read_client(SimpleApp* app, size_t index, SnifferClientEntry* out);
+static void simple_app_probe_drop_store(SimpleApp* app);
+static const ProbeSsidEntry* simple_app_probe_get_ssid(SimpleApp* app, size_t index);
+static const SnifferClientEntry* simple_app_probe_get_client(SimpleApp* app, size_t index);
 static size_t simple_app_menu_visible_count(const SimpleApp* app, uint32_t section_index);
 static size_t simple_app_section_visible_count(void);
 static void simple_app_adjust_section_offset(SimpleApp* app);
@@ -1276,12 +1369,12 @@ typedef struct {
     const char* label;
     const char* command;
     MenuAction action;
-    const char* hint;
+    const char* hint_id;
 } MenuEntry;
 
 typedef struct {
     const char* title;
-    const char* hint;
+    const char* hint_id;
     const MenuEntry* entries;
     size_t entry_count;
     uint8_t display_y;
@@ -1293,83 +1386,48 @@ static const uint8_t image_icon_0_bits[] = {
     0x1d, 0x03, 0x71, 0x03, 0x1f, 0x03, 0xff, 0x03, 0xff, 0x03,
 };
 
-static const char hint_section_scanner[] =
-    "Passively listens \nto network events collecting \ninfo about APs, STAs associated \nand Probe Requests.";
-static const char hint_section_sniffers[] =
-    "Passive Wi-Fi tools\nMonitor live clients\nAuto channel hopping\nReview captured data\nFrom the results tab.";
-static const char hint_section_attacks[] =
-    "Test features here\nUse only on own lab\nTargets come from\nScanner selection\nFollow local laws.";
-static const char hint_section_monitoring[] =
-    "Monitoring tools\nPacket rates +\nChannel analyzer\nSwitch views with\nUp/Down buttons.";
-static const char hint_section_bluetooth[] =
-    "BLE utilities\nTrackers and tags\nCounts Air/SmartTags\nScroll log on top\nStop with Back.";
-static const char hint_section_setup[] =
-    "General settings\nBacklight, 5V, LED\nAdjust scanner view\nConsole with logs\nUseful for debug.";
+static const char hint_section_scanner[] = "section_scanner";
+static const char hint_section_sniffers[] = "section_sniffers";
+static const char hint_section_attacks[] = "section_attacks";
+static const char hint_section_monitoring[] = "section_monitoring";
+static const char hint_section_bluetooth[] = "section_bluetooth";
+static const char hint_section_setup[] = "section_setup";
 
-static const char hint_sniffer_start[] =
-    "Start passive sniffer\nCaptures frames live\nHops 2.4 and 5 GHz\nWatch status in log\nStop with Back/Stop.";
-static const char hint_sniffer_results[] =
-    "Display sniffer list\nAccess points sorted\nBy client activity\nUse to inspect who\nWas seen on air.";
-static const char hint_sniffer_probes[] =
-    "View probe requests\nSee devices searching\nFor nearby SSIDs\nGreat for finding\nHidden networks.";
-static const char hint_sniffer_resume[] =
-    "Resume sniffer\nUse last scan data\nSkip new scan\nKeeps old results\nKismet style.";
-static const char hint_sniffer_debug[] =
-    "Enable verbose logs\nPrints frame details\nDecision reasoning\nHelpful diagnostics\nBut very noisy.";
+static const char hint_sniffer_start[] = "sniffer_start";
+static const char hint_sniffer_results[] = "sniffer_results";
+static const char hint_sniffer_probes[] = "sniffer_probes";
+static const char hint_sniffer_resume[] = "sniffer_resume";
+static const char hint_sniffer_debug[] = "sniffer_debug";
 
-static const char hint_attack_blackout[] =
-    "Sends broadcast deauth \npackets to all networks \naround you.";
-static const char hint_attack_deauth[] =
-    "Disconnects clients \nof all selected networks.";
-static const char hint_attack_deauth_guard[] =
-    "Monitors for deauths\nOptional target list\nUse scan selection\n1 or many networks\nStop with Back.";
-static const char hint_attack_handshaker[] =
-    "Collect WPA handshakes\nWorks with or without\nselected networks.\nNo selection grabs\nall in the air.";
-static const char hint_attack_evil_twin[] =
-    "Creates fake network \nwith captive portal in the \nname of the first selected.";
-static const char hint_attack_portal[] =
-    "Custom captive portal\nSet SSID manually\nUse keyboard input\nStart when ready\nLab testing only.";
-static const char hint_attack_karma[] =
-    "Collect probe SSIDs\nPick captive portal\nStart Karma beacon\nSniffer auto stops\nLab use only.";
-static const char hint_attack_sae_overflow[] =
-    "Sends SAE Commit frames \nto overflow WPA3 router.";
-static const char hint_attack_sniffer_dog[] =
-    "Listens to traffic \nbetween AP and STA \nand sends deauth packet \ndirectly to this STA";
-static const char hint_attack_wardrive[] =
-    "Logs networks around you \nwith GPS coordinates.";
-static const char hint_bluetooth_airtag[] =
-    "Continuous tag scan\nOutputs counts only\nUpdates as data arrives\nStop/back to exit\nFor Air/SmartTags.";
-static const char hint_bluetooth_scan[] =
-    "One-off 10s BLE scan\nLists seen devices\nHighlights trackers\nSummary shown below\nStop/back to reset.";
-static const char hint_bluetooth_locator[] =
-    "Tracker mode\nScan first to pick MAC\nRight starts tracing\nUpdates RSSI live\nStop/back to exit.";
+static const char hint_attack_blackout[] = "attack_blackout";
+static const char hint_attack_deauth[] = "attack_deauth";
+static const char hint_attack_deauth_guard[] = "attack_deauth_guard";
+static const char hint_attack_handshaker[] = "attack_handshaker";
+static const char hint_attack_evil_twin[] = "attack_evil_twin";
+static const char hint_attack_portal[] = "attack_portal";
+static const char hint_attack_karma[] = "attack_karma";
+static const char hint_attack_sae_overflow[] = "attack_sae_overflow";
+static const char hint_attack_sniffer_dog[] = "attack_sniffer_dog";
+static const char hint_attack_wardrive[] = "attack_wardrive";
+static const char hint_bluetooth_airtag[] = "bluetooth_airtag";
+static const char hint_bluetooth_scan[] = "bluetooth_scan";
+static const char hint_bluetooth_locator[] = "bluetooth_locator";
 
-static const char hint_setup_backlight[] =
-    "Toggle screen light\nKeep brightness high\nOr allow auto dim\nGreat for console\nLong sessions.";
-static const char hint_setup_otg[] =
-    "Toggle 5V rail\nPowers GPIO 5V pin\nUse only if needed\nLeave off to save\nbattery.";
-static const char hint_setup_ram[] =
-    "Show free RAM\nOverlay in corner\nUse for testing\nTurn off normally.";
-static const char hint_setup_debug[] =
-    "Toggle debug log\nWrites CLI commands\nTo SD card file\nKeep off normally\nEnable for trace.";
-static const char hint_setup_download[] =
-    "Send download cmd\nThen open UART GPIO\nbridge manually and\nreconnect USB to PC\nfor flashing.";
-static const char hint_setup_led[] =
-    "Control status LED\nLeft/Right toggles\nSends CLI command\nAdjust brightness\nRange 1 to 100.";
-static const char hint_setup_boot[] =
-    "Assign boot button\nShort/Long actions\nToggle on/off\nPick command\nSaved in device.";
-static const char hint_setup_filters[] =
-    "Choose visible fields\nSimplify result list\nHide unused data\nTailor display\nOK flips options.";
-static const char hint_setup_scanner_timing[] =
-    "Channel dwell times\nLeft/Right adjusts\nMin/Max per channel\nSync with board\nStored in config.";
-static const char hint_setup_console[] =
-    "Open live console\nStream UART output\nWatch commands\nDebug operations\nClose with Back.";
-static const char hint_setup_gps[] =
-    "Live GPS status\nShows coords/time\nLeft/Right UTC offset\nUp/Down DST +1h\nBack stops stream.";
-static const char hint_setup_help[] =
-    "QR link to Wiki\nScan to open\nBack returns";
-static const char hint_setup_sd_manager[] =
-    "Browse SD folders\nPick lab captures\nDelete safely\nDefault: handshakes.";
+static const char hint_setup_backlight[] = "setup_backlight";
+static const char hint_setup_otg[] = "setup_otg";
+static const char hint_setup_ram[] = "setup_ram";
+static const char hint_setup_debug[] = "setup_debug";
+static const char hint_setup_download[] = "setup_download";
+static const char hint_setup_led[] = "setup_led";
+static const char hint_setup_boot[] = "setup_boot";
+static const char hint_setup_filters[] = "setup_filters";
+static const char hint_setup_scanner_timing[] = "setup_scanner_timing";
+static const char hint_setup_console[] = "setup_console";
+static const char hint_setup_gps[] = "setup_gps";
+static const char hint_setup_help[] = "setup_help";
+static const char hint_setup_sd_manager[] = "setup_sd_manager";
+static const char hint_monitor_package[] = "monitor_package";
+static const char hint_monitor_channel[] = "monitor_channel";
 
 static const SdFolderOption sd_folder_options[] = {
     {"Handshakes", "lab/handshakes"},
@@ -1400,11 +1458,6 @@ static const MenuEntry menu_entries_attacks[] = {
     {"Sniffer Dog", NULL, MenuActionConfirmSnifferDos, hint_attack_sniffer_dog},
     {"Wardrive", "start_wardrive", MenuActionCommand, hint_attack_wardrive},
 };
-
-static const char hint_monitor_package[] =
-    "Live packet count\nShows vertical bars\nBack stops monitor\nUp/Down change ch.";
-static const char hint_monitor_channel[] =
-    "Channel usage view\nAuto scans both bands\nUp/Down swap band\nLeft/Right scroll\nOK restarts scan.";
 
 static const MenuEntry menu_entries_monitoring[] = {
     {"Package Monitor", NULL, MenuActionOpenPackageMonitor, hint_monitor_package},
@@ -1494,6 +1547,17 @@ static void simple_app_adjust_section_offset(SimpleApp* app) {
         app->section_offset = app->section_index - visible + 1;
     }
 }
+
+static void simple_app_sd_lock(SimpleApp* app) {
+    if(!app || !app->sd_mutex) return;
+    furi_mutex_acquire(app->sd_mutex, FuriWaitForever);
+}
+
+static void simple_app_sd_unlock(SimpleApp* app) {
+    if(!app || !app->sd_mutex) return;
+    furi_mutex_release(app->sd_mutex);
+}
+
 
 static void simple_app_focus_attacks_menu(SimpleApp* app) {
     if(!app) return;
@@ -1863,7 +1927,9 @@ static void simple_app_reset_scan_results(SimpleApp* app) {
     if(app->visible_result_indices) {
         memset(app->visible_result_indices, 0, sizeof(uint16_t) * app->scan_results_capacity);
     }
-    memset(app->vendor_cache, 0, sizeof(app->vendor_cache));
+    if(app->vendor_cache) {
+        memset(app->vendor_cache, 0, sizeof(VendorCacheEntry) * VENDOR_CACHE_SIZE);
+    }
     app->scan_result_count = 0;
     app->scan_result_index = 0;
     app->scan_result_offset = 0;
@@ -1871,6 +1937,7 @@ static void simple_app_reset_scan_results(SimpleApp* app) {
     app->scan_line_len = 0;
     app->scan_results_loading = false;
     app->visible_result_count = 0;
+    app->scan_result_cache_valid = false;
     simple_app_reset_scanner_stats(app);
     simple_app_reset_result_scroll(app);
 }
@@ -1885,10 +1952,17 @@ static bool simple_app_result_is_visible(const SimpleApp* app, const ScanResult*
 
 static void simple_app_rebuild_visible_results(SimpleApp* app) {
     if(!app) return;
-    if(!app->scan_results || !app->visible_result_indices) return;
+    if(!app->visible_result_indices) return;
     app->visible_result_count = 0;
     for(size_t i = 0; i < app->scan_result_count && i < app->scan_results_capacity; i++) {
-        if(simple_app_result_is_visible(app, &app->scan_results[i])) {
+        ScanResult temp;
+        const ScanResult* result = NULL;
+        if(app->scan_results) {
+            result = &app->scan_results[i];
+        } else if(app->scan_results_on_sd && simple_app_scan_read_result(app, i, &temp)) {
+            result = &temp;
+        }
+        if(result && simple_app_result_is_visible(app, result)) {
             app->visible_result_indices[app->visible_result_count++] = (uint16_t)i;
         }
     }
@@ -1958,27 +2032,65 @@ static bool* simple_app_scanner_option_flag(SimpleApp* app, ScannerOption option
 }
 
 static ScanResult* simple_app_visible_result(SimpleApp* app, size_t visible_index) {
-    if(!app || !app->scan_results || !app->visible_result_indices) return NULL;
+    if(!app || !app->visible_result_indices) return NULL;
     if(visible_index >= app->visible_result_count) return NULL;
     uint16_t actual_index = app->visible_result_indices[visible_index];
     if(actual_index >= app->scan_results_capacity) return NULL;
-    return &app->scan_results[actual_index];
+    if(app->scan_results) {
+        return &app->scan_results[actual_index];
+    }
+    if(app->scan_results_on_sd) {
+        if(app->scan_result_cache_valid && app->scan_result_cache_index == actual_index) {
+            return &app->scan_result_cache;
+        }
+        if(simple_app_scan_read_result(app, actual_index, &app->scan_result_cache)) {
+            app->scan_result_cache_index = actual_index;
+            app->scan_result_cache_valid = true;
+            return &app->scan_result_cache;
+        }
+    }
+    return NULL;
 }
 
 static const ScanResult* simple_app_visible_result_const(const SimpleApp* app, size_t visible_index) {
-    if(!app || !app->scan_results || !app->visible_result_indices) return NULL;
+    if(!app || !app->visible_result_indices) return NULL;
     if(visible_index >= app->visible_result_count) return NULL;
     uint16_t actual_index = app->visible_result_indices[visible_index];
     if(actual_index >= app->scan_results_capacity) return NULL;
-    return &app->scan_results[actual_index];
+    if(app->scan_results) {
+        return &app->scan_results[actual_index];
+    }
+    if(app->scan_results_on_sd) {
+        SimpleApp* mutable = (SimpleApp*)app;
+        if(mutable->scan_result_cache_valid &&
+           mutable->scan_result_cache_index == actual_index) {
+            return &mutable->scan_result_cache;
+        }
+        if(simple_app_scan_read_result(mutable, actual_index, &mutable->scan_result_cache)) {
+            mutable->scan_result_cache_index = actual_index;
+            mutable->scan_result_cache_valid = true;
+            return &mutable->scan_result_cache;
+        }
+    }
+    return NULL;
 }
 
 static const ScanResult* simple_app_find_scan_result_by_number(const SimpleApp* app, uint16_t number) {
-    if(!app || !app->scan_results) return NULL;
+    if(!app) return NULL;
     for(size_t i = 0; i < app->scan_result_count; i++) {
-        const ScanResult* result = &app->scan_results[i];
-        if(result->number == number) {
-            return result;
+        if(app->scan_results) {
+            if(app->scan_results[i].number == number) {
+                return &app->scan_results[i];
+            }
+        } else if(app->scan_results_on_sd) {
+            SimpleApp* mutable = (SimpleApp*)app;
+            if(simple_app_scan_read_result(mutable, i, &mutable->scan_result_cache)) {
+                mutable->scan_result_cache_index = i;
+                mutable->scan_result_cache_valid = true;
+                if(mutable->scan_result_cache.number == number) {
+                    return &mutable->scan_result_cache;
+                }
+            }
         }
     }
     return NULL;
@@ -4211,6 +4323,7 @@ static void simple_app_reset_sniffer_status(SimpleApp* app) {
 
 static void simple_app_reset_sniffer_results(SimpleApp* app) {
     if(!app) return;
+    simple_app_sniffer_drop_store(app);
     if(app->sniffer_aps) {
         memset(app->sniffer_aps, 0, sizeof(SnifferApEntry) * SNIFFER_MAX_APS);
     }
@@ -4223,11 +4336,14 @@ static void simple_app_reset_sniffer_results(SimpleApp* app) {
     app->sniffer_results_client_offset = 0;
     app->sniffer_results_loading = false;
     app->sniffer_selected_count = 0;
-    memset(app->sniffer_selected_macs, 0, sizeof(app->sniffer_selected_macs));
+    app->sniffer_ap_cache_valid = false;
+    app->sniffer_client_cache_valid = false;
+    simple_app_free_sniffer_selected(app);
 }
 
 static void simple_app_reset_probe_results(SimpleApp* app) {
     if(!app) return;
+    simple_app_probe_drop_store(app);
     if(app->probe_ssids) {
         memset(app->probe_ssids, 0, sizeof(ProbeSsidEntry) * PROBE_MAX_SSIDS);
     }
@@ -4241,6 +4357,8 @@ static void simple_app_reset_probe_results(SimpleApp* app) {
     app->probe_total = 0;
     app->probe_results_loading = false;
     app->probe_full_console = false;
+    app->probe_ssid_cache_valid = false;
+    app->probe_client_cache_valid = false;
 }
 
 static void simple_app_clear_sniffer_data(SimpleApp* app) {
@@ -4256,18 +4374,37 @@ static void simple_app_clear_sniffer_data(SimpleApp* app) {
     app->sniffer_results_ap_index = 0;
     app->sniffer_results_client_offset = 0;
     app->sniffer_results_loading = false;
+    simple_app_sniffer_drop_store(app);
+    simple_app_free_sniffer_selected(app);
     app->probe_ssid_count = 0;
     app->probe_client_count = 0;
     app->probe_ssid_index = 0;
     app->probe_client_offset = 0;
     app->probe_total = 0;
     app->probe_results_loading = false;
+    simple_app_probe_drop_store(app);
     simple_app_free_sniffer_buffers(app);
     simple_app_free_probe_buffers(app);
 }
 
+static bool simple_app_ensure_sniffer_selected(SimpleApp* app) {
+    if(!app) return false;
+    if(app->sniffer_selected_macs) return true;
+    app->sniffer_selected_macs =
+        calloc(SNIFFER_MAX_SELECTED_STATIONS, sizeof(app->sniffer_selected_macs[0]));
+    return app->sniffer_selected_macs != NULL;
+}
+
+static void simple_app_free_sniffer_selected(SimpleApp* app) {
+    if(!app || !app->sniffer_selected_macs) return;
+    free(app->sniffer_selected_macs);
+    app->sniffer_selected_macs = NULL;
+    app->sniffer_selected_count = 0;
+}
+
 static int simple_app_find_sniffer_selected(const SimpleApp* app, const char* mac) {
     if(!app || !mac || mac[0] == '\0') return -1;
+    if(!app->sniffer_selected_macs) return -1;
     for(size_t i = 0; i < app->sniffer_selected_count; i++) {
         if(strcmp(app->sniffer_selected_macs[i], mac) == 0) {
             return (int)i;
@@ -4282,14 +4419,16 @@ static bool simple_app_sniffer_station_is_selected(const SimpleApp* app, const c
 
 static void simple_app_toggle_sniffer_selected(SimpleApp* app, const char* mac) {
     if(!app || !mac || mac[0] == '\0' || !strchr(mac, ':')) return;
+    if(!simple_app_ensure_sniffer_selected(app)) {
+        simple_app_show_status_message(app, "OOM: sniffer\nselection", 1200, true);
+        return;
+    }
     int existing = simple_app_find_sniffer_selected(app, mac);
     if(existing >= 0) {
         for(size_t i = (size_t)existing; i + 1 < app->sniffer_selected_count; i++) {
-            strncpy(
-                app->sniffer_selected_macs[i],
-                app->sniffer_selected_macs[i + 1],
-                sizeof(app->sniffer_selected_macs[i]) - 1);
-            app->sniffer_selected_macs[i][sizeof(app->sniffer_selected_macs[i]) - 1] = '\0';
+            size_t bytes = sizeof(app->sniffer_selected_macs[i]);
+            memmove(app->sniffer_selected_macs[i], app->sniffer_selected_macs[i + 1], bytes);
+            app->sniffer_selected_macs[i][bytes - 1] = '\0';
         }
         if(app->sniffer_selected_count > 0) {
             app->sniffer_selected_count--;
@@ -4312,14 +4451,26 @@ static void simple_app_toggle_sniffer_selected(SimpleApp* app, const char* mac) 
 
 static void simple_app_clear_station_selection(SimpleApp* app) {
     if(!app) return;
-    if(app->sniffer_selected_count == 0) return;
+    if(!app->sniffer_selected_macs) return;
+    if(app->sniffer_selected_count == 0) {
+        simple_app_free_sniffer_selected(app);
+        return;
+    }
     app->sniffer_selected_count = 0;
-    memset(app->sniffer_selected_macs, 0, sizeof(app->sniffer_selected_macs));
+    memset(
+        app->sniffer_selected_macs,
+        0,
+        sizeof(app->sniffer_selected_macs[0]) * SNIFFER_MAX_SELECTED_STATIONS);
+    simple_app_free_sniffer_selected(app);
     simple_app_send_command_quiet(app, "unselect_stations");
 }
 
 static void simple_app_send_select_stations(SimpleApp* app) {
     if(!app) return;
+    if(!app->sniffer_selected_macs || app->sniffer_selected_count == 0) {
+        simple_app_show_status_message(app, "No stations\nselected", 1200, true);
+        return;
+    }
     char command[256];
     size_t written = snprintf(command, sizeof(command), "select_stations");
     if(written >= sizeof(command)) {
@@ -4520,7 +4671,15 @@ static void simple_app_process_sniffer_line(SimpleApp* app, const char* line) {
     if(!app || !line || (!app->sniffer_view_active && !app->sniffer_results_active)) return;
 
     if(app->sniffer_results_active) {
-        if(!app->sniffer_aps || !app->sniffer_clients) {
+        bool use_sd = app->sniffer_results_on_sd ||
+                      (!app->sniffer_aps && !app->sniffer_clients && simple_app_sd_ok());
+        if(use_sd && !app->sniffer_results_on_sd) {
+            if(!simple_app_sniffer_store_begin(app)) {
+                simple_app_show_status_message(app, "Sniffer storage\nunavailable", 1500, true);
+                return;
+            }
+        }
+        if(!use_sd && (!app->sniffer_aps || !app->sniffer_clients)) {
             if(!simple_app_alloc_sniffer_buffers(app)) {
                 simple_app_show_status_message(app, "OOM: sniffer\nbuffers", 1500, true);
                 return;
@@ -4535,7 +4694,15 @@ static void simple_app_process_sniffer_line(SimpleApp* app, const char* line) {
         if(simple_app_sniffer_parse_header(app, line, &entry)) {
             if(app->sniffer_ap_count < SNIFFER_MAX_APS) {
                 entry.client_start = (uint16_t)app->sniffer_client_count;
-                app->sniffer_aps[app->sniffer_ap_count++] = entry;
+                if(use_sd) {
+                    if(!simple_app_sniffer_write_ap(app, app->sniffer_ap_count, &entry)) {
+                        simple_app_show_status_message(app, "Sniffer write\nfailed", 1500, true);
+                        return;
+                    }
+                } else {
+                    app->sniffer_aps[app->sniffer_ap_count] = entry;
+                }
+                app->sniffer_ap_count++;
                 app->sniffer_results_loading = false;
             }
             return;
@@ -4543,17 +4710,38 @@ static void simple_app_process_sniffer_line(SimpleApp* app, const char* line) {
 
         if(simple_app_sniffer_is_mac(line) && app->sniffer_ap_count > 0) {
             if(app->sniffer_client_count < SNIFFER_MAX_CLIENTS) {
-                SnifferClientEntry* client = &app->sniffer_clients[app->sniffer_client_count];
-                if(!simple_app_sniffer_extract_mac_token(line, client->mac, sizeof(client->mac))) {
+                SnifferClientEntry client = {0};
+                if(!simple_app_sniffer_extract_mac_token(line, client.mac, sizeof(client.mac))) {
                     return;
                 }
-                app->sniffer_client_count++;
-                SnifferApEntry* last_ap = &app->sniffer_aps[app->sniffer_ap_count - 1];
-                if(last_ap->client_count < UINT16_MAX) {
-                    last_ap->client_count++;
+                if(use_sd) {
+                    if(!simple_app_sniffer_write_client(app, app->sniffer_client_count, &client)) {
+                        simple_app_show_status_message(app, "Sniffer write\nfailed", 1500, true);
+                        return;
+                    }
+                } else {
+                    app->sniffer_clients[app->sniffer_client_count] = client;
                 }
-                if(last_ap->expected_count < last_ap->client_count) {
-                    last_ap->expected_count = last_ap->client_count;
+                app->sniffer_client_count++;
+                if(use_sd) {
+                    SnifferApEntry last_ap;
+                    if(simple_app_sniffer_read_ap(app, app->sniffer_ap_count - 1, &last_ap)) {
+                        if(last_ap.client_count < UINT16_MAX) {
+                            last_ap.client_count++;
+                        }
+                        if(last_ap.expected_count < last_ap.client_count) {
+                            last_ap.expected_count = last_ap.client_count;
+                        }
+                        simple_app_sniffer_write_ap(app, app->sniffer_ap_count - 1, &last_ap);
+                    }
+                } else {
+                    SnifferApEntry* last_ap = &app->sniffer_aps[app->sniffer_ap_count - 1];
+                    if(last_ap->client_count < UINT16_MAX) {
+                        last_ap->client_count++;
+                    }
+                    if(last_ap->expected_count < last_ap->client_count) {
+                        last_ap->expected_count = last_ap->client_count;
+                    }
                 }
                 app->sniffer_results_loading = false;
             }
@@ -4665,9 +4853,11 @@ static void simple_app_sniffer_feed(SimpleApp* app, char ch) {
 }
 
 static int simple_app_find_probe_ssid(SimpleApp* app, const char* ssid) {
-    if(!app || !ssid || !app->probe_ssids) return -1;
+    if(!app || !ssid) return -1;
+    if(!app->probe_ssids && !app->probe_results_on_sd) return -1;
     for(size_t i = 0; i < app->probe_ssid_count; i++) {
-        if(strncmp(app->probe_ssids[i].ssid, ssid, sizeof(app->probe_ssids[i].ssid)) == 0) {
+        const ProbeSsidEntry* entry = simple_app_probe_get_ssid(app, i);
+        if(entry && strncmp(entry->ssid, ssid, sizeof(entry->ssid)) == 0) {
             return (int)i;
         }
     }
@@ -4676,7 +4866,15 @@ static int simple_app_find_probe_ssid(SimpleApp* app, const char* ssid) {
 
 static void simple_app_process_probe_line(SimpleApp* app, const char* line) {
     if(!app || !line || !app->probe_results_active) return;
-    if(!app->probe_ssids || !app->probe_clients) {
+    bool use_sd = app->probe_results_on_sd ||
+                  (!app->probe_ssids && !app->probe_clients && simple_app_sd_ok());
+    if(use_sd && !app->probe_results_on_sd) {
+        if(!simple_app_probe_store_begin(app)) {
+            simple_app_show_status_message(app, "Probe storage\nunavailable", 1500, true);
+            return;
+        }
+    }
+    if(!use_sd && (!app->probe_ssids || !app->probe_clients)) {
         if(!simple_app_alloc_probe_buffers(app)) {
             simple_app_show_status_message(app, "OOM: probe\nbuffers", 1500, true);
             return;
@@ -4720,31 +4918,66 @@ static void simple_app_process_probe_line(SimpleApp* app, const char* line) {
     if(mac[0] == '\0') return;
 
     int existing = simple_app_find_probe_ssid(app, ssid);
+    ProbeSsidEntry entry_local;
     ProbeSsidEntry* entry = NULL;
     if(existing >= 0) {
-        entry = &app->probe_ssids[existing];
+        if(use_sd) {
+            if(!simple_app_probe_read_ssid(app, (size_t)existing, &entry_local)) {
+                return;
+            }
+            entry = &entry_local;
+        } else {
+            entry = &app->probe_ssids[existing];
+        }
     } else if(app->probe_ssid_count < PROBE_MAX_SSIDS) {
-        entry = &app->probe_ssids[app->probe_ssid_count++];
-        memset(entry, 0, sizeof(*entry));
-        strncpy(entry->ssid, ssid, sizeof(entry->ssid) - 1);
-        entry->ssid[sizeof(entry->ssid) - 1] = '\0';
-        entry->client_start = (uint16_t)app->probe_client_count;
+        if(use_sd) {
+            memset(&entry_local, 0, sizeof(entry_local));
+            strncpy(entry_local.ssid, ssid, sizeof(entry_local.ssid) - 1);
+            entry_local.ssid[sizeof(entry_local.ssid) - 1] = '\0';
+            entry_local.client_start = (uint16_t)app->probe_client_count;
+            entry = &entry_local;
+        } else {
+            entry = &app->probe_ssids[app->probe_ssid_count];
+            memset(entry, 0, sizeof(*entry));
+            strncpy(entry->ssid, ssid, sizeof(entry->ssid) - 1);
+            entry->ssid[sizeof(entry->ssid) - 1] = '\0';
+            entry->client_start = (uint16_t)app->probe_client_count;
+        }
+        app->probe_ssid_count++;
+        if(use_sd) {
+            simple_app_probe_write_ssid(app, app->probe_ssid_count - 1, entry);
+        }
     }
 
     if(!entry) return;
 
     if(app->probe_client_count < PROBE_MAX_CLIENTS) {
-        SnifferClientEntry* client = &app->probe_clients[app->probe_client_count++];
-        strncpy(client->mac, mac, sizeof(client->mac) - 1);
-        client->mac[sizeof(client->mac) - 1] = '\0';
+        SnifferClientEntry client;
+        memset(&client, 0, sizeof(client));
+        strncpy(client.mac, mac, sizeof(client.mac) - 1);
+        client.mac[sizeof(client.mac) - 1] = '\0';
+        if(use_sd) {
+            simple_app_probe_write_client(app, app->probe_client_count, &client);
+        } else {
+            app->probe_clients[app->probe_client_count] = client;
+        }
+        app->probe_client_count++;
         if(entry->client_count < UINT16_MAX) {
             entry->client_count++;
         }
         if(entry->expected_count < entry->client_count) {
             entry->expected_count = entry->client_count;
         }
+        if(use_sd) {
+            size_t target_index = (existing >= 0) ? (size_t)existing : (app->probe_ssid_count - 1);
+            simple_app_probe_write_ssid(app, target_index, entry);
+        }
     } else {
         if(entry->expected_count < UINT16_MAX) entry->expected_count++;
+        if(use_sd) {
+            size_t target_index = (existing >= 0) ? (size_t)existing : (app->probe_ssid_count - 1);
+            simple_app_probe_write_ssid(app, target_index, entry);
+        }
     }
 
     app->probe_results_loading = false;
@@ -5632,23 +5865,21 @@ static bool simple_app_scan_alloc_buffers(SimpleApp* app, size_t capacity) {
         simple_app_scan_free_buffers(app);
         return true;
     }
-    if(app->scan_results && app->scan_selected_numbers && app->visible_result_indices &&
-       app->scan_results_capacity == capacity) {
+    if((app->scan_results || app->scan_results_on_sd) && app->scan_selected_numbers &&
+       app->visible_result_indices && app->scan_results_capacity == capacity) {
         return true;
     }
 
     simple_app_scan_free_buffers(app);
 
-    app->scan_results = malloc(sizeof(ScanResult) * capacity);
     app->scan_selected_numbers = malloc(sizeof(uint16_t) * capacity);
     app->visible_result_indices = malloc(sizeof(uint16_t) * capacity);
 
-    if(!app->scan_results || !app->scan_selected_numbers || !app->visible_result_indices) {
+    if(!app->scan_selected_numbers || !app->visible_result_indices) {
         simple_app_scan_free_buffers(app);
         return false;
     }
 
-    memset(app->scan_results, 0, sizeof(ScanResult) * capacity);
     memset(app->scan_selected_numbers, 0, sizeof(uint16_t) * capacity);
     memset(app->visible_result_indices, 0, sizeof(uint16_t) * capacity);
     app->scan_results_capacity = capacity;
@@ -5670,7 +5901,786 @@ static void simple_app_scan_free_buffers(SimpleApp* app) {
         app->visible_result_indices = NULL;
     }
     app->scan_results_capacity = 0;
+    app->scan_result_cache_valid = false;
 }
+
+static bool simple_app_scan_store_begin(SimpleApp* app, size_t capacity) {
+    if(!app) return false;
+    if(!simple_app_sd_ok()) {
+        simple_app_show_sd_busy();
+        return false;
+    }
+    if(capacity > SCAN_RESULTS_MAX_CAPACITY) {
+        capacity = SCAN_RESULTS_MAX_CAPACITY;
+    }
+    if(capacity == 0) return false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+
+    simple_app_sd_lock(app);
+    simple_app_ensure_flipper_sd_dirs(storage);
+    storage_simply_mkdir(storage, FLIPPER_SD_TMP_PATH);
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/scan_results.bin", FLIPPER_SD_TMP_PATH);
+    if(!storage_file_open(file, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        storage_file_free(file);
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    ScanStoreHeader header = {
+        .magic = SCAN_STORE_MAGIC,
+        .capacity = (uint16_t)capacity,
+        .count = 0,
+    };
+    storage_file_write(file, &header, sizeof(header));
+    storage_file_close(file);
+    storage_file_free(file);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    app->scan_results_on_sd = true;
+    app->scan_result_count = 0;
+    app->scan_results_capacity = capacity;
+    app->scan_result_cache_valid = false;
+
+    return true;
+}
+
+static bool simple_app_scan_write_result(SimpleApp* app, size_t index, const ScanResult* result) {
+    if(!app || !result) return false;
+    if(!app->scan_results_on_sd) return false;
+    if(index >= app->scan_results_capacity) return false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+
+    simple_app_sd_lock(app);
+    simple_app_ensure_flipper_sd_dirs(storage);
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/scan_results.bin", FLIPPER_SD_TMP_PATH);
+    if(!storage_file_open(file, path, FSAM_READ_WRITE, FSOM_OPEN_EXISTING)) {
+        storage_file_free(file);
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    ScanStoreHeader header = {
+        .magic = SCAN_STORE_MAGIC,
+        .capacity = (uint16_t)app->scan_results_capacity,
+        .count = (uint16_t)(index + 1),
+    };
+    storage_file_seek(file, 0, true);
+    storage_file_write(file, &header, sizeof(header));
+
+    size_t offset = sizeof(ScanStoreHeader) + (index * sizeof(ScanResult));
+    storage_file_seek(file, offset, true);
+    storage_file_write(file, result, sizeof(ScanResult));
+
+    storage_file_close(file);
+    storage_file_free(file);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    app->probe_ssid_cache_valid = false;
+    return true;
+}
+
+static bool simple_app_scan_read_result(SimpleApp* app, size_t index, ScanResult* out) {
+    if(!app || !out) return false;
+    if(!app->scan_results_on_sd) return false;
+    if(index >= app->scan_results_capacity) return false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+
+    simple_app_sd_lock(app);
+    simple_app_ensure_flipper_sd_dirs(storage);
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/scan_results.bin", FLIPPER_SD_TMP_PATH);
+    if(!storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        storage_file_free(file);
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    size_t offset = sizeof(ScanStoreHeader) + (index * sizeof(ScanResult));
+    storage_file_seek(file, offset, true);
+    size_t read = storage_file_read(file, out, sizeof(ScanResult));
+
+    storage_file_close(file);
+    storage_file_free(file);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    return read == sizeof(ScanResult);
+}
+
+static bool simple_app_scan_store(SimpleApp* app) {
+    if(!app || !app->scan_results || app->scan_results_capacity == 0) return false;
+    if(app->scan_result_count == 0) return false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+
+    simple_app_sd_lock(app);
+    simple_app_ensure_flipper_sd_dirs(storage);
+    storage_simply_mkdir(storage, FLIPPER_SD_TMP_PATH);
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/scan_results.bin", FLIPPER_SD_TMP_PATH);
+    if(!storage_file_open(file, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        storage_file_free(file);
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    ScanStoreHeader header = {
+        .magic = SCAN_STORE_MAGIC,
+        .capacity = (uint16_t)app->scan_results_capacity,
+        .count = (uint16_t)app->scan_result_count,
+    };
+    storage_file_write(file, &header, sizeof(header));
+    storage_file_write(
+        file,
+        app->scan_results,
+        sizeof(ScanResult) * app->scan_results_capacity);
+
+    storage_file_close(file);
+    storage_file_free(file);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    app->scan_results_on_sd = true;
+    return true;
+}
+
+static void simple_app_scan_drop_store(SimpleApp* app) {
+    if(!app) return;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return;
+
+    simple_app_sd_lock(app);
+    char path[96];
+    snprintf(path, sizeof(path), "%s/scan_results.bin", FLIPPER_SD_TMP_PATH);
+    storage_simply_remove(storage, path);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    app->scan_results_on_sd = false;
+    app->scan_result_cache_valid = false;
+}
+
+static bool simple_app_sniffer_store_begin(SimpleApp* app) {
+    if(!app) return false;
+    if(!simple_app_sd_ok()) {
+        simple_app_show_sd_busy();
+        return false;
+    }
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+
+    simple_app_sd_lock(app);
+    simple_app_ensure_flipper_sd_dirs(storage);
+    storage_simply_mkdir(storage, FLIPPER_SD_TMP_PATH);
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/sniffer_results.bin", FLIPPER_SD_TMP_PATH);
+    if(!storage_file_open(file, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        storage_file_free(file);
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    SnifferStoreHeader header = {
+        .magic = SNIFFER_STORE_MAGIC,
+        .ap_count = 0,
+        .client_count = 0,
+    };
+    storage_file_write(file, &header, sizeof(header));
+    storage_file_close(file);
+    storage_file_free(file);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    app->sniffer_results_on_sd = true;
+    app->sniffer_ap_count = 0;
+    app->sniffer_client_count = 0;
+    app->sniffer_ap_cache_valid = false;
+    app->sniffer_client_cache_valid = false;
+    return true;
+}
+
+static bool simple_app_sniffer_write_ap(SimpleApp* app, size_t index, const SnifferApEntry* entry) {
+    if(!app || !entry) return false;
+    if(!app->sniffer_results_on_sd) return false;
+    if(index >= SNIFFER_MAX_APS) return false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+
+    simple_app_sd_lock(app);
+    simple_app_ensure_flipper_sd_dirs(storage);
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/sniffer_results.bin", FLIPPER_SD_TMP_PATH);
+    if(!storage_file_open(file, path, FSAM_READ_WRITE, FSOM_OPEN_EXISTING)) {
+        storage_file_free(file);
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    size_t new_ap_count = app->sniffer_ap_count;
+    if(index + 1 > new_ap_count) new_ap_count = index + 1;
+    SnifferStoreHeader header = {
+        .magic = SNIFFER_STORE_MAGIC,
+        .ap_count = (uint16_t)new_ap_count,
+        .client_count = (uint16_t)app->sniffer_client_count,
+    };
+    storage_file_seek(file, 0, true);
+    storage_file_write(file, &header, sizeof(header));
+
+    size_t offset = sizeof(SnifferStoreHeader) + (index * sizeof(SnifferApEntry));
+    storage_file_seek(file, offset, true);
+    storage_file_write(file, entry, sizeof(SnifferApEntry));
+
+    storage_file_close(file);
+    storage_file_free(file);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    app->probe_client_cache_valid = false;
+    return true;
+}
+
+static bool simple_app_sniffer_write_client(
+    SimpleApp* app,
+    size_t index,
+    const SnifferClientEntry* entry) {
+    if(!app || !entry) return false;
+    if(!app->sniffer_results_on_sd) return false;
+    if(index >= SNIFFER_MAX_CLIENTS) return false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+
+    simple_app_sd_lock(app);
+    simple_app_ensure_flipper_sd_dirs(storage);
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/sniffer_results.bin", FLIPPER_SD_TMP_PATH);
+    if(!storage_file_open(file, path, FSAM_READ_WRITE, FSOM_OPEN_EXISTING)) {
+        storage_file_free(file);
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    size_t new_client_count = app->sniffer_client_count;
+    if(index + 1 > new_client_count) new_client_count = index + 1;
+    SnifferStoreHeader header = {
+        .magic = SNIFFER_STORE_MAGIC,
+        .ap_count = (uint16_t)app->sniffer_ap_count,
+        .client_count = (uint16_t)new_client_count,
+    };
+    storage_file_seek(file, 0, true);
+    storage_file_write(file, &header, sizeof(header));
+
+    size_t base = sizeof(SnifferStoreHeader) + (SNIFFER_MAX_APS * sizeof(SnifferApEntry));
+    size_t offset = base + (index * sizeof(SnifferClientEntry));
+    storage_file_seek(file, offset, true);
+    storage_file_write(file, entry, sizeof(SnifferClientEntry));
+
+    storage_file_close(file);
+    storage_file_free(file);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    return true;
+}
+
+static bool simple_app_sniffer_read_ap(SimpleApp* app, size_t index, SnifferApEntry* out) {
+    if(!app || !out) return false;
+    if(!app->sniffer_results_on_sd) return false;
+    if(index >= app->sniffer_ap_count || index >= SNIFFER_MAX_APS) return false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+
+    simple_app_sd_lock(app);
+    simple_app_ensure_flipper_sd_dirs(storage);
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/sniffer_results.bin", FLIPPER_SD_TMP_PATH);
+    if(!storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        storage_file_free(file);
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    size_t offset = sizeof(SnifferStoreHeader) + (index * sizeof(SnifferApEntry));
+    storage_file_seek(file, offset, true);
+    size_t read = storage_file_read(file, out, sizeof(SnifferApEntry));
+
+    storage_file_close(file);
+    storage_file_free(file);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    return read == sizeof(SnifferApEntry);
+}
+
+static bool simple_app_sniffer_read_client(SimpleApp* app, size_t index, SnifferClientEntry* out) {
+    if(!app || !out) return false;
+    if(!app->sniffer_results_on_sd) return false;
+    if(index >= app->sniffer_client_count || index >= SNIFFER_MAX_CLIENTS) return false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+
+    simple_app_sd_lock(app);
+    simple_app_ensure_flipper_sd_dirs(storage);
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/sniffer_results.bin", FLIPPER_SD_TMP_PATH);
+    if(!storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        storage_file_free(file);
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    size_t base = sizeof(SnifferStoreHeader) + (SNIFFER_MAX_APS * sizeof(SnifferApEntry));
+    size_t offset = base + (index * sizeof(SnifferClientEntry));
+    storage_file_seek(file, offset, true);
+    size_t read = storage_file_read(file, out, sizeof(SnifferClientEntry));
+
+    storage_file_close(file);
+    storage_file_free(file);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    return read == sizeof(SnifferClientEntry);
+}
+
+static void simple_app_sniffer_drop_store(SimpleApp* app) {
+    if(!app) return;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return;
+
+    simple_app_sd_lock(app);
+    char path[96];
+    snprintf(path, sizeof(path), "%s/sniffer_results.bin", FLIPPER_SD_TMP_PATH);
+    storage_simply_remove(storage, path);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    app->sniffer_results_on_sd = false;
+    app->sniffer_ap_cache_valid = false;
+    app->sniffer_client_cache_valid = false;
+}
+
+static const SnifferApEntry* simple_app_sniffer_get_ap(SimpleApp* app, size_t index) {
+    if(!app) return NULL;
+    if(app->sniffer_aps) {
+        if(index >= app->sniffer_ap_count) return NULL;
+        return &app->sniffer_aps[index];
+    }
+    if(app->sniffer_results_on_sd) {
+        if(app->sniffer_ap_cache_valid && app->sniffer_ap_cache_index == index) {
+            return &app->sniffer_ap_cache;
+        }
+        if(simple_app_sniffer_read_ap(app, index, &app->sniffer_ap_cache)) {
+            app->sniffer_ap_cache_index = index;
+            app->sniffer_ap_cache_valid = true;
+            return &app->sniffer_ap_cache;
+        }
+    }
+    return NULL;
+}
+
+static const SnifferClientEntry* simple_app_sniffer_get_client(SimpleApp* app, size_t index) {
+    if(!app) return NULL;
+    if(app->sniffer_clients) {
+        if(index >= app->sniffer_client_count) return NULL;
+        return &app->sniffer_clients[index];
+    }
+    if(app->sniffer_results_on_sd) {
+        if(app->sniffer_client_cache_valid && app->sniffer_client_cache_index == index) {
+            return &app->sniffer_client_cache;
+        }
+        if(simple_app_sniffer_read_client(app, index, &app->sniffer_client_cache)) {
+            app->sniffer_client_cache_index = index;
+            app->sniffer_client_cache_valid = true;
+            return &app->sniffer_client_cache;
+        }
+    }
+    return NULL;
+}
+
+static bool simple_app_probe_store_begin(SimpleApp* app) {
+    if(!app) return false;
+    if(!simple_app_sd_ok()) {
+        simple_app_show_sd_busy();
+        return false;
+    }
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+
+    simple_app_sd_lock(app);
+    simple_app_ensure_flipper_sd_dirs(storage);
+    storage_simply_mkdir(storage, FLIPPER_SD_TMP_PATH);
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/probe_results.bin", FLIPPER_SD_TMP_PATH);
+    if(!storage_file_open(file, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        storage_file_free(file);
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    ProbeStoreHeader header = {
+        .magic = PROBE_STORE_MAGIC,
+        .ssid_count = 0,
+        .client_count = 0,
+    };
+    storage_file_write(file, &header, sizeof(header));
+    storage_file_close(file);
+    storage_file_free(file);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    app->probe_results_on_sd = true;
+    app->probe_ssid_count = 0;
+    app->probe_client_count = 0;
+    app->probe_ssid_cache_valid = false;
+    app->probe_client_cache_valid = false;
+    return true;
+}
+
+static bool simple_app_probe_write_ssid(SimpleApp* app, size_t index, const ProbeSsidEntry* entry) {
+    if(!app || !entry) return false;
+    if(!app->probe_results_on_sd) return false;
+    if(index >= PROBE_MAX_SSIDS) return false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+
+    simple_app_sd_lock(app);
+    simple_app_ensure_flipper_sd_dirs(storage);
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/probe_results.bin", FLIPPER_SD_TMP_PATH);
+    if(!storage_file_open(file, path, FSAM_READ_WRITE, FSOM_OPEN_EXISTING)) {
+        storage_file_free(file);
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    size_t new_ssid_count = app->probe_ssid_count;
+    if(index + 1 > new_ssid_count) new_ssid_count = index + 1;
+    ProbeStoreHeader header = {
+        .magic = PROBE_STORE_MAGIC,
+        .ssid_count = (uint16_t)new_ssid_count,
+        .client_count = (uint16_t)app->probe_client_count,
+    };
+    storage_file_seek(file, 0, true);
+    storage_file_write(file, &header, sizeof(header));
+
+    size_t offset = sizeof(ProbeStoreHeader) + (index * sizeof(ProbeSsidEntry));
+    storage_file_seek(file, offset, true);
+    storage_file_write(file, entry, sizeof(ProbeSsidEntry));
+
+    storage_file_close(file);
+    storage_file_free(file);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    return true;
+}
+
+static bool simple_app_probe_write_client(
+    SimpleApp* app,
+    size_t index,
+    const SnifferClientEntry* entry) {
+    if(!app || !entry) return false;
+    if(!app->probe_results_on_sd) return false;
+    if(index >= PROBE_MAX_CLIENTS) return false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+
+    simple_app_sd_lock(app);
+    simple_app_ensure_flipper_sd_dirs(storage);
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/probe_results.bin", FLIPPER_SD_TMP_PATH);
+    if(!storage_file_open(file, path, FSAM_READ_WRITE, FSOM_OPEN_EXISTING)) {
+        storage_file_free(file);
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    size_t new_client_count = app->probe_client_count;
+    if(index + 1 > new_client_count) new_client_count = index + 1;
+    ProbeStoreHeader header = {
+        .magic = PROBE_STORE_MAGIC,
+        .ssid_count = (uint16_t)app->probe_ssid_count,
+        .client_count = (uint16_t)new_client_count,
+    };
+    storage_file_seek(file, 0, true);
+    storage_file_write(file, &header, sizeof(header));
+
+    size_t base = sizeof(ProbeStoreHeader) + (PROBE_MAX_SSIDS * sizeof(ProbeSsidEntry));
+    size_t offset = base + (index * sizeof(SnifferClientEntry));
+    storage_file_seek(file, offset, true);
+    storage_file_write(file, entry, sizeof(SnifferClientEntry));
+
+    storage_file_close(file);
+    storage_file_free(file);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    return true;
+}
+
+static bool simple_app_probe_read_ssid(SimpleApp* app, size_t index, ProbeSsidEntry* out) {
+    if(!app || !out) return false;
+    if(!app->probe_results_on_sd) return false;
+    if(index >= app->probe_ssid_count || index >= PROBE_MAX_SSIDS) return false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+
+    simple_app_sd_lock(app);
+    simple_app_ensure_flipper_sd_dirs(storage);
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/probe_results.bin", FLIPPER_SD_TMP_PATH);
+    if(!storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        storage_file_free(file);
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    size_t offset = sizeof(ProbeStoreHeader) + (index * sizeof(ProbeSsidEntry));
+    storage_file_seek(file, offset, true);
+    size_t read = storage_file_read(file, out, sizeof(ProbeSsidEntry));
+
+    storage_file_close(file);
+    storage_file_free(file);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    return read == sizeof(ProbeSsidEntry);
+}
+
+static bool simple_app_probe_read_client(SimpleApp* app, size_t index, SnifferClientEntry* out) {
+    if(!app || !out) return false;
+    if(!app->probe_results_on_sd) return false;
+    if(index >= app->probe_client_count || index >= PROBE_MAX_CLIENTS) return false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+
+    simple_app_sd_lock(app);
+    simple_app_ensure_flipper_sd_dirs(storage);
+
+    File* file = storage_file_alloc(storage);
+    if(!file) {
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/probe_results.bin", FLIPPER_SD_TMP_PATH);
+    if(!storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        storage_file_free(file);
+        simple_app_sd_unlock(app);
+        furi_record_close(RECORD_STORAGE);
+        return false;
+    }
+
+    size_t base = sizeof(ProbeStoreHeader) + (PROBE_MAX_SSIDS * sizeof(ProbeSsidEntry));
+    size_t offset = base + (index * sizeof(SnifferClientEntry));
+    storage_file_seek(file, offset, true);
+    size_t read = storage_file_read(file, out, sizeof(SnifferClientEntry));
+
+    storage_file_close(file);
+    storage_file_free(file);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    return read == sizeof(SnifferClientEntry);
+}
+
+static void simple_app_probe_drop_store(SimpleApp* app) {
+    if(!app) return;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) return;
+
+    simple_app_sd_lock(app);
+    char path[96];
+    snprintf(path, sizeof(path), "%s/probe_results.bin", FLIPPER_SD_TMP_PATH);
+    storage_simply_remove(storage, path);
+    simple_app_sd_unlock(app);
+    furi_record_close(RECORD_STORAGE);
+
+    app->probe_results_on_sd = false;
+    app->probe_ssid_cache_valid = false;
+    app->probe_client_cache_valid = false;
+}
+
+static const ProbeSsidEntry* simple_app_probe_get_ssid(SimpleApp* app, size_t index) {
+    if(!app) return NULL;
+    if(app->probe_ssids) {
+        if(index >= app->probe_ssid_count) return NULL;
+        return &app->probe_ssids[index];
+    }
+    if(app->probe_results_on_sd) {
+        if(app->probe_ssid_cache_valid && app->probe_ssid_cache_index == index) {
+            return &app->probe_ssid_cache;
+        }
+        if(simple_app_probe_read_ssid(app, index, &app->probe_ssid_cache)) {
+            app->probe_ssid_cache_index = index;
+            app->probe_ssid_cache_valid = true;
+            return &app->probe_ssid_cache;
+        }
+    }
+    return NULL;
+}
+
+static const SnifferClientEntry* simple_app_probe_get_client(SimpleApp* app, size_t index) {
+    if(!app) return NULL;
+    if(app->probe_clients) {
+        if(index >= app->probe_client_count) return NULL;
+        return &app->probe_clients[index];
+    }
+    if(app->probe_results_on_sd) {
+        if(app->probe_client_cache_valid && app->probe_client_cache_index == index) {
+            return &app->probe_client_cache;
+        }
+        if(simple_app_probe_read_client(app, index, &app->probe_client_cache)) {
+            app->probe_client_cache_index = index;
+            app->probe_client_cache_valid = true;
+            return &app->probe_client_cache;
+        }
+    }
+    return NULL;
+}
+
 
 static bool simple_app_alloc_package_monitor_buffers(SimpleApp* app) {
     if(!app) return false;
@@ -5746,6 +6756,7 @@ static void simple_app_free_channel_view_buffers(SimpleApp* app) {
 
 static void simple_app_prepare_scan_buffers(SimpleApp* app) {
     if(!app) return;
+    simple_app_scan_drop_store(app);
     simple_app_reset_passwords_listing(app);
     simple_app_reset_evil_twin_pass_listing(app);
     simple_app_reset_evil_twin_listing(app);
@@ -5762,6 +6773,7 @@ static void simple_app_prepare_scan_buffers(SimpleApp* app) {
 
 static void simple_app_prepare_password_buffers(SimpleApp* app) {
     if(!app) return;
+    simple_app_scan_drop_store(app);
     if(app->scan_results || app->scan_selected_numbers || app->visible_result_indices) {
         simple_app_scan_free_buffers(app);
         simple_app_reset_scan_results(app);
@@ -6739,7 +7751,7 @@ static uint8_t simple_app_parse_channel(const char* text) {
 }
 
 static const char* simple_app_vendor_cache_lookup(const SimpleApp* app, const uint8_t bssid[6]) {
-    if(!app || simple_app_bssid_is_empty(bssid)) return NULL;
+    if(!app || !app->vendor_cache || simple_app_bssid_is_empty(bssid)) return NULL;
     for(size_t i = 0; i < VENDOR_CACHE_SIZE; i++) {
         const VendorCacheEntry* entry = &app->vendor_cache[i];
         if(entry->valid && memcmp(entry->oui, bssid, 3) == 0) {
@@ -6751,6 +7763,7 @@ static const char* simple_app_vendor_cache_lookup(const SimpleApp* app, const ui
 
 static void simple_app_vendor_cache_update(SimpleApp* app, const uint8_t bssid[6], const char* vendor) {
     if(!app || simple_app_bssid_is_empty(bssid) || !vendor || vendor[0] == '\0') return;
+    if(!simple_app_ensure_vendor_cache(app)) return;
 
     size_t candidate = VENDOR_CACHE_SIZE;
     uint32_t oldest_tick = UINT32_MAX;
@@ -6813,11 +7826,12 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
     }
     if(expected_count > 0 && app->scan_result_count == 0 &&
        app->scan_results_capacity != expected_count) {
-        if(!simple_app_scan_alloc_buffers(app, expected_count)) {
+        if(!simple_app_scan_alloc_buffers(app, expected_count) ||
+           (!app->scan_results && !simple_app_scan_store_begin(app, expected_count))) {
             app->scan_results_loading = false;
             app->scanner_scan_running = false;
             app->scanner_rescan_hint = false;
-            simple_app_show_status_message(app, "OOM: scan buffers", 2000, true);
+            simple_app_show_status_message(app, "Scan storage\nunavailable", 2000, true);
             if(app->viewport) view_port_update(app->viewport);
             return;
         }
@@ -6854,7 +7868,29 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
     }
 
     if(cursor[0] != '"') return;
-    if(!app->scan_results || app->scan_results_capacity == 0) return;
+    bool buffers_ready = app->scan_results_capacity > 0 && app->scan_selected_numbers &&
+                         app->visible_result_indices;
+    size_t capacity = buffers_ready ? app->scan_results_capacity : SCAN_RESULTS_DEFAULT_CAPACITY;
+    if(!buffers_ready) {
+        if(!simple_app_scan_alloc_buffers(app, capacity)) {
+            app->scan_results_loading = false;
+            app->scanner_scan_running = false;
+            app->scanner_rescan_hint = false;
+            simple_app_show_status_message(app, "Scan storage\nunavailable", 2000, true);
+            if(app->viewport) view_port_update(app->viewport);
+            return;
+        }
+    }
+    if(!app->scan_results && !app->scan_results_on_sd) {
+        if(!simple_app_scan_store_begin(app, capacity)) {
+            app->scan_results_loading = false;
+            app->scanner_scan_running = false;
+            app->scanner_rescan_hint = false;
+            simple_app_show_status_message(app, "Scan storage\nunavailable", 2000, true);
+            if(app->viewport) view_port_update(app->viewport);
+            return;
+        }
+    }
     if(app->scan_result_count >= app->scan_results_capacity) return;
 
     char fields[8][SCAN_FIELD_BUFFER_LEN];
@@ -6867,20 +7903,20 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
 
     bool ssid_hidden = (fields[1][0] == '\0');
 
-    ScanResult* result = &app->scan_results[app->scan_result_count];
-    memset(result, 0, sizeof(ScanResult));
-    result->number = (uint16_t)strtoul(fields[0], NULL, 10);
-    simple_app_copy_field(result->ssid, sizeof(result->ssid), fields[1], SCAN_SSID_HIDDEN_LABEL);
-    simple_app_copy_field(result->security, sizeof(result->security), fields[5], "Unknown");
-    simple_app_parse_bssid(fields[3], result->bssid);
-    result->channel = simple_app_parse_channel(fields[4]);
-    result->band = simple_app_parse_band_value(fields[7]);
+    ScanResult result;
+    memset(&result, 0, sizeof(result));
+    result.number = (uint16_t)strtoul(fields[0], NULL, 10);
+    simple_app_copy_field(result.ssid, sizeof(result.ssid), fields[1], SCAN_SSID_HIDDEN_LABEL);
+    simple_app_copy_field(result.security, sizeof(result.security), fields[5], "Unknown");
+    simple_app_parse_bssid(fields[3], result.bssid);
+    result.channel = simple_app_parse_channel(fields[4]);
+    result.band = simple_app_parse_band_value(fields[7]);
 
     if(fields[2][0] != '\0') {
         char vendor_ascii[SCAN_VENDOR_MAX_LEN];
         simple_app_utf8_to_ascii_pl(fields[2], vendor_ascii, sizeof(vendor_ascii));
         simple_app_trim(vendor_ascii);
-        simple_app_vendor_cache_update(app, result->bssid, vendor_ascii);
+        simple_app_vendor_cache_update(app, result.bssid, vendor_ascii);
     }
 
     const char* power_str = fields[6];
@@ -6892,18 +7928,33 @@ static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
         } else if(power_value > SCAN_POWER_MAX_DBM) {
             power_value = SCAN_POWER_MAX_DBM;
         }
-        result->power_dbm = (int16_t)power_value;
-        result->power_valid = true;
+        result.power_dbm = (int16_t)power_value;
+        result.power_valid = true;
     } else {
-        result->power_dbm = 0;
-        result->power_valid = false;
+        result.power_dbm = 0;
+        result.power_valid = false;
     }
-    result->selected = false;
+    result.selected = false;
 
+    if(app->scan_results) {
+        app->scan_results[app->scan_result_count] = result;
+    } else if(!simple_app_scan_write_result(app, app->scan_result_count, &result)) {
+        app->scan_results_loading = false;
+        app->scanner_scan_running = false;
+        app->scanner_rescan_hint = false;
+        simple_app_show_status_message(app, "Scan storage\nwrite failed", 2000, true);
+        if(app->viewport) view_port_update(app->viewport);
+        return;
+    }
+
+    size_t stored_index = app->scan_result_count;
     app->scan_result_count++;
-    simple_app_update_scanner_stats(app, result, ssid_hidden);
+    simple_app_update_scanner_stats(app, &result, ssid_hidden);
     app->scanner_scan_running = app->scan_results_loading;
-    simple_app_rebuild_visible_results(app);
+    if(simple_app_result_is_visible(app, &result) &&
+       app->visible_result_count < app->scan_results_capacity) {
+        app->visible_result_indices[app->visible_result_count++] = (uint16_t)stored_index;
+    }
 
     if(app->screen == ScreenResults) {
         simple_app_adjust_result_offset(app);
@@ -7117,7 +8168,7 @@ static void simple_app_update_overlay_title_scroll(SimpleApp* app) {
     desired_title[0] = '\0';
 
     if(app->sniffer_results_active && !app->sniffer_full_console) {
-        if(!app->sniffer_aps || !app->sniffer_clients) return;
+        if(!app->sniffer_aps && !app->sniffer_results_on_sd) return;
         if(app->sniffer_ap_count == 0) {
             if(app->overlay_title_scroll_text[0] != '\0' || app->overlay_title_scroll_offset != 0) {
                 simple_app_reset_overlay_title_scroll(app);
@@ -7132,11 +8183,12 @@ static void simple_app_update_overlay_title_scroll(SimpleApp* app) {
         if(ap_index >= app->sniffer_ap_count) {
             ap_index = app->sniffer_ap_count - 1;
         }
-        const SnifferApEntry* ap = &app->sniffer_aps[ap_index];
+        const SnifferApEntry* ap = simple_app_sniffer_get_ap(app, ap_index);
+        if(!ap) return;
         const char* ssid = ap->ssid[0] ? ap->ssid : "<hidden>";
         snprintf(desired_title, sizeof(desired_title), "%s", ssid);
     } else if(app->probe_results_active && !app->probe_full_console) {
-        if(!app->probe_ssids || !app->probe_clients) return;
+        if(!app->probe_ssids && !app->probe_results_on_sd) return;
         if(app->probe_ssid_count == 0) {
             if(app->overlay_title_scroll_text[0] != '\0' || app->overlay_title_scroll_offset != 0) {
                 simple_app_reset_overlay_title_scroll(app);
@@ -7151,7 +8203,8 @@ static void simple_app_update_overlay_title_scroll(SimpleApp* app) {
         if(ssid_index >= app->probe_ssid_count) {
             ssid_index = app->probe_ssid_count - 1;
         }
-        const ProbeSsidEntry* ssid = &app->probe_ssids[ssid_index];
+        const ProbeSsidEntry* ssid = simple_app_probe_get_ssid(app, ssid_index);
+        if(!ssid) return;
         const char* ssid_text = ssid->ssid[0] ? ssid->ssid : "<hidden>";
         snprintf(desired_title, sizeof(desired_title), "%s", ssid_text);
     } else if(app->evil_twin_running && !app->evil_twin_full_console) {
@@ -7435,6 +8488,17 @@ static void simple_app_toggle_scan_selection(SimpleApp* app, ScanResult* result)
     simple_app_reset_result_scroll(app);
 }
 
+static void simple_app_toggle_scan_selection_sd(SimpleApp* app, size_t result_index) {
+    if(!app) return;
+    ScanResult result;
+    if(!simple_app_scan_read_result(app, result_index, &result)) return;
+    result.selected = !result.selected;
+    if(!simple_app_scan_write_result(app, result_index, &result)) return;
+    app->scan_result_cache_valid = false;
+    simple_app_update_selected_numbers(app, &result);
+    simple_app_reset_result_scroll(app);
+}
+
 static void simple_app_adjust_result_offset(SimpleApp* app) {
     if(!app) return;
 
@@ -7482,7 +8546,7 @@ static void simple_app_adjust_result_offset(SimpleApp* app) {
 }
 
 static size_t simple_app_trim_oldest_line(SimpleApp* app) {
-    if(!app || app->serial_len == 0) return 0;
+    if(!app || !app->serial_buffer || app->serial_len == 0) return 0;
     size_t drop = 0;
     size_t removed_lines = 0;
 
@@ -7536,6 +8600,7 @@ static size_t simple_app_count_display_lines(const char* buffer, size_t length) 
 
 static size_t simple_app_total_display_lines(SimpleApp* app) {
     if(!app->serial_mutex) return 0;
+    if(!app->serial_buffer) return 0;
     furi_mutex_acquire(app->serial_mutex, FuriWaitForever);
     size_t total = simple_app_count_display_lines(app->serial_buffer, app->serial_len);
     furi_mutex_release(app->serial_mutex);
@@ -7589,6 +8654,7 @@ static void simple_app_update_scroll(SimpleApp* app) {
 
 static void simple_app_reset_serial_log(SimpleApp* app, const char* status) {
     if(!app || !app->serial_mutex) return;
+    if(!simple_app_ensure_serial_buffer(app)) return;
     furi_mutex_acquire(app->serial_mutex, FuriWaitForever);
     int written = snprintf(
         app->serial_buffer,
@@ -7611,6 +8677,7 @@ static void simple_app_reset_serial_log(SimpleApp* app, const char* status) {
 
 static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, size_t length) {
     if(!app || !data || length == 0 || !app->serial_mutex) return;
+    if(!simple_app_ensure_serial_buffer(app)) return;
 
     bool trimmed_any = false;
 
@@ -8054,7 +9121,7 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
         if(app->scan_results || app->scan_selected_numbers || app->visible_result_indices) {
             if(app->scan_selected_count > 0 && app->scan_selected_numbers && app->scan_results) {
                 simple_app_compact_scan_results(app);
-            } else {
+            } else if(!app->scan_results_on_sd) {
                 simple_app_scan_free_buffers(app);
                 simple_app_reset_scan_results(app);
             }
@@ -8335,6 +9402,7 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     simple_app_karma_free_probes(app);
     simple_app_reset_karma_html_listing(app);
     simple_app_reset_scan_results(app);
+    simple_app_scan_drop_store(app);
     simple_app_scan_free_buffers(app);
     simple_app_reset_deauth_guard(app);
     app->deauth_view_active = false;
@@ -8353,6 +9421,7 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     app->probe_results_active = false;
     simple_app_reset_sniffer_status(app);
     simple_app_reset_sniffer_results(app);
+    simple_app_sniffer_drop_store(app);
     simple_app_reset_probe_results(app);
     simple_app_free_sniffer_buffers(app);
     simple_app_free_probe_buffers(app);
@@ -8384,6 +9453,8 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     app->evil_twin_popup_active = false;
     simple_app_free_hint_lines(app);
     simple_app_free_line_buffers(app);
+    simple_app_free_serial_buffer(app);
+    simple_app_free_vendor_cache(app);
 
     if(app->rx_stream) {
         furi_stream_buffer_reset(app->rx_stream);
@@ -8392,6 +9463,7 @@ static void simple_app_prepare_exit(SimpleApp* app) {
 
 static void simple_app_request_scan_results(SimpleApp* app, const char* command) {
     if(!app) return;
+    simple_app_scan_drop_store(app);
     simple_app_scan_free_buffers(app);
     if(!simple_app_scan_alloc_buffers(app, SCAN_RESULTS_DEFAULT_CAPACITY)) {
         simple_app_show_status_message(app, "OOM: scan buffers", 2000, true);
@@ -9510,7 +10582,7 @@ static size_t simple_app_hint_max_scroll(const SimpleApp* app) {
     return app->hint_line_count - HINT_VISIBLE_LINES;
 }
 
-static void simple_app_prepare_hint_lines(SimpleApp* app, const char* text) {
+static void __attribute__((unused)) simple_app_prepare_hint_lines(SimpleApp* app, const char* text) {
     if(!app) return;
     app->hint_line_count = 0;
     if(!text || !app->hint_lines) return;
@@ -9580,7 +10652,10 @@ static void simple_app_prepare_hint_lines(SimpleApp* app, const char* text) {
     }
 }
 
-static void simple_app_show_hint(SimpleApp* app, const char* title, const char* text) {
+static void __attribute__((unused)) simple_app_show_hint(
+    SimpleApp* app,
+    const char* title,
+    const char* text) {
     if(!app || !title || !text) return;
     if(!simple_app_alloc_hint_lines(app)) {
         simple_app_show_status_message(app, "OOM: hints", 1500, true);
@@ -9704,32 +10779,8 @@ static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas) {
 }
 
 static bool simple_app_try_show_hint(SimpleApp* app) {
-    if(!app) return false;
-    if(app->screen != ScreenMenu) return false;
-    if(app->section_index >= menu_section_count) return false;
-
-    const MenuSection* section = &menu_sections[app->section_index];
-
-    if(app->menu_state == MenuStateSections) {
-        if(!section->hint) return false;
-        simple_app_show_hint(app, section->title, section->hint);
-        return true;
-    }
-
-    if(section->entry_count == 0) {
-        if(!section->hint) return false;
-        simple_app_show_hint(app, section->title, section->hint);
-        return true;
-    }
-
-    if(app->item_index >= section->entry_count) return false;
-
-    const MenuEntry* entry = &section->entries[app->item_index];
-    const char* hint_text = entry->hint ? entry->hint : section->hint;
-    if(!hint_text) return false;
-
-    simple_app_show_hint(app, entry->label, hint_text);
-    return true;
+    UNUSED(app);
+    return false;
 }
 
 static void simple_app_draw_portal_menu(SimpleApp* app, Canvas* canvas) {
@@ -11909,13 +12960,6 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
 
     canvas_set_font(canvas, FontSecondary);
 
-    if(app->help_hint_visible) {
-        const uint8_t help_text_x = DISPLAY_WIDTH - 2;
-        const uint8_t help_text_y = 63;
-        canvas_draw_str_aligned(canvas, help_text_x, (int16_t)help_text_y - 8, AlignRight, AlignBottom, "Hold OK");
-        canvas_draw_str_aligned(canvas, help_text_x, help_text_y, AlignRight, AlignBottom, "for Help");
-    }
-
     if(simple_app_status_message_is_active(app) && !app->status_message_fullscreen) {
         canvas_draw_str(canvas, 2, 52, app->status_message);
     }
@@ -12032,6 +13076,7 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
 static size_t simple_app_render_display_lines(SimpleApp* app, size_t skip_lines, char dest[][64], size_t max_lines) {
     memset(dest, 0, max_lines * 64);
     if(!app->serial_mutex) return 0;
+    if(!app->serial_buffer) return 0;
 
     furi_mutex_acquire(app->serial_mutex, FuriWaitForever);
     const char* buffer = app->serial_buffer;
@@ -12339,7 +13384,8 @@ static void simple_app_draw_deauth_overlay(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str_aligned(
         canvas, DISPLAY_WIDTH - 2, 12, AlignRight, AlignBottom, header_right);
 
-    if(app->scan_selected_count == 0 || !app->scan_selected_numbers || !app->scan_results) {
+    if(app->scan_selected_count == 0 || !app->scan_selected_numbers ||
+       (!app->scan_results && !app->scan_results_on_sd)) {
         canvas_draw_str_aligned(
             canvas, DISPLAY_WIDTH / 2, 36, AlignCenter, AlignCenter, "No target list");
         return;
@@ -12985,7 +14031,7 @@ static void simple_app_draw_sniffer_overlay(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas) return;
-    if(!app->sniffer_aps || !app->sniffer_clients) {
+    if(!app->sniffer_aps && !app->sniffer_results_on_sd) {
         canvas_set_color(canvas, ColorBlack);
         canvas_set_font(canvas, FontSecondary);
         canvas_draw_str_aligned(
@@ -13023,7 +14069,11 @@ static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canv
         return;
     }
 
-    const SnifferApEntry* ap = &app->sniffer_aps[app->sniffer_results_ap_index];
+    const SnifferApEntry* ap = simple_app_sniffer_get_ap(app, app->sniffer_results_ap_index);
+    if(!ap) {
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 36, AlignCenter, AlignCenter, "No data");
+        return;
+    }
     canvas_set_font(canvas, FontPrimary);
     char computed_title[64];
     snprintf(computed_title, sizeof(computed_title), "%s", ap->ssid[0] ? ap->ssid : "<hidden>");
@@ -13063,9 +14113,9 @@ static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canv
     if(app->scanner_show_vendor && ap->client_count > 0) {
         size_t idx = ap->client_start + app->sniffer_results_client_offset;
         if(idx < ap->client_start + ap->client_count && idx < SNIFFER_MAX_CLIENTS) {
-            const SnifferClientEntry* client = &app->sniffer_clients[idx];
+            const SnifferClientEntry* client = simple_app_sniffer_get_client(app, idx);
             uint8_t mac_bytes[6];
-            if(simple_app_parse_mac_bytes(client->mac, mac_bytes)) {
+            if(client && simple_app_parse_mac_bytes(client->mac, mac_bytes)) {
                 vendor_name = simple_app_vendor_cache_lookup(app, mac_bytes);
                 vendor_visible = (vendor_name && vendor_name[0] != '\0');
             }
@@ -13106,7 +14156,8 @@ static void simple_app_draw_sniffer_results_overlay(SimpleApp* app, Canvas* canv
     uint8_t y = list_top;
     for(size_t idx = first; idx < last_possible && lines_drawn < max_lines; idx++) {
         if(idx >= SNIFFER_MAX_CLIENTS) break;
-        const SnifferClientEntry* client = &app->sniffer_clients[idx];
+        const SnifferClientEntry* client = simple_app_sniffer_get_client(app, idx);
+        if(!client) break;
         char line[24];
         bool selected = simple_app_sniffer_station_is_selected(app, client->mac);
         snprintf(line, sizeof(line), "%c %s", selected ? '*' : ' ', client->mac);
@@ -13168,7 +14219,7 @@ static void simple_app_draw_bt_scan_overlay(SimpleApp* app, Canvas* canvas) {
 
 static void simple_app_draw_probe_results_overlay(SimpleApp* app, Canvas* canvas) {
     if(!app || !canvas) return;
-    if(!app->probe_ssids || !app->probe_clients) {
+    if(!app->probe_ssids && !app->probe_results_on_sd) {
         canvas_set_color(canvas, ColorBlack);
         canvas_set_font(canvas, FontSecondary);
         canvas_draw_str_aligned(
@@ -13200,7 +14251,11 @@ static void simple_app_draw_probe_results_overlay(SimpleApp* app, Canvas* canvas
         return;
     }
 
-    const ProbeSsidEntry* ssid = &app->probe_ssids[app->probe_ssid_index];
+    const ProbeSsidEntry* ssid = simple_app_probe_get_ssid(app, app->probe_ssid_index);
+    if(!ssid) {
+        canvas_draw_str_aligned(canvas, DISPLAY_WIDTH / 2, 36, AlignCenter, AlignCenter, "No data");
+        return;
+    }
     canvas_set_font(canvas, FontPrimary);
     char computed_title[64];
     snprintf(computed_title, sizeof(computed_title), "%s", ssid->ssid[0] ? ssid->ssid : "<hidden>");
@@ -13262,7 +14317,8 @@ static void simple_app_draw_probe_results_overlay(SimpleApp* app, Canvas* canvas
     uint8_t y = list_top;
     for(size_t idx = first; idx < last_possible && lines_drawn < max_lines; idx++) {
         if(idx >= PROBE_MAX_CLIENTS) break;
-        const SnifferClientEntry* client = &app->probe_clients[idx];
+        const SnifferClientEntry* client = simple_app_probe_get_client(app, idx);
+        if(!client) break;
         canvas_draw_str(canvas, 6, y, client->mac);
         y += SERIAL_TEXT_LINE_HEIGHT;
         lines_drawn++;
@@ -17345,7 +18401,7 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
     }
 
     if(app->probe_results_active) {
-        if(!app->probe_ssids || !app->probe_clients) {
+        if(!app->probe_ssids && !app->probe_results_on_sd) {
             return;
         }
         if(key == InputKeyBack) {
@@ -17378,7 +18434,8 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
             return;
         }
         if(!app->probe_full_console && app->probe_ssid_count > 0) {
-            ProbeSsidEntry* ssid = &app->probe_ssids[app->probe_ssid_index];
+            const ProbeSsidEntry* ssid = simple_app_probe_get_ssid(app, app->probe_ssid_index);
+            if(!ssid) return;
             uint8_t list_top = 54;
             uint8_t list_bottom = DISPLAY_HEIGHT - 8;
             uint8_t max_lines = (uint8_t)(
@@ -17412,14 +18469,16 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
     }
 
     if(app->sniffer_results_active && !app->sniffer_full_console) {
-        if(!app->sniffer_aps || !app->sniffer_clients) {
+        if(!app->sniffer_aps && !app->sniffer_results_on_sd) {
             return;
         }
         size_t ap_count = app->sniffer_ap_count;
         if(ap_count == 0) {
             return;
         }
-        SnifferApEntry* ap = &app->sniffer_aps[app->sniffer_results_ap_index];
+        const SnifferApEntry* ap =
+            simple_app_sniffer_get_ap(app, app->sniffer_results_ap_index);
+        if(!ap) return;
         uint8_t list_top = 54;
         uint8_t list_bottom = DISPLAY_HEIGHT - 8;
         uint8_t max_lines =
@@ -17429,7 +18488,10 @@ static void simple_app_handle_serial_input(SimpleApp* app, InputKey key) {
         if(ap->client_count > 0) {
             size_t idx = ap->client_start + app->sniffer_results_client_offset;
             if(idx < ap->client_start + ap->client_count && idx < SNIFFER_MAX_CLIENTS) {
-                current_mac = app->sniffer_clients[idx].mac;
+                const SnifferClientEntry* client = simple_app_sniffer_get_client(app, idx);
+                if(client) {
+                    current_mac = client->mac;
+                }
             }
         }
 
@@ -17680,16 +18742,26 @@ static void simple_app_handle_results_input(SimpleApp* app, InputKey key) {
         }
     } else if(key == InputKeyOk) {
         if(app->scan_result_index < app->visible_result_count) {
-            ScanResult* result = simple_app_visible_result(app, app->scan_result_index);
-            if(result) {
-                simple_app_toggle_scan_selection(app, result);
-                simple_app_adjust_result_offset(app);
-                view_port_update(app->viewport);
+            uint16_t actual_index = app->visible_result_indices[app->scan_result_index];
+            if(app->scan_results) {
+                ScanResult* result = simple_app_visible_result(app, app->scan_result_index);
+                if(result) {
+                    simple_app_toggle_scan_selection(app, result);
+                }
+            } else if(app->scan_results_on_sd) {
+                simple_app_toggle_scan_selection_sd(app, actual_index);
             }
+            simple_app_adjust_result_offset(app);
+            view_port_update(app->viewport);
         }
     } else if(key == InputKeyRight) {
         if(app->scan_selected_count > 0) {
-            simple_app_compact_scan_results(app);
+            if(app->scan_results) {
+                simple_app_compact_scan_results(app);
+                simple_app_scan_store(app);
+                simple_app_scan_free_buffers(app);
+                simple_app_reset_scan_results(app);
+            }
             app->screen = ScreenMenu;
             app->menu_state = MenuStateItems;
             app->section_index = MENU_SECTION_ATTACKS;
@@ -18232,6 +19304,11 @@ int32_t Lab_C5_app(void* p) {
         return 0;
     }
     memset(app, 0, sizeof(SimpleApp));
+    if(!simple_app_ensure_serial_buffer(app)) {
+        free(app);
+        simple_app_show_low_memory(free_heap, SERIAL_BUFFER_SIZE);
+        return 0;
+    }
     app->heap_start_free = memmgr_get_free_heap();
     FURI_LOG_I(
         TAG,
@@ -18249,6 +19326,7 @@ int32_t Lab_C5_app(void* p) {
     app->scanner_show_power = true;
     app->scanner_show_band = true;
     app->scanner_show_vendor = false;
+    simple_app_ensure_vendor_cache(app);
     app->vendor_scan_enabled = false;
     app->vendor_read_pending = false;
     app->vendor_read_length = 0;
@@ -18346,6 +19424,12 @@ int32_t Lab_C5_app(void* p) {
         furi_hal_serial_control_release(app->serial);
         free(app);
         return 0;
+    }
+
+    app->sd_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    if(!app->sd_mutex) {
+        // SD ops are serialized by the main loop anyway; proceed without a lock.
+        app->sd_mutex = NULL;
     }
 
     app->rx_stream = furi_stream_buffer_alloc(UART_STREAM_SIZE, 1);
@@ -18456,33 +19540,12 @@ int32_t Lab_C5_app(void* p) {
             }
         }
 
-        bool previous_help_hint = app->help_hint_visible;
-        bool can_show_help_hint = (app->screen == ScreenMenu) && (app->menu_state == MenuStateSections) &&
-                                  !app->hint_active && !app->evil_twin_popup_active &&
-                                  !app->portal_ssid_popup_active && !app->sd_folder_popup_active &&
-                                  !app->sd_file_popup_active && !app->sd_delete_confirm_active &&
-                                  !simple_app_status_message_is_active(app);
-
-        if(app->exit_confirm_active) {
-            uint32_t now = furi_get_tick();
-            if(now - app->exit_confirm_tick >= furi_ms_to_ticks(2000)) {
-                app->exit_confirm_active = false;
-            }
+    if(app->exit_confirm_active) {
+        uint32_t now = furi_get_tick();
+        if(now - app->exit_confirm_tick >= furi_ms_to_ticks(2000)) {
+            app->exit_confirm_active = false;
         }
-
-        if(can_show_help_hint) {
-            uint32_t now = furi_get_tick();
-            if(!app->help_hint_visible &&
-               (now - app->last_input_tick) >= furi_ms_to_ticks(HELP_HINT_IDLE_MS)) {
-                app->help_hint_visible = true;
-            }
-        } else {
-            app->help_hint_visible = false;
-        }
-
-        if(app->help_hint_visible != previous_help_hint && app->viewport) {
-            view_port_update(app->viewport);
-        }
+    }
 
         furi_delay_ms(20);
     }
@@ -18520,6 +19583,10 @@ int32_t Lab_C5_app(void* p) {
     furi_hal_serial_deinit(app->serial);
     furi_hal_serial_control_release(app->serial);
     furi_mutex_free(app->serial_mutex);
+    if(app->sd_mutex) {
+        furi_mutex_free(app->sd_mutex);
+        app->sd_mutex = NULL;
+    }
     FURI_LOG_I(
         TAG,
         "Heap after mutex free:%lu min:%lu",
