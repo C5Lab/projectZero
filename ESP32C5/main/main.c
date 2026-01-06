@@ -540,6 +540,7 @@ static wifi_ap_record_t g_scan_results[MAX_AP_CNT];
 static uint16_t g_scan_count = 0;
 static volatile bool g_scan_in_progress = false;
 static volatile bool g_scan_done = false;
+static volatile bool g_scan_quiet_once = false;
 static volatile uint32_t g_last_scan_status = 1; // 0 => success, non-zero => failure/unknown
 static int64_t g_scan_start_time_us = 0;
 
@@ -824,11 +825,25 @@ static bool vendor_last_valid = false;
 static bool vendor_last_hit = false;
 static bool vendor_lookup_enabled = true;
 static size_t vendor_record_count = 0;
+static bool g_api_mode = false;
+
+#define API_MAGIC_1 0xA5
+#define API_MAGIC_2 0x5A
+#define API_VERSION 1
+
+typedef enum {
+    API_MSG_HELLO = 0x01,
+    API_MSG_SCAN_SUMMARY = 0x10,
+    API_MSG_SCAN_ROW = 0x11,
+    API_MSG_SCAN_END = 0x12,
+} api_msg_type_t;
 
 
 // Methods forward declarations
 static int cmd_scan_networks(int argc, char **argv);
 static int cmd_show_scan_results(int argc, char **argv);
+static int cmd_scan_results_page(int argc, char **argv);
+static int cmd_scan_networks_quiet(int argc, char **argv);
 static int cmd_select_networks(int argc, char **argv);
 static int cmd_unselect_networks(int argc, char **argv);
 static int cmd_select_stations(int argc, char **argv);
@@ -865,8 +880,31 @@ static int cmd_led(int argc, char **argv);
 static int cmd_vendor(int argc, char **argv);
 static int cmd_download(int argc, char **argv);
 static int cmd_channel_time(int argc, char **argv);
+static int cmd_api(int argc, char **argv);
 static esp_err_t start_background_scan(uint32_t min_time, uint32_t max_time);
 static void print_scan_results(void);
+static void print_scan_results_page(uint16_t offset, uint16_t limit);
+static void print_scan_summary_only(void);
+static void api_send_frame(uint8_t type, const uint8_t* payload, uint8_t len);
+static void api_send_hello(void);
+static void api_send_scan_summary(uint16_t total,
+                                  uint16_t offset,
+                                  uint16_t count,
+                                  uint16_t band24,
+                                  uint16_t band5,
+                                  uint16_t open_count,
+                                  uint16_t hidden_count,
+                                  int16_t best_rssi,
+                                  const char* best_ssid);
+static void api_send_scan_row(uint16_t number,
+                              const uint8_t bssid[6],
+                              uint8_t channel,
+                              uint8_t auth_code,
+                              int8_t rssi,
+                              uint8_t band,
+                              const char* ssid,
+                              const char* vendor);
+static void api_send_scan_end(uint8_t status);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
 // Target BSSID management functions
 static void save_target_bssids(void);
@@ -1136,7 +1174,8 @@ static void wifi_event_handler(void *event_handler_arg,
         }
         case WIFI_EVENT_SCAN_DONE: {
             const wifi_event_sta_scan_done_t *e = (const wifi_event_sta_scan_done_t *)event_data;
-            bool suppress_scan_logs = periodic_rescan_in_progress || wardrive_active || channel_view_scan_mode;
+            bool suppress_scan_logs =
+                periodic_rescan_in_progress || wardrive_active || channel_view_scan_mode || g_scan_quiet_once;
 
             if (!suppress_scan_logs) {
                 MY_LOG_INFO(TAG, "WiFi scan completed. Found %u networks, status: %" PRIu32, e->number, e->status);
@@ -1157,19 +1196,24 @@ static void wifi_event_handler(void *event_handler_arg,
                     }
                     
                     // Automatically display scan results after completion
-                    if (g_scan_count > 0 && !sniffer_active) {
+                    if (g_scan_count > 0 && !sniffer_active && !g_scan_quiet_once) {
                         print_scan_results();
                     }
                 }
-            } else {
-                if (!suppress_scan_logs) {
-                    MY_LOG_INFO(TAG, "Scan failed with status: %" PRIu32, e->status);
-                }
-                g_scan_count = 0;
-            }
-            
-            g_scan_done = true;
+              } else {
+                  if (!suppress_scan_logs) {
+                      MY_LOG_INFO(TAG, "Scan failed with status: %" PRIu32, e->status);
+                  }
+                  g_scan_count = 0;
+              }
+
+              if(g_scan_quiet_once) {
+                  print_scan_summary_only();
+              }
+              
+              g_scan_done = true;
             g_scan_in_progress = false;
+            g_scan_quiet_once = false;
             
             // Only reset applicationState to IDLE if not in active attack mode
             if (applicationState != DEAUTH && applicationState != DEAUTH_EVIL_TWIN && applicationState != EVIL_TWIN_PASS_CHECK) {
@@ -2244,6 +2288,146 @@ static void print_scan_results(void) {
     MY_LOG_INFO(TAG, "Scan results printed.");
 }
 
+static void scan_sanitize_field(const char* src, char* dst, size_t dst_size) {
+    if(!dst || dst_size == 0) return;
+    dst[0] = '\0';
+    if(!src) return;
+    size_t j = 0;
+    for(size_t i = 0; src[i] != '\0' && j + 1 < dst_size; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if(c < 0x20 || c == '|' || c == '\r' || c == '\n') {
+            continue;
+        }
+        if(c > 0x7E) {
+            continue;
+        }
+        dst[j++] = (char)c;
+    }
+    dst[j] = '\0';
+}
+
+static void print_scan_results_page(uint16_t offset, uint16_t limit) {
+    uint16_t total = g_scan_count;
+    if(offset > total) {
+        offset = total;
+    }
+    if(limit == 0) {
+        limit = 16;
+    }
+    uint16_t count = (offset < total) ? (uint16_t)((total - offset) < limit ? (total - offset) : limit) : 0;
+
+    uint16_t band24 = 0;
+    uint16_t band5 = 0;
+    uint16_t open_count = 0;
+    uint16_t hidden_count = 0;
+    int best_rssi = -1000;
+    char best_ssid_raw[MAX_SSID_NAME_LEN + 1];
+    best_ssid_raw[0] = '\0';
+
+    for(uint16_t i = 0; i < total; i++) {
+        const wifi_ap_record_t* ap = &g_scan_results[i];
+        if(ap->primary <= 14) {
+            band24++;
+        } else {
+            band5++;
+        }
+        if(ap->ssid[0] == '\0') {
+            hidden_count++;
+        }
+        if(ap->authmode == WIFI_AUTH_OPEN) {
+            open_count++;
+        }
+        if(ap->rssi > best_rssi) {
+            best_rssi = ap->rssi;
+            strncpy(best_ssid_raw, (const char*)ap->ssid, sizeof(best_ssid_raw) - 1);
+            best_ssid_raw[sizeof(best_ssid_raw) - 1] = '\0';
+        }
+    }
+
+    char best_ssid[MAX_SSID_NAME_LEN + 1];
+    scan_sanitize_field(best_ssid_raw, best_ssid, sizeof(best_ssid));
+
+    MY_LOG_INFO(TAG, "SRH|%u|%u|%u|%u|%u|%u|%u|%d|%s",
+                (unsigned)total,
+                (unsigned)offset,
+                (unsigned)count,
+                (unsigned)band24,
+                (unsigned)band5,
+                (unsigned)open_count,
+                (unsigned)hidden_count,
+                best_rssi,
+                best_ssid);
+
+    for(uint16_t i = 0; i < count; i++) {
+        uint16_t idx = (uint16_t)(offset + i);
+        const wifi_ap_record_t* ap = &g_scan_results[idx];
+        const char* vendor_name = vendor_is_enabled() ? lookup_vendor_name(ap->bssid) : NULL;
+        char ssid[64];
+        char vendor[64];
+        scan_sanitize_field((const char*)ap->ssid, ssid, sizeof(ssid));
+        scan_sanitize_field(vendor_name ? vendor_name : "", vendor, sizeof(vendor));
+        const char* band = (ap->primary <= 14) ? "2.4" : "5";
+
+        MY_LOG_INFO(TAG,
+                    "SR|%u|%s|%s|%02X:%02X:%02X:%02X:%02X:%02X|%u|%s|%d|%s",
+                    (unsigned)(idx + 1),
+                    ssid,
+                    vendor,
+                    ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                    ap->bssid[3], ap->bssid[4], ap->bssid[5],
+                    (unsigned)ap->primary,
+                    authmode_to_string(ap->authmode),
+                    ap->rssi,
+                    band);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    MY_LOG_INFO(TAG, "SRE|OK");
+}
+
+static void print_scan_summary_only(void) {
+    uint16_t total = g_scan_count;
+    uint16_t band24 = 0;
+    uint16_t band5 = 0;
+    uint16_t open_count = 0;
+    uint16_t hidden_count = 0;
+    int best_rssi = -1000;
+    char best_ssid_raw[MAX_SSID_NAME_LEN + 1];
+    best_ssid_raw[0] = '\0';
+
+    for(uint16_t i = 0; i < total; i++) {
+        const wifi_ap_record_t* ap = &g_scan_results[i];
+        if(ap->primary <= 14) {
+            band24++;
+        } else {
+            band5++;
+        }
+        if(ap->ssid[0] == '\0') {
+            hidden_count++;
+        }
+        if(ap->authmode == WIFI_AUTH_OPEN) {
+            open_count++;
+        }
+        if(ap->rssi > best_rssi) {
+            best_rssi = ap->rssi;
+            strncpy(best_ssid_raw, (const char*)ap->ssid, sizeof(best_ssid_raw) - 1);
+            best_ssid_raw[sizeof(best_ssid_raw) - 1] = '\0';
+        }
+    }
+
+    char best_ssid[MAX_SSID_NAME_LEN + 1];
+    scan_sanitize_field(best_ssid_raw, best_ssid, sizeof(best_ssid));
+
+    MY_LOG_INFO(TAG, "SRH|%u|0|0|%u|%u|%u|%u|%d|%s",
+                (unsigned)total,
+                (unsigned)band24,
+                (unsigned)band5,
+                (unsigned)open_count,
+                (unsigned)hidden_count,
+                best_rssi,
+                best_ssid);
+    MY_LOG_INFO(TAG, "SRE|OK");
+}
+
 // --- CLI: commands ---
 static int cmd_scan_networks(int argc, char **argv) {
     (void)argc; (void)argv;
@@ -2291,6 +2475,13 @@ static int cmd_scan_networks(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_scan_networks_quiet(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    g_scan_quiet_once = true;
+    return cmd_scan_networks(0, NULL);
+}
+
 static int cmd_show_scan_results(int argc, char **argv) {
     (void)argc; (void)argv;
     
@@ -2314,6 +2505,41 @@ static int cmd_show_scan_results(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_scan_results_page(int argc, char **argv) {
+    uint16_t offset = 0;
+    uint16_t limit = 16;
+
+    if(argc >= 2) {
+        int value = atoi(argv[1]);
+        if(value > 0) {
+            offset = (uint16_t)value;
+        }
+    }
+    if(argc >= 3) {
+        int value = atoi(argv[2]);
+        if(value > 0) {
+            limit = (uint16_t)value;
+        }
+    }
+
+    if(g_scan_in_progress) {
+        MY_LOG_INFO(TAG, "SRE|ERR|IN_PROGRESS");
+        return 0;
+    }
+    if(!g_scan_done) {
+        MY_LOG_INFO(TAG, "SRE|ERR|NO_SCAN");
+        return 0;
+    }
+    if(g_scan_count == 0) {
+        MY_LOG_INFO(TAG, "SRH|0|%u|0|0|0|0|0|0|",
+                    (unsigned)offset);
+        MY_LOG_INFO(TAG, "SRE|OK");
+        return 0;
+    }
+
+    print_scan_results_page(offset, limit);
+    return 0;
+}
 static int cmd_select_networks(int argc, char **argv) {
     if (argc < 2) {
         ESP_LOGW(TAG,"Syntax: select_networks <index1> [index2] ...");
@@ -7669,6 +7895,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&scan_cmd));
 
+    const esp_console_cmd_t scan_quiet_cmd = {
+        .command = "scan_networks_quiet",
+        .help = "Starts background network scan without auto output",
+        .hint = NULL,
+        .func = &cmd_scan_networks_quiet,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&scan_quiet_cmd));
+
     const esp_console_cmd_t show_scan_cmd = {
         .command = "show_scan_results",
         .help = "Shows results from last network scan",
@@ -7677,6 +7912,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&show_scan_cmd));
+
+    const esp_console_cmd_t scan_page_cmd = {
+        .command = "scan_results_page",
+        .help = "Paged scan results: scan_results_page <offset> <limit>",
+        .hint = NULL,
+        .func = &cmd_scan_results_page,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&scan_page_cmd));
     
 
     const esp_console_cmd_t sniffer_cmd = {
@@ -8204,6 +8448,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  scan_airtag");
       MY_LOG_INFO(TAG,"  scan_bt");
       MY_LOG_INFO(TAG,"  scan_networks");
+      MY_LOG_INFO(TAG,"  scan_networks_quiet");
       MY_LOG_INFO(TAG,"  select_html <index>");
       MY_LOG_INFO(TAG,"  select_networks <index1> [index2] ...");
       MY_LOG_INFO(TAG,"  unselect_networks");
@@ -8211,6 +8456,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  unselect_stations");
       MY_LOG_INFO(TAG,"  show_probes");
       MY_LOG_INFO(TAG,"  show_scan_results");
+      MY_LOG_INFO(TAG,"  scan_results_page <offset> <limit>");
       MY_LOG_INFO(TAG,"  show_sniffer_results");
       MY_LOG_INFO(TAG,"  clear_sniffer_results");
       MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
