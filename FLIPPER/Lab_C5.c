@@ -254,10 +254,6 @@ static const char* boot_command_options[BOOT_COMMAND_OPTION_COUNT] = {
     "start_wardrive",
 };
 
-#define HINT_MAX_LINES 16
-#define HINT_VISIBLE_LINES 3
-#define HINT_LINE_CHAR_LIMIT 48
-#define HINT_WRAP_LIMIT 21
 #define HINT_LINE_HEIGHT 12
 #define EVIL_TWIN_MAX_HTML_FILES 16
 #define EVIL_TWIN_HTML_NAME_MAX 32
@@ -293,7 +289,6 @@ static const char* boot_command_options[BOOT_COMMAND_OPTION_COUNT] = {
 #define KARMA_SNIFFER_DURATION_MAX_SEC 180
 #define KARMA_SNIFFER_DURATION_STEP 5
 #define KARMA_AUTO_LIST_DELAY_MS 500
-#define HELP_HINT_IDLE_MS 3000
 #define DOUBLE_BACK_EXIT_MS 700
 #define SD_MANAGER_MAX_FILES 24
 #define SD_MANAGER_FILE_NAME_MAX 64
@@ -863,6 +858,8 @@ typedef struct {
     size_t scan_result_offset;
     uint16_t* scan_selected_numbers;
     size_t scan_selected_count;
+    uint16_t scan_selected_primary;
+    bool scan_selected_primary_valid;
     bool scan_results_loading;
     bool scan_results_on_sd;
     ScanResult scan_result_cache;
@@ -940,11 +937,6 @@ typedef struct {
     uint8_t overlay_title_scroll_hold;
     uint32_t overlay_title_scroll_last_tick;
     char overlay_title_scroll_text[64];
-    bool hint_active;
-    char hint_title[24];
-    char (*hint_lines)[HINT_LINE_CHAR_LIMIT];
-    size_t hint_line_count;
-    size_t hint_scroll;
     NotificationApp* notifications;
     bool backlight_notification_enforced;
     bool config_dirty;
@@ -962,7 +954,6 @@ typedef struct {
     uint32_t last_input_tick;
     uint32_t last_back_tick;
     uint32_t usb_guard_last_tick;
-    bool help_hint_visible;
     bool package_monitor_active;
     uint8_t package_monitor_channel;
     uint16_t* package_monitor_history;
@@ -1015,6 +1006,7 @@ static void simple_app_free_serial_buffer(SimpleApp* app) {
     free(app->serial_buffer);
     app->serial_buffer = NULL;
 }
+
 static void simple_app_reset_result_scroll(SimpleApp* app);
 static void simple_app_update_result_scroll(SimpleApp* app);
 static void simple_app_reset_overlay_title_scroll(SimpleApp* app);
@@ -1037,8 +1029,6 @@ static bool simple_app_alloc_sniffer_buffers(SimpleApp* app);
 static void simple_app_free_sniffer_buffers(SimpleApp* app);
 static bool simple_app_alloc_probe_buffers(SimpleApp* app);
 static void simple_app_free_probe_buffers(SimpleApp* app);
-static bool simple_app_alloc_hint_lines(SimpleApp* app);
-static void simple_app_free_hint_lines(SimpleApp* app);
 static void simple_app_free_line_buffers(SimpleApp* app);
 static uint8_t simple_app_parse_band_value(const char* band_field);
 static const char* simple_app_band_label(uint8_t band);
@@ -1117,17 +1107,11 @@ static bool simple_app_is_start_sniffer_noscan_command(const char* command);
 static void simple_app_send_start_sniffer(SimpleApp* app);
 static void simple_app_send_resume_sniffer(SimpleApp* app);
 static void simple_app_send_command(SimpleApp* app, const char* command, bool go_to_serial);
+static void simple_app_activate_serial_log(SimpleApp* app, const char* status);
 static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, size_t length);
 static void simple_app_draw_wardrive_serial(SimpleApp* app, Canvas* canvas);
 static void simple_app_draw_gps(SimpleApp* app, Canvas* canvas);
 static void simple_app_mark_config_dirty(SimpleApp* app);
-static void simple_app_show_hint(SimpleApp* app, const char* title, const char* text);
-static void simple_app_hide_hint(SimpleApp* app);
-static void simple_app_handle_hint_event(SimpleApp* app, const InputEvent* event);
-static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas);
-static void simple_app_prepare_hint_lines(SimpleApp* app, const char* text);
-static void simple_app_hint_scroll(SimpleApp* app, int delta);
-static size_t simple_app_hint_max_scroll(const SimpleApp* app);
 static void simple_app_package_monitor_enter(SimpleApp* app);
 static void simple_app_package_monitor_start(SimpleApp* app, uint8_t channel, bool reset_history);
 static void simple_app_package_monitor_stop(SimpleApp* app);
@@ -1193,7 +1177,6 @@ static size_t simple_app_channel_view_visible_columns(ChannelViewBand band);
 static uint8_t simple_app_channel_view_max_offset(ChannelViewBand band);
 static uint8_t* simple_app_channel_view_offset_ptr(SimpleApp* app, ChannelViewBand band);
 static bool simple_app_channel_view_adjust_offset(SimpleApp* app, ChannelViewBand band, int delta);
-static bool simple_app_try_show_hint(SimpleApp* app);
 static void simple_app_draw_portal_menu(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key);
 static void simple_app_reset_portal_ssid_listing(SimpleApp* app);
@@ -1369,12 +1352,10 @@ typedef struct {
     const char* label;
     const char* command;
     MenuAction action;
-    const char* hint_id;
 } MenuEntry;
 
 typedef struct {
     const char* title;
-    const char* hint_id;
     const MenuEntry* entries;
     size_t entry_count;
     uint8_t display_y;
@@ -1386,49 +1367,6 @@ static const uint8_t image_icon_0_bits[] = {
     0x1d, 0x03, 0x71, 0x03, 0x1f, 0x03, 0xff, 0x03, 0xff, 0x03,
 };
 
-static const char hint_section_scanner[] = "section_scanner";
-static const char hint_section_sniffers[] = "section_sniffers";
-static const char hint_section_attacks[] = "section_attacks";
-static const char hint_section_monitoring[] = "section_monitoring";
-static const char hint_section_bluetooth[] = "section_bluetooth";
-static const char hint_section_setup[] = "section_setup";
-
-static const char hint_sniffer_start[] = "sniffer_start";
-static const char hint_sniffer_results[] = "sniffer_results";
-static const char hint_sniffer_probes[] = "sniffer_probes";
-static const char hint_sniffer_resume[] = "sniffer_resume";
-static const char hint_sniffer_debug[] = "sniffer_debug";
-
-static const char hint_attack_blackout[] = "attack_blackout";
-static const char hint_attack_deauth[] = "attack_deauth";
-static const char hint_attack_deauth_guard[] = "attack_deauth_guard";
-static const char hint_attack_handshaker[] = "attack_handshaker";
-static const char hint_attack_evil_twin[] = "attack_evil_twin";
-static const char hint_attack_portal[] = "attack_portal";
-static const char hint_attack_karma[] = "attack_karma";
-static const char hint_attack_sae_overflow[] = "attack_sae_overflow";
-static const char hint_attack_sniffer_dog[] = "attack_sniffer_dog";
-static const char hint_attack_wardrive[] = "attack_wardrive";
-static const char hint_bluetooth_airtag[] = "bluetooth_airtag";
-static const char hint_bluetooth_scan[] = "bluetooth_scan";
-static const char hint_bluetooth_locator[] = "bluetooth_locator";
-
-static const char hint_setup_backlight[] = "setup_backlight";
-static const char hint_setup_otg[] = "setup_otg";
-static const char hint_setup_ram[] = "setup_ram";
-static const char hint_setup_debug[] = "setup_debug";
-static const char hint_setup_download[] = "setup_download";
-static const char hint_setup_led[] = "setup_led";
-static const char hint_setup_boot[] = "setup_boot";
-static const char hint_setup_filters[] = "setup_filters";
-static const char hint_setup_scanner_timing[] = "setup_scanner_timing";
-static const char hint_setup_console[] = "setup_console";
-static const char hint_setup_gps[] = "setup_gps";
-static const char hint_setup_help[] = "setup_help";
-static const char hint_setup_sd_manager[] = "setup_sd_manager";
-static const char hint_monitor_package[] = "monitor_package";
-static const char hint_monitor_channel[] = "monitor_channel";
-
 static const SdFolderOption sd_folder_options[] = {
     {"Handshakes", "lab/handshakes"},
     {"HTML portals", "lab/htmls"},
@@ -1438,36 +1376,36 @@ static const SdFolderOption sd_folder_options[] = {
 static const size_t sd_folder_option_count = sizeof(sd_folder_options) / sizeof(sd_folder_options[0]);
 
 static const MenuEntry menu_entries_sniffers[] = {
-    {"Start Sniffer", "start_sniffer", MenuActionCommand, hint_sniffer_start},
-    {"Show Sniffer Results", "show_sniffer_results", MenuActionCommand, hint_sniffer_results},
-    {"Show Probes", "show_probes", MenuActionCommand, hint_sniffer_probes},
-    {"Resume Sniffer", "start_sniffer_noscan", MenuActionCommand, hint_sniffer_resume},
-    {"Sniffer Debug", "sniffer_debug 1", MenuActionCommand, hint_sniffer_debug},
+    {"Start Sniffer", "start_sniffer", MenuActionCommand},
+    {"Show Sniffer Results", "show_sniffer_results", MenuActionCommand},
+    {"Show Probes", "show_probes", MenuActionCommand},
+    {"Resume Sniffer", "start_sniffer_noscan", MenuActionCommand},
+    {"Sniffer Debug", "sniffer_debug 1", MenuActionCommand},
 };
 
 static const MenuEntry menu_entries_attacks[] = {
-    {"Blackout", NULL, MenuActionConfirmBlackout, hint_attack_blackout},
-    {"Deauth", "start_deauth", MenuActionCommandWithTargets, hint_attack_deauth},
-    {"Deauth Guard", "deauth_detector", MenuActionCommandWithTargets, hint_attack_deauth_guard},
-    {"Handshaker", "start_handshake", MenuActionCommandWithTargets, hint_attack_handshaker},
-    {"Evil Twin", NULL, MenuActionOpenEvilTwinMenu, hint_attack_evil_twin},
-    {"Portal", NULL, MenuActionOpenPortalMenu, hint_attack_portal},
-    {"Karma", NULL, MenuActionOpenKarmaMenu, hint_attack_karma},
-    {"Sniffer", "start_sniffer", MenuActionCommand, hint_sniffer_start},
-    {"SAE Overflow", "sae_overflow", MenuActionCommandWithTargets, hint_attack_sae_overflow},
-    {"Sniffer Dog", NULL, MenuActionConfirmSnifferDos, hint_attack_sniffer_dog},
-    {"Wardrive", "start_wardrive", MenuActionCommand, hint_attack_wardrive},
+    {"Blackout", NULL, MenuActionConfirmBlackout},
+    {"Deauth", "start_deauth", MenuActionCommandWithTargets},
+    {"Deauth Guard", "deauth_detector", MenuActionCommandWithTargets},
+    {"Handshaker", "start_handshake", MenuActionCommandWithTargets},
+    {"Evil Twin", NULL, MenuActionOpenEvilTwinMenu},
+    {"Portal", NULL, MenuActionOpenPortalMenu},
+    {"Karma", NULL, MenuActionOpenKarmaMenu},
+    {"Sniffer", "start_sniffer", MenuActionCommand},
+    {"SAE Overflow", "sae_overflow", MenuActionCommandWithTargets},
+    {"Sniffer Dog", NULL, MenuActionConfirmSnifferDos},
+    {"Wardrive", "start_wardrive", MenuActionCommand},
 };
 
 static const MenuEntry menu_entries_monitoring[] = {
-    {"Package Monitor", NULL, MenuActionOpenPackageMonitor, hint_monitor_package},
-    {"Channel View", NULL, MenuActionOpenChannelView, hint_monitor_channel},
+    {"Package Monitor", NULL, MenuActionOpenPackageMonitor},
+    {"Channel View", NULL, MenuActionOpenChannelView},
 };
 
 static const MenuEntry menu_entries_bluetooth[] = {
-    {"AirTag Scan", "scan_airtag", MenuActionCommand, hint_bluetooth_airtag},
-    {"BT Scan", "scan_bt", MenuActionCommand, hint_bluetooth_scan},
-    {"BT Locator", NULL, MenuActionOpenBtLocator, hint_bluetooth_locator},
+    {"AirTag Scan", "scan_airtag", MenuActionCommand},
+    {"BT Scan", "scan_bt", MenuActionCommand},
+    {"BT Locator", NULL, MenuActionOpenBtLocator},
 };
 
 static char menu_label_backlight[24] = "Backlight: On";
@@ -1479,29 +1417,29 @@ static char menu_label_ram[24] = "Show RAM: Off";
 static char menu_label_debug[24] = "Debug Log: Off";
 
 static const MenuEntry menu_entries_setup[] = {
-    {menu_label_backlight, NULL, MenuActionToggleBacklight, hint_setup_backlight},
-    {menu_label_boot_long, NULL, MenuActionOpenBootSetup, hint_setup_boot},
-    {menu_label_boot_short, NULL, MenuActionOpenBootSetup, hint_setup_boot},
-    {"Console", NULL, MenuActionOpenConsole, hint_setup_console},
-    {"Download Mode", NULL, MenuActionOpenDownload, hint_setup_download},
-    {"Scanner Filters", NULL, MenuActionOpenScannerSetup, hint_setup_filters},
-    {"Scanner Timing", NULL, MenuActionOpenScannerTiming, hint_setup_scanner_timing},
-    {"GPS", NULL, MenuActionOpenGps, hint_setup_gps},
-    {"Help", NULL, MenuActionOpenHelp, hint_setup_help},
-    {menu_label_led, NULL, MenuActionOpenLedSetup, hint_setup_led},
-    {menu_label_otg_power, NULL, MenuActionToggleOtgPower, hint_setup_otg},
-    {menu_label_ram, NULL, MenuActionToggleShowRam, hint_setup_ram},
-    {menu_label_debug, NULL, MenuActionToggleDebugMark, hint_setup_debug},
-    {"SD Manager", NULL, MenuActionOpenSdManager, hint_setup_sd_manager},
+    {menu_label_backlight, NULL, MenuActionToggleBacklight},
+    {menu_label_boot_long, NULL, MenuActionOpenBootSetup},
+    {menu_label_boot_short, NULL, MenuActionOpenBootSetup},
+    {"Console", NULL, MenuActionOpenConsole},
+    {"Download Mode", NULL, MenuActionOpenDownload},
+    {"Scanner Filters", NULL, MenuActionOpenScannerSetup},
+    {"Scanner Timing", NULL, MenuActionOpenScannerTiming},
+    {"GPS", NULL, MenuActionOpenGps},
+    {"Help", NULL, MenuActionOpenHelp},
+    {menu_label_led, NULL, MenuActionOpenLedSetup},
+    {menu_label_otg_power, NULL, MenuActionToggleOtgPower},
+    {menu_label_ram, NULL, MenuActionToggleShowRam},
+    {menu_label_debug, NULL, MenuActionToggleDebugMark},
+    {"SD Manager", NULL, MenuActionOpenSdManager},
 };
 
 static const MenuSection menu_sections[] = {
-    {"Scanner", hint_section_scanner, NULL, 0, 10, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 18, MENU_VISIBLE_COUNT_SNIFFERS * MENU_ITEM_SPACING},
-    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 26, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
-    {"Monitoring", hint_section_monitoring, menu_entries_monitoring, sizeof(menu_entries_monitoring) / sizeof(menu_entries_monitoring[0]), 34, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Bluetooth", hint_section_bluetooth, menu_entries_bluetooth, sizeof(menu_entries_bluetooth) / sizeof(menu_entries_bluetooth[0]), 42, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 50, MENU_VISIBLE_COUNT_SETUP * MENU_ITEM_SPACING},
+    {"Scanner", NULL, 0, 10, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Sniffers", menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 18, MENU_VISIBLE_COUNT_SNIFFERS * MENU_ITEM_SPACING},
+    {"Attacks", menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 26, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
+    {"Monitoring", menu_entries_monitoring, sizeof(menu_entries_monitoring) / sizeof(menu_entries_monitoring[0]), 34, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Bluetooth", menu_entries_bluetooth, sizeof(menu_entries_bluetooth) / sizeof(menu_entries_bluetooth[0]), 42, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Setup", menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 50, MENU_VISIBLE_COUNT_SETUP * MENU_ITEM_SPACING},
 };
 
 static const size_t menu_section_count = sizeof(menu_sections) / sizeof(menu_sections[0]);
@@ -1934,6 +1872,8 @@ static void simple_app_reset_scan_results(SimpleApp* app) {
     app->scan_result_index = 0;
     app->scan_result_offset = 0;
     app->scan_selected_count = 0;
+    app->scan_selected_primary_valid = false;
+    app->scan_selected_primary = 0;
     app->scan_line_len = 0;
     app->scan_results_loading = false;
     app->visible_result_count = 0;
@@ -2098,13 +2038,89 @@ static const ScanResult* simple_app_find_scan_result_by_number(const SimpleApp* 
 
 static bool simple_app_get_first_selected_ssid(SimpleApp* app, char* out, size_t out_size) {
     if(!app || !out || out_size == 0) return false;
-    if(app->scan_selected_count == 0 || !app->scan_selected_numbers) return false;
-    const ScanResult* result =
-        simple_app_find_scan_result_by_number(app, app->scan_selected_numbers[0]);
+    if(app->scan_selected_count == 0) return false;
+    uint16_t number = 0;
+    if(app->scan_selected_numbers) {
+        number = app->scan_selected_numbers[0];
+    } else if(app->scan_selected_primary_valid) {
+        number = app->scan_selected_primary;
+    } else {
+        return false;
+    }
+    const ScanResult* result = simple_app_find_scan_result_by_number(app, number);
     if(!result || result->ssid[0] == '\0') return false;
     simple_app_utf8_to_ascii_pl(result->ssid, out, out_size);
     simple_app_trim(out);
     return out[0] != '\0';
+}
+
+static bool simple_app_restore_scan_selected(SimpleApp* app) {
+    if(!app) return false;
+    if(app->scan_selected_count == 0) return true;
+    bool force_rebuild = (app->scan_results_on_sd && !app->scan_results);
+    if(app->scan_selected_numbers && !force_rebuild) return true;
+
+    if(force_rebuild) {
+        if(app->scan_selected_numbers) {
+            free(app->scan_selected_numbers);
+            app->scan_selected_numbers = NULL;
+        }
+        if(app->visible_result_indices) {
+            free(app->visible_result_indices);
+            app->visible_result_indices = NULL;
+            app->visible_result_count = 0;
+        }
+    }
+
+    size_t capacity = app->scan_results_capacity;
+    if(capacity == 0) {
+        capacity = (app->scan_result_count > 0) ? app->scan_result_count : SCAN_RESULTS_DEFAULT_CAPACITY;
+    }
+    app->scan_selected_numbers = malloc(sizeof(uint16_t) * capacity);
+    if(!app->scan_selected_numbers) {
+        app->scan_selected_count = 0;
+        return false;
+    }
+    memset(app->scan_selected_numbers, 0, sizeof(uint16_t) * capacity);
+    if(!app->visible_result_indices) {
+        app->visible_result_indices = malloc(sizeof(uint16_t) * capacity);
+        if(!app->visible_result_indices) {
+            free(app->scan_selected_numbers);
+            app->scan_selected_numbers = NULL;
+            app->scan_selected_count = 0;
+            return false;
+        }
+        memset(app->visible_result_indices, 0, sizeof(uint16_t) * capacity);
+    }
+    if(app->scan_results_capacity == 0) {
+        app->scan_results_capacity = capacity;
+    }
+
+    size_t found = 0;
+    size_t limit = app->scan_result_count;
+    if(limit > capacity) {
+        limit = capacity;
+    }
+    for(size_t i = 0; i < limit; i++) {
+        ScanResult temp;
+        const ScanResult* result = NULL;
+        if(app->scan_results) {
+            result = &app->scan_results[i];
+        } else if(app->scan_results_on_sd && simple_app_scan_read_result(app, i, &temp)) {
+            result = &temp;
+        }
+        if(result && result->selected && found < capacity) {
+            app->scan_selected_numbers[found++] = result->number;
+        }
+    }
+    app->scan_selected_count = found;
+    if(found > 0) {
+        app->scan_selected_primary = app->scan_selected_numbers[0];
+        app->scan_selected_primary_valid = true;
+    } else {
+        app->scan_selected_primary_valid = false;
+    }
+    return found > 0;
 }
 
 static void simple_app_compact_scan_results(SimpleApp* app) {
@@ -2359,6 +2375,7 @@ static void simple_app_handle_boot_trigger(SimpleApp* app, bool is_long) {
     simple_app_show_status_message(app, message, 1500, true);
 
     if(enabled) {
+        simple_app_activate_serial_log(app, "READY");
         app->screen = ScreenSerial;
         app->serial_follow_tail = true;
         app->last_command_sent = true; // allow Back to send stop for boot-triggered actions
@@ -3861,21 +3878,6 @@ static void simple_app_free_probe_buffers(SimpleApp* app) {
     if(app->probe_clients) {
         free(app->probe_clients);
         app->probe_clients = NULL;
-    }
-}
-
-static bool simple_app_alloc_hint_lines(SimpleApp* app) {
-    if(!app) return false;
-    if(app->hint_lines) return true;
-    app->hint_lines = calloc(HINT_MAX_LINES, sizeof(app->hint_lines[0]));
-    return app->hint_lines != NULL;
-}
-
-static void simple_app_free_hint_lines(SimpleApp* app) {
-    if(!app) return;
-    if(app->hint_lines) {
-        free(app->hint_lines);
-        app->hint_lines = NULL;
     }
 }
 
@@ -5628,6 +5630,7 @@ static void simple_app_bt_locator_begin_scan(SimpleApp* app) {
     app->bt_locator_list_ready = false;
     app->bt_locator_mode = false;
     simple_app_bt_locator_reset_scroll(app);
+    simple_app_activate_serial_log(app, "READY");
     app->screen = ScreenSerial;
     if(app->viewport) {
         view_port_update(app->viewport);
@@ -5721,19 +5724,21 @@ static bool simple_app_append_log_line(const char* path, const char* line) {
 
     File* file = storage_file_alloc(storage);
     bool ok = false;
-    if(storage_file_open(file, path, FSAM_WRITE, FSOM_OPEN_APPEND) ||
-       storage_file_open(file, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        size_t len = strlen(line);
-        if(len > 0) {
-            ok = (storage_file_write(file, line, len) == len);
+    if(file) {
+        if(storage_file_open(file, path, FSAM_WRITE, FSOM_OPEN_APPEND) ||
+           storage_file_open(file, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+            size_t len = strlen(line);
+            if(len > 0) {
+                ok = (storage_file_write(file, line, len) == len);
+            }
+            if(ok && line[len - 1] != '\n') {
+                const char nl = '\n';
+                ok = (storage_file_write(file, &nl, 1) == 1);
+            }
+            storage_file_close(file);
         }
-        if(ok && line[len - 1] != '\n') {
-            const char nl = '\n';
-            ok = (storage_file_write(file, &nl, 1) == 1);
-        }
-        storage_file_close(file);
+        storage_file_free(file);
     }
-    storage_file_free(file);
     furi_record_close(RECORD_STORAGE);
     return ok;
 }
@@ -7223,9 +7228,6 @@ static void simple_app_show_status_message(
     uint32_t duration_ms,
     bool fullscreen) {
     if(!app) return;
-    if(app->hint_active) {
-        simple_app_hide_hint(app);
-    }
     if(message && message[0] != '\0') {
         strncpy(app->status_message, message, sizeof(app->status_message) - 1);
         app->status_message[sizeof(app->status_message) - 1] = '\0';
@@ -8456,6 +8458,17 @@ static void simple_app_scan_feed(SimpleApp* app, char ch) {
 
 static void simple_app_update_selected_numbers(SimpleApp* app, const ScanResult* result) {
     if(!app || !result) return;
+    if(!app->scan_selected_numbers) {
+        if(result->selected) {
+            app->scan_selected_primary = result->number;
+            app->scan_selected_primary_valid = true;
+            app->scan_selected_count = 1;
+        } else {
+            app->scan_selected_primary_valid = false;
+            app->scan_selected_count = 0;
+        }
+        return;
+    }
     if(result->selected) {
         for(size_t i = 0; i < app->scan_selected_count; i++) {
             if(app->scan_selected_numbers[i] == result->number) {
@@ -8478,6 +8491,12 @@ static void simple_app_update_selected_numbers(SimpleApp* app, const ScanResult*
                 break;
             }
         }
+    }
+    if(app->scan_selected_count > 0) {
+        app->scan_selected_primary = app->scan_selected_numbers[0];
+        app->scan_selected_primary_valid = true;
+    } else {
+        app->scan_selected_primary_valid = false;
     }
 }
 
@@ -8654,7 +8673,13 @@ static void simple_app_update_scroll(SimpleApp* app) {
 
 static void simple_app_reset_serial_log(SimpleApp* app, const char* status) {
     if(!app || !app->serial_mutex) return;
-    if(!simple_app_ensure_serial_buffer(app)) return;
+    if(!app->serial_buffer) {
+        app->serial_len = 0;
+        app->serial_scroll = 0;
+        app->serial_follow_tail = true;
+        app->serial_targets_hint = false;
+        return;
+    }
     furi_mutex_acquire(app->serial_mutex, FuriWaitForever);
     int written = snprintf(
         app->serial_buffer,
@@ -8675,38 +8700,43 @@ static void simple_app_reset_serial_log(SimpleApp* app, const char* status) {
     simple_app_update_scroll(app);
 }
 
+static void simple_app_activate_serial_log(SimpleApp* app, const char* status) {
+    if(!simple_app_ensure_serial_buffer(app)) return;
+    simple_app_reset_serial_log(app, status);
+}
+
 static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, size_t length) {
     if(!app || !data || length == 0 || !app->serial_mutex) return;
-    if(!simple_app_ensure_serial_buffer(app)) return;
-
     bool trimmed_any = false;
-
-    furi_mutex_acquire(app->serial_mutex, FuriWaitForever);
-    for(size_t i = 0; i < length; i++) {
-        while(app->serial_len >= SERIAL_BUFFER_SIZE - 1) {
-            trimmed_any = simple_app_trim_oldest_line(app) > 0 || trimmed_any;
-        }
-        app->serial_buffer[app->serial_len++] = (char)data[i];
-    }
-    app->serial_buffer[app->serial_len] = '\0';
-
-    if(!app->serial_targets_hint && !app->blackout_view_active && !app->deauth_guard_view_active &&
-       !app->deauth_view_active && !app->handshake_view_active && !app->sae_view_active) {
-        static const char hint_phrase[] = "Scan results printed.";
-        size_t phrase_len = strlen(hint_phrase);
-        if(app->serial_len >= phrase_len) {
-            size_t search_window = phrase_len + 64;
-            if(search_window > app->serial_len) {
-                search_window = app->serial_len;
+    if(app->serial_buffer) {
+        furi_mutex_acquire(app->serial_mutex, FuriWaitForever);
+        for(size_t i = 0; i < length; i++) {
+            while(app->serial_len >= SERIAL_BUFFER_SIZE - 1) {
+                trimmed_any = simple_app_trim_oldest_line(app) > 0 || trimmed_any;
             }
-            const char* start = app->serial_buffer + (app->serial_len - search_window);
-            if(strstr(start, hint_phrase) != NULL) {
-                app->serial_targets_hint = true;
+            app->serial_buffer[app->serial_len++] = (char)data[i];
+        }
+        app->serial_buffer[app->serial_len] = '\0';
+
+        if(!app->serial_targets_hint && !app->blackout_view_active &&
+           !app->deauth_guard_view_active && !app->deauth_view_active &&
+           !app->handshake_view_active && !app->sae_view_active) {
+            static const char hint_phrase[] = "Scan results printed.";
+            size_t phrase_len = strlen(hint_phrase);
+            if(app->serial_len >= phrase_len) {
+                size_t search_window = phrase_len + 64;
+                if(search_window > app->serial_len) {
+                    search_window = app->serial_len;
+                }
+                const char* start = app->serial_buffer + (app->serial_len - search_window);
+                if(strstr(start, hint_phrase) != NULL) {
+                    app->serial_targets_hint = true;
+                }
             }
         }
-    }
 
-    furi_mutex_release(app->serial_mutex);
+        furi_mutex_release(app->serial_mutex);
+    }
 
     for(size_t i = 0; i < length; i++) {
         char ch = (char)data[i];
@@ -8884,19 +8914,33 @@ static void simple_app_send_start_sniffer(SimpleApp* app) {
     size_t written = snprintf(select_command, sizeof(select_command), "select_networks");
     if(written >= sizeof(select_command)) written = sizeof(select_command) - 1;
 
-    for(size_t i = 0; i < app->scan_selected_count && written < sizeof(select_command) - 1; i++) {
+    if(app->scan_selected_numbers) {
+        for(size_t i = 0; i < app->scan_selected_count && written < sizeof(select_command) - 1; i++) {
+            int added = snprintf(
+                select_command + written,
+                sizeof(select_command) - written,
+                " %u",
+                (unsigned)app->scan_selected_numbers[i]);
+            if(added < 0) break;
+            written += (size_t)added;
+            if(written >= sizeof(select_command)) {
+                written = sizeof(select_command) - 1;
+                select_command[written] = '\0';
+                break;
+            }
+        }
+    } else if(app->scan_selected_primary_valid) {
         int added = snprintf(
             select_command + written,
             sizeof(select_command) - written,
             " %u",
-            (unsigned)app->scan_selected_numbers[i]);
-        if(added < 0) break;
-        written += (size_t)added;
-        if(written >= sizeof(select_command)) {
-            written = sizeof(select_command) - 1;
-            select_command[written] = '\0';
-            break;
+            (unsigned)app->scan_selected_primary);
+        if(added > 0) {
+            written += (size_t)added;
         }
+    } else if(!simple_app_restore_scan_selected(app)) {
+        simple_app_show_status_message(app, "Select network\nfirst", 1500, true);
+        return;
     }
 
     char combined_command[256];
@@ -8923,19 +8967,33 @@ static void simple_app_send_resume_sniffer(SimpleApp* app) {
     size_t written = snprintf(select_command, sizeof(select_command), "select_networks");
     if(written >= sizeof(select_command)) written = sizeof(select_command) - 1;
 
-    for(size_t i = 0; i < app->scan_selected_count && written < sizeof(select_command) - 1; i++) {
+    if(app->scan_selected_numbers) {
+        for(size_t i = 0; i < app->scan_selected_count && written < sizeof(select_command) - 1; i++) {
+            int added = snprintf(
+                select_command + written,
+                sizeof(select_command) - written,
+                " %u",
+                (unsigned)app->scan_selected_numbers[i]);
+            if(added < 0) break;
+            written += (size_t)added;
+            if(written >= sizeof(select_command)) {
+                written = sizeof(select_command) - 1;
+                select_command[written] = '\0';
+                break;
+            }
+        }
+    } else if(app->scan_selected_primary_valid) {
         int added = snprintf(
             select_command + written,
             sizeof(select_command) - written,
             " %u",
-            (unsigned)app->scan_selected_numbers[i]);
-        if(added < 0) break;
-        written += (size_t)added;
-        if(written >= sizeof(select_command)) {
-            written = sizeof(select_command) - 1;
-            select_command[written] = '\0';
-            break;
+            (unsigned)app->scan_selected_primary);
+        if(added > 0) {
+            written += (size_t)added;
         }
+    } else if(!simple_app_restore_scan_selected(app)) {
+        simple_app_show_status_message(app, "Select network\nfirst", 1500, true);
+        return;
     }
 
     char combined_command[256];
@@ -9236,7 +9294,11 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     furi_hal_serial_tx_wait_complete(app->serial);
 
     furi_stream_buffer_reset(app->rx_stream);
-    simple_app_reset_serial_log(app, "COMMAND SENT");
+    if(go_to_serial) {
+        simple_app_activate_serial_log(app, "COMMAND SENT");
+    } else {
+        simple_app_reset_serial_log(app, "COMMAND SENT");
+    }
 
     char log_line[96];
     int log_len = snprintf(log_line, sizeof(log_line), "TX: %s\n", command);
@@ -9246,6 +9308,9 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
 
     app->last_command_sent = true;
     if(go_to_serial) {
+        if(!app->serial_buffer) {
+            simple_app_activate_serial_log(app, "COMMAND SENT");
+        }
         app->screen = ScreenSerial;
         app->serial_follow_tail = true;
         simple_app_update_scroll(app);
@@ -9268,6 +9333,15 @@ static void simple_app_send_command_with_targets(SimpleApp* app, const char* bas
         }
         return;
     }
+    if(app->scan_selected_count > 0 && !app->scan_selected_numbers) {
+        if(!app->scan_selected_primary_valid && !simple_app_restore_scan_selected(app)) {
+            simple_app_show_status_message(app, "Please select\nnetwork first", 1500, true);
+            if(app->viewport) {
+                view_port_update(app->viewport);
+            }
+            return;
+        }
+    }
 
     if(requires_select_networks) {
         char select_command[160];
@@ -9277,20 +9351,31 @@ static void simple_app_send_command_with_targets(SimpleApp* app, const char* bas
             written = strlen(select_command);
         }
 
-        for(size_t i = 0; i < app->scan_selected_count && written < sizeof(select_command) - 1; i++) {
+        if(app->scan_selected_numbers) {
+            for(size_t i = 0; i < app->scan_selected_count && written < sizeof(select_command) - 1; i++) {
+                int added = snprintf(
+                    select_command + written,
+                    sizeof(select_command) - written,
+                    " %u",
+                    (unsigned)app->scan_selected_numbers[i]);
+                if(added < 0) {
+                    break;
+                }
+                written += (size_t)added;
+                if(written >= sizeof(select_command)) {
+                    written = sizeof(select_command) - 1;
+                    select_command[written] = '\0';
+                    break;
+                }
+            }
+        } else if(app->scan_selected_primary_valid) {
             int added = snprintf(
                 select_command + written,
                 sizeof(select_command) - written,
                 " %u",
-                (unsigned)app->scan_selected_numbers[i]);
-            if(added < 0) {
-                break;
-            }
-            written += (size_t)added;
-            if(written >= sizeof(select_command)) {
-                written = sizeof(select_command) - 1;
-                select_command[written] = '\0';
-                break;
+                (unsigned)app->scan_selected_primary);
+            if(added > 0) {
+                written += (size_t)added;
             }
         }
 
@@ -9315,20 +9400,31 @@ static void simple_app_send_command_with_targets(SimpleApp* app, const char* bas
         written = strlen(command);
     }
 
-    for(size_t i = 0; i < app->scan_selected_count && written < sizeof(command) - 1; i++) {
+    if(app->scan_selected_numbers) {
+        for(size_t i = 0; i < app->scan_selected_count && written < sizeof(command) - 1; i++) {
+            int added = snprintf(
+                command + written,
+                sizeof(command) - written,
+                " %u",
+                (unsigned)app->scan_selected_numbers[i]);
+            if(added < 0) {
+                break;
+            }
+            written += (size_t)added;
+            if(written >= sizeof(command)) {
+                written = sizeof(command) - 1;
+                command[written] = '\0';
+                break;
+            }
+        }
+    } else if(app->scan_selected_primary_valid) {
         int added = snprintf(
             command + written,
             sizeof(command) - written,
             " %u",
-            (unsigned)app->scan_selected_numbers[i]);
-        if(added < 0) {
-            break;
-        }
-        written += (size_t)added;
-        if(written >= sizeof(command)) {
-            written = sizeof(command) - 1;
-            command[written] = '\0';
-            break;
+            (unsigned)app->scan_selected_primary);
+        if(added > 0) {
+            written += (size_t)added;
         }
     }
 
@@ -9448,10 +9544,7 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     app->sd_folder_popup_active = false;
     app->sd_file_popup_active = false;
     app->sd_delete_confirm_active = false;
-    app->hint_active = false;
-    app->help_hint_visible = false;
     app->evil_twin_popup_active = false;
-    simple_app_free_hint_lines(app);
     simple_app_free_line_buffers(app);
     simple_app_free_serial_buffer(app);
     simple_app_free_vendor_cache(app);
@@ -9481,6 +9574,7 @@ static void simple_app_request_scan_results(SimpleApp* app, const char* command)
 
 static void simple_app_console_enter(SimpleApp* app) {
     if(!app) return;
+    simple_app_activate_serial_log(app, "READY");
     app->screen = ScreenConsole;
     app->serial_follow_tail = true;
     simple_app_update_scroll(app);
@@ -10573,214 +10667,6 @@ static void simple_app_handle_channel_view_input(SimpleApp* app, InputKey key) {
         }
         return;
     }
-}
-
-static size_t simple_app_hint_max_scroll(const SimpleApp* app) {
-    if(!app || app->hint_line_count <= HINT_VISIBLE_LINES) {
-        return 0;
-    }
-    return app->hint_line_count - HINT_VISIBLE_LINES;
-}
-
-static void __attribute__((unused)) simple_app_prepare_hint_lines(SimpleApp* app, const char* text) {
-    if(!app) return;
-    app->hint_line_count = 0;
-    if(!text || !app->hint_lines) return;
-
-    const char* ptr = text;
-    while(*ptr && app->hint_line_count < HINT_MAX_LINES) {
-        if(*ptr == '\n') {
-            app->hint_lines[app->hint_line_count][0] = '\0';
-            app->hint_line_count++;
-            ptr++;
-            continue;
-        }
-
-        size_t line_len = 0;
-        while(ptr[line_len] && ptr[line_len] != '\n') {
-            line_len++;
-        }
-
-        size_t consumed = 0;
-        while(consumed < line_len && app->hint_line_count < HINT_MAX_LINES) {
-            size_t remaining = line_len - consumed;
-            size_t block = remaining > HINT_WRAP_LIMIT ? HINT_WRAP_LIMIT : remaining;
-
-            size_t copy_len = block;
-            if(block == HINT_WRAP_LIMIT && consumed + block < line_len) {
-                size_t adjust = block;
-                while(adjust > 0 &&
-                      ptr[consumed + adjust - 1] != ' ' &&
-                      ptr[consumed + adjust - 1] != '-') {
-                    adjust--;
-                }
-                if(adjust > 0) {
-                    copy_len = adjust;
-                }
-            }
-
-            if(copy_len == 0) {
-                copy_len = block;
-            }
-            if(copy_len >= HINT_LINE_CHAR_LIMIT) {
-                copy_len = HINT_LINE_CHAR_LIMIT - 1;
-            }
-
-            memcpy(app->hint_lines[app->hint_line_count], ptr + consumed, copy_len);
-            app->hint_lines[app->hint_line_count][copy_len] = '\0';
-
-            size_t trim = copy_len;
-            while(trim > 0 && app->hint_lines[app->hint_line_count][trim - 1] == ' ') {
-                app->hint_lines[app->hint_line_count][--trim] = '\0';
-            }
-
-            app->hint_line_count++;
-            if(app->hint_line_count >= HINT_MAX_LINES) {
-                break;
-            }
-
-            consumed += copy_len;
-            while(consumed < line_len && ptr[consumed] == ' ') {
-                consumed++;
-            }
-        }
-
-        ptr += line_len;
-        if(*ptr == '\n') {
-            ptr++;
-        }
-    }
-}
-
-static void __attribute__((unused)) simple_app_show_hint(
-    SimpleApp* app,
-    const char* title,
-    const char* text) {
-    if(!app || !title || !text) return;
-    if(!simple_app_alloc_hint_lines(app)) {
-        simple_app_show_status_message(app, "OOM: hints", 1500, true);
-        return;
-    }
-
-    memset(app->hint_title, 0, sizeof(app->hint_title));
-    strncpy(app->hint_title, title, sizeof(app->hint_title) - 1);
-    simple_app_prepare_hint_lines(app, text);
-
-    if(app->hint_line_count == 0) {
-        if(!app->hint_lines) return;
-        strncpy(app->hint_lines[0], text, HINT_LINE_CHAR_LIMIT - 1);
-        app->hint_lines[0][HINT_LINE_CHAR_LIMIT - 1] = '\0';
-        app->hint_line_count = 1;
-    }
-
-    app->hint_scroll = 0;
-    app->hint_active = true;
-    if(app->viewport) {
-        view_port_update(app->viewport);
-    }
-}
-
-static void simple_app_hide_hint(SimpleApp* app) {
-    if(!app || !app->hint_active) return;
-    app->hint_active = false;
-    app->hint_line_count = 0;
-    app->hint_scroll = 0;
-    simple_app_free_hint_lines(app);
-    if(app->viewport) {
-        view_port_update(app->viewport);
-    }
-}
-
-static void simple_app_hint_scroll(SimpleApp* app, int delta) {
-    if(!app || !app->hint_active || delta == 0) return;
-    size_t max_scroll = simple_app_hint_max_scroll(app);
-    int32_t new_value = (int32_t)app->hint_scroll + delta;
-    if(new_value < 0) {
-        new_value = 0;
-    }
-    if(new_value > (int32_t)max_scroll) {
-        new_value = (int32_t)max_scroll;
-    }
-    if((size_t)new_value != app->hint_scroll) {
-        app->hint_scroll = (size_t)new_value;
-        if(app->viewport) {
-            view_port_update(app->viewport);
-        }
-    }
-}
-
-static void simple_app_handle_hint_event(SimpleApp* app, const InputEvent* event) {
-    if(!app || !event) return;
-
-    if(event->type == InputTypeShort && event->key == InputKeyBack) {
-        simple_app_send_stop_if_needed(app);
-        simple_app_hide_hint(app);
-        return;
-    }
-
-    if((event->type == InputTypeShort || event->type == InputTypeRepeat)) {
-        if(event->key == InputKeyUp) {
-            simple_app_hint_scroll(app, -1);
-        } else if(event->key == InputKeyDown) {
-            simple_app_hint_scroll(app, 1);
-        }
-    }
-}
-
-static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas) {
-    if(!app || !canvas || !app->hint_active || !app->hint_lines) return;
-
-    const uint8_t bubble_x = 6;
-    const uint8_t bubble_y = 6;
-    const uint8_t bubble_w = DISPLAY_WIDTH - (bubble_x * 2);
-    const uint8_t bubble_h = 56;
-    const uint8_t radius = 8;
-
-    canvas_set_color(canvas, ColorWhite);
-    canvas_draw_rbox(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
-    canvas_set_color(canvas, ColorBlack);
-    canvas_draw_rframe(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
-
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, bubble_x + 7, bubble_y + 16, app->hint_title);
-
-    canvas_set_font(canvas, FontSecondary);
-    uint8_t text_x = bubble_x + 7;
-    uint8_t text_y = bubble_y + 28;
-
-    if(app->hint_line_count > 0) {
-        size_t visible = app->hint_line_count - app->hint_scroll;
-        if(visible > HINT_VISIBLE_LINES) {
-            visible = HINT_VISIBLE_LINES;
-        }
-        for(size_t i = 0; i < visible; i++) {
-            size_t line_index = app->hint_scroll + i;
-            if(line_index >= app->hint_line_count) break;
-            canvas_draw_str(
-                canvas, text_x, (uint8_t)(text_y + i * HINT_LINE_HEIGHT), app->hint_lines[line_index]);
-        }
-    }
-
-    if(app->hint_line_count > HINT_VISIBLE_LINES) {
-        size_t max_scroll = simple_app_hint_max_scroll(app);
-        bool show_up = (app->hint_scroll > 0);
-        bool show_down = (app->hint_scroll < max_scroll);
-        if(show_up || show_down) {
-            uint8_t arrow_x = (uint8_t)(bubble_x + bubble_w - 10);
-            int16_t content_top = text_y;
-            int16_t content_bottom =
-                text_y + (int16_t)((HINT_VISIBLE_LINES > 0 ? (HINT_VISIBLE_LINES - 1) : 0) * HINT_LINE_HEIGHT);
-            int16_t min_base = bubble_y + 12;
-            int16_t max_base = bubble_y + bubble_h - 12;
-            simple_app_draw_scroll_hints_clamped(
-                canvas, arrow_x, content_top, content_bottom, show_up, show_down, min_base, max_base);
-        }
-    }
-}
-
-static bool simple_app_try_show_hint(SimpleApp* app) {
-    UNUSED(app);
-    return false;
 }
 
 static void simple_app_draw_portal_menu(SimpleApp* app, Canvas* canvas) {
@@ -13384,7 +13270,8 @@ static void simple_app_draw_deauth_overlay(SimpleApp* app, Canvas* canvas) {
     canvas_draw_str_aligned(
         canvas, DISPLAY_WIDTH - 2, 12, AlignRight, AlignBottom, header_right);
 
-    if(app->scan_selected_count == 0 || !app->scan_selected_numbers ||
+    if(app->scan_selected_count == 0 ||
+       (!app->scan_selected_numbers && !app->scan_selected_primary_valid) ||
        (!app->scan_results && !app->scan_results_on_sd)) {
         canvas_draw_str_aligned(
             canvas, DISPLAY_WIDTH / 2, 36, AlignCenter, AlignCenter, "No target list");
@@ -13401,7 +13288,9 @@ static void simple_app_draw_deauth_overlay(SimpleApp* app, Canvas* canvas) {
     for(size_t i = 0; i < visible; i++) {
         size_t idx = offset + i;
         if(idx >= app->scan_selected_count) break;
-        uint16_t number = app->scan_selected_numbers[idx];
+        uint16_t number = app->scan_selected_numbers
+                              ? app->scan_selected_numbers[idx]
+                              : app->scan_selected_primary;
         const ScanResult* result = simple_app_find_scan_result_by_number(app, number);
         char line[32];
         if(result) {
@@ -16185,8 +16074,6 @@ static void simple_app_draw(Canvas* canvas, void* context) {
         simple_app_draw_karma_html_popup(app, canvas);
     } else if(app->evil_twin_popup_active) {
         simple_app_draw_evil_twin_popup(app, canvas);
-    } else if(app->hint_active) {
-        simple_app_draw_hint(app, canvas);
     }
 
     simple_app_draw_ram_overlay(app, canvas);
@@ -18913,7 +18800,6 @@ static void simple_app_input(InputEvent* event, void* context) {
             app->exit_confirm_tick = now;
             app->screen = ScreenConfirmExit;
             app->menu_state = MenuStateSections;
-            app->help_hint_visible = false;
             app->last_back_tick = 0;
             app->last_input_tick = now;
             if(app->viewport) {
@@ -18924,12 +18810,6 @@ static void simple_app_input(InputEvent* event, void* context) {
     }
 
     app->last_input_tick = now;
-    if(app->help_hint_visible) {
-        app->help_hint_visible = false;
-        if(app->viewport) {
-            view_port_update(app->viewport);
-        }
-    }
 
     if(simple_app_status_message_is_active(app) && app->status_message_fullscreen) {
         if(event->type == InputTypeShort &&
@@ -18974,11 +18854,6 @@ static void simple_app_input(InputEvent* event, void* context) {
 
     if(app->evil_twin_popup_active) {
         simple_app_handle_evil_twin_popup_event(app, event);
-        return;
-    }
-
-    if(app->hint_active) {
-        simple_app_handle_hint_event(app, event);
         return;
     }
 
@@ -19028,6 +18903,7 @@ static void simple_app_input(InputEvent* event, void* context) {
 
     if(event->type == InputTypeLong && event->key == InputKeyOk) {
         if(app->screen == ScreenGps) {
+            simple_app_activate_serial_log(app, "READY");
             app->screen = ScreenSerial;
             app->gps_console_mode = true;
             app->serial_follow_tail = true;
@@ -19126,9 +19002,6 @@ static void simple_app_input(InputEvent* event, void* context) {
             if(app->viewport) {
                 view_port_update(app->viewport);
             }
-            return;
-        }
-        if(simple_app_try_show_hint(app)) {
             return;
         }
     }
@@ -19304,11 +19177,6 @@ int32_t Lab_C5_app(void* p) {
         return 0;
     }
     memset(app, 0, sizeof(SimpleApp));
-    if(!simple_app_ensure_serial_buffer(app)) {
-        free(app);
-        simple_app_show_low_memory(free_heap, SERIAL_BUFFER_SIZE);
-        return 0;
-    }
     app->heap_start_free = memmgr_get_free_heap();
     FURI_LOG_I(
         TAG,
@@ -19408,7 +19276,6 @@ int32_t Lab_C5_app(void* p) {
     simple_app_reset_evil_twin_status(app);
     simple_app_reset_passwords_listing(app);
     app->last_input_tick = furi_get_tick();
-    app->help_hint_visible = false;
 
     app->serial = furi_hal_serial_control_acquire(FuriHalSerialIdUsart);
     if(!app->serial) {
