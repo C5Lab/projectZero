@@ -87,7 +87,7 @@ typedef enum {
     SnifferDogPhaseError,
     SnifferDogPhaseFinished,
 } SnifferDogPhase;
-#define LAB_C5_VERSION_TEXT "0.40"
+#define LAB_C5_VERSION_TEXT "1.00"
 
 #define SCAN_SSID_HIDDEN_LABEL "Hidden"
 #define SCAN_RESULTS_DEFAULT_CAPACITY 24
@@ -112,6 +112,10 @@ typedef enum {
 
 #define SERIAL_BUFFER_SIZE 768
 #define UART_STREAM_SIZE 256
+#define API_MAGIC_1 0xA5
+#define API_MAGIC_2 0x5A
+#define API_VERSION 1
+#define API_RX_MAX_LEN 96
 #define MENU_VISIBLE_COUNT 6
 #define MENU_VISIBLE_COUNT_SNIFFERS 4
 #define MENU_VISIBLE_COUNT_ATTACKS 4
@@ -479,7 +483,7 @@ typedef struct {
     FuriStreamBuffer* rx_stream;
     ViewPort* viewport;
     Gui* gui;
-    char serial_buffer[SERIAL_BUFFER_SIZE];
+    char* serial_buffer;
     size_t serial_len;
     size_t serial_scroll;
     bool serial_follow_tail;
@@ -657,6 +661,14 @@ typedef struct {
     bool confirm_exit_yes;
     uint32_t last_attack_index;
     bool board_reboot_sent;
+    bool api_requested;
+    bool api_enabled;
+    uint8_t api_state;
+    uint8_t api_type;
+    uint8_t api_len;
+    uint8_t api_pos;
+    uint8_t api_crc;
+    uint8_t api_buf[API_RX_MAX_LEN];
     bool exit_confirm_active;
     uint32_t exit_confirm_tick;
     size_t evil_twin_menu_index;
@@ -788,8 +800,6 @@ typedef struct {
     uint16_t* scan_selected_numbers;
     size_t scan_selected_count;
     bool scan_results_loading;
-    char scan_line_buffer[SCAN_LINE_BUFFER_SIZE];
-    size_t scan_line_len;
     uint16_t scan_page_offset;
     uint16_t scan_page_expected;
     uint16_t scan_page_limit;
@@ -921,21 +931,14 @@ static void simple_app_update_karma_duration_label(SimpleApp* app);
 static bool simple_app_is_scan_selected(const SimpleApp* app, uint16_t number);
 static void simple_app_update_selected_numbers(SimpleApp* app, const ScanResult* result);
 static bool simple_app_bssid_is_empty(const uint8_t bssid[6]);
-static bool simple_app_parse_bssid(const char* text, uint8_t out[6]);
 static void simple_app_format_bssid(const uint8_t bssid[6], char* out, size_t out_size);
-static uint8_t simple_app_parse_channel(const char* text);
 static const char* simple_app_vendor_cache_lookup(const SimpleApp* app, const uint8_t bssid[6]);
 static void simple_app_vendor_cache_update(SimpleApp* app, const uint8_t bssid[6], const char* vendor);
 static bool simple_app_alloc_sniffer_buffers(SimpleApp* app);
 static void simple_app_free_sniffer_buffers(SimpleApp* app);
 static bool simple_app_alloc_probe_buffers(SimpleApp* app);
 static void simple_app_free_probe_buffers(SimpleApp* app);
-static uint8_t simple_app_parse_band_value(const char* band_field);
 static const char* simple_app_band_label(uint8_t band);
-static size_t simple_app_parse_pipe_fields(
-    const char* line,
-    char fields[][SCAN_FIELD_BUFFER_LEN],
-    size_t max_fields);
 static bool simple_app_parse_bool_value(const char* value, bool current);
 static void simple_app_apply_backlight(SimpleApp* app);
 static void simple_app_toggle_backlight(SimpleApp* app);
@@ -1730,7 +1733,6 @@ static void simple_app_reset_scan_results(SimpleApp* app) {
     if(app->scan_selected_numbers) {
         memset(app->scan_selected_numbers, 0, sizeof(uint16_t) * app->scan_results_capacity);
     }
-    memset(app->scan_line_buffer, 0, sizeof(app->scan_line_buffer));
     if(app->visible_result_indices) {
         memset(app->visible_result_indices, 0, sizeof(uint16_t) * app->scan_results_capacity);
     }
@@ -1739,7 +1741,6 @@ static void simple_app_reset_scan_results(SimpleApp* app) {
     app->scan_result_index = 0;
     app->scan_result_offset = 0;
     app->scan_selected_count = 0;
-    app->scan_line_len = 0;
     app->scan_results_loading = false;
     app->scan_page_offset = 0;
     app->scan_page_expected = 0;
@@ -2143,6 +2144,11 @@ static void simple_app_on_board_online(SimpleApp* app, const char* source) {
     app->board_last_rx_tick = furi_get_tick();
     app->board_missing_shown = false;
 
+    if(!app->api_requested) {
+        app->api_requested = true;
+        simple_app_send_command_quiet(app, "api on");
+    }
+
     if(app->board_bootstrap_active) {
         // End bootstrap discovery without forcing a reboot
         app->board_bootstrap_active = false;
@@ -2230,6 +2236,9 @@ static void simple_app_ping_watchdog(SimpleApp* app) {
        (now - app->board_last_ping_tick) >= BOARD_PING_TIMEOUT_MS) {
         app->board_ping_outstanding = false;
         app->board_ready_seen = false;
+        app->api_enabled = false;
+        app->api_requested = false;
+        app->api_state = 0;
 
         if(app->board_bootstrap_active) {
             const char* waiting_msg = app->board_bootstrap_reboot_sent
@@ -5412,7 +5421,7 @@ static void simple_app_reset_debug_log(SimpleApp* app) {
         snprintf(
             allocs,
             sizeof(allocs),
-            "ALLOC app=%lu rx=%u vp=1 gui=1 notif=1 mutex=1",
+            "ALLOC app=%lu rx=%u vp=1 gui=1 notif=1 mutex=0",
             (unsigned long)sizeof(SimpleApp),
             (unsigned)UART_STREAM_SIZE);
         simple_app_append_log_line(FLIPPER_SD_DEBUG_LOG_PATH, allocs);
@@ -6429,36 +6438,6 @@ static void simple_app_toggle_debug_mark(SimpleApp* app) {
     }
 }
 
-static size_t simple_app_parse_pipe_fields(
-    const char* line,
-    char fields[][SCAN_FIELD_BUFFER_LEN],
-    size_t max_fields) {
-    if(!line || !fields || max_fields == 0) return 0;
-    size_t count = 0;
-    const char* cursor = line;
-    while(count < max_fields) {
-        const char* next = strchr(cursor, '|');
-        size_t len = next ? (size_t)(next - cursor) : strlen(cursor);
-        if(len >= SCAN_FIELD_BUFFER_LEN) {
-            len = SCAN_FIELD_BUFFER_LEN - 1;
-        }
-        memcpy(fields[count], cursor, len);
-        fields[count][len] = '\0';
-        count++;
-        if(!next) break;
-        cursor = next + 1;
-    }
-    return count;
-}
-
-static uint8_t simple_app_parse_band_value(const char* band_field) {
-    if(!band_field || band_field[0] == '\0') return SCAN_BAND_UNKNOWN;
-    if(strncmp(band_field, "2.4", 3) == 0) return SCAN_BAND_24;
-    if(band_field[0] == '5') return SCAN_BAND_5;
-    if(strstr(band_field, "5G") != NULL || strstr(band_field, "5g") != NULL) return SCAN_BAND_5;
-    return SCAN_BAND_UNKNOWN;
-}
-
 static const char* simple_app_band_label(uint8_t band) {
     if(band == SCAN_BAND_24) return "2.4G";
     if(band == SCAN_BAND_5) return "5G";
@@ -6469,28 +6448,6 @@ static bool simple_app_bssid_is_empty(const uint8_t bssid[6]) {
     if(!bssid) return true;
     for(size_t i = 0; i < 6; i++) {
         if(bssid[i] != 0) return false;
-    }
-    return true;
-}
-
-static bool simple_app_parse_bssid(const char* text, uint8_t out[6]) {
-    if(!out) return false;
-    memset(out, 0, 6);
-    if(!text || text[0] == '\0') return false;
-
-    unsigned int values[6];
-    if(sscanf(text, "%x:%x:%x:%x:%x:%x",
-              &values[0],
-              &values[1],
-              &values[2],
-              &values[3],
-              &values[4],
-              &values[5]) != 6) {
-        return false;
-    }
-    for(size_t i = 0; i < 6; i++) {
-        if(values[i] > 0xFF) return false;
-        out[i] = (uint8_t)values[i];
     }
     return true;
 }
@@ -6511,15 +6468,6 @@ static void simple_app_format_bssid(const uint8_t bssid[6], char* out, size_t ou
         bssid[3],
         bssid[4],
         bssid[5]);
-}
-
-static uint8_t simple_app_parse_channel(const char* text) {
-    if(!text || text[0] == '\0') return 0;
-    char* end = NULL;
-    unsigned long value = strtoul(text, &end, 10);
-    if(end == text) return 0;
-    if(value > UINT8_MAX) value = UINT8_MAX;
-    return (uint8_t)value;
 }
 
 static const char* simple_app_vendor_cache_lookup(const SimpleApp* app, const uint8_t bssid[6]) {
@@ -6561,150 +6509,6 @@ static void simple_app_vendor_cache_update(SimpleApp* app, const uint8_t bssid[6
     entry->name[sizeof(entry->name) - 1] = '\0';
     entry->last_tick = furi_get_tick();
     entry->valid = true;
-}
-
-static void simple_app_process_scan_line(SimpleApp* app, const char* line) {
-    if(!app || !line) return;
-
-    const char* cursor = line;
-    while(*cursor == ' ' || *cursor == '\t' || *cursor == '>') {
-        cursor++;
-    }
-
-    if(strncmp(cursor, "SRH|", 4) == 0) {
-        char fields[10][SCAN_FIELD_BUFFER_LEN];
-        for(size_t i = 0; i < 10; i++) {
-            memset(fields[i], 0, SCAN_FIELD_BUFFER_LEN);
-        }
-        size_t field_count = simple_app_parse_pipe_fields(cursor, fields, 10);
-        if(field_count < 4) return;
-
-        app->scanner_total = (uint16_t)strtoul(fields[1], NULL, 10);
-        app->scan_page_offset = (uint16_t)strtoul(fields[2], NULL, 10);
-        app->scan_page_expected = (uint16_t)strtoul(fields[3], NULL, 10);
-        app->scan_page_summary_valid = (field_count >= 9);
-        app->scanner_band_24 = (field_count > 4) ? (uint16_t)strtoul(fields[4], NULL, 10) : 0;
-        app->scanner_band_5 = (field_count > 5) ? (uint16_t)strtoul(fields[5], NULL, 10) : 0;
-        app->scanner_open_count = (field_count > 6) ? (uint16_t)strtoul(fields[6], NULL, 10) : 0;
-        app->scanner_hidden_count = (field_count > 7) ? (uint16_t)strtoul(fields[7], NULL, 10) : 0;
-        if(field_count > 8) {
-            app->scanner_best_rssi = (int16_t)strtol(fields[8], NULL, 10);
-            app->scanner_best_rssi_valid = true;
-        } else {
-            app->scanner_best_rssi_valid = false;
-        }
-        if(field_count > 9) {
-            simple_app_copy_field(
-                app->scanner_best_ssid,
-                sizeof(app->scanner_best_ssid),
-                fields[9],
-                SCAN_SSID_HIDDEN_LABEL);
-        } else {
-            app->scanner_best_ssid[0] = '\0';
-        }
-        app->scanner_last_update_tick = furi_get_tick();
-        if(app->scanner_view_active && app->viewport) {
-            view_port_update(app->viewport);
-        }
-        return;
-    }
-
-    if(strncmp(cursor, "SRE|", 4) == 0) {
-        char fields[4][SCAN_FIELD_BUFFER_LEN];
-        for(size_t i = 0; i < 4; i++) {
-            memset(fields[i], 0, SCAN_FIELD_BUFFER_LEN);
-        }
-        size_t field_count = simple_app_parse_pipe_fields(cursor, fields, 4);
-        app->scan_results_loading = false;
-        app->scanner_scan_running = false;
-        app->scanner_rescan_hint = false;
-        if(field_count >= 3 && strcmp(fields[1], "ERR") == 0 && app->screen == ScreenResults) {
-            if(strcmp(fields[2], "IN_PROGRESS") == 0) {
-                simple_app_show_status_message(app, "Scan running\nTry again soon", 1500, true);
-            } else if(strcmp(fields[2], "NO_SCAN") == 0) {
-                simple_app_show_status_message(app, "No scan results\nRun Scanner first", 1500, true);
-            }
-        }
-        if(app->scanner_last_update_tick == 0) {
-            app->scanner_last_update_tick = furi_get_tick();
-        }
-        if((app->screen == ScreenResults || app->scanner_view_active) && app->viewport) {
-            view_port_update(app->viewport);
-        }
-        return;
-    }
-
-    if(strncmp(cursor, "SR|", 3) == 0) {
-        if(!app->scan_results || app->scan_results_capacity == 0) return;
-        if(app->scan_result_count >= app->scan_results_capacity) return;
-
-        char fields[9][SCAN_FIELD_BUFFER_LEN];
-        for(size_t i = 0; i < 9; i++) {
-            memset(fields[i], 0, SCAN_FIELD_BUFFER_LEN);
-        }
-
-        size_t field_count = simple_app_parse_pipe_fields(cursor, fields, 9);
-        if(field_count < 9) return;
-
-        bool ssid_hidden = (fields[2][0] == '\0');
-
-        ScanResult* result = &app->scan_results[app->scan_result_count];
-        memset(result, 0, sizeof(ScanResult));
-        result->number = (uint16_t)strtoul(fields[1], NULL, 10);
-        simple_app_copy_field(result->ssid, sizeof(result->ssid), fields[2], SCAN_SSID_HIDDEN_LABEL);
-        simple_app_copy_field(result->security, sizeof(result->security), fields[6], "Unknown");
-        simple_app_parse_bssid(fields[4], result->bssid);
-        result->channel = simple_app_parse_channel(fields[5]);
-        result->band = simple_app_parse_band_value(fields[8]);
-
-        if(fields[3][0] != '\0') {
-            char vendor_ascii[SCAN_VENDOR_MAX_LEN];
-            simple_app_utf8_to_ascii_pl(fields[3], vendor_ascii, sizeof(vendor_ascii));
-            simple_app_trim(vendor_ascii);
-            simple_app_vendor_cache_update(app, result->bssid, vendor_ascii);
-        }
-
-        const char* power_str = fields[7];
-        char* power_end = NULL;
-        long power_value = strtol(power_str, &power_end, 10);
-        if(power_str[0] != '\0' && power_end && *power_end == '\0') {
-            if(power_value < SCAN_POWER_MIN_DBM) {
-                power_value = SCAN_POWER_MIN_DBM;
-            } else if(power_value > SCAN_POWER_MAX_DBM) {
-                power_value = SCAN_POWER_MAX_DBM;
-            }
-            result->power_dbm = (int16_t)power_value;
-            result->power_valid = true;
-        } else {
-            result->power_dbm = 0;
-            result->power_valid = false;
-        }
-        result->selected = simple_app_is_scan_selected(app, result->number);
-
-        app->scan_result_count++;
-        if(!app->scan_page_summary_valid) {
-            simple_app_update_scanner_stats(app, result, ssid_hidden);
-        }
-        app->scanner_scan_running = app->scan_results_loading;
-        simple_app_rebuild_visible_results(app);
-
-        if(app->scan_page_expected > 0 && app->scan_result_count >= app->scan_page_expected) {
-            app->scan_results_loading = false;
-            app->scanner_scan_running = false;
-            app->scanner_rescan_hint = false;
-            if(app->scanner_last_update_tick == 0) {
-                app->scanner_last_update_tick = furi_get_tick();
-            }
-        }
-
-        if(app->screen == ScreenResults) {
-            simple_app_adjust_result_offset(app);
-            view_port_update(app->viewport);
-        }
-        return;
-    }
-
-    return;
 }
 
 static uint8_t simple_app_result_line_count(const SimpleApp* app, const ScanResult* result) {
@@ -7172,32 +6976,235 @@ static void simple_app_update_handshake_blink(SimpleApp* app) {
     }
 }
 
-static void simple_app_scan_feed(SimpleApp* app, char ch) {
+static void simple_app_api_handle_scan_summary(SimpleApp* app, const uint8_t* payload, uint8_t len) {
+    if(!app || !payload || len < 17) return;
+    uint16_t total = (uint16_t)(payload[0] | (payload[1] << 8));
+    uint16_t offset = (uint16_t)(payload[2] | (payload[3] << 8));
+    uint16_t count = (uint16_t)(payload[4] | (payload[5] << 8));
+    uint16_t band24 = (uint16_t)(payload[6] | (payload[7] << 8));
+    uint16_t band5 = (uint16_t)(payload[8] | (payload[9] << 8));
+    uint16_t open_count = (uint16_t)(payload[10] | (payload[11] << 8));
+    uint16_t hidden_count = (uint16_t)(payload[12] | (payload[13] << 8));
+    int16_t best_rssi = (int16_t)(payload[14] | (payload[15] << 8));
+    uint8_t ssid_len = payload[16];
+    if(17u + ssid_len > len) {
+        ssid_len = (len > 17) ? (uint8_t)(len - 17) : 0;
+    }
+
+    app->scanner_total = total;
+    app->scan_page_offset = offset;
+    app->scan_page_expected = count;
+    app->scan_page_summary_valid = true;
+    app->scanner_band_24 = band24;
+    app->scanner_band_5 = band5;
+    app->scanner_open_count = open_count;
+    app->scanner_hidden_count = hidden_count;
+    app->scanner_best_rssi = best_rssi;
+    app->scanner_best_rssi_valid = true;
+
+    if(ssid_len > 0) {
+        size_t copy_len = ssid_len;
+        if(copy_len >= sizeof(app->scanner_best_ssid)) {
+            copy_len = sizeof(app->scanner_best_ssid) - 1;
+        }
+        memcpy(app->scanner_best_ssid, &payload[17], copy_len);
+        app->scanner_best_ssid[copy_len] = '\0';
+    } else {
+        app->scanner_best_ssid[0] = '\0';
+    }
+
+    app->scanner_last_update_tick = furi_get_tick();
+    if((app->screen == ScreenResults || app->scanner_view_active) && app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
+
+static const char* simple_app_api_auth_to_string(uint8_t code) {
+    switch(code) {
+    case 0:
+        return "Open";
+    case 1:
+        return "WEP";
+    case 2:
+        return "WPA";
+    case 3:
+        return "WPA2";
+    case 4:
+        return "WPA/WPA2 Mixed";
+    case 5:
+        return "WPA3";
+    case 6:
+        return "WPA2/WPA3 Mixed";
+    default:
+        return "Unknown";
+    }
+}
+
+static void simple_app_api_handle_scan_row(SimpleApp* app, const uint8_t* payload, uint8_t len) {
+    if(!app || !payload || len < 14) return;
+    if(!app->scan_results || app->scan_results_capacity == 0) return;
+    if(app->scan_result_count >= app->scan_results_capacity) return;
+
+    uint16_t number = (uint16_t)(payload[0] | (payload[1] << 8));
+    const uint8_t* bssid = &payload[2];
+    uint8_t channel = payload[8];
+    uint8_t auth_code = payload[9];
+    int8_t rssi = (int8_t)payload[10];
+    uint8_t band = payload[11];
+    uint8_t ssid_len = payload[12];
+    size_t pos = 13;
+    if(pos + ssid_len > len) {
+        ssid_len = (pos < len) ? (uint8_t)(len - pos) : 0;
+    }
+    const uint8_t* ssid_ptr = &payload[pos];
+    pos += ssid_len;
+    uint8_t vendor_len = 0;
+    const uint8_t* vendor_ptr = NULL;
+    if(pos < len) {
+        vendor_len = payload[pos++];
+        if(pos + vendor_len > len) {
+            vendor_len = (pos < len) ? (uint8_t)(len - pos) : 0;
+        }
+        vendor_ptr = &payload[pos];
+    }
+
+    ScanResult* result = &app->scan_results[app->scan_result_count];
+    memset(result, 0, sizeof(ScanResult));
+    result->number = number;
+    if(ssid_len > 0) {
+        size_t copy_len = ssid_len;
+        if(copy_len >= sizeof(result->ssid)) {
+            copy_len = sizeof(result->ssid) - 1;
+        }
+        memcpy(result->ssid, ssid_ptr, copy_len);
+        result->ssid[copy_len] = '\0';
+    } else {
+        simple_app_copy_field(result->ssid, sizeof(result->ssid), "", SCAN_SSID_HIDDEN_LABEL);
+    }
+    simple_app_copy_field(
+        result->security,
+        sizeof(result->security),
+        simple_app_api_auth_to_string(auth_code),
+        "Unknown");
+    memcpy(result->bssid, bssid, sizeof(result->bssid));
+    result->channel = channel;
+    result->band = band;
+    result->power_dbm = rssi;
+    result->power_valid = true;
+    result->selected = simple_app_is_scan_selected(app, result->number);
+
+    if(vendor_len > 0 && vendor_ptr) {
+        char vendor_ascii[SCAN_VENDOR_MAX_LEN];
+        size_t copy_len = vendor_len;
+        if(copy_len >= sizeof(vendor_ascii)) {
+            copy_len = sizeof(vendor_ascii) - 1;
+        }
+        memcpy(vendor_ascii, vendor_ptr, copy_len);
+        vendor_ascii[copy_len] = '\0';
+        simple_app_trim(vendor_ascii);
+        simple_app_vendor_cache_update(app, result->bssid, vendor_ascii);
+    }
+
+    app->scan_result_count++;
+    if(!app->scan_page_summary_valid) {
+        bool ssid_hidden = (ssid_len == 0);
+        simple_app_update_scanner_stats(app, result, ssid_hidden);
+    }
+    app->scanner_scan_running = app->scan_results_loading;
+    simple_app_rebuild_visible_results(app);
+
+    if(app->scan_page_expected > 0 && app->scan_result_count >= app->scan_page_expected) {
+        app->scan_results_loading = false;
+        app->scanner_scan_running = false;
+        app->scanner_rescan_hint = false;
+        if(app->scanner_last_update_tick == 0) {
+            app->scanner_last_update_tick = furi_get_tick();
+        }
+    }
+
+    if(app->screen == ScreenResults && app->viewport) {
+        simple_app_adjust_result_offset(app);
+        view_port_update(app->viewport);
+    }
+}
+
+static void simple_app_api_handle_scan_end(SimpleApp* app, uint8_t status) {
     if(!app) return;
-    if(!app->scan_results_loading && !app->scanner_view_active) return;
+    app->scan_results_loading = false;
+    app->scanner_scan_running = false;
+    app->scanner_rescan_hint = false;
+    if(status == 1 && app->screen == ScreenResults) {
+        simple_app_show_status_message(app, "Scan running\nTry again soon", 1500, true);
+    } else if(status == 2 && app->screen == ScreenResults) {
+        simple_app_show_status_message(app, "No scan results\nRun Scanner first", 1500, true);
+    }
+    if(app->scanner_last_update_tick == 0) {
+        app->scanner_last_update_tick = furi_get_tick();
+    }
+    if((app->screen == ScreenResults || app->scanner_view_active) && app->viewport) {
+        view_port_update(app->viewport);
+    }
+}
 
-    if(ch == '\r') return;
-
-    if(ch == '\n') {
-        if(app->scan_line_len > 0) {
-            app->scan_line_buffer[app->scan_line_len] = '\0';
-            if(app->scan_results_loading) {
-                simple_app_process_scan_line(app, app->scan_line_buffer);
-            } else if(strncmp(app->scan_line_buffer, "SRH|", 4) == 0 ||
-                      strncmp(app->scan_line_buffer, "SRE|", 4) == 0) {
-                simple_app_process_scan_line(app, app->scan_line_buffer);
+static void simple_app_api_feed(SimpleApp* app, uint8_t byte) {
+    if(!app) return;
+    switch(app->api_state) {
+    case 0:
+        if(byte == API_MAGIC_1) {
+            app->api_state = 1;
+        }
+        break;
+    case 1:
+        if(byte == API_MAGIC_2) {
+            app->api_state = 2;
+        } else if(byte != API_MAGIC_1) {
+            app->api_state = 0;
+        }
+        break;
+    case 2:
+        app->api_type = byte;
+        app->api_crc = byte;
+        app->api_state = 3;
+        break;
+    case 3:
+        app->api_len = byte;
+        app->api_crc ^= byte;
+        app->api_pos = 0;
+        if(app->api_len > API_RX_MAX_LEN) {
+            app->api_state = 0;
+        } else if(app->api_len == 0) {
+            app->api_state = 5;
+        } else {
+            app->api_state = 4;
+        }
+        break;
+    case 4:
+        app->api_buf[app->api_pos++] = byte;
+        app->api_crc ^= byte;
+        if(app->api_pos >= app->api_len) {
+            app->api_state = 5;
+        }
+        break;
+    case 5:
+        if(app->api_crc == byte) {
+            if(app->api_type == 0x01 && app->api_len >= 2) {
+                if(app->api_buf[0] == API_VERSION) {
+                    app->api_enabled = true;
+                }
+            } else if(app->api_type == 0x10) {
+                simple_app_api_handle_scan_summary(app, app->api_buf, app->api_len);
+            } else if(app->api_type == 0x11) {
+                simple_app_api_handle_scan_row(app, app->api_buf, app->api_len);
+            } else if(app->api_type == 0x12 && app->api_len >= 1) {
+                simple_app_api_handle_scan_end(app, app->api_buf[0]);
             }
         }
-        app->scan_line_len = 0;
-        return;
+        app->api_state = 0;
+        break;
+    default:
+        app->api_state = 0;
+        break;
     }
-
-    if(app->scan_line_len + 1 >= sizeof(app->scan_line_buffer)) {
-        app->scan_line_len = 0;
-        return;
-    }
-
-    app->scan_line_buffer[app->scan_line_len++] = ch;
 }
 
 static bool simple_app_is_scan_selected(const SimpleApp* app, uint16_t number) {
@@ -7291,7 +7298,7 @@ static void simple_app_adjust_result_offset(SimpleApp* app) {
 }
 
 static size_t simple_app_trim_oldest_line(SimpleApp* app) {
-    if(!app || app->serial_len == 0) return 0;
+    if(!app || !app->serial_buffer || app->serial_len == 0) return 0;
     size_t drop = 0;
     size_t removed_lines = 0;
 
@@ -7344,11 +7351,8 @@ static size_t simple_app_count_display_lines(const char* buffer, size_t length) 
 }
 
 static size_t simple_app_total_display_lines(SimpleApp* app) {
-    if(!app->serial_mutex) return 0;
-    furi_mutex_acquire(app->serial_mutex, FuriWaitForever);
-    size_t total = simple_app_count_display_lines(app->serial_buffer, app->serial_len);
-    furi_mutex_release(app->serial_mutex);
-    return total;
+    if(!app || !app->serial_buffer) return 0;
+    return simple_app_count_display_lines(app->serial_buffer, app->serial_len);
 }
 
 static size_t simple_app_visible_serial_lines(const SimpleApp* app) {
@@ -7397,45 +7401,33 @@ static void simple_app_update_scroll(SimpleApp* app) {
 }
 
 static void simple_app_reset_serial_log(SimpleApp* app, const char* status) {
-    if(!app || !app->serial_mutex) return;
-    furi_mutex_acquire(app->serial_mutex, FuriWaitForever);
-    int written = snprintf(
-        app->serial_buffer,
-        SERIAL_BUFFER_SIZE,
-        "=== UART TERMINAL ===\n115200 baud\nStatus: %s\n\n",
-        status ? status : "READY");
-    if(written < 0) {
-        written = 0;
-    } else if(written >= (int)SERIAL_BUFFER_SIZE) {
-        written = SERIAL_BUFFER_SIZE - 1;
-    }
-    app->serial_len = (size_t)written;
-    app->serial_buffer[app->serial_len] = '\0';
-    furi_mutex_release(app->serial_mutex);
+    (void)status;
+    if(!app || !app->serial_buffer) return;
+    app->serial_len = 0;
+    app->serial_buffer[0] = '\0';
     app->serial_scroll = 0;
     app->serial_follow_tail = true;
-    simple_app_update_scroll(app);
 }
 
 static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, size_t length) {
-    if(!app || !data || length == 0 || !app->serial_mutex) return;
+    if(!app || !data || length == 0) return;
 
     bool trimmed_any = false;
-
-    furi_mutex_acquire(app->serial_mutex, FuriWaitForever);
-    for(size_t i = 0; i < length; i++) {
-        while(app->serial_len >= SERIAL_BUFFER_SIZE - 1) {
-            trimmed_any = simple_app_trim_oldest_line(app) > 0 || trimmed_any;
+    if(app->serial_buffer && app->serial_mutex) {
+        furi_mutex_acquire(app->serial_mutex, FuriWaitForever);
+        for(size_t i = 0; i < length; i++) {
+            while(app->serial_len >= SERIAL_BUFFER_SIZE - 1) {
+                trimmed_any = simple_app_trim_oldest_line(app) > 0 || trimmed_any;
+            }
+            app->serial_buffer[app->serial_len++] = (char)data[i];
         }
-        app->serial_buffer[app->serial_len++] = (char)data[i];
+        app->serial_buffer[app->serial_len] = '\0';
+        furi_mutex_release(app->serial_mutex);
     }
-    app->serial_buffer[app->serial_len] = '\0';
-
-    furi_mutex_release(app->serial_mutex);
 
     for(size_t i = 0; i < length; i++) {
         char ch = (char)data[i];
-        simple_app_scan_feed(app, ch);
+        simple_app_api_feed(app, (uint8_t)ch);
         simple_app_package_monitor_feed(app, ch);
         simple_app_channel_view_feed(app, ch);
         simple_app_portal_ssid_feed(app, ch);
@@ -7469,7 +7461,7 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
         simple_app_probe_feed(app, ch);
     }
 
-    if(trimmed_any && !app->serial_follow_tail) {
+    if(trimmed_any && !app->serial_follow_tail && app->serial_buffer) {
         size_t max_scroll = simple_app_max_scroll(app);
         if(app->serial_scroll > max_scroll) {
             app->serial_scroll = max_scroll;
@@ -7700,15 +7692,6 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
     if(is_wifi_scan_command) {
         simple_app_prepare_scan_buffers(app);
         simple_app_scan_free_buffers(app);
-        if(!simple_app_scan_alloc_buffers(app, SCAN_RESULTS_DEFAULT_CAPACITY)) {
-            app->scan_results_loading = false;
-            app->scanner_view_active = false;
-            app->scanner_full_console = false;
-            app->scanner_scan_running = false;
-            simple_app_show_status_message(app, "OOM: scan buffers", 2000, true);
-            if(app->viewport) view_port_update(app->viewport);
-            return;
-        }
         simple_app_reset_scan_results(app);
         app->scan_results_loading = true;
         app->scanner_view_active = true;
@@ -7842,14 +7825,6 @@ static void simple_app_send_command(SimpleApp* app, const char* command, bool go
         app->handshake_overlay_allowed = true;
         app->handshake_vibro_done = false;
         simple_app_handshake_set_note(app, "Starting");
-        if(app->scan_results || app->scan_selected_numbers || app->visible_result_indices) {
-            if(app->scan_selected_count > 0 && app->scan_selected_numbers && app->scan_results) {
-                simple_app_compact_scan_results(app);
-            } else {
-                simple_app_scan_free_buffers(app);
-                simple_app_reset_scan_results(app);
-            }
-        }
     } else if(is_stop_command) {
         simple_app_reset_handshake_status(app);
     } else {
@@ -11573,9 +11548,10 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
 
 static size_t simple_app_render_display_lines(SimpleApp* app, size_t skip_lines, char dest[][64], size_t max_lines) {
     memset(dest, 0, max_lines * 64);
-    if(!app->serial_mutex) return 0;
-
-    furi_mutex_acquire(app->serial_mutex, FuriWaitForever);
+    if(!app || !app->serial_buffer) return 0;
+    if(app->serial_mutex) {
+        furi_mutex_acquire(app->serial_mutex, FuriWaitForever);
+    }
     const char* buffer = app->serial_buffer;
     size_t length = app->serial_len;
     size_t line_index = 0;
@@ -11622,7 +11598,9 @@ static size_t simple_app_render_display_lines(SimpleApp* app, size_t skip_lines,
         }
     }
 
-    furi_mutex_release(app->serial_mutex);
+    if(app->serial_mutex) {
+        furi_mutex_release(app->serial_mutex);
+    }
     return lines_filled;
 }
 
@@ -17800,6 +17778,13 @@ int32_t Lab_C5_app(void* p) {
     app->board_bootstrap_active = true;
     app->board_bootstrap_reboot_sent = false;
     app->board_reboot_sent = false;
+    app->api_requested = false;
+    app->api_enabled = false;
+    app->api_state = 0;
+    app->api_type = 0;
+    app->api_len = 0;
+    app->api_pos = 0;
+    app->api_crc = 0;
     app->exit_confirm_active = false;
     app->exit_confirm_tick = 0;
     app->boot_short_enabled = false;
@@ -17850,17 +17835,8 @@ int32_t Lab_C5_app(void* p) {
 
     furi_hal_serial_init(app->serial, 115200);
 
-    app->serial_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
-    if(!app->serial_mutex) {
-        furi_hal_serial_deinit(app->serial);
-        furi_hal_serial_control_release(app->serial);
-        free(app);
-        return 0;
-    }
-
     app->rx_stream = furi_stream_buffer_alloc(UART_STREAM_SIZE, 1);
     if(!app->rx_stream) {
-        furi_mutex_free(app->serial_mutex);
         furi_hal_serial_deinit(app->serial);
         furi_hal_serial_control_release(app->serial);
         free(app);
@@ -18008,12 +17984,14 @@ int32_t Lab_C5_app(void* p) {
         (unsigned long)memmgr_get_minimum_free_heap());
     furi_hal_serial_deinit(app->serial);
     furi_hal_serial_control_release(app->serial);
-    furi_mutex_free(app->serial_mutex);
-    FURI_LOG_I(
-        TAG,
-        "Heap after mutex free:%lu min:%lu",
-        (unsigned long)memmgr_get_free_heap(),
-        (unsigned long)memmgr_get_minimum_free_heap());
+    if(app->serial_mutex) {
+        furi_mutex_free(app->serial_mutex);
+        FURI_LOG_I(
+            TAG,
+            "Heap after mutex free:%lu min:%lu",
+            (unsigned long)memmgr_get_free_heap(),
+            (unsigned long)memmgr_get_minimum_free_heap());
+    }
     if(app->notifications) {
         if(app->backlight_notification_enforced) {
             notification_message(app->notifications, &sequence_display_backlight_enforce_auto);

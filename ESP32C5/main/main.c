@@ -886,6 +886,7 @@ static void print_scan_results(void);
 static void print_scan_results_page(uint16_t offset, uint16_t limit);
 static void print_scan_summary_only(void);
 static void api_send_frame(uint8_t type, const uint8_t* payload, uint8_t len);
+static uint8_t api_auth_code(wifi_auth_mode_t mode);
 static void api_send_hello(void);
 static void api_send_scan_summary(uint16_t total,
                                   uint16_t offset,
@@ -2347,6 +2348,41 @@ static void print_scan_results_page(uint16_t offset, uint16_t limit) {
     char best_ssid[MAX_SSID_NAME_LEN + 1];
     scan_sanitize_field(best_ssid_raw, best_ssid, sizeof(best_ssid));
 
+    if(g_api_mode) {
+        api_send_scan_summary(
+            total,
+            offset,
+            count,
+            band24,
+            band5,
+            open_count,
+            hidden_count,
+            (int16_t)best_rssi,
+            best_ssid);
+        for(uint16_t i = 0; i < count; i++) {
+            uint16_t idx = (uint16_t)(offset + i);
+            const wifi_ap_record_t* ap = &g_scan_results[idx];
+            const char* vendor_name = vendor_is_enabled() ? lookup_vendor_name(ap->bssid) : NULL;
+            char ssid[64];
+            char vendor[64];
+            scan_sanitize_field((const char*)ap->ssid, ssid, sizeof(ssid));
+            scan_sanitize_field(vendor_name ? vendor_name : "", vendor, sizeof(vendor));
+            uint8_t band = (ap->primary <= 14) ? 0 : 1;
+            api_send_scan_row(
+                (uint16_t)(idx + 1),
+                ap->bssid,
+                (uint8_t)ap->primary,
+                api_auth_code(ap->authmode),
+                (int8_t)ap->rssi,
+                band,
+                ssid,
+                vendor);
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+        api_send_scan_end(0);
+        return;
+    }
+
     MY_LOG_INFO(TAG, "SRH|%u|%u|%u|%u|%u|%u|%u|%d|%s",
                 (unsigned)total,
                 (unsigned)offset,
@@ -2384,6 +2420,131 @@ static void print_scan_results_page(uint16_t offset, uint16_t limit) {
     MY_LOG_INFO(TAG, "SRE|OK");
 }
 
+static void api_send_frame(uint8_t type, const uint8_t* payload, uint8_t len) {
+    uint8_t header[4];
+    uint8_t crc = (uint8_t)(type ^ len);
+    header[0] = API_MAGIC_1;
+    header[1] = API_MAGIC_2;
+    header[2] = type;
+    header[3] = len;
+    if(payload && len > 0) {
+        for(uint8_t i = 0; i < len; i++) {
+            crc ^= payload[i];
+        }
+    }
+    uart_write_bytes(UART_NUM_0, (const char*)header, sizeof(header));
+    if(payload && len > 0) {
+        uart_write_bytes(UART_NUM_0, (const char*)payload, len);
+    }
+    uart_write_bytes(UART_NUM_0, (const char*)&crc, 1);
+}
+
+static uint8_t api_auth_code(wifi_auth_mode_t mode) {
+    switch(mode) {
+    case WIFI_AUTH_OPEN:
+        return 0;
+    case WIFI_AUTH_WEP:
+        return 1;
+    case WIFI_AUTH_WPA_PSK:
+        return 2;
+    case WIFI_AUTH_WPA2_PSK:
+        return 3;
+    case WIFI_AUTH_WPA_WPA2_PSK:
+        return 4;
+    case WIFI_AUTH_WPA3_PSK:
+        return 5;
+    case WIFI_AUTH_WPA2_WPA3_PSK:
+        return 6;
+    default:
+        return 255;
+    }
+}
+
+static void api_send_hello(void) {
+    uint8_t payload[2];
+    payload[0] = API_VERSION;
+    payload[1] = 1; // flags: scan API supported
+    api_send_frame(API_MSG_HELLO, payload, sizeof(payload));
+}
+
+static void api_send_scan_summary(uint16_t total,
+                                  uint16_t offset,
+                                  uint16_t count,
+                                  uint16_t band24,
+                                  uint16_t band5,
+                                  uint16_t open_count,
+                                  uint16_t hidden_count,
+                                  int16_t best_rssi,
+                                  const char* best_ssid) {
+    uint8_t payload[64];
+    size_t pos = 0;
+    const char* safe_ssid = best_ssid ? best_ssid : "";
+    size_t ssid_len = strnlen(safe_ssid, 32);
+    payload[pos++] = (uint8_t)(total & 0xFF);
+    payload[pos++] = (uint8_t)((total >> 8) & 0xFF);
+    payload[pos++] = (uint8_t)(offset & 0xFF);
+    payload[pos++] = (uint8_t)((offset >> 8) & 0xFF);
+    payload[pos++] = (uint8_t)(count & 0xFF);
+    payload[pos++] = (uint8_t)((count >> 8) & 0xFF);
+    payload[pos++] = (uint8_t)(band24 & 0xFF);
+    payload[pos++] = (uint8_t)((band24 >> 8) & 0xFF);
+    payload[pos++] = (uint8_t)(band5 & 0xFF);
+    payload[pos++] = (uint8_t)((band5 >> 8) & 0xFF);
+    payload[pos++] = (uint8_t)(open_count & 0xFF);
+    payload[pos++] = (uint8_t)((open_count >> 8) & 0xFF);
+    payload[pos++] = (uint8_t)(hidden_count & 0xFF);
+    payload[pos++] = (uint8_t)((hidden_count >> 8) & 0xFF);
+    payload[pos++] = (uint8_t)(best_rssi & 0xFF);
+    payload[pos++] = (uint8_t)((best_rssi >> 8) & 0xFF);
+    payload[pos++] = (uint8_t)ssid_len;
+    if(ssid_len > 0) {
+        memcpy(&payload[pos], safe_ssid, ssid_len);
+        pos += ssid_len;
+    }
+    api_send_frame(API_MSG_SCAN_SUMMARY, payload, (uint8_t)pos);
+}
+
+static void api_send_scan_row(uint16_t number,
+                              const uint8_t bssid[6],
+                              uint8_t channel,
+                              uint8_t auth_code,
+                              int8_t rssi,
+                              uint8_t band,
+                              const char* ssid,
+                              const char* vendor) {
+    uint8_t payload[96];
+    size_t pos = 0;
+    const char* safe_ssid = ssid ? ssid : "";
+    const char* safe_vendor = vendor ? vendor : "";
+    size_t ssid_len = strnlen(safe_ssid, 32);
+    size_t vendor_len = strnlen(safe_vendor, 24);
+    payload[pos++] = (uint8_t)(number & 0xFF);
+    payload[pos++] = (uint8_t)((number >> 8) & 0xFF);
+    memcpy(&payload[pos], bssid, 6);
+    pos += 6;
+    payload[pos++] = channel;
+    payload[pos++] = auth_code;
+    payload[pos++] = (uint8_t)rssi;
+    payload[pos++] = band;
+    payload[pos++] = (uint8_t)ssid_len;
+    if(ssid_len > 0) {
+        memcpy(&payload[pos], safe_ssid, ssid_len);
+        pos += ssid_len;
+    }
+    payload[pos++] = (uint8_t)vendor_len;
+    if(vendor_len > 0) {
+        memcpy(&payload[pos], safe_vendor, vendor_len);
+        pos += vendor_len;
+    }
+    api_send_frame(API_MSG_SCAN_ROW, payload, (uint8_t)pos);
+}
+
+static void api_send_scan_end(uint8_t status) {
+    uint8_t payload[1];
+    payload[0] = status;
+    api_send_frame(API_MSG_SCAN_END, payload, sizeof(payload));
+}
+
 static void print_scan_summary_only(void) {
     uint16_t total = g_scan_count;
     uint16_t band24 = 0;
@@ -2416,6 +2577,21 @@ static void print_scan_summary_only(void) {
 
     char best_ssid[MAX_SSID_NAME_LEN + 1];
     scan_sanitize_field(best_ssid_raw, best_ssid, sizeof(best_ssid));
+
+    if(g_api_mode) {
+        api_send_scan_summary(
+            total,
+            0,
+            0,
+            band24,
+            band5,
+            open_count,
+            hidden_count,
+            (int16_t)best_rssi,
+            best_ssid);
+        api_send_scan_end(0);
+        return;
+    }
 
     MY_LOG_INFO(TAG, "SRH|%u|0|0|%u|%u|%u|%u|%d|%s",
                 (unsigned)total,
@@ -2523,21 +2699,58 @@ static int cmd_scan_results_page(int argc, char **argv) {
     }
 
     if(g_scan_in_progress) {
-        MY_LOG_INFO(TAG, "SRE|ERR|IN_PROGRESS");
+        if(g_api_mode) {
+            api_send_scan_end(1);
+        } else {
+            MY_LOG_INFO(TAG, "SRE|ERR|IN_PROGRESS");
+        }
         return 0;
     }
     if(!g_scan_done) {
-        MY_LOG_INFO(TAG, "SRE|ERR|NO_SCAN");
+        if(g_api_mode) {
+            api_send_scan_end(2);
+        } else {
+            MY_LOG_INFO(TAG, "SRE|ERR|NO_SCAN");
+        }
         return 0;
     }
     if(g_scan_count == 0) {
-        MY_LOG_INFO(TAG, "SRH|0|%u|0|0|0|0|0|0|",
-                    (unsigned)offset);
-        MY_LOG_INFO(TAG, "SRE|OK");
+        if(g_api_mode) {
+            api_send_scan_summary(0, offset, 0, 0, 0, 0, 0, 0, "");
+            api_send_scan_end(0);
+        } else {
+            MY_LOG_INFO(TAG, "SRH|0|%u|0|0|0|0|0|0|",
+                        (unsigned)offset);
+            MY_LOG_INFO(TAG, "SRE|OK");
+        }
         return 0;
     }
 
     print_scan_results_page(offset, limit);
+    return 0;
+}
+
+static int cmd_api(int argc, char **argv) {
+    if(argc < 2) {
+        MY_LOG_INFO(TAG, "API mode: %s", g_api_mode ? "ON" : "OFF");
+        return 0;
+    }
+    if(strcmp(argv[1], "on") == 0 || strcmp(argv[1], "1") == 0) {
+        g_api_mode = true;
+        MY_LOG_INFO(TAG, "API mode enabled");
+        api_send_hello();
+        return 0;
+    }
+    if(strcmp(argv[1], "off") == 0 || strcmp(argv[1], "0") == 0) {
+        g_api_mode = false;
+        MY_LOG_INFO(TAG, "API mode disabled");
+        return 0;
+    }
+    if(strcmp(argv[1], "status") == 0) {
+        MY_LOG_INFO(TAG, "API mode: %s", g_api_mode ? "ON" : "OFF");
+        return 0;
+    }
+    MY_LOG_INFO(TAG, "Usage: api on|off|status");
     return 0;
 }
 static int cmd_select_networks(int argc, char **argv) {
@@ -8230,6 +8443,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&ping_cmd));
 
+    const esp_console_cmd_t api_cmd = {
+        .command = "api",
+        .help = "API mode: api on|off|status",
+        .hint = NULL,
+        .func = &cmd_api,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&api_cmd));
+
     const esp_console_cmd_t list_sd_cmd = {
         .command = "list_sd",
         .help = "Lists HTML files on SD card",
@@ -8443,6 +8665,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  list_ssid");
       MY_LOG_INFO(TAG,"  packet_monitor <channel>");
       MY_LOG_INFO(TAG,"  ping");
+      MY_LOG_INFO(TAG,"  api on|off|status");
       MY_LOG_INFO(TAG,"  reboot");
       MY_LOG_INFO(TAG,"  sae_overflow");
       MY_LOG_INFO(TAG,"  scan_airtag");
