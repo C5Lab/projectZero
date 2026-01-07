@@ -404,8 +404,19 @@ typedef struct {
     int8_t rssi;
     char name[32];
     uint16_t company_id;
+    uint8_t adv_type;
+    uint8_t addr_type;
+    uint8_t adv_flags;
+    bool adv_flags_present;
+    int8_t tx_power;
+    bool tx_power_present;
+    uint8_t adv_data_len;
+    uint8_t uuid16_count;
+    uint8_t uuid32_count;
+    uint8_t uuid128_count;
     bool is_airtag;
     bool is_smarttag;
+    uint32_t last_seen_ms;
 } bt_device_info_t;
 
 static bt_device_info_t *bt_devices = NULL;                 // ~5.5 KB in PSRAM
@@ -417,6 +428,18 @@ static uint8_t bt_tracking_mac[6];
 static int8_t bt_tracking_rssi = 0;
 static bool bt_tracking_found = false;
 static char bt_tracking_name[32] = "";
+static uint8_t bt_tracking_adv_type = 0;
+static uint8_t bt_tracking_addr_type = 0;
+static uint8_t bt_tracking_adv_flags = 0;
+static bool bt_tracking_adv_flags_present = false;
+static int8_t bt_tracking_tx_power = 0;
+static bool bt_tracking_tx_power_present = false;
+static uint16_t bt_tracking_company_id = 0;
+static uint8_t bt_tracking_adv_data_len = 0;
+static uint8_t bt_tracking_uuid16_count = 0;
+static uint8_t bt_tracking_uuid32_count = 0;
+static uint8_t bt_tracking_uuid128_count = 0;
+static bool bt_tracking_scan_rsp = false;
 
 // ============================================================================
 
@@ -836,7 +859,34 @@ typedef enum {
     API_MSG_SCAN_SUMMARY = 0x10,
     API_MSG_SCAN_ROW = 0x11,
     API_MSG_SCAN_END = 0x12,
+    API_MSG_BT_SCAN_SUMMARY = 0x20,
+    API_MSG_BT_SCAN_ROW = 0x21,
+    API_MSG_BT_SCAN_END = 0x22,
+    API_MSG_BT_LOCATOR_UPDATE = 0x23,
+    API_MSG_SNIFFER_AP_SUMMARY = 0x30,
+    API_MSG_SNIFFER_AP_ROW = 0x31,
+    API_MSG_SNIFFER_CLIENT_SUMMARY = 0x32,
+    API_MSG_SNIFFER_CLIENT_ROW = 0x33,
+    API_MSG_SNIFFER_END = 0x34,
 } api_msg_type_t;
+
+#define API_BT_MODE_SCAN 0
+#define API_BT_MODE_AIRTAG 1
+#define API_BT_MODE_LOCATOR 2
+#define API_BT_ROW_FLAG_AIRTAG 0x01
+#define API_BT_ROW_FLAG_SMARTTAG 0x02
+#define API_BT_ROW_FLAG_SCAN_RSP 0x04
+#define API_BT_ROW_FLAG_NAME_PRESENT 0x08
+#define API_BT_ROW_FLAG_TX_POWER_PRESENT 0x10
+#define API_BT_ROW_FLAG_ADV_FLAGS_PRESENT 0x20
+#define API_BT_ROW_FLAG_COMPANY_ID_PRESENT 0x40
+
+#define API_BT_LOC_FLAG_HAS_RSSI 0x01
+#define API_BT_LOC_FLAG_SCAN_RSP 0x02
+#define API_BT_LOC_FLAG_NAME_PRESENT 0x04
+#define API_BT_LOC_FLAG_TX_POWER_PRESENT 0x08
+#define API_BT_LOC_FLAG_ADV_FLAGS_PRESENT 0x10
+#define API_BT_LOC_FLAG_COMPANY_ID_PRESENT 0x20
 
 
 // Methods forward declarations
@@ -863,6 +913,8 @@ static int cmd_clear_sniffer_results(int argc, char **argv);
 static int cmd_show_probes(int argc, char **argv);
 static int cmd_list_probes(int argc, char **argv);
 static int cmd_sniffer_debug(int argc, char **argv);
+static int cmd_sniffer_results_page(int argc, char **argv);
+static int cmd_sniffer_clients_page(int argc, char **argv);
 static int cmd_start_blackout(int argc, char **argv);
 static int cmd_ping(int argc, char **argv);
 static int cmd_boot_button(int argc, char **argv);
@@ -906,6 +958,56 @@ static void api_send_scan_row(uint16_t number,
                               const char* ssid,
                               const char* vendor);
 static void api_send_scan_end(uint8_t status);
+static void api_send_bt_scan_summary(uint8_t mode,
+                                     bool running,
+                                     uint16_t total,
+                                     uint16_t airtag_count,
+                                     uint16_t smarttag_count);
+static void api_send_bt_scan_row(uint16_t number,
+                                 const uint8_t addr[6],
+                                 int8_t rssi,
+                                 uint8_t flags,
+                                 uint8_t adv_type,
+                                 uint8_t addr_type,
+                                 uint8_t adv_flags,
+                                 int8_t tx_power,
+                                 uint16_t company_id,
+                                 uint8_t adv_data_len,
+                                 uint8_t uuid16_count,
+                                 uint8_t uuid32_count,
+                                 uint8_t uuid128_count,
+                                 const char* name);
+static void api_send_bt_scan_end(uint8_t status);
+static void api_send_bt_locator_update(const uint8_t addr[6],
+                                       int8_t rssi,
+                                       bool has_rssi,
+                                       uint8_t flags,
+                                       uint8_t adv_type,
+                                       uint8_t addr_type,
+                                       uint8_t adv_flags,
+                                       int8_t tx_power,
+                                       uint16_t company_id,
+                                       uint8_t adv_data_len,
+                                       uint8_t uuid16_count,
+                                       uint8_t uuid32_count,
+                                       uint8_t uuid128_count,
+                                       const char* name);
+static void api_send_sniffer_ap_summary(uint16_t total_aps,
+                                        uint16_t total_clients,
+                                        uint16_t offset,
+                                        uint16_t count);
+static void api_send_sniffer_ap_row(uint16_t index,
+                                    uint8_t channel,
+                                    uint16_t client_count,
+                                    const char* ssid);
+static void api_send_sniffer_client_summary(uint16_t ap_index,
+                                            uint16_t total_clients,
+                                            uint16_t offset,
+                                            uint16_t count);
+static void api_send_sniffer_client_row(uint16_t ap_index,
+                                        uint16_t client_index,
+                                        const uint8_t mac[6]);
+static void api_send_sniffer_end(uint8_t status);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
 // Target BSSID management functions
 static void save_target_bssids(void);
@@ -2463,7 +2565,7 @@ static uint8_t api_auth_code(wifi_auth_mode_t mode) {
 static void api_send_hello(void) {
     uint8_t payload[2];
     payload[0] = API_VERSION;
-    payload[1] = 1; // flags: scan API supported
+    payload[1] = 0x07; // flags: bit0=scan API, bit1=BT API, bit2=sniffer API
     api_send_frame(API_MSG_HELLO, payload, sizeof(payload));
 }
 
@@ -2543,6 +2645,280 @@ static void api_send_scan_end(uint8_t status) {
     uint8_t payload[1];
     payload[0] = status;
     api_send_frame(API_MSG_SCAN_END, payload, sizeof(payload));
+}
+
+static void api_send_bt_scan_summary(uint8_t mode,
+                                     bool running,
+                                     uint16_t total,
+                                     uint16_t airtag_count,
+                                     uint16_t smarttag_count) {
+    uint8_t payload[8];
+    payload[0] = mode;
+    payload[1] = running ? 1 : 0;
+    payload[2] = (uint8_t)(total & 0xFF);
+    payload[3] = (uint8_t)((total >> 8) & 0xFF);
+    payload[4] = (uint8_t)(airtag_count & 0xFF);
+    payload[5] = (uint8_t)((airtag_count >> 8) & 0xFF);
+    payload[6] = (uint8_t)(smarttag_count & 0xFF);
+    payload[7] = (uint8_t)((smarttag_count >> 8) & 0xFF);
+    api_send_frame(API_MSG_BT_SCAN_SUMMARY, payload, sizeof(payload));
+}
+
+static void api_send_bt_scan_row(uint16_t number,
+                                 const uint8_t addr[6],
+                                 int8_t rssi,
+                                 uint8_t flags,
+                                 uint8_t adv_type,
+                                 uint8_t addr_type,
+                                 uint8_t adv_flags,
+                                 int8_t tx_power,
+                                 uint16_t company_id,
+                                 uint8_t adv_data_len,
+                                 uint8_t uuid16_count,
+                                 uint8_t uuid32_count,
+                                 uint8_t uuid128_count,
+                                 const char* name) {
+    uint8_t payload[64];
+    size_t pos = 0;
+    const char* safe_name = name ? name : "";
+    size_t name_len = strnlen(safe_name, 31);
+    payload[pos++] = (uint8_t)(number & 0xFF);
+    payload[pos++] = (uint8_t)((number >> 8) & 0xFF);
+    payload[pos++] = (uint8_t)rssi;
+    payload[pos++] = flags;
+    payload[pos++] = adv_type;
+    payload[pos++] = addr_type;
+    payload[pos++] = adv_flags;
+    payload[pos++] = (uint8_t)tx_power;
+    payload[pos++] = (uint8_t)(company_id & 0xFF);
+    payload[pos++] = (uint8_t)((company_id >> 8) & 0xFF);
+    payload[pos++] = adv_data_len;
+    payload[pos++] = uuid16_count;
+    payload[pos++] = uuid32_count;
+    payload[pos++] = uuid128_count;
+    if(addr) {
+        memcpy(&payload[pos], addr, 6);
+    } else {
+        memset(&payload[pos], 0, 6);
+    }
+    pos += 6;
+    payload[pos++] = (uint8_t)name_len;
+    if(name_len > 0) {
+        memcpy(&payload[pos], safe_name, name_len);
+        pos += name_len;
+    }
+    api_send_frame(API_MSG_BT_SCAN_ROW, payload, (uint8_t)pos);
+}
+
+static void api_send_bt_scan_end(uint8_t status) {
+    uint8_t payload[1];
+    payload[0] = status;
+    api_send_frame(API_MSG_BT_SCAN_END, payload, sizeof(payload));
+}
+
+static void api_send_bt_locator_update(const uint8_t addr[6],
+                                       int8_t rssi,
+                                       bool has_rssi,
+                                       uint8_t flags,
+                                       uint8_t adv_type,
+                                       uint8_t addr_type,
+                                       uint8_t adv_flags,
+                                       int8_t tx_power,
+                                       uint16_t company_id,
+                                       uint8_t adv_data_len,
+                                       uint8_t uuid16_count,
+                                       uint8_t uuid32_count,
+                                       uint8_t uuid128_count,
+                                       const char* name) {
+    uint8_t payload[64];
+    size_t pos = 0;
+    const char* safe_name = name ? name : "";
+    size_t name_len = strnlen(safe_name, 31);
+    if(addr) {
+        memcpy(&payload[pos], addr, 6);
+    } else {
+        memset(&payload[pos], 0, 6);
+    }
+    pos += 6;
+    payload[pos++] = (uint8_t)rssi;
+    payload[pos++] = has_rssi ? (flags | API_BT_LOC_FLAG_HAS_RSSI) : flags;
+    payload[pos++] = adv_type;
+    payload[pos++] = addr_type;
+    payload[pos++] = adv_flags;
+    payload[pos++] = (uint8_t)tx_power;
+    payload[pos++] = (uint8_t)(company_id & 0xFF);
+    payload[pos++] = (uint8_t)((company_id >> 8) & 0xFF);
+    payload[pos++] = adv_data_len;
+    payload[pos++] = uuid16_count;
+    payload[pos++] = uuid32_count;
+    payload[pos++] = uuid128_count;
+    payload[pos++] = (uint8_t)name_len;
+    if(name_len > 0) {
+        memcpy(&payload[pos], safe_name, name_len);
+        pos += name_len;
+    }
+    api_send_frame(API_MSG_BT_LOCATOR_UPDATE, payload, (uint8_t)pos);
+}
+
+static void api_send_sniffer_ap_summary(uint16_t total_aps,
+                                        uint16_t total_clients,
+                                        uint16_t offset,
+                                        uint16_t count) {
+    uint8_t payload[8];
+    payload[0] = (uint8_t)(total_aps & 0xFF);
+    payload[1] = (uint8_t)((total_aps >> 8) & 0xFF);
+    payload[2] = (uint8_t)(total_clients & 0xFF);
+    payload[3] = (uint8_t)((total_clients >> 8) & 0xFF);
+    payload[4] = (uint8_t)(offset & 0xFF);
+    payload[5] = (uint8_t)((offset >> 8) & 0xFF);
+    payload[6] = (uint8_t)(count & 0xFF);
+    payload[7] = (uint8_t)((count >> 8) & 0xFF);
+    api_send_frame(API_MSG_SNIFFER_AP_SUMMARY, payload, sizeof(payload));
+}
+
+static void api_send_sniffer_ap_row(uint16_t index,
+                                    uint8_t channel,
+                                    uint16_t client_count,
+                                    const char* ssid) {
+    uint8_t payload[64];
+    size_t pos = 0;
+    const char* safe_ssid = ssid ? ssid : "";
+    size_t ssid_len = strnlen(safe_ssid, 32);
+    payload[pos++] = (uint8_t)(index & 0xFF);
+    payload[pos++] = (uint8_t)((index >> 8) & 0xFF);
+    payload[pos++] = channel;
+    payload[pos++] = (uint8_t)(client_count & 0xFF);
+    payload[pos++] = (uint8_t)((client_count >> 8) & 0xFF);
+    payload[pos++] = (uint8_t)ssid_len;
+    if(ssid_len > 0) {
+        memcpy(&payload[pos], safe_ssid, ssid_len);
+        pos += ssid_len;
+    }
+    api_send_frame(API_MSG_SNIFFER_AP_ROW, payload, (uint8_t)pos);
+}
+
+static void api_send_sniffer_client_summary(uint16_t ap_index,
+                                            uint16_t total_clients,
+                                            uint16_t offset,
+                                            uint16_t count) {
+    uint8_t payload[8];
+    payload[0] = (uint8_t)(ap_index & 0xFF);
+    payload[1] = (uint8_t)((ap_index >> 8) & 0xFF);
+    payload[2] = (uint8_t)(total_clients & 0xFF);
+    payload[3] = (uint8_t)((total_clients >> 8) & 0xFF);
+    payload[4] = (uint8_t)(offset & 0xFF);
+    payload[5] = (uint8_t)((offset >> 8) & 0xFF);
+    payload[6] = (uint8_t)(count & 0xFF);
+    payload[7] = (uint8_t)((count >> 8) & 0xFF);
+    api_send_frame(API_MSG_SNIFFER_CLIENT_SUMMARY, payload, sizeof(payload));
+}
+
+static void api_send_sniffer_client_row(uint16_t ap_index,
+                                        uint16_t client_index,
+                                        const uint8_t mac[6]) {
+    uint8_t payload[12];
+    size_t pos = 0;
+    payload[pos++] = (uint8_t)(ap_index & 0xFF);
+    payload[pos++] = (uint8_t)((ap_index >> 8) & 0xFF);
+    payload[pos++] = (uint8_t)(client_index & 0xFF);
+    payload[pos++] = (uint8_t)((client_index >> 8) & 0xFF);
+    if(mac) {
+        memcpy(&payload[pos], mac, 6);
+    } else {
+        memset(&payload[pos], 0, 6);
+    }
+    pos += 6;
+    api_send_frame(API_MSG_SNIFFER_CLIENT_ROW, payload, (uint8_t)pos);
+}
+
+static void api_send_sniffer_end(uint8_t status) {
+    uint8_t payload[1];
+    payload[0] = status;
+    api_send_frame(API_MSG_SNIFFER_END, payload, sizeof(payload));
+}
+
+static int sniffer_build_sorted_list(int* indices, int max_count) {
+    if(!indices || max_count <= 0) return 0;
+    int count = 0;
+    for(int i = 0; i < sniffer_ap_count && count < max_count; i++) {
+        sniffer_ap_t* ap = &sniffer_aps[i];
+        if(is_broadcast_bssid(ap->bssid) || is_own_device_mac(ap->bssid)) {
+            continue;
+        }
+        if(ap->client_count == 0) {
+            continue;
+        }
+        indices[count++] = i;
+    }
+    for(int i = 0; i < count - 1; i++) {
+        for(int j = 0; j < count - i - 1; j++) {
+            if(sniffer_aps[indices[j]].client_count < sniffer_aps[indices[j + 1]].client_count) {
+                int temp = indices[j];
+                indices[j] = indices[j + 1];
+                indices[j + 1] = temp;
+            }
+        }
+    }
+    return count;
+}
+
+static void bt_copy_addr_normal(const uint8_t in[6], uint8_t out[6]) {
+    if(!in || !out) return;
+    out[0] = in[5];
+    out[1] = in[4];
+    out[2] = in[3];
+    out[3] = in[2];
+    out[4] = in[1];
+    out[5] = in[0];
+}
+
+typedef struct {
+    uint8_t adv_flags;
+    bool adv_flags_present;
+    int8_t tx_power;
+    bool tx_power_present;
+    uint8_t uuid16_count;
+    uint8_t uuid32_count;
+    uint8_t uuid128_count;
+} bt_adv_extra_t;
+
+static void bt_parse_adv_extras(const uint8_t* data, uint8_t len, bt_adv_extra_t* out) {
+    if(!out) return;
+    out->adv_flags = 0;
+    out->adv_flags_present = false;
+    out->tx_power = 0;
+    out->tx_power_present = false;
+    out->uuid16_count = 0;
+    out->uuid32_count = 0;
+    out->uuid128_count = 0;
+    if(!data || len == 0) return;
+
+    size_t pos = 0;
+    while(pos < len) {
+        uint8_t field_len = data[pos];
+        if(field_len == 0) break;
+        size_t field_end = pos + 1 + field_len;
+        if(field_end > len) break;
+        uint8_t type = data[pos + 1];
+        const uint8_t* payload = &data[pos + 2];
+        size_t payload_len = field_len - 1;
+
+        if(type == 0x01 && payload_len >= 1) {
+            out->adv_flags = payload[0];
+            out->adv_flags_present = true;
+        } else if(type == 0x0A && payload_len >= 1) {
+            out->tx_power = (int8_t)payload[0];
+            out->tx_power_present = true;
+        } else if(type == 0x02 || type == 0x03) {
+            out->uuid16_count += (uint8_t)(payload_len / 2);
+        } else if(type == 0x04 || type == 0x05) {
+            out->uuid32_count += (uint8_t)(payload_len / 4);
+        } else if(type == 0x06 || type == 0x07) {
+            out->uuid128_count += (uint8_t)(payload_len / 16);
+        }
+
+        pos = field_end;
+    }
 }
 
 static void print_scan_summary_only(void) {
@@ -4948,6 +5324,126 @@ static int cmd_show_sniffer_results(int argc, char **argv) {
         MY_LOG_INFO(TAG, "No APs with clients found.");
     }
     
+    return 0;
+}
+
+static int cmd_sniffer_results_page(int argc, char **argv) {
+    if(!g_api_mode) {
+        MY_LOG_INFO(TAG, "API mode is OFF");
+        return 1;
+    }
+
+    if(sniffer_active && sniffer_scan_phase) {
+        api_send_sniffer_end(1);
+        return 0;
+    }
+
+    int offset = 0;
+    int limit = 24;
+    if(argc >= 2) offset = atoi(argv[1]);
+    if(argc >= 3) limit = atoi(argv[2]);
+    if(offset < 0) offset = 0;
+    if(limit <= 0) limit = 1;
+
+    if(sniffer_ap_count == 0) {
+        api_send_sniffer_ap_summary(0, 0, (uint16_t)offset, 0);
+        api_send_sniffer_end(2);
+        return 0;
+    }
+
+    int sorted_indices[MAX_SNIFFER_APS];
+    int total = sniffer_build_sorted_list(sorted_indices, MAX_SNIFFER_APS);
+    if(total <= 0) {
+        api_send_sniffer_ap_summary(0, 0, (uint16_t)offset, 0);
+        api_send_sniffer_end(2);
+        return 0;
+    }
+
+    uint32_t total_clients = 0;
+    for(int i = 0; i < total; i++) {
+        total_clients += sniffer_aps[sorted_indices[i]].client_count;
+    }
+
+    if(offset >= total) {
+        api_send_sniffer_ap_summary((uint16_t)total, (uint16_t)total_clients, (uint16_t)offset, 0);
+        api_send_sniffer_end(0);
+        return 0;
+    }
+
+    int count = total - offset;
+    if(count > limit) count = limit;
+    api_send_sniffer_ap_summary((uint16_t)total, (uint16_t)total_clients, (uint16_t)offset, (uint16_t)count);
+
+    for(int i = 0; i < count; i++) {
+        int sorted_idx = sorted_indices[offset + i];
+        sniffer_ap_t* ap = &sniffer_aps[sorted_idx];
+        uint16_t index = (uint16_t)(offset + i + 1);
+        api_send_sniffer_ap_row(index, ap->channel, (uint16_t)ap->client_count, ap->ssid);
+    }
+
+    api_send_sniffer_end(0);
+    return 0;
+}
+
+static int cmd_sniffer_clients_page(int argc, char **argv) {
+    if(!g_api_mode) {
+        MY_LOG_INFO(TAG, "API mode is OFF");
+        return 1;
+    }
+
+    if(sniffer_active && sniffer_scan_phase) {
+        api_send_sniffer_end(1);
+        return 0;
+    }
+
+    if(argc < 2) {
+        api_send_sniffer_end(2);
+        return 1;
+    }
+
+    int ap_index = atoi(argv[1]);
+    int offset = 0;
+    int limit = 24;
+    if(argc >= 3) offset = atoi(argv[2]);
+    if(argc >= 4) limit = atoi(argv[3]);
+    if(ap_index <= 0) {
+        api_send_sniffer_end(2);
+        return 0;
+    }
+    if(offset < 0) offset = 0;
+    if(limit <= 0) limit = 1;
+
+    if(sniffer_ap_count == 0) {
+        api_send_sniffer_client_summary((uint16_t)ap_index, 0, (uint16_t)offset, 0);
+        api_send_sniffer_end(2);
+        return 0;
+    }
+
+    int sorted_indices[MAX_SNIFFER_APS];
+    int total = sniffer_build_sorted_list(sorted_indices, MAX_SNIFFER_APS);
+    if(ap_index > total || ap_index <= 0) {
+        api_send_sniffer_client_summary((uint16_t)ap_index, 0, (uint16_t)offset, 0);
+        api_send_sniffer_end(2);
+        return 0;
+    }
+
+    sniffer_ap_t* ap = &sniffer_aps[sorted_indices[ap_index - 1]];
+    uint16_t total_clients = (uint16_t)ap->client_count;
+    if(offset >= total_clients) {
+        api_send_sniffer_client_summary((uint16_t)ap_index, total_clients, (uint16_t)offset, 0);
+        api_send_sniffer_end(0);
+        return 0;
+    }
+    int count = total_clients - offset;
+    if(count > limit) count = limit;
+    api_send_sniffer_client_summary((uint16_t)ap_index, total_clients, (uint16_t)offset, (uint16_t)count);
+    for(int i = 0; i < count; i++) {
+        int client_idx = offset + i;
+        if(client_idx >= ap->client_count) break;
+        sniffer_client_t* client = &ap->clients[client_idx];
+        api_send_sniffer_client_row((uint16_t)ap_index, (uint16_t)(client_idx + 1), client->mac);
+    }
+    api_send_sniffer_end(0);
     return 0;
 }
 
@@ -7548,16 +8044,34 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         if (memcmp(desc->addr.val, bt_tracking_mac, 6) == 0) {
             bt_tracking_rssi = desc->rssi;
             bt_tracking_found = true;
+            bt_tracking_adv_type = desc->event_type;
+            bt_tracking_addr_type = desc->addr.type;
+            bt_tracking_adv_data_len = desc->length_data;
+            bt_tracking_scan_rsp = (desc->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
+            bt_adv_extra_t extras;
+            bt_parse_adv_extras(desc->data, desc->length_data, &extras);
+            bt_tracking_adv_flags = extras.adv_flags;
+            bt_tracking_adv_flags_present = extras.adv_flags_present;
+            bt_tracking_tx_power = extras.tx_power;
+            bt_tracking_tx_power_present = extras.tx_power_present;
+            bt_tracking_uuid16_count = extras.uuid16_count;
+            bt_tracking_uuid32_count = extras.uuid32_count;
+            bt_tracking_uuid128_count = extras.uuid128_count;
             
-            // Try to extract name if we don't have one yet
-            if (bt_tracking_name[0] == '\0') {
-                struct ble_hs_adv_fields fields;
-                if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) == 0) {
+            struct ble_hs_adv_fields fields;
+            if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) == 0) {
+                // Try to extract name if we don't have one yet
+                if (bt_tracking_name[0] == '\0') {
                     if (fields.name != NULL && fields.name_len > 0) {
                         int name_len = fields.name_len < 31 ? fields.name_len : 31;
                         memcpy(bt_tracking_name, fields.name, name_len);
                         bt_tracking_name[name_len] = '\0';
                     }
+                }
+                if(fields.mfg_data != NULL && fields.mfg_data_len >= 2) {
+                    bt_tracking_company_id = fields.mfg_data[0] | (fields.mfg_data[1] << 8);
+                } else {
+                    bt_tracking_company_id = 0;
                 }
             }
         }
@@ -7601,8 +8115,28 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         dev->rssi = desc->rssi;
         dev->name[0] = '\0';
         dev->company_id = 0;
+        dev->adv_type = desc->event_type;
+        dev->addr_type = desc->addr.type;
+        dev->adv_data_len = desc->length_data;
+        dev->adv_flags = 0;
+        dev->adv_flags_present = false;
+        dev->tx_power = 0;
+        dev->tx_power_present = false;
+        dev->uuid16_count = 0;
+        dev->uuid32_count = 0;
+        dev->uuid128_count = 0;
         dev->is_airtag = false;
         dev->is_smarttag = false;
+        dev->last_seen_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        bt_adv_extra_t extras;
+        bt_parse_adv_extras(desc->data, desc->length_data, &extras);
+        dev->adv_flags = extras.adv_flags;
+        dev->adv_flags_present = extras.adv_flags_present;
+        dev->tx_power = extras.tx_power;
+        dev->tx_power_present = extras.tx_power_present;
+        dev->uuid16_count = extras.uuid16_count;
+        dev->uuid32_count = extras.uuid32_count;
+        dev->uuid128_count = extras.uuid128_count;
         
         // Extract device name if available (standard AD field)
         bool has_name = (fields.name != NULL && fields.name_len > 0);
@@ -7821,36 +8355,74 @@ static void bt_scan_task(void *pvParameters)
     bt_stop_scan();
     bt_scan_active = false;
     
-    // Print results
-    MY_LOG_INFO(TAG, "");
-    MY_LOG_INFO(TAG, "=== BLE Scan Results ===");
-    MY_LOG_INFO(TAG, "Found %d devices:", bt_device_count);
-    MY_LOG_INFO(TAG, "");
-    
-    for (int i = 0; i < bt_device_count; i++) {
-        bt_device_info_t *dev = &bt_devices[i];
-        char addr_str[18];
-        bt_format_addr(dev->addr, addr_str);
+    if(g_api_mode) {
+        api_send_bt_scan_summary(
+            API_BT_MODE_SCAN,
+            false,
+            (uint16_t)bt_device_count,
+            (uint16_t)bt_airtag_count,
+            (uint16_t)bt_smarttag_count);
+        for(int i = 0; i < bt_device_count; i++) {
+            bt_device_info_t *dev = &bt_devices[i];
+            uint8_t flags = 0;
+            if(dev->is_airtag) flags |= API_BT_ROW_FLAG_AIRTAG;
+            if(dev->is_smarttag) flags |= API_BT_ROW_FLAG_SMARTTAG;
+            if(dev->adv_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP) flags |= API_BT_ROW_FLAG_SCAN_RSP;
+            if(dev->name[0] != '\0') flags |= API_BT_ROW_FLAG_NAME_PRESENT;
+            if(dev->tx_power_present) flags |= API_BT_ROW_FLAG_TX_POWER_PRESENT;
+            if(dev->adv_flags_present) flags |= API_BT_ROW_FLAG_ADV_FLAGS_PRESENT;
+            if(dev->company_id != 0) flags |= API_BT_ROW_FLAG_COMPANY_ID_PRESENT;
+            uint8_t addr_normal[6];
+            bt_copy_addr_normal(dev->addr, addr_normal);
+            api_send_bt_scan_row(
+                (uint16_t)(i + 1),
+                addr_normal,
+                dev->rssi,
+                flags,
+                dev->adv_type,
+                dev->addr_type,
+                dev->adv_flags,
+                dev->tx_power,
+                dev->company_id,
+                dev->adv_data_len,
+                dev->uuid16_count,
+                dev->uuid32_count,
+                dev->uuid128_count,
+                dev->name);
+        }
+        api_send_bt_scan_end(0);
+    } else {
+        // Print results
+        MY_LOG_INFO(TAG, "");
+        MY_LOG_INFO(TAG, "=== BLE Scan Results ===");
+        MY_LOG_INFO(TAG, "Found %d devices:", bt_device_count);
+        MY_LOG_INFO(TAG, "");
         
-        char type_str[32] = "";
-        if (dev->is_airtag) {
-            strcpy(type_str, " [AirTag]");
-        } else if (dev->is_smarttag) {
-            strcpy(type_str, " [SmartTag]");
+        for (int i = 0; i < bt_device_count; i++) {
+            bt_device_info_t *dev = &bt_devices[i];
+            char addr_str[18];
+            bt_format_addr(dev->addr, addr_str);
+            
+            char type_str[32] = "";
+            if (dev->is_airtag) {
+                strcpy(type_str, " [AirTag]");
+            } else if (dev->is_smarttag) {
+                strcpy(type_str, " [SmartTag]");
+            }
+            
+            if (dev->name[0] != '\0') {
+                MY_LOG_INFO(TAG, "%3d. %s  RSSI: %d dBm  Name: %s%s", 
+                           i + 1, addr_str, dev->rssi, dev->name, type_str);
+            } else {
+                MY_LOG_INFO(TAG, "%3d. %s  RSSI: %d dBm%s", 
+                           i + 1, addr_str, dev->rssi, type_str);
+            }
         }
         
-        if (dev->name[0] != '\0') {
-            MY_LOG_INFO(TAG, "%3d. %s  RSSI: %d dBm  Name: %s%s", 
-                       i + 1, addr_str, dev->rssi, dev->name, type_str);
-        } else {
-            MY_LOG_INFO(TAG, "%3d. %s  RSSI: %d dBm%s", 
-                       i + 1, addr_str, dev->rssi, type_str);
-        }
+        MY_LOG_INFO(TAG, "");
+        MY_LOG_INFO(TAG, "Summary: %d AirTags, %d SmartTags, %d total devices",
+                   bt_airtag_count, bt_smarttag_count, bt_device_count);
     }
-    
-    MY_LOG_INFO(TAG, "");
-    MY_LOG_INFO(TAG, "Summary: %d AirTags, %d SmartTags, %d total devices",
-               bt_airtag_count, bt_smarttag_count, bt_device_count);
     
     bt_scan_task_handle = NULL;
     vTaskDelete(NULL);
@@ -7896,8 +8468,17 @@ static void bt_airtag_scan_task(void *pvParameters)
             break;
         }
         
-        // Output in requested format: airtag_count,smarttag_count
-        printf("%d,%d\n", bt_airtag_count, bt_smarttag_count);
+        if(g_api_mode) {
+            api_send_bt_scan_summary(
+                API_BT_MODE_AIRTAG,
+                true,
+                (uint16_t)(bt_airtag_count + bt_smarttag_count),
+                (uint16_t)bt_airtag_count,
+                (uint16_t)bt_smarttag_count);
+        } else {
+            // Output in requested format: airtag_count,smarttag_count
+            printf("%d,%d\n", bt_airtag_count, bt_smarttag_count);
+        }
         
         // Immediately start next scan cycle (no wait)
     }
@@ -7905,6 +8486,9 @@ static void bt_airtag_scan_task(void *pvParameters)
     // Restore idle LED
     led_set_idle();
     
+    if(g_api_mode) {
+        api_send_bt_scan_end(0);
+    }
     bt_airtag_scan_active = false;
     bt_scan_task_handle = NULL;
     MY_LOG_INFO(TAG, "AirTag scanner stopped.");
@@ -7956,21 +8540,50 @@ static void bt_tracking_task(void *pvParameters)
             break;
         }
         
-        // Output result
-        if (bt_tracking_found) {
-            if (bt_tracking_name[0] != '\0') {
-                printf("%s  RSSI: %d dBm  Name: %s\n", mac_str, bt_tracking_rssi, bt_tracking_name);
-            } else {
-                printf("%s  RSSI: %d dBm\n", mac_str, bt_tracking_rssi);
-            }
+        if(g_api_mode) {
+            uint8_t flags = 0;
+            if(bt_tracking_scan_rsp) flags |= API_BT_LOC_FLAG_SCAN_RSP;
+            if(bt_tracking_name[0] != '\0') flags |= API_BT_LOC_FLAG_NAME_PRESENT;
+            if(bt_tracking_tx_power_present) flags |= API_BT_LOC_FLAG_TX_POWER_PRESENT;
+            if(bt_tracking_adv_flags_present) flags |= API_BT_LOC_FLAG_ADV_FLAGS_PRESENT;
+            if(bt_tracking_company_id != 0) flags |= API_BT_LOC_FLAG_COMPANY_ID_PRESENT;
+            uint8_t addr_normal[6];
+            bt_copy_addr_normal(bt_tracking_mac, addr_normal);
+            api_send_bt_locator_update(
+                addr_normal,
+                bt_tracking_rssi,
+                bt_tracking_found,
+                flags,
+                bt_tracking_adv_type,
+                bt_tracking_addr_type,
+                bt_tracking_adv_flags,
+                bt_tracking_tx_power,
+                bt_tracking_company_id,
+                bt_tracking_adv_data_len,
+                bt_tracking_uuid16_count,
+                bt_tracking_uuid32_count,
+                bt_tracking_uuid128_count,
+                bt_tracking_found ? bt_tracking_name : NULL);
         } else {
-            printf("%s  not found\n", mac_str);
+            // Output result
+            if (bt_tracking_found) {
+                if (bt_tracking_name[0] != '\0') {
+                    printf("%s  RSSI: %d dBm  Name: %s\n", mac_str, bt_tracking_rssi, bt_tracking_name);
+                } else {
+                    printf("%s  RSSI: %d dBm\n", mac_str, bt_tracking_rssi);
+                }
+            } else {
+                printf("%s  not found\n", mac_str);
+            }
         }
     }
     
     // Restore idle LED
     led_set_idle();
     
+    if(g_api_mode) {
+        api_send_bt_scan_end(0);
+    }
     bt_tracking_mode = false;
     bt_scan_active = false;
     bt_scan_task_handle = NULL;
@@ -8016,6 +8629,18 @@ static int cmd_scan_bt(int argc, char **argv)
         bt_tracking_found = false;
         bt_tracking_rssi = 0;
         bt_tracking_name[0] = '\0';
+        bt_tracking_adv_type = 0;
+        bt_tracking_addr_type = 0;
+        bt_tracking_adv_flags = 0;
+        bt_tracking_adv_flags_present = false;
+        bt_tracking_tx_power = 0;
+        bt_tracking_tx_power_present = false;
+        bt_tracking_company_id = 0;
+        bt_tracking_adv_data_len = 0;
+        bt_tracking_uuid16_count = 0;
+        bt_tracking_uuid32_count = 0;
+        bt_tracking_uuid128_count = 0;
+        bt_tracking_scan_rsp = false;
         
         BaseType_t task_ret = xTaskCreate(
             bt_tracking_task,
@@ -8181,6 +8806,22 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&show_sniffer_cmd));
+    const esp_console_cmd_t sniffer_page_cmd = {
+        .command = "sniffer_results_page",
+        .help = "Sniffer results page (API): sniffer_results_page <offset> <limit>",
+        .hint = NULL,
+        .func = &cmd_sniffer_results_page,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_page_cmd));
+    const esp_console_cmd_t sniffer_clients_cmd = {
+        .command = "sniffer_clients_page",
+        .help = "Sniffer clients page (API): sniffer_clients_page <ap_index> <offset> <limit>",
+        .hint = NULL,
+        .func = &cmd_sniffer_clients_page,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_clients_cmd));
 
     const esp_console_cmd_t clear_sniffer_cmd = {
         .command = "clear_sniffer_results",
@@ -8681,6 +9322,8 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  show_scan_results");
       MY_LOG_INFO(TAG,"  scan_results_page <offset> <limit>");
       MY_LOG_INFO(TAG,"  show_sniffer_results");
+      MY_LOG_INFO(TAG,"  sniffer_results_page <offset> <limit>");
+      MY_LOG_INFO(TAG,"  sniffer_clients_page <ap_index> <offset> <limit>");
       MY_LOG_INFO(TAG,"  clear_sniffer_results");
       MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
       MY_LOG_INFO(TAG,"  start_blackout");
