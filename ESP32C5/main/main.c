@@ -712,11 +712,14 @@ static void led_load_state_from_nvs(void) {
 }
 
 static void led_boot_sequence(void) {
-    led_user_enabled = true;
-    led_brightness_percent = LED_BRIGHTNESS_DEFAULT;
     led_current_color = (led_color_t){0, 0, 0};
 
     if (!led_initialized) {
+        return;
+    }
+
+    if (!led_user_enabled) {
+        (void)led_commit_color(0, 0, 0);
         return;
     }
 
@@ -4963,6 +4966,11 @@ static int cmd_led(int argc, char **argv) {
             esp_err_t err = led_set_enabled(true);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "Failed to enable LED: %s", esp_err_to_name(err));
+                return 1;
+            }
+            err = led_set_idle();
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to set LED idle color: %s", esp_err_to_name(err));
                 return 1;
             }
             led_persist_state();

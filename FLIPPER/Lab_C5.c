@@ -222,10 +222,6 @@ static const char* boot_command_options[BOOT_COMMAND_OPTION_COUNT] = {
     "start_wardrive",
 };
 
-#define HINT_MAX_LINES 16
-#define HINT_VISIBLE_LINES 3
-#define HINT_LINE_CHAR_LIMIT 48
-#define HINT_WRAP_LIMIT 21
 #define HINT_LINE_HEIGHT 12
 #define EVIL_TWIN_MAX_HTML_FILES 16
 #define EVIL_TWIN_HTML_NAME_MAX 32
@@ -261,7 +257,6 @@ static const char* boot_command_options[BOOT_COMMAND_OPTION_COUNT] = {
 #define KARMA_SNIFFER_DURATION_MAX_SEC 180
 #define KARMA_SNIFFER_DURATION_STEP 5
 #define KARMA_AUTO_LIST_DELAY_MS 500
-#define HELP_HINT_IDLE_MS 3000
 #define DOUBLE_BACK_EXIT_MS 700
 #define SD_MANAGER_MAX_FILES 24
 #define SD_MANAGER_FILE_NAME_MAX 64
@@ -865,14 +860,14 @@ typedef struct {
     uint8_t overlay_title_scroll_hold;
     uint32_t overlay_title_scroll_last_tick;
     char overlay_title_scroll_text[64];
-    bool hint_active;
-    char hint_title[24];
-    char (*hint_lines)[HINT_LINE_CHAR_LIMIT];
-    size_t hint_line_count;
-    size_t hint_scroll;
     NotificationApp* notifications;
     bool backlight_notification_enforced;
     bool config_dirty;
+    bool config_seen_led_enabled;
+    bool config_seen_led_level;
+    bool config_seen_gps_utc_offset;
+    bool config_seen_gps_dst;
+    bool config_seen_gps_zda_tz;
     char status_message[64];
     uint32_t status_message_until;
     bool status_message_fullscreen;
@@ -887,7 +882,6 @@ typedef struct {
     uint32_t last_input_tick;
     uint32_t last_back_tick;
     uint32_t usb_guard_last_tick;
-    bool help_hint_visible;
     bool package_monitor_active;
     uint8_t package_monitor_channel;
     uint16_t* package_monitor_history;
@@ -936,8 +930,6 @@ static bool simple_app_alloc_sniffer_buffers(SimpleApp* app);
 static void simple_app_free_sniffer_buffers(SimpleApp* app);
 static bool simple_app_alloc_probe_buffers(SimpleApp* app);
 static void simple_app_free_probe_buffers(SimpleApp* app);
-static bool simple_app_alloc_hint_lines(SimpleApp* app);
-static void simple_app_free_hint_lines(SimpleApp* app);
 static uint8_t simple_app_parse_band_value(const char* band_field);
 static const char* simple_app_band_label(uint8_t band);
 static size_t simple_app_parse_scan_count(const char* line);
@@ -1018,13 +1010,6 @@ static void simple_app_append_serial_data(SimpleApp* app, const uint8_t* data, s
 static void simple_app_draw_wardrive_serial(SimpleApp* app, Canvas* canvas);
 static void simple_app_draw_gps(SimpleApp* app, Canvas* canvas);
 static void simple_app_mark_config_dirty(SimpleApp* app);
-static void simple_app_show_hint(SimpleApp* app, const char* title, const char* text);
-static void simple_app_hide_hint(SimpleApp* app);
-static void simple_app_handle_hint_event(SimpleApp* app, const InputEvent* event);
-static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas);
-static void simple_app_prepare_hint_lines(SimpleApp* app, const char* text);
-static void simple_app_hint_scroll(SimpleApp* app, int delta);
-static size_t simple_app_hint_max_scroll(const SimpleApp* app);
 static void simple_app_package_monitor_enter(SimpleApp* app);
 static void simple_app_package_monitor_start(SimpleApp* app, uint8_t channel, bool reset_history);
 static void simple_app_package_monitor_stop(SimpleApp* app);
@@ -1090,7 +1075,6 @@ static size_t simple_app_channel_view_visible_columns(ChannelViewBand band);
 static uint8_t simple_app_channel_view_max_offset(ChannelViewBand band);
 static uint8_t* simple_app_channel_view_offset_ptr(SimpleApp* app, ChannelViewBand band);
 static bool simple_app_channel_view_adjust_offset(SimpleApp* app, ChannelViewBand band, int delta);
-static bool simple_app_try_show_hint(SimpleApp* app);
 static void simple_app_draw_portal_menu(SimpleApp* app, Canvas* canvas);
 static void simple_app_handle_portal_menu_input(SimpleApp* app, InputKey key);
 static void simple_app_reset_portal_ssid_listing(SimpleApp* app);
@@ -1245,12 +1229,10 @@ typedef struct {
     const char* label;
     const char* command;
     MenuAction action;
-    const char* hint;
 } MenuEntry;
 
 typedef struct {
     const char* title;
-    const char* hint;
     const MenuEntry* entries;
     size_t entry_count;
     uint8_t display_y;
@@ -1262,84 +1244,6 @@ static const uint8_t image_icon_0_bits[] = {
     0x1d, 0x03, 0x71, 0x03, 0x1f, 0x03, 0xff, 0x03, 0xff, 0x03,
 };
 
-static const char hint_section_scanner[] =
-    "Passively listens \nto network events collecting \ninfo about APs, STAs associated \nand Probe Requests.";
-static const char hint_section_sniffers[] =
-    "Passive Wi-Fi tools\nMonitor live clients\nAuto channel hopping\nReview captured data\nFrom the results tab.";
-static const char hint_section_attacks[] =
-    "Test features here\nUse only on own lab\nTargets come from\nScanner selection\nFollow local laws.";
-static const char hint_section_monitoring[] =
-    "Monitoring tools\nPacket rates +\nChannel analyzer\nSwitch views with\nUp/Down buttons.";
-static const char hint_section_bluetooth[] =
-    "BLE utilities\nTrackers and tags\nCounts Air/SmartTags\nScroll log on top\nStop with Back.";
-static const char hint_section_setup[] =
-    "General settings\nBacklight, 5V, LED\nAdjust scanner view\nConsole with logs\nUseful for debug.";
-
-static const char hint_sniffer_start[] =
-    "Start passive sniffer\nCaptures frames live\nHops 2.4 and 5 GHz\nWatch status in log\nStop with Back/Stop.";
-static const char hint_sniffer_results[] =
-    "Display sniffer list\nAccess points sorted\nBy client activity\nUse to inspect who\nWas seen on air.";
-static const char hint_sniffer_probes[] =
-    "View probe requests\nSee devices searching\nFor nearby SSIDs\nGreat for finding\nHidden networks.";
-static const char hint_sniffer_resume[] =
-    "Resume sniffer\nUse last scan data\nSkip new scan\nKeeps old results\nKismet style.";
-static const char hint_sniffer_debug[] =
-    "Enable verbose logs\nPrints frame details\nDecision reasoning\nHelpful diagnostics\nBut very noisy.";
-
-static const char hint_attack_blackout[] =
-    "Sends broadcast deauth \npackets to all networks \naround you.";
-static const char hint_attack_deauth[] =
-    "Disconnects clients \nof all selected networks.";
-static const char hint_attack_deauth_guard[] =
-    "Monitors for deauths\nOptional target list\nUse scan selection\n1 or many networks\nStop with Back.";
-static const char hint_attack_handshaker[] =
-    "Collect WPA handshakes\nWorks with or without\nselected networks.\nNo selection grabs\nall in the air.";
-static const char hint_attack_evil_twin[] =
-    "Creates fake network \nwith captive portal in the \nname of the first selected.";
-static const char hint_attack_portal[] =
-    "Custom captive portal\nSet SSID manually\nUse keyboard input\nStart when ready\nLab testing only.";
-static const char hint_attack_karma[] =
-    "Collect probe SSIDs\nPick captive portal\nStart Karma beacon\nSniffer auto stops\nLab use only.";
-static const char hint_attack_sae_overflow[] =
-    "Sends SAE Commit frames \nto overflow WPA3 router.";
-static const char hint_attack_sniffer_dog[] =
-    "Listens to traffic \nbetween AP and STA \nand sends deauth packet \ndirectly to this STA";
-static const char hint_attack_wardrive[] =
-    "Logs networks around you \nwith GPS coordinates.";
-static const char hint_bluetooth_airtag[] =
-    "Continuous tag scan\nOutputs counts only\nUpdates as data arrives\nStop/back to exit\nFor Air/SmartTags.";
-static const char hint_bluetooth_scan[] =
-    "One-off 10s BLE scan\nLists seen devices\nHighlights trackers\nSummary shown below\nStop/back to reset.";
-static const char hint_bluetooth_locator[] =
-    "Tracker mode\nScan first to pick MAC\nRight starts tracing\nUpdates RSSI live\nStop/back to exit.";
-
-static const char hint_setup_backlight[] =
-    "Toggle screen light\nKeep brightness high\nOr allow auto dim\nGreat for console\nLong sessions.";
-static const char hint_setup_otg[] =
-    "Toggle 5V rail\nPowers GPIO 5V pin\nUse only if needed\nLeave off to save\nbattery.";
-static const char hint_setup_ram[] =
-    "Show free RAM\nOverlay in corner\nUse for testing\nTurn off normally.";
-static const char hint_setup_debug[] =
-    "Toggle debug log\nWrites CLI commands\nTo SD card file\nKeep off normally\nEnable for trace.";
-static const char hint_setup_download[] =
-    "Send download cmd\nThen open UART GPIO\nbridge manually and\nreconnect USB to PC\nfor flashing.";
-static const char hint_setup_led[] =
-    "Control status LED\nLeft/Right toggles\nSends CLI command\nAdjust brightness\nRange 1 to 100.";
-static const char hint_setup_boot[] =
-    "Assign boot button\nShort/Long actions\nToggle on/off\nPick command\nSaved in device.";
-static const char hint_setup_filters[] =
-    "Choose visible fields\nSimplify result list\nHide unused data\nTailor display\nOK flips options.";
-static const char hint_setup_scanner_timing[] =
-    "Channel dwell times\nLeft/Right adjusts\nMin/Max per channel\nSync with board\nStored in config.";
-static const char hint_setup_console[] =
-    "Open live console\nStream UART output\nWatch commands\nDebug operations\nClose with Back.";
-static const char hint_setup_gps[] =
-    "Live GPS status\nShows coords/time\nLeft/Right UTC offset\nUp/Down DST +1h\nBack stops stream.";
-static const char hint_setup_help[] =
-    "QR link to Wiki\nScan to open\nBack returns";
-static const char hint_setup_sd_manager[] =
-    "Browse SD folders\nPick lab captures\nDelete safely\nDefault: handshakes.";
-
 static const SdFolderOption sd_folder_options[] = {
     {"Handshakes", "lab/handshakes"},
     {"HTML portals", "lab/htmls"},
@@ -1349,41 +1253,36 @@ static const SdFolderOption sd_folder_options[] = {
 static const size_t sd_folder_option_count = sizeof(sd_folder_options) / sizeof(sd_folder_options[0]);
 
 static const MenuEntry menu_entries_sniffers[] = {
-    {"Start Sniffer", "start_sniffer", MenuActionCommand, hint_sniffer_start},
-    {"Show Sniffer Results", "show_sniffer_results", MenuActionCommand, hint_sniffer_results},
-    {"Show Probes", "show_probes", MenuActionCommand, hint_sniffer_probes},
-    {"Resume Sniffer", "start_sniffer_noscan", MenuActionCommand, hint_sniffer_resume},
-    {"Sniffer Debug", "sniffer_debug 1", MenuActionCommand, hint_sniffer_debug},
+    {"Start Sniffer", "start_sniffer", MenuActionCommand},
+    {"Show Sniffer Results", "show_sniffer_results", MenuActionCommand},
+    {"Show Probes", "show_probes", MenuActionCommand},
+    {"Resume Sniffer", "start_sniffer_noscan", MenuActionCommand},
+    {"Sniffer Debug", "sniffer_debug 1", MenuActionCommand},
 };
 
 static const MenuEntry menu_entries_attacks[] = {
-    {"Blackout", NULL, MenuActionConfirmBlackout, hint_attack_blackout},
-    {"Deauth", "start_deauth", MenuActionCommandWithTargets, hint_attack_deauth},
-    {"Deauth Guard", "deauth_detector", MenuActionCommandWithTargets, hint_attack_deauth_guard},
-    {"Handshaker", "start_handshake", MenuActionCommandWithTargets, hint_attack_handshaker},
-    {"Evil Twin", NULL, MenuActionOpenEvilTwinMenu, hint_attack_evil_twin},
-    {"Portal", NULL, MenuActionOpenPortalMenu, hint_attack_portal},
-    {"Karma", NULL, MenuActionOpenKarmaMenu, hint_attack_karma},
-    {"Sniffer", "start_sniffer", MenuActionCommand, hint_sniffer_start},
-    {"SAE Overflow", "sae_overflow", MenuActionCommandWithTargets, hint_attack_sae_overflow},
-    {"Sniffer Dog", NULL, MenuActionConfirmSnifferDos, hint_attack_sniffer_dog},
-    {"Wardrive", "start_wardrive", MenuActionCommand, hint_attack_wardrive},
+    {"Blackout", NULL, MenuActionConfirmBlackout},
+    {"Deauth", "start_deauth", MenuActionCommandWithTargets},
+    {"Deauth Guard", "deauth_detector", MenuActionCommandWithTargets},
+    {"Handshaker", "start_handshake", MenuActionCommandWithTargets},
+    {"Evil Twin", NULL, MenuActionOpenEvilTwinMenu},
+    {"Portal", NULL, MenuActionOpenPortalMenu},
+    {"Karma", NULL, MenuActionOpenKarmaMenu},
+    {"Sniffer", "start_sniffer", MenuActionCommand},
+    {"SAE Overflow", "sae_overflow", MenuActionCommandWithTargets},
+    {"Sniffer Dog", NULL, MenuActionConfirmSnifferDos},
+    {"Wardrive", "start_wardrive", MenuActionCommand},
 };
 
-static const char hint_monitor_package[] =
-    "Live packet count\nShows vertical bars\nBack stops monitor\nUp/Down change ch.";
-static const char hint_monitor_channel[] =
-    "Channel usage view\nAuto scans both bands\nUp/Down swap band\nLeft/Right scroll\nOK restarts scan.";
-
 static const MenuEntry menu_entries_monitoring[] = {
-    {"Package Monitor", NULL, MenuActionOpenPackageMonitor, hint_monitor_package},
-    {"Channel View", NULL, MenuActionOpenChannelView, hint_monitor_channel},
+    {"Package Monitor", NULL, MenuActionOpenPackageMonitor},
+    {"Channel View", NULL, MenuActionOpenChannelView},
 };
 
 static const MenuEntry menu_entries_bluetooth[] = {
-    {"AirTag Scan", "scan_airtag", MenuActionCommand, hint_bluetooth_airtag},
-    {"BT Scan", "scan_bt", MenuActionCommand, hint_bluetooth_scan},
-    {"BT Locator", NULL, MenuActionOpenBtLocator, hint_bluetooth_locator},
+    {"AirTag Scan", "scan_airtag", MenuActionCommand},
+    {"BT Scan", "scan_bt", MenuActionCommand},
+    {"BT Locator", NULL, MenuActionOpenBtLocator},
 };
 
 static char menu_label_backlight[24] = "Backlight: On";
@@ -1395,29 +1294,29 @@ static char menu_label_ram[24] = "Show RAM: Off";
 static char menu_label_debug[24] = "Debug Log: Off";
 
 static const MenuEntry menu_entries_setup[] = {
-    {menu_label_backlight, NULL, MenuActionToggleBacklight, hint_setup_backlight},
-    {menu_label_boot_long, NULL, MenuActionOpenBootSetup, hint_setup_boot},
-    {menu_label_boot_short, NULL, MenuActionOpenBootSetup, hint_setup_boot},
-    {"Console", NULL, MenuActionOpenConsole, hint_setup_console},
-    {"Download Mode", NULL, MenuActionOpenDownload, hint_setup_download},
-    {"Scanner Filters", NULL, MenuActionOpenScannerSetup, hint_setup_filters},
-    {"Scanner Timing", NULL, MenuActionOpenScannerTiming, hint_setup_scanner_timing},
-    {"GPS", NULL, MenuActionOpenGps, hint_setup_gps},
-    {"Help", NULL, MenuActionOpenHelp, hint_setup_help},
-    {menu_label_led, NULL, MenuActionOpenLedSetup, hint_setup_led},
-    {menu_label_otg_power, NULL, MenuActionToggleOtgPower, hint_setup_otg},
-    {menu_label_ram, NULL, MenuActionToggleShowRam, hint_setup_ram},
-    {menu_label_debug, NULL, MenuActionToggleDebugMark, hint_setup_debug},
-    {"SD Manager", NULL, MenuActionOpenSdManager, hint_setup_sd_manager},
+    {menu_label_backlight, NULL, MenuActionToggleBacklight},
+    {menu_label_boot_long, NULL, MenuActionOpenBootSetup},
+    {menu_label_boot_short, NULL, MenuActionOpenBootSetup},
+    {"Console", NULL, MenuActionOpenConsole},
+    {"Download Mode", NULL, MenuActionOpenDownload},
+    {"Scanner Filters", NULL, MenuActionOpenScannerSetup},
+    {"Scanner Timing", NULL, MenuActionOpenScannerTiming},
+    {"GPS", NULL, MenuActionOpenGps},
+    {"Help", NULL, MenuActionOpenHelp},
+    {menu_label_led, NULL, MenuActionOpenLedSetup},
+    {menu_label_otg_power, NULL, MenuActionToggleOtgPower},
+    {menu_label_ram, NULL, MenuActionToggleShowRam},
+    {menu_label_debug, NULL, MenuActionToggleDebugMark},
+    {"SD Manager", NULL, MenuActionOpenSdManager},
 };
 
 static const MenuSection menu_sections[] = {
-    {"Scanner", hint_section_scanner, NULL, 0, 10, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Sniffers", hint_section_sniffers, menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 18, MENU_VISIBLE_COUNT_SNIFFERS * MENU_ITEM_SPACING},
-    {"Attacks", hint_section_attacks, menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 26, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
-    {"Monitoring", hint_section_monitoring, menu_entries_monitoring, sizeof(menu_entries_monitoring) / sizeof(menu_entries_monitoring[0]), 34, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Bluetooth", hint_section_bluetooth, menu_entries_bluetooth, sizeof(menu_entries_bluetooth) / sizeof(menu_entries_bluetooth[0]), 42, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
-    {"Setup", hint_section_setup, menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 50, MENU_VISIBLE_COUNT_SETUP * MENU_ITEM_SPACING},
+    {"Scanner", NULL, 0, 10, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Sniffers", menu_entries_sniffers, sizeof(menu_entries_sniffers) / sizeof(menu_entries_sniffers[0]), 18, MENU_VISIBLE_COUNT_SNIFFERS * MENU_ITEM_SPACING},
+    {"Attacks", menu_entries_attacks, sizeof(menu_entries_attacks) / sizeof(menu_entries_attacks[0]), 26, MENU_VISIBLE_COUNT_ATTACKS * MENU_ITEM_SPACING},
+    {"Monitoring", menu_entries_monitoring, sizeof(menu_entries_monitoring) / sizeof(menu_entries_monitoring[0]), 34, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Bluetooth", menu_entries_bluetooth, sizeof(menu_entries_bluetooth) / sizeof(menu_entries_bluetooth[0]), 42, MENU_VISIBLE_COUNT * MENU_ITEM_SPACING},
+    {"Setup", menu_entries_setup, sizeof(menu_entries_setup) / sizeof(menu_entries_setup[0]), 50, MENU_VISIBLE_COUNT_SETUP * MENU_ITEM_SPACING},
 };
 
 static const size_t menu_section_count = sizeof(menu_sections) / sizeof(menu_sections[0]);
@@ -2252,6 +2151,8 @@ static void simple_app_on_board_online(SimpleApp* app, const char* source) {
             view_port_update(app->viewport);
         }
     }
+
+    simple_app_request_led_status(app);
 }
 
 static void simple_app_draw_sync_status(const SimpleApp* app, Canvas* canvas) {
@@ -2437,6 +2338,8 @@ static bool simple_app_handle_led_status_line(SimpleApp* app, const char* line) 
     app->led_enabled = enabled;
     app->led_level = (uint8_t)level;
     simple_app_update_led_label(app);
+    simple_app_mark_config_dirty(app);
+    simple_app_save_config_if_dirty(app, NULL, false);
 
     if(app->screen == ScreenMenu && app->menu_state == MenuStateItems &&
        app->section_index == MENU_SECTION_SETUP && app->viewport) {
@@ -3695,21 +3598,6 @@ static void simple_app_free_probe_buffers(SimpleApp* app) {
     if(app->probe_clients) {
         free(app->probe_clients);
         app->probe_clients = NULL;
-    }
-}
-
-static bool simple_app_alloc_hint_lines(SimpleApp* app) {
-    if(!app) return false;
-    if(app->hint_lines) return true;
-    app->hint_lines = calloc(HINT_MAX_LINES, sizeof(app->hint_lines[0]));
-    return app->hint_lines != NULL;
-}
-
-static void simple_app_free_hint_lines(SimpleApp* app) {
-    if(!app) return;
-    if(app->hint_lines) {
-        free(app->hint_lines);
-        app->hint_lines = NULL;
     }
 }
 
@@ -6116,9 +6004,6 @@ static void simple_app_show_status_message(
     uint32_t duration_ms,
     bool fullscreen) {
     if(!app) return;
-    if(app->hint_active) {
-        simple_app_hide_hint(app);
-    }
     if(message && message[0] != '\0') {
         strncpy(app->status_message, message, sizeof(app->status_message) - 1);
         app->status_message[sizeof(app->status_message) - 1] = '\0';
@@ -6263,8 +6148,10 @@ static void simple_app_parse_config_line(SimpleApp* app, char* line) {
     } else if(strcmp(key, "karma_duration") == 0) {
         app->karma_sniffer_duration_sec = (uint32_t)strtoul(value, NULL, 10);
     } else if(strcmp(key, "led_enabled") == 0) {
+        app->config_seen_led_enabled = true;
         app->led_enabled = simple_app_parse_bool_value(value, app->led_enabled);
     } else if(strcmp(key, "led_level") == 0) {
+        app->config_seen_led_level = true;
         long parsed = strtol(value, NULL, 10);
         if(parsed >= 0) {
             if(parsed > 255) {
@@ -6273,10 +6160,13 @@ static void simple_app_parse_config_line(SimpleApp* app, char* line) {
             app->led_level = (uint8_t)parsed;
         }
     } else if(strcmp(key, "gps_utc_offset_min") == 0) {
+        app->config_seen_gps_utc_offset = true;
         app->gps_utc_offset_minutes = simple_app_clamp_gps_utc_offset(strtol(value, NULL, 10));
     } else if(strcmp(key, "gps_dst") == 0) {
+        app->config_seen_gps_dst = true;
         app->gps_dst_enabled = simple_app_parse_bool_value(value, app->gps_dst_enabled);
     } else if(strcmp(key, "gps_zda_tz") == 0) {
+        app->config_seen_gps_zda_tz = true;
         app->gps_zda_tz_enabled = simple_app_parse_bool_value(value, app->gps_zda_tz_enabled);
     } else if(strcmp(key, "boot_short_status") == 0) {
         app->boot_short_enabled = simple_app_parse_bool_value(value, app->boot_short_enabled);
@@ -6334,12 +6224,14 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
               "show_ram_overlay=%d\n"
               "debug_mark=%d\n"
               "karma_duration=%lu\n"
-              "gps_utc_offset_min=%d\n"
-              "gps_dst=%d\n"
-              "gps_zda_tz=%d\n"
-              "boot_short_status=%d\n"
-              "boot_short=%s\n"
-              "boot_long_status=%d\n"
+            "gps_utc_offset_min=%d\n"
+            "gps_dst=%d\n"
+            "gps_zda_tz=%d\n"
+            "led_enabled=%d\n"
+            "led_level=%u\n"
+            "boot_short_status=%d\n"
+            "boot_short=%s\n"
+            "boot_long_status=%d\n"
             "boot_long=%s\n",
             app->scanner_show_ssid ? 1 : 0,
             app->scanner_show_bssid ? 1 : 0,
@@ -6359,6 +6251,8 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
               (int)app->gps_utc_offset_minutes,
               app->gps_dst_enabled ? 1 : 0,
               app->gps_zda_tz_enabled ? 1 : 0,
+              app->led_enabled ? 1 : 0,
+              (unsigned)app->led_level,
               app->boot_short_enabled ? 1 : 0,
               boot_command_options[short_idx],
               app->boot_long_enabled ? 1 : 0,
@@ -6392,6 +6286,11 @@ static bool simple_app_save_config(SimpleApp* app, const char* success_message, 
 
 static void simple_app_load_config(SimpleApp* app) {
     if(!app) return;
+    app->config_seen_led_enabled = false;
+    app->config_seen_led_level = false;
+    app->config_seen_gps_utc_offset = false;
+    app->config_seen_gps_dst = false;
+    app->config_seen_gps_zda_tz = false;
     Storage* storage = furi_record_open(RECORD_STORAGE);
     if(!storage) return;
     storage_simply_mkdir(storage, EXT_PATH("apps_assets"));
@@ -6470,6 +6369,16 @@ static void simple_app_load_config(SimpleApp* app) {
     }
     if(app->boot_long_command_index >= BOOT_COMMAND_OPTION_COUNT) {
         app->boot_long_command_index = 0;
+    }
+    if(loaded) {
+        bool missing_fields = !app->config_seen_led_enabled ||
+                              !app->config_seen_led_level ||
+                              !app->config_seen_gps_utc_offset ||
+                              !app->config_seen_gps_dst ||
+                              !app->config_seen_gps_zda_tz;
+        if(missing_fields) {
+            simple_app_save_config(app, NULL, false);
+        }
     }
     simple_app_reset_karma_probe_listing(app);
     simple_app_reset_karma_probe_listing(app);
@@ -8281,10 +8190,7 @@ static void simple_app_prepare_exit(SimpleApp* app) {
     app->sd_folder_popup_active = false;
     app->sd_file_popup_active = false;
     app->sd_delete_confirm_active = false;
-    app->hint_active = false;
-    app->help_hint_visible = false;
     app->evil_twin_popup_active = false;
-    simple_app_free_hint_lines(app);
 
     if(app->rx_stream) {
         furi_stream_buffer_reset(app->rx_stream);
@@ -9396,235 +9302,6 @@ static void simple_app_handle_channel_view_input(SimpleApp* app, InputKey key) {
         }
         return;
     }
-}
-
-static size_t simple_app_hint_max_scroll(const SimpleApp* app) {
-    if(!app || app->hint_line_count <= HINT_VISIBLE_LINES) {
-        return 0;
-    }
-    return app->hint_line_count - HINT_VISIBLE_LINES;
-}
-
-static void simple_app_prepare_hint_lines(SimpleApp* app, const char* text) {
-    if(!app) return;
-    app->hint_line_count = 0;
-    if(!text || !app->hint_lines) return;
-
-    const char* ptr = text;
-    while(*ptr && app->hint_line_count < HINT_MAX_LINES) {
-        if(*ptr == '\n') {
-            app->hint_lines[app->hint_line_count][0] = '\0';
-            app->hint_line_count++;
-            ptr++;
-            continue;
-        }
-
-        size_t line_len = 0;
-        while(ptr[line_len] && ptr[line_len] != '\n') {
-            line_len++;
-        }
-
-        size_t consumed = 0;
-        while(consumed < line_len && app->hint_line_count < HINT_MAX_LINES) {
-            size_t remaining = line_len - consumed;
-            size_t block = remaining > HINT_WRAP_LIMIT ? HINT_WRAP_LIMIT : remaining;
-
-            size_t copy_len = block;
-            if(block == HINT_WRAP_LIMIT && consumed + block < line_len) {
-                size_t adjust = block;
-                while(adjust > 0 &&
-                      ptr[consumed + adjust - 1] != ' ' &&
-                      ptr[consumed + adjust - 1] != '-') {
-                    adjust--;
-                }
-                if(adjust > 0) {
-                    copy_len = adjust;
-                }
-            }
-
-            if(copy_len == 0) {
-                copy_len = block;
-            }
-            if(copy_len >= HINT_LINE_CHAR_LIMIT) {
-                copy_len = HINT_LINE_CHAR_LIMIT - 1;
-            }
-
-            memcpy(app->hint_lines[app->hint_line_count], ptr + consumed, copy_len);
-            app->hint_lines[app->hint_line_count][copy_len] = '\0';
-
-            size_t trim = copy_len;
-            while(trim > 0 && app->hint_lines[app->hint_line_count][trim - 1] == ' ') {
-                app->hint_lines[app->hint_line_count][--trim] = '\0';
-            }
-
-            app->hint_line_count++;
-            if(app->hint_line_count >= HINT_MAX_LINES) {
-                break;
-            }
-
-            consumed += copy_len;
-            while(consumed < line_len && ptr[consumed] == ' ') {
-                consumed++;
-            }
-        }
-
-        ptr += line_len;
-        if(*ptr == '\n') {
-            ptr++;
-        }
-    }
-}
-
-static void simple_app_show_hint(SimpleApp* app, const char* title, const char* text) {
-    if(!app || !title || !text) return;
-    if(!simple_app_alloc_hint_lines(app)) {
-        simple_app_show_status_message(app, "OOM: hints", 1500, true);
-        return;
-    }
-
-    memset(app->hint_title, 0, sizeof(app->hint_title));
-    strncpy(app->hint_title, title, sizeof(app->hint_title) - 1);
-    simple_app_prepare_hint_lines(app, text);
-
-    if(app->hint_line_count == 0) {
-        if(!app->hint_lines) return;
-        strncpy(app->hint_lines[0], text, HINT_LINE_CHAR_LIMIT - 1);
-        app->hint_lines[0][HINT_LINE_CHAR_LIMIT - 1] = '\0';
-        app->hint_line_count = 1;
-    }
-
-    app->hint_scroll = 0;
-    app->hint_active = true;
-    if(app->viewport) {
-        view_port_update(app->viewport);
-    }
-}
-
-static void simple_app_hide_hint(SimpleApp* app) {
-    if(!app || !app->hint_active) return;
-    app->hint_active = false;
-    app->hint_line_count = 0;
-    app->hint_scroll = 0;
-    simple_app_free_hint_lines(app);
-    if(app->viewport) {
-        view_port_update(app->viewport);
-    }
-}
-
-static void simple_app_hint_scroll(SimpleApp* app, int delta) {
-    if(!app || !app->hint_active || delta == 0) return;
-    size_t max_scroll = simple_app_hint_max_scroll(app);
-    int32_t new_value = (int32_t)app->hint_scroll + delta;
-    if(new_value < 0) {
-        new_value = 0;
-    }
-    if(new_value > (int32_t)max_scroll) {
-        new_value = (int32_t)max_scroll;
-    }
-    if((size_t)new_value != app->hint_scroll) {
-        app->hint_scroll = (size_t)new_value;
-        if(app->viewport) {
-            view_port_update(app->viewport);
-        }
-    }
-}
-
-static void simple_app_handle_hint_event(SimpleApp* app, const InputEvent* event) {
-    if(!app || !event) return;
-
-    if(event->type == InputTypeShort && event->key == InputKeyBack) {
-        simple_app_send_stop_if_needed(app);
-        simple_app_hide_hint(app);
-        return;
-    }
-
-    if((event->type == InputTypeShort || event->type == InputTypeRepeat)) {
-        if(event->key == InputKeyUp) {
-            simple_app_hint_scroll(app, -1);
-        } else if(event->key == InputKeyDown) {
-            simple_app_hint_scroll(app, 1);
-        }
-    }
-}
-
-static void simple_app_draw_hint(SimpleApp* app, Canvas* canvas) {
-    if(!app || !canvas || !app->hint_active || !app->hint_lines) return;
-
-    const uint8_t bubble_x = 6;
-    const uint8_t bubble_y = 6;
-    const uint8_t bubble_w = DISPLAY_WIDTH - (bubble_x * 2);
-    const uint8_t bubble_h = 56;
-    const uint8_t radius = 8;
-
-    canvas_set_color(canvas, ColorWhite);
-    canvas_draw_rbox(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
-    canvas_set_color(canvas, ColorBlack);
-    canvas_draw_rframe(canvas, bubble_x, bubble_y, bubble_w, bubble_h, radius);
-
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, bubble_x + 7, bubble_y + 16, app->hint_title);
-
-    canvas_set_font(canvas, FontSecondary);
-    uint8_t text_x = bubble_x + 7;
-    uint8_t text_y = bubble_y + 28;
-
-    if(app->hint_line_count > 0) {
-        size_t visible = app->hint_line_count - app->hint_scroll;
-        if(visible > HINT_VISIBLE_LINES) {
-            visible = HINT_VISIBLE_LINES;
-        }
-        for(size_t i = 0; i < visible; i++) {
-            size_t line_index = app->hint_scroll + i;
-            if(line_index >= app->hint_line_count) break;
-            canvas_draw_str(
-                canvas, text_x, (uint8_t)(text_y + i * HINT_LINE_HEIGHT), app->hint_lines[line_index]);
-        }
-    }
-
-    if(app->hint_line_count > HINT_VISIBLE_LINES) {
-        size_t max_scroll = simple_app_hint_max_scroll(app);
-        bool show_up = (app->hint_scroll > 0);
-        bool show_down = (app->hint_scroll < max_scroll);
-        if(show_up || show_down) {
-            uint8_t arrow_x = (uint8_t)(bubble_x + bubble_w - 10);
-            int16_t content_top = text_y;
-            int16_t content_bottom =
-                text_y + (int16_t)((HINT_VISIBLE_LINES > 0 ? (HINT_VISIBLE_LINES - 1) : 0) * HINT_LINE_HEIGHT);
-            int16_t min_base = bubble_y + 12;
-            int16_t max_base = bubble_y + bubble_h - 12;
-            simple_app_draw_scroll_hints_clamped(
-                canvas, arrow_x, content_top, content_bottom, show_up, show_down, min_base, max_base);
-        }
-    }
-}
-
-static bool simple_app_try_show_hint(SimpleApp* app) {
-    if(!app) return false;
-    if(app->screen != ScreenMenu) return false;
-    if(app->section_index >= menu_section_count) return false;
-
-    const MenuSection* section = &menu_sections[app->section_index];
-
-    if(app->menu_state == MenuStateSections) {
-        if(!section->hint) return false;
-        simple_app_show_hint(app, section->title, section->hint);
-        return true;
-    }
-
-    if(section->entry_count == 0) {
-        if(!section->hint) return false;
-        simple_app_show_hint(app, section->title, section->hint);
-        return true;
-    }
-
-    if(app->item_index >= section->entry_count) return false;
-
-    const MenuEntry* entry = &section->entries[app->item_index];
-    const char* hint_text = entry->hint ? entry->hint : section->hint;
-    if(!hint_text) return false;
-
-    simple_app_show_hint(app, entry->label, hint_text);
-    return true;
 }
 
 static void simple_app_draw_portal_menu(SimpleApp* app, Canvas* canvas) {
@@ -11794,13 +11471,6 @@ static void simple_app_draw_menu(SimpleApp* app, Canvas* canvas) {
     canvas_set_bitmap_mode(canvas, false);
 
     canvas_set_font(canvas, FontSecondary);
-
-    if(app->help_hint_visible) {
-        const uint8_t help_text_x = DISPLAY_WIDTH - 2;
-        const uint8_t help_text_y = 63;
-        canvas_draw_str_aligned(canvas, help_text_x, (int16_t)help_text_y - 8, AlignRight, AlignBottom, "Hold OK");
-        canvas_draw_str_aligned(canvas, help_text_x, help_text_y, AlignRight, AlignBottom, "for Help");
-    }
 
     if(simple_app_status_message_is_active(app) && !app->status_message_fullscreen) {
         canvas_draw_str(canvas, 2, 52, app->status_message);
@@ -15012,8 +14682,6 @@ static void simple_app_draw(Canvas* canvas, void* context) {
         simple_app_draw_karma_html_popup(app, canvas);
     } else if(app->evil_twin_popup_active) {
         simple_app_draw_evil_twin_popup(app, canvas);
-    } else if(app->hint_active) {
-        simple_app_draw_hint(app, canvas);
     }
 
     simple_app_draw_ram_overlay(app, canvas);
@@ -17020,6 +16688,7 @@ static void simple_app_handle_setup_led_input(SimpleApp* app, InputKey key) {
             return;
         }
         if(previous != app->led_enabled) {
+            simple_app_mark_config_dirty(app);
             simple_app_update_led_label(app);
             simple_app_send_led_power_command(app);
             if(app->viewport) {
@@ -17045,6 +16714,7 @@ static void simple_app_handle_setup_led_input(SimpleApp* app, InputKey key) {
             return;
         }
         if(before != app->led_level) {
+            simple_app_mark_config_dirty(app);
             simple_app_update_led_label(app);
             simple_app_send_led_level_command(app);
             if(app->viewport) {
@@ -17715,7 +17385,6 @@ static void simple_app_input(InputEvent* event, void* context) {
             app->exit_confirm_tick = now;
             app->screen = ScreenConfirmExit;
             app->menu_state = MenuStateSections;
-            app->help_hint_visible = false;
             app->last_back_tick = 0;
             app->last_input_tick = now;
             if(app->viewport) {
@@ -17726,12 +17395,6 @@ static void simple_app_input(InputEvent* event, void* context) {
     }
 
     app->last_input_tick = now;
-    if(app->help_hint_visible) {
-        app->help_hint_visible = false;
-        if(app->viewport) {
-            view_port_update(app->viewport);
-        }
-    }
 
     if(simple_app_status_message_is_active(app) && app->status_message_fullscreen) {
         if(event->type == InputTypeShort &&
@@ -17776,11 +17439,6 @@ static void simple_app_input(InputEvent* event, void* context) {
 
     if(app->evil_twin_popup_active) {
         simple_app_handle_evil_twin_popup_event(app, event);
-        return;
-    }
-
-    if(app->hint_active) {
-        simple_app_handle_hint_event(app, event);
         return;
     }
 
@@ -17928,9 +17586,6 @@ static void simple_app_input(InputEvent* event, void* context) {
             if(app->viewport) {
                 view_port_update(app->viewport);
             }
-            return;
-        }
-        if(simple_app_try_show_hint(app)) {
             return;
         }
     }
@@ -18200,7 +17855,6 @@ int32_t Lab_C5_app(void* p) {
     simple_app_reset_evil_twin_status(app);
     simple_app_reset_passwords_listing(app);
     app->last_input_tick = furi_get_tick();
-    app->help_hint_visible = false;
 
     app->serial = furi_hal_serial_control_acquire(FuriHalSerialIdUsart);
     if(!app->serial) {
@@ -18326,32 +17980,11 @@ int32_t Lab_C5_app(void* p) {
             }
         }
 
-        bool previous_help_hint = app->help_hint_visible;
-        bool can_show_help_hint = (app->screen == ScreenMenu) && (app->menu_state == MenuStateSections) &&
-                                  !app->hint_active && !app->evil_twin_popup_active &&
-                                  !app->portal_ssid_popup_active && !app->sd_folder_popup_active &&
-                                  !app->sd_file_popup_active && !app->sd_delete_confirm_active &&
-                                  !simple_app_status_message_is_active(app);
-
         if(app->exit_confirm_active) {
             uint32_t now = furi_get_tick();
             if(now - app->exit_confirm_tick >= furi_ms_to_ticks(2000)) {
                 app->exit_confirm_active = false;
             }
-        }
-
-        if(can_show_help_hint) {
-            uint32_t now = furi_get_tick();
-            if(!app->help_hint_visible &&
-               (now - app->last_input_tick) >= furi_ms_to_ticks(HELP_HINT_IDLE_MS)) {
-                app->help_hint_visible = true;
-            }
-        } else {
-            app->help_hint_visible = false;
-        }
-
-        if(app->help_hint_visible != previous_help_hint && app->viewport) {
-            view_port_update(app->viewport);
         }
 
         furi_delay_ms(20);
