@@ -180,6 +180,7 @@ typedef enum {
 
 #define BOARD_PING_INTERVAL_MS 4000
 #define BOARD_PING_TIMEOUT_MS 3000
+#define BOARD_PING_FAILURE_LIMIT 2
 
 #define PACKAGE_MONITOR_CHANNELS_24GHZ 14
 #define PACKAGE_MONITOR_CHANNELS_5GHZ 23
@@ -656,7 +657,6 @@ typedef struct {
     bool confirm_sniffer_dos_yes;
     bool confirm_exit_yes;
     uint32_t last_attack_index;
-    bool board_reboot_sent;
     bool exit_confirm_active;
     uint32_t exit_confirm_tick;
     size_t evil_twin_menu_index;
@@ -879,6 +879,7 @@ typedef struct {
     bool board_missing_shown;
     bool board_bootstrap_active;
     bool board_bootstrap_reboot_sent;
+    uint8_t board_ping_failures;
     uint32_t last_input_tick;
     uint32_t last_back_tick;
     uint32_t usb_guard_last_tick;
@@ -2133,6 +2134,7 @@ static void simple_app_on_board_online(SimpleApp* app, const char* source) {
     app->board_ping_outstanding = false;
     app->board_last_rx_tick = furi_get_tick();
     app->board_missing_shown = false;
+    app->board_ping_failures = 0;
 
     if(app->board_bootstrap_active) {
         // End bootstrap discovery without forcing a reboot
@@ -2222,7 +2224,6 @@ static void simple_app_ping_watchdog(SimpleApp* app) {
     if(app->board_ping_outstanding &&
        (now - app->board_last_ping_tick) >= BOARD_PING_TIMEOUT_MS) {
         app->board_ping_outstanding = false;
-        app->board_ready_seen = false;
 
         if(app->board_bootstrap_active) {
             const char* waiting_msg = app->board_bootstrap_reboot_sent
@@ -2235,13 +2236,15 @@ static void simple_app_ping_watchdog(SimpleApp* app) {
             return;
         }
 
-        if(!app->board_missing_shown) {
-            app->board_missing_shown = true;
-            simple_app_show_status_message(app, "No board", 1500, true);
+        if(app->board_ping_failures < UINT8_MAX) {
+            app->board_ping_failures++;
         }
-        if(!app->board_reboot_sent) {
-            simple_app_send_command_quiet(app, "reboot");
-            app->board_reboot_sent = true;
+        if(app->board_ping_failures >= BOARD_PING_FAILURE_LIMIT) {
+            app->board_ready_seen = false;
+            if(!app->board_missing_shown) {
+                app->board_missing_shown = true;
+                simple_app_show_status_message(app, "No board", 1500, true);
+            }
         }
     }
 }
@@ -17813,7 +17816,7 @@ int32_t Lab_C5_app(void* p) {
     app->board_missing_shown = false;
     app->board_bootstrap_active = true;
     app->board_bootstrap_reboot_sent = false;
-    app->board_reboot_sent = false;
+    app->board_ping_failures = 0;
     app->exit_confirm_active = false;
     app->exit_confirm_tick = 0;
     app->boot_short_enabled = false;
