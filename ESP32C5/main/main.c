@@ -848,8 +848,11 @@ static int cmd_packet_monitor(int argc, char **argv);
 static int cmd_channel_view(int argc, char **argv);
 static int cmd_show_sniffer_results(int argc, char **argv);
 static int cmd_clear_sniffer_results(int argc, char **argv);
+static int cmd_show_sniffer_results_vendor(int argc, char **argv);
 static int cmd_show_probes(int argc, char **argv);
 static int cmd_list_probes(int argc, char **argv);
+static int cmd_show_probes_vendor(int argc, char **argv);
+static int cmd_list_probes_vendor(int argc, char **argv);
 static int cmd_sniffer_debug(int argc, char **argv);
 static int cmd_start_blackout(int argc, char **argv);
 static int cmd_ping(int argc, char **argv);
@@ -4515,6 +4518,82 @@ static int cmd_show_sniffer_results(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_show_sniffer_results_vendor(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    // Allow showing results even after sniffer is stopped
+    if (sniffer_active && sniffer_scan_phase) {
+        MY_LOG_INFO(TAG, "Sniffer is still scanning networks. Please wait...");
+        return 0;
+    }
+    
+    if (sniffer_ap_count == 0) {
+        MY_LOG_INFO(TAG, "No sniffer data available. Use 'start_sniffer' to collect data.");
+        return 0;
+    }
+    
+    // Create a sorted array of AP indices by client count (descending)
+    int sorted_indices[MAX_SNIFFER_APS];
+    for (int i = 0; i < sniffer_ap_count; i++) {
+        sorted_indices[i] = i;
+    }
+    
+    // Simple bubble sort by client count (descending)
+    for (int i = 0; i < sniffer_ap_count - 1; i++) {
+        for (int j = 0; j < sniffer_ap_count - i - 1; j++) {
+            if (sniffer_aps[sorted_indices[j]].client_count < sniffer_aps[sorted_indices[j + 1]].client_count) {
+                int temp = sorted_indices[j];
+                sorted_indices[j] = sorted_indices[j + 1];
+                sorted_indices[j + 1] = temp;
+            }
+        }
+    }
+    
+    // Compact format for Flipper Zero display with vendor info
+    int displayed_count = 0;
+    for (int i = 0; i < sniffer_ap_count; i++) {
+        int idx = sorted_indices[i];
+        sniffer_ap_t *ap = &sniffer_aps[idx];
+        
+        // Skip broadcast BSSID and our own device
+        if (is_broadcast_bssid(ap->bssid) || is_own_device_mac(ap->bssid)) {
+            continue;
+        }
+        
+        // Skip APs with no clients
+        if (ap->client_count == 0) {
+            continue;
+        }
+        
+        displayed_count++;
+        
+        // Print AP info in compact format: SSID, CH: CLIENT_COUNT [Vendor]
+        const char *ap_vendor = lookup_vendor_name(ap->bssid);
+        printf("%s, CH%d: %d [%s]\n", ap->ssid, ap->channel, ap->client_count,
+               ap_vendor ? ap_vendor : "Unknown");
+        
+        // Print each client MAC on a separate line with 1 space indentation and vendor
+        if (ap->client_count > 0) {
+            for (int j = 0; j < ap->client_count; j++) {
+                sniffer_client_t *client = &ap->clients[j];
+                const char *client_vendor = lookup_vendor_name(client->mac);
+                printf(" %02X:%02X:%02X:%02X:%02X:%02X [%s]\n",
+                       client->mac[0], client->mac[1], client->mac[2],
+                       client->mac[3], client->mac[4], client->mac[5],
+                       client_vendor ? client_vendor : "Unknown");
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(20)); // Small delay to avoid overwhelming UART
+    }
+    
+    if (displayed_count == 0) {
+        MY_LOG_INFO(TAG, "No APs with clients found.");
+    }
+    
+    return 0;
+}
+
 static int cmd_clear_sniffer_results(int argc, char **argv) {
     (void)argc; (void)argv;
     
@@ -4554,6 +4633,32 @@ static int cmd_show_probes(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_show_probes_vendor(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    if (probe_request_count == 0) {
+        MY_LOG_INFO(TAG, "No probe requests captured. Use 'start_sniffer' to collect data.");
+        return 0;
+    }
+    
+    MY_LOG_INFO(TAG, "Probe requests: %d", probe_request_count);
+    
+    // Display each probe request with vendor: SSID (MAC) [Vendor]
+    for (int i = 0; i < probe_request_count; i++) {
+        probe_request_t *probe = &probe_requests[i];
+        const char *vendor_name = lookup_vendor_name(probe->mac);
+        printf("%s (%02X:%02X:%02X:%02X:%02X:%02X) [%s]\n",
+               probe->ssid,
+               probe->mac[0], probe->mac[1], probe->mac[2],
+               probe->mac[3], probe->mac[4], probe->mac[5],
+               vendor_name ? vendor_name : "Unknown");
+        
+        vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to avoid overwhelming UART
+    }
+    
+    return 0;
+}
+
 static int cmd_list_probes(int argc, char **argv) {
     (void)argc; (void)argv;
     
@@ -4581,6 +4686,42 @@ static int cmd_list_probes(int argc, char **argv) {
         if (!already_displayed) {
             unique_count++;
             printf("%d %s\n", unique_count, probe->ssid);
+            
+            vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to avoid overwhelming UART
+        }
+    }
+    
+    return 0;
+}
+
+static int cmd_list_probes_vendor(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    if (probe_request_count == 0) {
+        MY_LOG_INFO(TAG, "No probe requests captured. Use 'start_sniffer' to collect data.");
+        return 0;
+    }
+    
+    int unique_count = 0;
+    
+    // Display each unique SSID only once with vendor from first seen MAC
+    for (int i = 0; i < probe_request_count; i++) {
+        probe_request_t *probe = &probe_requests[i];
+        
+        // Check if this SSID has already been displayed by looking at previous entries
+        bool already_displayed = false;
+        for (int j = 0; j < i; j++) {
+            if (strcmp(probe->ssid, probe_requests[j].ssid) == 0) {
+                already_displayed = true;
+                break;
+            }
+        }
+        
+        // If not displayed yet, display it
+        if (!already_displayed) {
+            unique_count++;
+            const char *vendor_name = lookup_vendor_name(probe->mac);
+            printf("%d %s [%s]\n", unique_count, probe->ssid, vendor_name ? vendor_name : "Unknown");
             
             vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to avoid overwhelming UART
         }
@@ -7732,6 +7873,14 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&show_sniffer_cmd));
+    const esp_console_cmd_t show_sniffer_vendor_cmd = {
+        .command = "show_sniffer_results_vendor",
+        .help = "Shows sniffer results sorted by client count with vendors",
+        .hint = NULL,
+        .func = &cmd_show_sniffer_results_vendor,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&show_sniffer_vendor_cmd));
 
     const esp_console_cmd_t clear_sniffer_cmd = {
         .command = "clear_sniffer_results",
@@ -7750,6 +7899,14 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&show_probes_cmd));
+    const esp_console_cmd_t show_probes_vendor_cmd = {
+        .command = "show_probes_vendor",
+        .help = "Shows captured probe requests with SSIDs and vendors",
+        .hint = NULL,
+        .func = &cmd_show_probes_vendor,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&show_probes_vendor_cmd));
 
     const esp_console_cmd_t list_probes_cmd = {
         .command = "list_probes",
@@ -7759,6 +7916,14 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&list_probes_cmd));
+    const esp_console_cmd_t list_probes_vendor_cmd = {
+        .command = "list_probes_vendor",
+        .help = "Lists probe requests with index, SSID, and vendor",
+        .hint = NULL,
+        .func = &cmd_list_probes_vendor,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&list_probes_vendor_cmd));
 
     const esp_console_cmd_t sniffer_debug_cmd = {
         .command = "sniffer_debug",
@@ -8218,8 +8383,11 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  select_stations <MAC1> [MAC2] ...");
       MY_LOG_INFO(TAG,"  unselect_stations");
       MY_LOG_INFO(TAG,"  show_probes");
+      MY_LOG_INFO(TAG,"  show_probes_vendor");
+      MY_LOG_INFO(TAG,"  list_probes_vendor");
       MY_LOG_INFO(TAG,"  show_scan_results");
       MY_LOG_INFO(TAG,"  show_sniffer_results");
+      MY_LOG_INFO(TAG,"  show_sniffer_results_vendor");
       MY_LOG_INFO(TAG,"  clear_sniffer_results");
       MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
       MY_LOG_INFO(TAG,"  start_blackout");
