@@ -93,7 +93,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.1.0"
+#define JANOS_VERSION "1.1.1"
 
 
 #define NEOPIXEL_GPIO      27
@@ -505,7 +505,7 @@ static void channel_time_load_state_from_nvs(void) {
 // Calculate dynamic scan timeout based on channel times
 // 14 channels (2.4 GHz) + 5 second buffer for overhead
 static int get_scan_timeout_iterations(void) {
-    int max_scan_duration_ms = (14 * g_scan_max_channel_time) + 5000;
+    int max_scan_duration_ms = (14 * g_scan_max_channel_time) + 15000;  // 15s buffer for scan overhead
     return max_scan_duration_ms / 100; // 100ms per iteration
 }
 
@@ -885,6 +885,7 @@ static int cmd_file_delete(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_wifi_connect(int argc, char **argv);
 static int cmd_list_hosts(int argc, char **argv);
+static int cmd_list_hosts_vendor(int argc, char **argv);
 static int cmd_arp_ban(int argc, char **argv);
 static void arp_ban_task(void *pvParameters);
 static int cmd_reboot(int argc, char **argv);
@@ -1703,9 +1704,9 @@ static esp_err_t quick_channel_scan(void) {
         if (!periodic_rescan_in_progress) {
             MY_LOG_INFO(TAG, "Scan taking longer than expected, waiting for completion...");
         }
-        // Wait additional time for scan to complete naturally
+        // Wait additional time for scan to complete naturally (up to 30 seconds)
         int extra_wait = 0;
-        while (g_scan_in_progress && extra_wait < 100) {
+        while (g_scan_in_progress && extra_wait < 300) {
             vTaskDelay(pdMS_TO_TICKS(100));
             extra_wait++;
         }
@@ -2599,9 +2600,9 @@ static void blackout_attack_task(void *pvParameters) {
         
         if (g_scan_in_progress) {
             MY_LOG_INFO(TAG, "Scan taking longer than expected, waiting for completion...");
-            // Wait additional time for scan to complete naturally
+            // Wait additional time for scan to complete naturally (30s max)
             int extra_wait = 0;
-            while (g_scan_in_progress && extra_wait < 100 && blackout_attack_active && !operation_stop_requested) {
+            while (g_scan_in_progress && extra_wait < 300 && blackout_attack_active && !operation_stop_requested) {
                 vTaskDelay(pdMS_TO_TICKS(100));
                 extra_wait++;
             }
@@ -2863,9 +2864,9 @@ static void handshake_attack_task(void *pvParameters) {
                 
                 if (g_scan_in_progress) {
                     MY_LOG_INFO(TAG, "Scan taking longer than expected, waiting for completion...");
-                    // Wait additional time for scan to complete naturally
+                    // Wait additional time for scan to complete naturally (30s max)
                     int extra_wait = 0;
-                    while (g_scan_in_progress && extra_wait < 100 && handshake_attack_active && !operation_stop_requested) {
+                    while (g_scan_in_progress && extra_wait < 300 && handshake_attack_active && !operation_stop_requested) {
                         vTaskDelay(pdMS_TO_TICKS(100));
                         extra_wait++;
                     }
@@ -4116,6 +4117,94 @@ static int cmd_list_hosts(int argc, char **argv) {
                 ip4_addr1(ip_ret), ip4_addr2(ip_ret), ip4_addr3(ip_ret), ip4_addr4(ip_ret),
                 eth_ret->addr[0], eth_ret->addr[1], eth_ret->addr[2],
                 eth_ret->addr[3], eth_ret->addr[4], eth_ret->addr[5]);
+            found_count++;
+        }
+    }
+    MY_LOG_INFO(TAG, "========================");
+    MY_LOG_INFO(TAG, "Found %d hosts", found_count);
+    
+    return 0;
+}
+
+static int cmd_list_hosts_vendor(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    // Check if connected to AP
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        MY_LOG_INFO(TAG, "Not connected to any AP. Use 'wifi_connect' first.");
+        return 1;
+    }
+    
+    // Get STA netif
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        MY_LOG_INFO(TAG, "STA interface not found");
+        return 1;
+    }
+    
+    // Get IP info
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(sta_netif, &ip_info) != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to get IP info. DHCP may not have completed.");
+        return 1;
+    }
+    
+    if (ip_info.ip.addr == 0) {
+        MY_LOG_INFO(TAG, "No IP address assigned yet. Wait for DHCP.");
+        return 1;
+    }
+    
+    // Calculate host range from subnet
+    uint32_t ip = ntohl(ip_info.ip.addr);
+    uint32_t mask = ntohl(ip_info.netmask.addr);
+    uint32_t network = ip & mask;
+    uint32_t broadcast = network | ~mask;
+    uint32_t host_count_to_scan = broadcast - network - 1;
+    
+    MY_LOG_INFO(TAG, "Our IP: " IPSTR ", Netmask: " IPSTR, IP2STR(&ip_info.ip), IP2STR(&ip_info.netmask));
+    MY_LOG_INFO(TAG, "Scanning %lu hosts on network...", (unsigned long)host_count_to_scan);
+    
+    // Get LwIP netif from esp_netif
+    struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
+    if (!lwip_netif) {
+        MY_LOG_INFO(TAG, "Failed to get LwIP netif");
+        return 1;
+    }
+    
+    // Send ARP requests to all IPs in subnet
+    int requests_sent = 0;
+    for (uint32_t target = network + 1; target < broadcast && requests_sent < 254; target++) {
+        ip4_addr_t target_ip;
+        target_ip.addr = htonl(target);
+        etharp_request(lwip_netif, &target_ip);
+        requests_sent++;
+        
+        // Small delay between requests to avoid flooding
+        if (requests_sent % 10 == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    
+    MY_LOG_INFO(TAG, "Sent %d ARP requests, waiting for responses...", requests_sent);
+    
+    // Wait for ARP responses
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    
+    // Read and display ARP table with vendor info
+    MY_LOG_INFO(TAG, "=== Discovered Hosts ===");
+    int found_count = 0;
+    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+        ip4_addr_t *ip_ret;
+        struct netif *netif_ret;
+        struct eth_addr *eth_ret;
+        if (etharp_get_entry(i, &ip_ret, &netif_ret, &eth_ret) == 1) {
+            const char *vendor = lookup_vendor_name(eth_ret->addr);
+            MY_LOG_INFO(TAG, "  %d.%d.%d.%d  ->  %02X:%02X:%02X:%02X:%02X:%02X [%s]",
+                ip4_addr1(ip_ret), ip4_addr2(ip_ret), ip4_addr3(ip_ret), ip4_addr4(ip_ret),
+                eth_ret->addr[0], eth_ret->addr[1], eth_ret->addr[2],
+                eth_ret->addr[3], eth_ret->addr[4], eth_ret->addr[5],
+                vendor ? vendor : "Unknown");
             found_count++;
         }
     }
@@ -8656,6 +8745,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&list_hosts_cmd));
+
+    const esp_console_cmd_t list_hosts_vendor_cmd = {
+        .command = "list_hosts_vendor",
+        .help = "Scan local network via ARP and list discovered hosts with vendor names",
+        .hint = NULL,
+        .func = &cmd_list_hosts_vendor,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&list_hosts_vendor_cmd));
 
     const esp_console_cmd_t arp_ban_cmd = {
         .command = "arp_ban",
