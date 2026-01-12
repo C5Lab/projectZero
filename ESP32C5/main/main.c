@@ -93,7 +93,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.1.1"
+#define JANOS_VERSION "1.1.2"
 
 
 #define NEOPIXEL_GPIO      27
@@ -842,7 +842,7 @@ static bool vendor_file_present = false;
 static uint8_t vendor_last_oui[3] = {0};
 static bool vendor_last_valid = false;
 static bool vendor_last_hit = false;
-static bool vendor_lookup_enabled = true;
+static bool vendor_lookup_enabled = false;
 static size_t vendor_record_count = 0;
 
 
