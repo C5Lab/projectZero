@@ -1,4 +1,4 @@
-name: ESP32C5 Build (IDF 6.0-dev)
+name: ESP32C5 Build (IDF 6.0-beta1)
 
 on:
   workflow_dispatch:
