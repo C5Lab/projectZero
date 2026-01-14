@@ -31,8 +31,9 @@ DIST_FAP = DIST_DIR / "lab_c5.fap"
 SOURCE_FILE = ROOT / "Lab_C5.c"
 
 VARIANTS = (
-    ("momentum", ("mntm", "momentum")),
-    ("unleashed", ("unlsh", "unlshed", "unleashed")),
+    ("momentum_dev", ("mntm-dev", "momentum dev", "momentum-dev", "momentum_dev"), ()),
+    ("momentum", ("mntm", "momentum"), ("mntm-dev",)),
+    ("unleashed", ("unlsh", "unlshed", "unleashed"), ()),
 )
 
 
@@ -60,11 +61,14 @@ def read_version() -> str:
     return match.group(1)
 
 
-def pick_sdk(sdk_dir: Path, patterns: Iterable[str]) -> Optional[Path]:
+def pick_sdk(
+    sdk_dir: Path, patterns: Iterable[str], exclude: Iterable[str] = ()
+) -> Optional[Path]:
     candidates = [
         path
         for path in sdk_dir.glob("*.zip")
         if any(token in path.name.lower() for token in patterns)
+        and not any(token in path.name.lower() for token in exclude)
     ]
     if not candidates:
         return None
@@ -161,8 +165,8 @@ def main() -> None:
 
     built_variants: list[tuple[str, Path]] = []
 
-    for variant, patterns in VARIANTS:
-        sdk = pick_sdk(args.sdk_dir, patterns)
+    for variant, patterns, exclude in VARIANTS:
+        sdk = pick_sdk(args.sdk_dir, patterns, exclude)
         if not sdk:
             print(f"Skipping {variant}: no matching SDK zip in {args.sdk_dir}")
             continue

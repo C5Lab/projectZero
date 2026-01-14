@@ -1,6 +1,6 @@
 # Flipper Companion App
 
-The Flipper Zero companion app (`Lab_C5.fap`) mirrors the ESP32-C5 CLI workflows (scan, Targets, attacks, wardrive, Sniffer Dog, portal control) so you can steer the board from the handheld UI.
+The Flipper Zero companion app (`Lab_C5.fap`) mirrors the ESP32-C5 CLI workflows (scan, results, attacks, wardrive, Sniffer Dog, portal control) so you can steer the board from the handheld UI.
 
 ## Build with compatible SDKs
 
