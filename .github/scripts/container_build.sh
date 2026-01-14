@@ -30,10 +30,6 @@ normalize_sdkconfig() {
     [ -f "$f" ] || continue
     sed -i 's/\r$//' "$f"
   done
-
-  if [ -f "$cfg" ] && grep -q '^CONFIG_IEEE802154_CCA_THRESHOLD=$' "$cfg"; then
-    sed -i 's/^CONFIG_IEEE802154_CCA_THRESHOLD=$/CONFIG_IEEE802154_CCA_THRESHOLD=-75/' "$cfg"
-  fi
 }
 
 while [[ $# -gt 0 ]]; do
