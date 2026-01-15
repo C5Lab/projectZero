@@ -15,3 +15,4 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   espressif/led_strip: '>=3.0.0,<4.0.0'
+  espressif/cjson: '>=1.7.19,<2.0.0'
