@@ -113,6 +113,7 @@
 #define OTA_NVS_NAMESPACE "ota"
 #define OTA_NVS_KEY_CHANNEL "channel"
 #define OTA_DEV_BRANCH "development"
+#define OTA_PROJECT_NAME "projectZero"
 
 
 #define NEOPIXEL_GPIO      27
@@ -1648,6 +1649,80 @@ static esp_err_t ota_build_branch_url(char *url_out, size_t url_len) {
     return ESP_OK;
 }
 
+static bool ota_is_expected_project(const esp_app_desc_t *desc) {
+    if (!desc) {
+        return false;
+    }
+
+    if (strncmp(desc->project_name, OTA_PROJECT_NAME, sizeof(desc->project_name)) != 0) {
+        MY_LOG_INFO(TAG, "OTA: unexpected project '%s'", desc->project_name);
+        return false;
+    }
+    return true;
+}
+
+static esp_err_t ota_perform_https_update(const char *download_url) {
+    if (!download_url || !*download_url) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_http_client_config_t http_cfg = {
+        .url = download_url,
+        .timeout_ms = 15000,
+        .buffer_size = 16 * 1024,
+        .buffer_size_tx = 4 * 1024,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_https_ota_config_t ota_cfg = {
+        .http_config = &http_cfg,
+    };
+
+    esp_https_ota_handle_t ota_handle = NULL;
+    esp_err_t err = esp_https_ota_begin(&ota_cfg, &ota_handle);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA: begin failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    esp_app_desc_t app_desc = {0};
+    err = esp_https_ota_get_img_desc(ota_handle, &app_desc);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA: image desc failed: %s", esp_err_to_name(err));
+        esp_https_ota_abort(ota_handle);
+        return err;
+    }
+
+    MY_LOG_INFO(TAG, "OTA: image project=%s version=%s idf=%s",
+                app_desc.project_name, app_desc.version, app_desc.idf_ver);
+    if (!ota_is_expected_project(&app_desc)) {
+        esp_https_ota_abort(ota_handle);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    while ((err = esp_https_ota_perform(ota_handle)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA: perform failed: %s", esp_err_to_name(err));
+        esp_https_ota_abort(ota_handle);
+        return err;
+    }
+
+    if (!esp_https_ota_is_complete_data_received(ota_handle)) {
+        MY_LOG_INFO(TAG, "OTA: incomplete image");
+        esp_https_ota_abort(ota_handle);
+        return ESP_FAIL;
+    }
+
+    err = esp_https_ota_finish(ota_handle);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA: finish failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    return ESP_OK;
+}
+
 static bool ota_has_ip(void) {
     esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (!sta_netif) {
@@ -1822,18 +1897,7 @@ static void ota_check_task(void *pvParameters) {
                 target_part ? target_part->label : "n/a",
                 target_part ? (unsigned long)target_part->address : 0UL);
     ota_led_start();
-    esp_http_client_config_t http_cfg = {
-        .url = download_url,
-        .timeout_ms = 15000,
-        .buffer_size = 16 * 1024,
-        .buffer_size_tx = 4 * 1024,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-    };
-    esp_https_ota_config_t ota_cfg = {
-        .http_config = &http_cfg,
-    };
-
-    err = esp_https_ota(&ota_cfg);
+    err = ota_perform_https_update(download_url);
     ota_led_stop();
     if (err == ESP_OK) {
         MY_LOG_INFO(TAG, "OTA: update applied, restarting");
