@@ -22,6 +22,16 @@ Options:
 EOF
 }
 
+normalize_sdkconfig() {
+  local cfg="${APP_DIR}/sdkconfig"
+  local cfg_old="${APP_DIR}/sdkconfig.old"
+
+  for f in "$cfg" "$cfg_old"; do
+    [ -f "$f" ] || continue
+    sed -i 's/\r$//' "$f"
+  done
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-docker)
@@ -42,6 +52,7 @@ done
 
 build_native() {
   cd "$APP_DIR"
+  normalize_sdkconfig
   export IDF_TARGET=esp32c5
   if [ -f /opt/esp/idf/export.sh ]; then
     # shellcheck disable=SC1091
@@ -60,6 +71,7 @@ if [[ "$USE_DOCKER" == "0" || "$USE_DOCKER" == "false" ]]; then
 fi
 
 mkdir -p "$CACHE_DIR"
+normalize_sdkconfig
 
 docker run --rm \
   --workdir /project \
