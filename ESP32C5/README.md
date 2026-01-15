@@ -14,7 +14,8 @@ Important notes:
 - Auto-OTA on IP is disabled; use the CLI commands below.
 
 ### OTA Commands
-- `wifi_connect <SSID> <Password> [ota]`: Connect to Wi-Fi as STA. Add `ota` to trigger OTA right after DHCP.
+- `wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]`: Connect to Wi-Fi as STA. Add `ota` to trigger OTA right after DHCP, or pass static IP settings (optionally with DNS).
+- `wifi_disconnect`: Disconnect from the current Wi-Fi AP (STA).
 - `ota_check [latest|<tag>]`: Check and apply OTA. Default respects `ota_channel`. `latest` forces GitHub releases/latest. `<tag>` forces a specific release.
 - `ota_list`: List recent GitHub releases (up to 5) with dates.
 - `ota_channel [main|dev]`: Get/set OTA channel (saved in NVS).

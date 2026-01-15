@@ -64,9 +64,11 @@
 #include "lwip/dhcp.h"
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "lwip/ip_addr.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/prot/ethernet.h"
 #include "lwip/pbuf.h"
+#include "linenoise/linenoise.h"
 #include "esp_netif_net_stack.h"
 
 #include "attack_handshake.h"
@@ -99,7 +101,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.0.0"
+#define JANOS_VERSION "1.2.0"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -4623,17 +4625,297 @@ static int cmd_stop(int argc, char **argv) {
     return 0;
 }
 
+static bool parse_ipv4_arg(const char *arg, esp_ip4_addr_t *out) {
+    if (!arg || !out) {
+        return false;
+    }
+    ip4_addr_t tmp = { 0 };
+    if (ip4addr_aton(arg, &tmp) == 0) {
+        return false;
+    }
+    out->addr = tmp.addr;
+    return true;
+}
+
+static bool line_ends_with_space(const char *line) {
+    if (!line) {
+        return false;
+    }
+    size_t len = strlen(line);
+    if (len == 0) {
+        return false;
+    }
+    char last = line[len - 1];
+    return last == ' ' || last == '\t';
+}
+
+typedef struct {
+    const char *command;
+    const char *hint;
+} cli_hint_t;
+
+static const cli_hint_t k_cli_hints[] = {
+    { "packet_monitor", " <channel>" },
+    { "deauth_detector", " [index1 index2 ...]" },
+    { "select_networks", " <index1> [index2] ..." },
+    { "select_stations", " <MAC1> [MAC2] ..." },
+    { "sniffer_debug", " <0|1>" },
+    { "start_gps_raw", " [baud]" },
+    { "gps_set", " <m5|atgm>" },
+    { "start_portal", " <SSID>" },
+    { "start_karma", " <index>" },
+    { "vendor", " set <on|off> | read" },
+    { "boot_button", " read|list|set <short|long> <command> | status <short|long> <on|off>" },
+    { "led", " set <on|off> | level <1-100> | read" },
+    { "channel_time", " set <min|max> <ms> | read <min|max>" },
+    { "wifi_connect", " <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
+    { "ota_channel", " [main|dev]" },
+    { "ota_boot", " <ota_0|ota_1>" },
+    { "arp_ban", " <MAC> [IP]" },
+    { "show_pass", " [portal|evil]" },
+    { "list_dir", " [path]" },
+    { "file_delete", " <path>" },
+    { "select_html", " <index>" },
+    { "set_html", " <html>" },
+};
+
+static const char *lookup_cli_hint(const char *command) {
+    if (!command) {
+        return NULL;
+    }
+    for (size_t i = 0; i < (sizeof(k_cli_hints) / sizeof(k_cli_hints[0])); i++) {
+        if (strcmp(k_cli_hints[i].command, command) == 0) {
+            return k_cli_hints[i].hint;
+        }
+    }
+    return NULL;
+}
+
+static const char *wifi_connect_dynamic_hint(const char *buf, int *color, int *bold) {
+    static const char *hint_ssid = " <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_pass = " <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_optional = " [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_ip_optional = " [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_mask = " <Netmask> <GW> [DNS1] [DNS2]";
+    static const char *hint_gw = " <GW> [DNS1] [DNS2]";
+    static const char *hint_dns1 = " [DNS1] [DNS2]";
+    static const char *hint_dns2 = " [DNS2]";
+
+    if (!buf) {
+        return NULL;
+    }
+    if (color) {
+        *color = 39;
+    }
+    if (bold) {
+        *bold = 0;
+    }
+
+    char line[128];
+    size_t len = strnlen(buf, sizeof(line) - 1);
+    memcpy(line, buf, len);
+    line[len] = '\0';
+
+    char *argv[10];
+    size_t argc = esp_console_split_argv(line, argv, sizeof(argv) / sizeof(argv[0]));
+    if (argc == 0) {
+        return NULL;
+    }
+    if (strcmp(argv[0], "wifi_connect") != 0) {
+        return NULL;
+    }
+
+    if (argc == 1) {
+        return hint_ssid;
+    }
+
+    if (!line_ends_with_space(buf)) {
+        return NULL;
+    }
+
+    if (argc == 2) {
+        return hint_pass;
+    }
+    if (argc == 3) {
+        return hint_optional;
+    }
+
+    bool has_ota = (strcasecmp(argv[3], "ota") == 0);
+    int ip_start = has_ota ? 4 : 3;
+    int ip_args = (int)argc - ip_start;
+
+    if (ip_args <= 0) {
+        return hint_ip_optional;
+    }
+    if (ip_args == 1) {
+        return hint_mask;
+    }
+    if (ip_args == 2) {
+        return hint_gw;
+    }
+    if (ip_args == 3) {
+        return hint_dns1;
+    }
+    if (ip_args == 4) {
+        return hint_dns2;
+    }
+
+    return NULL;
+}
+
+static const char *generic_cli_hint(const char *buf, int *color, int *bold) {
+    if (!buf) {
+        return NULL;
+    }
+
+    char line[128];
+    size_t len = strnlen(buf, sizeof(line) - 1);
+    memcpy(line, buf, len);
+    line[len] = '\0';
+
+    char *argv[10];
+    size_t argc = esp_console_split_argv(line, argv, sizeof(argv) / sizeof(argv[0]));
+    if (argc == 0) {
+        return NULL;
+    }
+
+    if (strcmp(argv[0], "wifi_connect") == 0) {
+        return NULL;
+    }
+
+    if (argc != 1 && !line_ends_with_space(buf)) {
+        return NULL;
+    }
+
+    const char *hint = esp_console_get_hint(argv[0], color, bold);
+    if (hint) {
+        return hint;
+    }
+
+    hint = lookup_cli_hint(argv[0]);
+    if (hint && hint[0] != '\0') {
+        if (color) {
+            *color = 39;
+        }
+        if (bold) {
+            *bold = 0;
+        }
+        return hint;
+    }
+
+    return NULL;
+}
+
+static char *janos_console_hint(const char *buf, int *color, int *bold) {
+    const char *hint = wifi_connect_dynamic_hint(buf, color, bold);
+    if (hint != NULL) {
+        return (char *)hint;
+    }
+    hint = generic_cli_hint(buf, color, bold);
+    if (hint != NULL) {
+        return (char *)hint;
+    }
+    return (char *)esp_console_get_hint(buf, color, bold);
+}
+
+static bool wait_for_sta_ip_info(esp_netif_ip_info_t *out_info, int timeout_ms) {
+    if (!out_info) {
+        return false;
+    }
+
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        return false;
+    }
+
+    if (esp_netif_get_ip_info(sta_netif, out_info) == ESP_OK && out_info->ip.addr != 0) {
+        return true;
+    }
+
+    int loops = timeout_ms / 100;
+    for (int i = 0; i < loops; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (esp_netif_get_ip_info(sta_netif, out_info) == ESP_OK && out_info->ip.addr != 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static int cmd_wifi_disconnect(int argc, char **argv) {
+    if (argc != 1) {
+        MY_LOG_INFO(TAG, "Usage: wifi_disconnect");
+        return 0;
+    }
+
+    if (current_radio_mode != RADIO_MODE_WIFI || !wifi_initialized) {
+        MY_LOG_INFO(TAG, "WiFi not initialized");
+        return 0;
+    }
+
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        MY_LOG_INFO(TAG, "Not connected to any AP.");
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Disconnecting from AP '%s'...", ap_info.ssid);
+    esp_wifi_disconnect();
+    return 0;
+}
+
 static int cmd_wifi_connect(int argc, char **argv) {
-    if (argc < 3 || argc > 4) {
-        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> <Password> [ota]");
-        return 1;
+    if (argc < 3 || argc > 9) {
+        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+        return 0;
     }
     
     const char *ssid = argv[1];
     const char *password = argv[2];
     bool ota_after_connect = false;
-    if (argc == 4 && strcasecmp(argv[3], "ota") == 0) {
+    bool use_static_ip = false;
+    esp_ip4_addr_t static_ip = { 0 };
+    esp_ip4_addr_t static_mask = { 0 };
+    esp_ip4_addr_t static_gw = { 0 };
+    bool use_dns1 = false;
+    bool use_dns2 = false;
+    esp_ip4_addr_t static_dns1 = { 0 };
+    esp_ip4_addr_t static_dns2 = { 0 };
+
+    int argi = 3;
+    if (argc > argi && strcasecmp(argv[argi], "ota") == 0) {
         ota_after_connect = true;
+        argi++;
+    }
+
+    int remaining = argc - argi;
+    if (remaining != 0 && remaining != 3 && remaining != 4 && remaining != 5) {
+        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+        return 0;
+    }
+    if (remaining >= 3) {
+        if (!parse_ipv4_arg(argv[argi], &static_ip) ||
+            !parse_ipv4_arg(argv[argi + 1], &static_mask) ||
+            !parse_ipv4_arg(argv[argi + 2], &static_gw)) {
+            MY_LOG_INFO(TAG, "Invalid IP/netmask/gateway. Example: 192.168.1.10 255.255.255.0 192.168.1.1");
+            return 0;
+        }
+        use_static_ip = true;
+    }
+    if (remaining >= 4) {
+        if (!parse_ipv4_arg(argv[argi + 3], &static_dns1)) {
+            MY_LOG_INFO(TAG, "Invalid DNS1. Example: 8.8.8.8");
+            return 0;
+        }
+        use_dns1 = true;
+    }
+    if (remaining == 5) {
+        if (!parse_ipv4_arg(argv[argi + 4], &static_dns2)) {
+            MY_LOG_INFO(TAG, "Invalid DNS2. Example: 1.1.1.1");
+            return 0;
+        }
+        use_dns2 = true;
     }
     
     MY_LOG_INFO(TAG, "Connecting to AP '%s'...", ssid);
@@ -4656,9 +4938,48 @@ static int cmd_wifi_connect(int argc, char **argv) {
     // Reinitialize WiFi
     if (!ensure_wifi_mode()) {
         MY_LOG_INFO(TAG, "Failed to reinitialize WiFi");
-        return 1;
+        return 0;
     }
     
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        MY_LOG_INFO(TAG, "STA interface not found");
+        return 0;
+    }
+
+    if (use_static_ip) {
+        esp_netif_dhcpc_stop(sta_netif);
+        esp_netif_ip_info_t ip_info = { 0 };
+        ip_info.ip = static_ip;
+        ip_info.netmask = static_mask;
+        ip_info.gw = static_gw;
+        esp_err_t ret = esp_netif_set_ip_info(sta_netif, &ip_info);
+        if (ret != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to set static IP: %s", esp_err_to_name(ret));
+            return 0;
+        }
+        if (use_dns1) {
+            esp_netif_dns_info_t dns = { 0 };
+            dns.ip.u_addr.ip4 = static_dns1;
+            dns.ip.type = IPADDR_TYPE_V4;
+            ret = esp_netif_set_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns);
+            if (ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to set DNS1: %s", esp_err_to_name(ret));
+            }
+        }
+        if (use_dns2) {
+            esp_netif_dns_info_t dns = { 0 };
+            dns.ip.u_addr.ip4 = static_dns2;
+            dns.ip.type = IPADDR_TYPE_V4;
+            ret = esp_netif_set_dns_info(sta_netif, ESP_NETIF_DNS_BACKUP, &dns);
+            if (ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to set DNS2: %s", esp_err_to_name(ret));
+            }
+        }
+    } else {
+        esp_netif_dhcpc_start(sta_netif);
+    }
+
     // Configure STA and connect
     wifi_config_t sta_config = { 0 };
     strncpy((char *)sta_config.sta.ssid, ssid, sizeof(sta_config.sta.ssid) - 1);
@@ -4678,26 +4999,42 @@ static int cmd_wifi_connect(int argc, char **argv) {
     }
     
     if (wifi_connect_result == 1) {
+        esp_netif_ip_info_t ip_info = { 0 };
+        bool has_ip = wait_for_sta_ip_info(&ip_info, 5000);
         MY_LOG_INFO(TAG, "SUCCESS: Connected to '%s'", ssid);
-        if (ota_after_connect) {
-            for (int i = 0; i < 50 && !ota_has_ip(); i++) {
-                vTaskDelay(pdMS_TO_TICKS(100));
+        if (has_ip) {
+            if (use_static_ip) {
+                MY_LOG_INFO(TAG, "Static IP: " IPSTR ", Netmask: " IPSTR ", GW: " IPSTR,
+                            IP2STR(&ip_info.ip), IP2STR(&ip_info.netmask), IP2STR(&ip_info.gw));
+                if (use_dns1) {
+                    MY_LOG_INFO(TAG, "DNS1: " IPSTR, IP2STR(&static_dns1));
+                }
+                if (use_dns2) {
+                    MY_LOG_INFO(TAG, "DNS2: " IPSTR, IP2STR(&static_dns2));
+                }
+            } else {
+                MY_LOG_INFO(TAG, "DHCP IP: " IPSTR ", Netmask: " IPSTR ", GW: " IPSTR,
+                            IP2STR(&ip_info.ip), IP2STR(&ip_info.netmask), IP2STR(&ip_info.gw));
             }
-            if (!ota_has_ip()) {
+        } else {
+            MY_LOG_INFO(TAG, "No IP assigned yet. Wait for DHCP.");
+        }
+        if (ota_after_connect) {
+            if (!has_ip) {
                 MY_LOG_INFO(TAG, "OTA: no IP yet. Wait for DHCP.");
-                return 1;
+                return 0;
             }
             if (!ota_start_check(NULL, false)) {
-                return 1;
+                return 0;
             }
         }
         return 0;
     } else if (wifi_connect_result == -1) {
-        MY_LOG_INFO(TAG, "FAILED: Could not connect to '%s' (wrong password or AP not found)", ssid);
-        return 1;
+        MY_LOG_INFO(TAG, "FAILED: Connection to '%s' failed. Check SSID/password and signal.", ssid);
+        return 0;
     } else {
         MY_LOG_INFO(TAG, "TIMEOUT: Connection to '%s' timed out", ssid);
-        return 1;
+        return 0;
     }
 }
 
@@ -9627,12 +9964,21 @@ static void register_commands(void)
 
     const esp_console_cmd_t wifi_connect_cmd = {
         .command = "wifi_connect",
-        .help = "Connect to AP as STA: wifi_connect <SSID> <Password> [ota]",
-        .hint = "<SSID> <Password> [ota]",
+        .help = "Connect to AP as STA: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
+        .hint = "<SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
         .func = &cmd_wifi_connect,
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_connect_cmd));
+
+    const esp_console_cmd_t wifi_disconnect_cmd = {
+        .command = "wifi_disconnect",
+        .help = "Disconnect from current AP (STA)",
+        .hint = NULL,
+        .func = &cmd_wifi_disconnect,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_disconnect_cmd));
 
     const esp_console_cmd_t ota_check_cmd = {
         .command = "ota_check",
@@ -9940,7 +10286,8 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  list_ssid");
       MY_LOG_INFO(TAG,"  packet_monitor <channel>");
       MY_LOG_INFO(TAG,"  ping");
-      MY_LOG_INFO(TAG,"  wifi_connect <SSID> <Password> [ota]");
+      MY_LOG_INFO(TAG,"  wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+      MY_LOG_INFO(TAG,"  wifi_disconnect");
       MY_LOG_INFO(TAG,"  ota_channel [main|dev]");
       MY_LOG_INFO(TAG,"  ota_list");
       MY_LOG_INFO(TAG,"  ota_check");
@@ -9985,6 +10332,8 @@ void app_main(void) {
 
     esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
+
+    linenoiseSetHintsCallback((linenoiseHintsCallback *)&janos_console_hint);
 
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
     vTaskDelay(pdMS_TO_TICKS(500));
