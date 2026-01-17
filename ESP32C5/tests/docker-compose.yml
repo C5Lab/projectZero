@@ -4,6 +4,8 @@ services:
     working_dir: /workspace/ESP32C5/tests
     volumes:
       - ../..:/workspace
+    env_file:
+      - .env
     devices:
       - ${ESP32C5_TEST_DEVICE:-/dev/ttyUSB0}:/dev/ttyUSB0
     environment:
