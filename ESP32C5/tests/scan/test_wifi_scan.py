@@ -28,14 +28,6 @@ def _wait_for_ready(ser, marker, timeout):
     return _read_until_marker(ser, marker, timeout)
 
 
-def _report(pytestconfig, message):
-    reporter = pytestconfig.pluginmanager.get_plugin("terminalreporter")
-    if reporter:
-        reporter.write_line(message)
-    else:
-        print(message)
-
-
 @pytest.mark.mandatory
 @pytest.mark.scan
 def test_wifi_scan(dut_port, settings_config, pytestconfig):
@@ -62,8 +54,10 @@ def test_wifi_scan(dut_port, settings_config, pytestconfig):
     retrieved_count = int(retrieved_match.group(1))
     retrieved_time = retrieved_match.group(2)
 
-    _report(pytestconfig, f"Scan summary: Found {found_count} networks")
-    _report(pytestconfig, f"Retrieved {retrieved_count} network records in {retrieved_time}s")
+    summaries = getattr(pytestconfig, "_scan_summaries", [])
+    summaries.append(f"Found {found_count} networks")
+    summaries.append(f"Retrieved {retrieved_count} network records in {retrieved_time}s")
+    pytestconfig._scan_summaries = summaries
 
     assert found_count >= 1, f"Found count < 1.\n{output}"
     assert retrieved_count >= 1, f"Retrieved count < 1.\n{output}"

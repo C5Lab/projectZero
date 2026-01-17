@@ -114,6 +114,19 @@ def pytest_sessionstart(session):
     _write_line(config, f"Preflight: flash baud: {settings.get('flash_baud', 460800)}")
     _write_line(config, f"Preflight: uart baud: {settings.get('uart_baud', 115200)}")
 
+
+def pytest_configure(config):
+    if not hasattr(config, "_scan_summaries"):
+        config._scan_summaries = []
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    summaries = getattr(config, "_scan_summaries", [])
+    if summaries:
+        terminalreporter.write_line("Scan summaries:")
+        for line in summaries:
+            terminalreporter.write_line(line)
+
 @pytest.fixture(scope="session")
 def dut_port(devices_config):
     env_port = os.environ.get("ESP32C5_DUT_PORT")
