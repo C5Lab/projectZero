@@ -31,6 +31,15 @@ docker compose -f ESP32C5/tests/docker-compose.yml run --rm \
   tests
 ```
 
+## Results artifacts
+
+After the run, the `results/` directory is packaged into a zip artifact named:
+`results_YYYYMMDD_HHMMSS_<version>_<build>.zip` (version/build from `ota_info`).
+All `.txt` and `.html` files are removed after zipping; only the zip remains.
+
+The full pytest console output is saved as `pytest_raw.txt` and included in the
+zip artifact.
+
 ## After git pull (rebuild image)
 
 If you pulled new changes, rebuild the test image before running:
@@ -283,6 +292,8 @@ flowchart TD
 
 1) `scan_bt`  
    - Run `scan_bt`, verify BLE scan summary output
+2) `scan_airtag`  
+   - Run `scan_airtag`, read N samples, then `stop`
 
 #### BLE flow
 
@@ -294,10 +305,24 @@ flowchart TD
     C --> D[Validate BLE summary]
 ```
 
+`scan_airtag`
+```mermaid
+flowchart TD
+    A[Wait for BOARD READY] --> B[Send scan_airtag]
+    B --> C[Read N samples]
+    C --> D[Send stop]
+    D --> E[Validate samples]
+```
+
 `scan_bt` expectations
 - Does: `scan_bt` and wait for BLE summary.
 - Pass: BLE scan header and Summary line present.
 - Fail: missing summary or scan start output.
+
+`scan_airtag` expectations
+- Does: `scan_airtag`, read `airtag_poll_count` samples, then `stop`.
+- Pass: at least one sample line like `0,2` is received.
+- Fail: no samples or no stop confirmation.
 
 ## Device configuration
 
@@ -323,7 +348,8 @@ Look for your CP2102N device and copy the `SerialNumber` into `devices.json`.
     "dut": {"vid": "10c4", "pid": "ea60", "serial": "..." },
     "clients": [
       {"name": "client1", "vid": "10c4", "pid": "ea60", "serial": "...", "mac": "..."},
-      {"name": "client2", "vid": "10c4", "pid": "ea60", "serial": "...", "mac": "..."}
+      {"name": "client2", "vid": "10c4", "pid": "ea60", "serial": "...", "mac": "..."},
+      {"name": "client_bt", "mac": "5E:A4:1F:54:AA:2B", "name_hint": "SHIELD"}
     ]
   },
   "target_ap": {"ssid": "HackMyMyBoy", "bssid": "AA:BB:CC:DD:EE:FF", "ip": "192.168.1.1", "password": "..." },

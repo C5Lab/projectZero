@@ -3,6 +3,8 @@ import os
 import re
 import time
 from pathlib import Path
+from datetime import datetime
+import zipfile
 
 import pytest
 import serial
@@ -225,6 +227,28 @@ def pytest_sessionstart(session):
 def pytest_configure(config):
     if not hasattr(config, "_scan_summaries"):
         config._scan_summaries = []
+    reporter = config.pluginmanager.get_plugin("terminalreporter")
+    if reporter and not hasattr(config, "_raw_log_file"):
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        raw_path = RESULTS_DIR / "pytest_raw.txt"
+        raw_file = raw_path.open("w", encoding="utf-8")
+        config._raw_log_file = raw_file
+
+        orig_write = reporter._tw.write
+        orig_line = reporter._tw.line
+
+        def write_proxy(s, **kwargs):
+            raw_file.write(str(s))
+            raw_file.flush()
+            return orig_write(s, **kwargs)
+
+        def line_proxy(s="", **kwargs):
+            raw_file.write(str(s) + "\n")
+            raw_file.flush()
+            return orig_line(s, **kwargs)
+
+        reporter._tw.write = write_proxy
+        reporter._tw.line = line_proxy
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
@@ -263,6 +287,46 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             terminalreporter.write_line(
                 f"{suite}: {totals['passed']} passed, {totals['failed']} failed, {totals['skipped']} skipped"
             )
+
+
+def pytest_sessionfinish(session, exitstatus):
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    meta_path = RESULTS_DIR / "metadata.txt"
+    version = "unknown"
+    build = "unknown"
+    if meta_path.exists():
+        meta = meta_path.read_text(encoding="utf-8")
+        for line in meta.splitlines():
+            if line.startswith("version="):
+                version = line.split("=", 1)[1].strip() or version
+            if line.startswith("build="):
+                build = line.split("=", 1)[1].strip() or build
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_version = re.sub(r"[^A-Za-z0-9._-]+", "_", version)
+    safe_build = re.sub(r"[^A-Za-z0-9._-]+", "_", build)
+    zip_name = f"results_{timestamp}_{safe_version}_{safe_build}.zip"
+    zip_path = RESULTS_DIR / zip_name
+
+    files = []
+    for ext in ("*.txt", "*.html"):
+        files.extend(RESULTS_DIR.glob(ext))
+
+    if files:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for path in files:
+                zf.write(path, arcname=path.name)
+        for path in files:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    raw_file = getattr(session.config, "_raw_log_file", None)
+    if raw_file:
+        try:
+            raw_file.close()
+        except OSError:
+            pass
 
 @pytest.fixture(scope="session")
 def dut_port(devices_config):
