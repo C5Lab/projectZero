@@ -32,6 +32,42 @@ flowchart TD
     G --> H[Flash suite done]
 ```
 
+## Test flow (current suites)
+
+```mermaid
+flowchart TD
+    A[Preflight: device + files] --> B[Flash base firmware]
+    B --> C[Flash target firmware]
+    C --> D[Validate OTA info]
+    D --> E[WiFi scan tests]
+```
+
+## Test suites
+
+### Flash (mandatory)
+
+1) `flash_base`  
+   - Full erase + flash base firmware from `ESP32C5/tests/SW`
+2) `flash_target`  
+   - Full erase + flash target firmware from `ESP32C5/binaries-esp32c5`
+3) `flash_validate`  
+   - Wait for `BOARD READY`, send `ota_info`, validate OTA info output
+
+### Scan (mandatory)
+
+1) `scan_networks_basic`  
+   - Run `scan_networks`, verify summary and status
+2) `scan_networks_repeatability`  
+   - Run `scan_networks` twice, both must pass basic checks
+3) `show_scan_results_after_scan`  
+   - Run `show_scan_results`, verify CSV-like output
+4) `scan_channel_time_defaults`  
+   - Run `channel_time read min/max`, verify values >= 1
+5) `scan_networks_timeout_guard`  
+   - Ensure scan completes within timeout
+6) `scan_networks_output_fields`  
+   - Validate CSV rows have 8 fields
+
 ## Device configuration
 
 Default detection uses `ESP32C5/tests/config/devices.json` and looks for a
