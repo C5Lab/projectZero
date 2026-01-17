@@ -12,6 +12,8 @@
     "ready_marker": "BOARD READY",
     "ready_timeout": 20,
     "ota_info_timeout": 6,
-    "ota_info_cmd": "ota_info"
+    "ota_info_cmd": "ota_info",
+    "scan_cmd": "scan_networks",
+    "scan_timeout": 60
   }
 }
