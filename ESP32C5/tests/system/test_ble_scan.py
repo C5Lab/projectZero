@@ -43,7 +43,7 @@ def test_scan_bt(dut_port, settings_config):
         ser.reset_input_buffer()
         ser.write(b"scan_bt\n")
         ser.flush()
-    output = _read_until_marker(ser, "Summary:", scan_timeout + 5)
+        output = _read_until_marker(ser, "Summary:", scan_timeout + 5)
 
     assert "BLE scan starting" in output, f"Missing BLE scan start.\n{output}"
     assert "=== BLE Scan Results ===" in output, f"Missing BLE results header.\n{output}"
