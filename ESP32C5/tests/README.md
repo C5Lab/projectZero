@@ -31,6 +31,17 @@ docker compose -f ESP32C5/tests/docker-compose.yml run --rm \
   tests
 ```
 
+## After git pull (rebuild image)
+
+If you pulled new changes, rebuild the test image before running:
+```bash
+docker compose -f ESP32C5/tests/docker-compose.yml build --no-cache tests && \
+docker compose -f ESP32C5/tests/docker-compose.yml run --rm \
+  -e ESP32C5_DUT_PORT=/dev/ttyUSB0 \
+  -e PYTEST_ADDOPTS="--html=/workspace/ESP32C5/tests/results/report.html --self-contained-html" \
+  tests
+```
+
 ## Hardware
 
 Primary test device (master):
