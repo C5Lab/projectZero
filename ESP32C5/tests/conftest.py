@@ -158,6 +158,33 @@ def write_results_file(name, content):
     path.write_text(content, encoding="utf-8")
 
 
+@pytest.fixture
+def cli_log(request):
+    def _log(name, content):
+        write_results_file(name, content)
+        request.node.user_properties.append(("cli_log", (name, content)))
+    return _log
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if report.when != "call":
+        return
+
+    pytest_html = item.config.pluginmanager.get_plugin("html")
+    if not pytest_html:
+        return
+
+    extras = getattr(report, "extra", [])
+    for key, value in item.user_properties:
+        if key == "cli_log":
+            name, content = value
+            extras.append(pytest_html.extras.text(content, name))
+    report.extra = extras
+
+
 def pytest_sessionstart(session):
     config = session.config
     devices_config = _load_devices_config()
