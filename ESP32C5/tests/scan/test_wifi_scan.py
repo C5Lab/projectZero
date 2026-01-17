@@ -32,6 +32,12 @@ def _wait_for_ready(ser, marker, timeout):
     return _read_until_marker(ser, marker, timeout)
 
 
+def _reboot_and_wait(ser, ready_marker, ready_timeout):
+    ser.write(b"reboot\n")
+    ser.flush()
+    return _read_until_marker(ser, ready_marker, ready_timeout)
+
+
 def _run_scan(ser, command, marker, timeout):
     ser.reset_input_buffer()
     ser.write((command + "\n").encode("ascii"))
@@ -55,6 +61,10 @@ def _parse_scan_summary(output):
     return found_count, retrieved_count, retrieved_time, status
 
 
+def _min_networks(settings_config):
+    return int(settings_config.get("scan_min_networks", 10))
+
+
 def _extract_csv_lines(output):
     return [line.strip() for line in output.splitlines() if line.strip().startswith('"')]
 
@@ -66,6 +76,12 @@ def _read_until_prompt(ser, timeout):
 def _parse_first_int(output):
     match = re.search(r"(-?\d+)", output)
     return int(match.group(1)) if match else None
+
+
+def _send_and_read(ser, command, timeout):
+    ser.write((command + "\n").encode("ascii"))
+    ser.flush()
+    return _read_until_prompt(ser, timeout)
 
 
 def _ensure_vendor_enabled(ser):
@@ -93,6 +109,7 @@ def scan_once_result(dut_port, settings_config):
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
         _wait_for_ready(ser, ready_marker, ready_timeout)
+        _reboot_and_wait(ser, ready_marker, ready_timeout)
         _ensure_vendor_enabled(ser)
         output, elapsed = _run_scan(ser, command, RESULT_MARKER, scan_timeout)
 
@@ -108,13 +125,14 @@ def scan_once_result(dut_port, settings_config):
 
 @pytest.mark.mandatory
 @pytest.mark.scan
-def test_scan_networks_basic(scan_once_result, pytestconfig):
+def test_scan_networks_basic(scan_once_result, pytestconfig, settings_config):
     output = scan_once_result["output"]
     summary = scan_once_result["summary"]
     assert summary, f"Missing scan summary.\n{output}"
     found_count, retrieved_count, retrieved_time, status = summary
-    assert found_count >= 1, f"Found count < 1.\n{output}"
-    assert retrieved_count >= 1, f"Retrieved count < 1.\n{output}"
+    min_networks = _min_networks(settings_config)
+    assert found_count >= min_networks, f"Found count < {min_networks}.\n{output}"
+    assert retrieved_count >= min_networks, f"Retrieved count < {min_networks}.\n{output}"
     assert status == 0, f"Scan status not zero.\n{output}"
 
     summaries = getattr(pytestconfig, "_scan_summaries", [])
@@ -131,20 +149,33 @@ def test_scan_networks_repeatability(dut_port, settings_config):
     ready_marker = settings_config.get("ready_marker", "BOARD READY")
     ready_timeout = float(settings_config.get("ready_timeout", 20))
     scan_timeout = float(settings_config.get("scan_timeout", 60))
+    repeat_count = int(settings_config.get("scan_repeat_count", 10))
+    max_variation_pct = float(settings_config.get("scan_repeat_max_variation_pct", 25))
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
         _wait_for_ready(ser, ready_marker, ready_timeout)
-        first_output, _ = _run_scan(ser, command, RESULT_MARKER, scan_timeout)
-        second_output, _ = _run_scan(ser, command, RESULT_MARKER, scan_timeout)
+        results = []
+        outputs = []
+        for _ in range(repeat_count):
+            _reboot_and_wait(ser, ready_marker, ready_timeout)
+            output, _ = _run_scan(ser, command, RESULT_MARKER, scan_timeout)
+            summary = _parse_scan_summary(output)
+            assert summary, f"Missing scan summary.\n{output}"
+            found_count, retrieved_count, _retrieved_time, status = summary
+            assert found_count >= _min_networks(settings_config), f"Found count below minimum.\n{output}"
+            assert retrieved_count >= _min_networks(settings_config), f"Retrieved count below minimum.\n{output}"
+            assert status == 0, f"Scan status not zero.\n{output}"
+            results.append(found_count)
+            outputs.append(output)
 
-    first_summary = _parse_scan_summary(first_output)
-    second_summary = _parse_scan_summary(second_output)
-    assert first_summary and second_summary, "Missing scan summaries for repeatability."
-    for summary, output in [(first_summary, first_output), (second_summary, second_output)]:
-        found_count, retrieved_count, _retrieved_time, status = summary
-        assert found_count >= 1, f"Found count < 1.\n{output}"
-        assert retrieved_count >= 1, f"Retrieved count < 1.\n{output}"
-        assert status == 0, f"Scan status not zero.\n{output}"
+    min_count = min(results)
+    max_count = max(results)
+    avg_count = sum(results) / len(results)
+    variation_pct = ((max_count - min_count) / avg_count) * 100 if avg_count else 0.0
+    assert variation_pct <= max_variation_pct, (
+        f"Scan variation {variation_pct:.1f}% exceeds {max_variation_pct:.1f}%.\n"
+        f"counts={results}"
+    )
 
 
 @pytest.mark.mandatory
@@ -157,6 +188,13 @@ def test_show_scan_results_after_scan(scan_once_result, dut_port, settings_confi
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
         _wait_for_ready(ser, ready_marker, ready_timeout)
+        _reboot_and_wait(ser, ready_marker, ready_timeout)
+        scan_output, _ = _run_scan(ser, "scan_networks", RESULT_MARKER, response_timeout)
+        scan_summary = _parse_scan_summary(scan_output)
+        assert scan_summary, f"Missing scan summary.\n{scan_output}"
+        _found_count, retrieved_count, _retrieved_time, status = scan_summary
+        assert status == 0, f"Scan status not zero.\n{scan_output}"
+
         ser.write(b"show_scan_results\n")
         ser.flush()
         output = _read_until_prompt(ser, response_timeout)
@@ -164,6 +202,9 @@ def test_show_scan_results_after_scan(scan_once_result, dut_port, settings_confi
 
     csv_lines = _extract_csv_lines(output)
     assert csv_lines, f"No CSV scan results found.\n{output}"
+    assert retrieved_count == len(csv_lines), (
+        f"Retrieved count mismatch: scan={retrieved_count} show_scan_results={len(csv_lines)}"
+    )
 
 
 @pytest.mark.mandatory
@@ -172,20 +213,51 @@ def test_scan_channel_time_defaults(dut_port, settings_config):
     baud = int(settings_config.get("uart_baud", 115200))
     ready_marker = settings_config.get("ready_marker", "BOARD READY")
     ready_timeout = float(settings_config.get("ready_timeout", 20))
+    scan_timeout = float(settings_config.get("scan_timeout", 60))
+    min_low = int(settings_config.get("scan_channel_min_low", 10))
+    max_low = int(settings_config.get("scan_channel_max_low", 30))
+    max_high = int(settings_config.get("scan_channel_max_high", 100))
+    min_default = int(settings_config.get("scan_channel_min_default", 100))
+    max_default = int(settings_config.get("scan_channel_max_default", 300))
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
         _wait_for_ready(ser, ready_marker, ready_timeout)
-        ser.write(b"channel_time read min\n")
-        ser.flush()
-        min_out = _read_until_prompt(ser, 4.0)
-        ser.write(b"channel_time read max\n")
-        ser.flush()
-        max_out = _read_until_prompt(ser, 4.0)
+        _reboot_and_wait(ser, ready_marker, ready_timeout)
+        min_out = _send_and_read(ser, "channel_time read min", 4.0)
+        max_out = _send_and_read(ser, "channel_time read max", 4.0)
 
-    min_val = _parse_first_int(min_out)
-    max_val = _parse_first_int(max_out)
-    assert min_val is not None and min_val >= 1, f"Invalid min channel time.\n{min_out}"
-    assert max_val is not None and max_val >= 1, f"Invalid max channel time.\n{max_out}"
+        min_val = _parse_first_int(min_out)
+        max_val = _parse_first_int(max_out)
+        assert min_val is not None and min_val >= 1, f"Invalid min channel time.\n{min_out}"
+        assert max_val is not None and max_val >= 1, f"Invalid max channel time.\n{max_out}"
+
+        _send_and_read(ser, f"channel_time set min {min_low}", 4.0)
+        _send_and_read(ser, f"channel_time set max {max_low}", 4.0)
+        _reboot_and_wait(ser, ready_marker, ready_timeout)
+        low_output, _ = _run_scan(ser, "scan_networks", RESULT_MARKER, scan_timeout)
+        low_summary = _parse_scan_summary(low_output)
+        assert low_summary, f"Missing scan summary.\n{low_output}"
+        low_count, _retrieved_count, _retrieved_time, status = low_summary
+        assert status == 0, f"Scan status not zero.\n{low_output}"
+
+        _send_and_read(ser, f"channel_time set max {max_high}", 4.0)
+        _reboot_and_wait(ser, ready_marker, ready_timeout)
+        high_output, _ = _run_scan(ser, "scan_networks", RESULT_MARKER, scan_timeout)
+        high_summary = _parse_scan_summary(high_output)
+        assert high_summary, f"Missing scan summary.\n{high_output}"
+        high_count, _retrieved_count, _retrieved_time, status = high_summary
+        assert status == 0, f"Scan status not zero.\n{high_output}"
+        assert high_count >= low_count, (
+            f"Expected more or equal networks with higher max time. low={low_count} high={high_count}"
+        )
+
+        _send_and_read(ser, f"channel_time set max {max_default}", 4.0)
+        _send_and_read(ser, f"channel_time set min {min_default}", 4.0)
+        _reboot_and_wait(ser, ready_marker, ready_timeout)
+        default_output, _ = _run_scan(ser, "scan_networks", RESULT_MARKER, scan_timeout)
+        assert f"Background scan started (min: {min_default} ms, max: {max_default} ms per channel)" in default_output, (
+            f"Default channel_time not applied.\n{default_output}"
+        )
 
 
 @pytest.mark.mandatory
@@ -231,6 +303,7 @@ def test_vendor_toggle_affects_scan(dut_port, settings_config):
         on_out = _send_vendor_command(ser, "vendor set on")
         assert "Vendor scan: on" in on_out, f"Vendor on failed.\n{on_out}"
 
+        _reboot_and_wait(ser, ready_marker, ready_timeout)
         scan_on, _ = _run_scan(ser, command, RESULT_MARKER, scan_timeout)
         csv_lines_on = _extract_csv_lines(scan_on)
         has_vendor = False
@@ -244,6 +317,7 @@ def test_vendor_toggle_affects_scan(dut_port, settings_config):
         off_out = _send_vendor_command(ser, "vendor set off")
         assert "Vendor scan: off" in off_out, f"Vendor off failed.\n{off_out}"
 
+        _reboot_and_wait(ser, ready_marker, ready_timeout)
         scan_off, _ = _run_scan(ser, command, RESULT_MARKER, scan_timeout)
         csv_lines_off = _extract_csv_lines(scan_off)
         has_vendor_off = False

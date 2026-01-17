@@ -15,6 +15,14 @@
     "ota_info_cmd": "ota_info",
     "scan_cmd": "scan_networks",
     "scan_timeout": 60,
+    "scan_min_networks": 10,
+    "scan_repeat_count": 10,
+    "scan_repeat_max_variation_pct": 25,
+    "scan_channel_min_low": 10,
+    "scan_channel_max_low": 30,
+    "scan_channel_max_high": 100,
+    "scan_channel_min_default": 100,
+    "scan_channel_max_default": 300,
     "ble_scan_timeout": 20
   }
 }

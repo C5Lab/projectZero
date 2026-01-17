@@ -71,6 +71,23 @@ flowchart TD
 3) `flash_validate`  
    - Wait for `BOARD READY`, send `ota_info`, validate OTA info output
 
+#### Flash expectations
+
+`flash_base`
+- Does: erase + write base firmware.
+- Pass: `esptool` succeeds, binaries present.
+- Fail: missing files or `esptool` returns non-zero.
+
+`flash_target`
+- Does: erase + write target firmware.
+- Pass: `esptool` succeeds, binaries present.
+- Fail: missing files or `esptool` returns non-zero.
+
+`flash_validate`
+- Does: waits for `BOARD READY`, sends `ota_info`.
+- Pass: output contains OTA info block (legacy or new format).
+- Fail: missing OTA fields or no prompt response.
+
 #### Flash flows
 
 `flash_base`
@@ -100,17 +117,19 @@ flowchart TD
 ### Scan (mandatory)
 
 1) `scan_networks_basic`  
-   - Run `scan_networks`, verify summary and status
+   - Run `scan_networks`, verify summary/status and minimum networks
 2) `scan_networks_repeatability`  
-   - Run `scan_networks` twice, both must pass basic checks
+   - Run `scan_networks` N times, fail if variation > 25%
 3) `show_scan_results_after_scan`  
    - Run `show_scan_results`, verify CSV-like output
 4) `scan_channel_time_defaults`  
-   - Run `channel_time read min/max`, verify values >= 1
+   - Set min/max, verify fewer networks at low times and more at higher max, then restore defaults
 5) `scan_networks_timeout_guard`  
    - Ensure scan completes within timeout
 6) `scan_networks_output_fields`  
    - Validate CSV rows have 8 fields
+7) `vendor_toggle_affects_scan`  
+   - Vendor on -> CSV has vendor names, vendor off -> CSV has no vendor names
 
 #### Scan flows
 
@@ -120,16 +139,26 @@ flowchart TD
     A[Wait for BOARD READY] --> B[Send scan_networks]
     B --> C[Wait for Scan results printed.]
     C --> D[Parse summary]
-    D --> E[Validate counts + status]
+    D --> E[Validate counts >= scan_min_networks + status]
 ```
+
+`scan_networks_basic` expectations
+- Does: `vendor set on`, reboot, `scan_networks`.
+- Pass: `Vendor file: available`, status=0, counts >= `scan_min_networks`.
+- Fail: vendor not enabled, status != 0, or counts below minimum.
 
 `scan_networks_repeatability`
 ```mermaid
 flowchart TD
     A[Wait for BOARD READY] --> B["Send scan_networks 1"]
-    B --> C["Send scan_networks 2"]
-    C --> D[Validate both summaries]
+    B --> C["Repeat scan_networks N times"]
+    C --> D[Validate variation <= 25%]
 ```
+
+`scan_networks_repeatability` expectations
+- Does: reboot before each scan, run N scans.
+- Pass: each scan status=0 and counts >= `scan_min_networks`, variation <= `scan_repeat_max_variation_pct`.
+- Fail: missing summary, status!=0, or variation too high.
 
 `show_scan_results_after_scan`
 ```mermaid
@@ -137,6 +166,11 @@ flowchart TD
     A[Send show_scan_results] --> B[Read until prompt]
     B --> C[Validate CSV output]
 ```
+
+`show_scan_results_after_scan` expectations
+- Does: reboot, `scan_networks`, then `show_scan_results`.
+- Pass: CSV lines exist and count matches `Retrieved N`.
+- Fail: no CSV output or count mismatch.
 
 `scan_channel_time_defaults`
 ```mermaid
@@ -147,6 +181,11 @@ flowchart TD
     D --> E[Validate values >= 1]
 ```
 
+`scan_channel_time_defaults` expectations
+- Does: set low min/max, scan; set higher max, scan; restore defaults and verify applied.
+- Pass: higher max yields >= networks vs low, default log shows expected min/max.
+- Fail: missing summary, status!=0, or counts not increasing.
+
 `scan_networks_timeout_guard`
 ```mermaid
 flowchart TD
@@ -154,11 +193,26 @@ flowchart TD
     B --> C[Validate within timeout]
 ```
 
+`scan_networks_timeout_guard` expectations
+- Does: use timing from last scan.
+- Pass: elapsed <= `scan_timeout` (+ small buffer).
+- Fail: scan exceeds timeout.
+
 `scan_networks_output_fields`
 ```mermaid
 flowchart TD
     A[Parse CSV lines] --> B[Check 8 fields per row]
 ```
+
+`scan_networks_output_fields` expectations
+- Does: parse first CSV rows from `scan_networks`.
+- Pass: each row has 8 fields and at least one vendor name present.
+- Fail: wrong field count or no vendor names.
+
+`vendor_toggle_affects_scan` expectations
+- Does: vendor on + scan, vendor off + scan.
+- Pass: vendor on -> at least one vendor name; vendor off -> no vendor names.
+- Fail: vendor state not applied or vendor names present in off mode.
 
 ### System (mandatory)
 
@@ -179,6 +233,11 @@ flowchart TD
     C --> D[Validate Vendor scan output]
 ```
 
+`vendor_read` expectations
+- Does: `vendor read`, possibly `vendor set on`, then `vendor read`.
+- Pass: `Vendor scan: on` and `Vendor file: available`.
+- Fail: vendor not enabled or vendor file missing.
+
 `led_set_and_read`
 ```mermaid
 flowchart TD
@@ -187,12 +246,27 @@ flowchart TD
     C --> D[Read LED status]
 ```
 
+`led_set_and_read` expectations
+- Does: set on, read; set level 1-5, read; set off, read.
+- Pass: outputs reflect on/off and chosen level.
+- Fail: output missing expected LED status or level.
+
 `list_sd`
 ```mermaid
 flowchart TD
     A[Send list_sd] --> B[Read until prompt]
     B --> C[Validate SD output]
 ```
+
+`list_sd` expectations
+- Does: `list_sd`.
+- Pass: no SD init error; either “No HTML files” or list of HTML files.
+- Fail: SD init failure or unexpected output.
+
+`select_html` expectations
+- Does: `list_sd`, pick first index, run `select_html <index>`.
+- Pass: “Loaded HTML file” + “Portal will now use this custom HTML.”
+- Fail: missing index or missing success lines.
 
 ### BLE (mandatory)
 
@@ -208,6 +282,11 @@ flowchart TD
     B --> C[Wait for Summary line]
     C --> D[Validate BLE summary]
 ```
+
+`scan_bt` expectations
+- Does: `scan_bt` and wait for BLE summary.
+- Pass: BLE scan header and Summary line present.
+- Fail: missing summary or scan start output.
 
 ## Device configuration
 
