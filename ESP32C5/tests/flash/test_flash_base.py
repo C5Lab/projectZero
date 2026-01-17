@@ -36,13 +36,14 @@ def _run_esptool(args):
         pytest.fail(f"esptool failed: {' '.join(cmd)} (code {result.returncode})")
 
 
+@pytest.mark.mandatory
 @pytest.mark.flash
-def test_flash_base_firmware(dut_port):
+def test_flash_base_firmware(dut_port, settings_config):
     base_dir = Path(os.environ.get("ESP32C5_BASE_SW_DIR", _default_base_dir()))
     _require_files(base_dir)
 
     chip = os.environ.get("ESP32C5_CHIP", "esp32c5")
-    baud = os.environ.get("ESP32C5_BAUD", "460800")
+    baud = str(settings_config.get("flash_baud", 460800))
     flash_mode = os.environ.get("ESP32C5_FLASH_MODE", "dio")
     flash_freq = os.environ.get("ESP32C5_FLASH_FREQ", "80m")
 

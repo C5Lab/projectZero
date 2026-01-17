@@ -8,6 +8,7 @@ from serial.tools import list_ports
 
 THIS_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = THIS_DIR / "config" / "devices.json"
+REQUIRED_BASE_FILES = ["bootloader.bin", "partition-table.bin", "projectZero.bin"]
 
 
 def _normalize_hex(value):
@@ -62,6 +63,56 @@ def _find_matching_ports(spec):
 def devices_config():
     return _load_devices_config()
 
+
+@pytest.fixture(scope="session")
+def settings_config(devices_config):
+    return devices_config.get("settings", {})
+
+
+def _write_line(config, message):
+    reporter = config.pluginmanager.get_plugin("terminalreporter")
+    if reporter:
+        reporter.write_line(message)
+    else:
+        print(message)
+
+
+def _resolve_base_dir():
+    return Path(os.environ.get("ESP32C5_BASE_SW_DIR", THIS_DIR / "SW"))
+
+
+def _check_base_files(base_dir):
+    missing = [str(base_dir / name) for name in REQUIRED_BASE_FILES if not (base_dir / name).exists()]
+    if missing:
+        pytest.exit("Missing base firmware files: " + ", ".join(missing))
+
+
+def pytest_sessionstart(session):
+    config = session.config
+    devices_config = _load_devices_config()
+    settings = devices_config.get("settings", {})
+    spec = devices_config.get("devices", {}).get("dut")
+    if not spec:
+        pytest.exit("Missing 'dut' device in devices config.")
+
+    env_port = os.environ.get("ESP32C5_DUT_PORT")
+    matches = _find_matching_ports(spec)
+    if env_port:
+        port = env_port
+    elif len(matches) == 1:
+        port = matches[0]
+    elif not matches:
+        pytest.exit("No matching DUT found. Check USB connection and devices config.")
+    else:
+        pytest.exit(f"Multiple DUT ports matched: {matches}. Use ESP32C5_DUT_PORT.")
+
+    base_dir = _resolve_base_dir()
+    _check_base_files(base_dir)
+
+    _write_line(config, f"Preflight: DUT port: {port}")
+    _write_line(config, f"Preflight: base dir: {base_dir}")
+    _write_line(config, f"Preflight: flash baud: {settings.get('flash_baud', 460800)}")
+    _write_line(config, f"Preflight: uart baud: {settings.get('uart_baud', 115200)}")
 
 @pytest.fixture(scope="session")
 def dut_port(devices_config):

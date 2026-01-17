@@ -5,5 +5,13 @@
       "pid": "ea60",
       "serial": "ae6b425fe199ef1190ca0d7161ce3355"
     }
+  },
+  "settings": {
+    "flash_baud": 460800,
+    "uart_baud": 115200,
+    "ready_marker": "BOARD READY",
+    "ready_timeout": 20,
+    "ota_info_timeout": 6,
+    "ota_info_cmd": "ota_info"
   }
 }

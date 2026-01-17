@@ -28,13 +28,14 @@ def _wait_for_ready(ser, marker, timeout):
     return _read_until_marker(ser, marker, timeout)
 
 
+@pytest.mark.mandatory
 @pytest.mark.flash
-def test_flash_validate_ota_info(dut_port):
-    baud = int(os.environ.get("ESP32C5_UART_BAUD", "115200"))
-    command = os.environ.get("ESP32C5_OTA_INFO_CMD", "ota_info")
-    ready_marker = os.environ.get("ESP32C5_READY_MARKER", "BOARD READY")
-    ready_timeout = float(os.environ.get("ESP32C5_READY_TIMEOUT", "15"))
-    response_timeout = float(os.environ.get("ESP32C5_OTA_INFO_TIMEOUT", "6"))
+def test_flash_validate_ota_info(dut_port, settings_config):
+    baud = int(settings_config.get("uart_baud", 115200))
+    command = settings_config.get("ota_info_cmd", "ota_info")
+    ready_marker = settings_config.get("ready_marker", "BOARD READY")
+    ready_timeout = float(settings_config.get("ready_timeout", 15))
+    response_timeout = float(settings_config.get("ota_info_timeout", 6))
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
         ser.reset_input_buffer()
