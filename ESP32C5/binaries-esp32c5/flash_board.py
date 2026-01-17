@@ -69,7 +69,7 @@ def wait_for_new_port(before, timeout=20.0):
 def erase_all(port, baud=DEFAULT_BAUD):
     cmd = [sys.executable, "-m", "esptool", "-p", port, "-b", str(baud),
            "--before", "default_reset", "--after", "no_reset", "--chip", "esp32c5",
-           "erase_flash"]
+           "erase-flash"]
     print(f"{CYAN}Erasing full flash:{RESET} {' '.join(cmd)}")
     res = subprocess.run(cmd)
     if res.returncode != 0:
