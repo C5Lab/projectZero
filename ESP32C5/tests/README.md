@@ -68,6 +68,16 @@ flowchart TD
 6) `scan_networks_output_fields`  
    - Validate CSV rows have 8 fields
 
+### Scan flow
+
+```mermaid
+flowchart TD
+    A[Wait for BOARD READY] --> B[Send scan_networks]
+    B --> C[Wait for Scan results printed.]
+    C --> D[Parse summary + CSV lines]
+    D --> E[Validate counts/status/fields]
+```
+
 ## Device configuration
 
 Default detection uses `ESP32C5/tests/config/devices.json` and looks for a
