@@ -15,18 +15,18 @@ OFFSETS = {
 }
 
 
-def _default_base_dir():
-    return Path(__file__).resolve().parents[1] / "SW"
+def _default_target_dir():
+    return Path(__file__).resolve().parents[2] / "binaries-esp32c5"
 
 
-def _require_files(base_dir):
+def _require_files(target_dir):
     missing = [
-        str(base_dir / name)
+        str(target_dir / name)
         for name in REQUIRED_FILES
-        if not (base_dir / name).exists()
+        if not (target_dir / name).exists()
     ]
     if missing:
-        pytest.fail("Missing base firmware files: " + ", ".join(missing))
+        pytest.fail("Missing target firmware files: " + ", ".join(missing))
 
 
 def _run_esptool(args):
@@ -38,9 +38,9 @@ def _run_esptool(args):
 
 @pytest.mark.mandatory
 @pytest.mark.flash
-def test_flash_base_firmware(dut_port, settings_config):
-    base_dir = Path(os.environ.get("ESP32C5_BASE_SW_DIR", _default_base_dir()))
-    _require_files(base_dir)
+def test_flash_target_firmware(dut_port, settings_config):
+    target_dir = Path(os.environ.get("ESP32C5_TARGET_SW_DIR", _default_target_dir()))
+    _require_files(target_dir)
 
     chip = os.environ.get("ESP32C5_CHIP", "esp32c5")
     baud = str(settings_config.get("flash_baud", 460800))
@@ -81,5 +81,5 @@ def test_flash_base_firmware(dut_port, settings_config):
         "detect",
     ]
     for name, offset in OFFSETS.items():
-        write_args.extend([offset, str(base_dir / name)])
+        write_args.extend([offset, str(target_dir / name)])
     _run_esptool(write_args)

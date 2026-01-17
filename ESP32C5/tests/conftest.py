@@ -9,6 +9,7 @@ from serial.tools import list_ports
 THIS_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = THIS_DIR / "config" / "devices.json"
 REQUIRED_BASE_FILES = ["bootloader.bin", "partition-table.bin", "projectZero.bin"]
+REQUIRED_TARGET_FILES = ["bootloader.bin", "partition-table.bin", "projectZero.bin"]
 
 
 def _normalize_hex(value):
@@ -81,10 +82,20 @@ def _resolve_base_dir():
     return Path(os.environ.get("ESP32C5_BASE_SW_DIR", THIS_DIR / "SW"))
 
 
+def _resolve_target_dir():
+    return Path(os.environ.get("ESP32C5_TARGET_SW_DIR", THIS_DIR.parent / "binaries-esp32c5"))
+
+
 def _check_base_files(base_dir):
     missing = [str(base_dir / name) for name in REQUIRED_BASE_FILES if not (base_dir / name).exists()]
     if missing:
         pytest.exit("Missing base firmware files: " + ", ".join(missing))
+
+
+def _check_target_files(target_dir):
+    missing = [str(target_dir / name) for name in REQUIRED_TARGET_FILES if not (target_dir / name).exists()]
+    if missing:
+        pytest.exit("Missing target firmware files: " + ", ".join(missing))
 
 
 def pytest_sessionstart(session):
@@ -107,10 +118,13 @@ def pytest_sessionstart(session):
         pytest.exit(f"Multiple DUT ports matched: {matches}. Use ESP32C5_DUT_PORT.")
 
     base_dir = _resolve_base_dir()
+    target_dir = _resolve_target_dir()
     _check_base_files(base_dir)
+    _check_target_files(target_dir)
 
     _write_line(config, f"Preflight: DUT port: {port}")
     _write_line(config, f"Preflight: base dir: {base_dir}")
+    _write_line(config, f"Preflight: target dir: {target_dir}")
     _write_line(config, f"Preflight: flash baud: {settings.get('flash_baud', 460800)}")
     _write_line(config, f"Preflight: uart baud: {settings.get('uart_baud', 115200)}")
 
