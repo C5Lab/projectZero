@@ -49,6 +49,5 @@ def test_flash_base_firmware(dut_port):
     _require_files(base_dir)
 
     baud = os.environ.get("ESP32C5_BAUD", "460800")
-    skip_erase = os.environ.get("ESP32C5_SKIP_ERASE", "").lower() in {"1", "true", "yes"}
 
-    _run_flash_script(dut_port, baud, erase=not skip_erase, base_dir=base_dir)
+    _run_flash_script(dut_port, baud, erase=True, base_dir=base_dir)
