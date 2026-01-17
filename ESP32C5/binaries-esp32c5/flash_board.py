@@ -82,7 +82,7 @@ def do_flash(port, baud=DEFAULT_BAUD, flash_mode="dio", flash_freq="80m"):
         "-p", port,
         "-b", str(baud),
         "--before", "default_reset",
-        "--after", "watchdog-reset",            # we'll do a precise reset pattern ourselves
+        "--after", "watchdog_reset",            # we'll do a precise reset pattern ourselves
         "--chip", "esp32c5",
         "write-flash",
         "--flash-mode", flash_mode,       # default "dio"
