@@ -1,0 +1,16 @@
+services:
+  tests:
+    image: python:3.12-slim
+    working_dir: /workspace/ESP32C5/tests
+    volumes:
+      - ../..:/workspace
+    devices:
+      - ${ESP32C5_TEST_DEVICE:-/dev/ttyUSB0}:/dev/ttyUSB0
+    environment:
+      ESP32C5_DUT_PORT: /dev/ttyUSB0
+      ESP32C5_DEVICES_CONFIG: /workspace/ESP32C5/tests/config/devices.json
+      ESP32C5_BASE_SW_DIR: /workspace/ESP32C5/tools/SW
+    command:
+      - bash
+      - -lc
+      - pip install -r requirements.txt && pytest -m flash

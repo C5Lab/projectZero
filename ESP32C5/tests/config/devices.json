@@ -1,0 +1,9 @@
+{
+  "devices": {
+    "dut": {
+      "vid": "10c4",
+      "pid": "ea60",
+      "serial": "ae6b425fe199ef1190ca0d7161ce3355"
+    }
+  }
+}
