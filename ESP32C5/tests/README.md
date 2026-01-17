@@ -130,7 +130,7 @@ flowchart TD
 1) `scan_networks_basic`  
    - Run `scan_networks`, verify summary/status and minimum networks
 2) `scan_networks_repeatability`  
-   - Run `scan_networks` N times, fail if variation > 25%
+   - Run `scan_networks` N times (default 3), fail if variation > 25%
 3) `show_scan_results_after_scan`  
    - Run `show_scan_results`, verify CSV-like output
 4) `scan_channel_time_defaults`  
@@ -162,7 +162,7 @@ flowchart TD
 ```mermaid
 flowchart TD
     A[Wait for BOARD READY] --> B["Send scan_networks 1"]
-    B --> C["Repeat scan_networks N times"]
+    B --> C["Repeat scan_networks N times (default 3)"]
     C --> D[Validate variation <= 25%]
 ```
 
@@ -306,6 +306,33 @@ single DUT device by VID/PID/serial. You can override with:
 
 - `ESP32C5_DUT_PORT=/dev/ttyUSB0`
 - `ESP32C5_DEVICES_CONFIG=/path/to/devices.json`
+
+### Find device serial (Linux)
+
+```bash
+python -m serial.tools.list_ports -v
+```
+
+Look for your CP2102N device and copy the `SerialNumber` into `devices.json`.
+
+### devices.json schema
+
+```json
+{
+  "devices": {
+    "dut": {"vid": "10c4", "pid": "ea60", "serial": "..." },
+    "clients": [
+      {"name": "client1", "vid": "10c4", "pid": "ea60", "serial": "...", "mac": "..."},
+      {"name": "client2", "vid": "10c4", "pid": "ea60", "serial": "...", "mac": "..."}
+    ]
+  },
+  "target_ap": {"ssid": "HackMyMyBoy", "bssid": "AA:BB:CC:DD:EE:FF", "ip": "192.168.1.1", "password": "..." },
+  "settings": { "flash_baud": 460800, "uart_baud": 115200 }
+}
+```
+
+Naming for clients: use `client1`, `client2`, etc. Add MAC addresses now if
+you plan to validate client behavior later.
 
 ## Flash manifest
 

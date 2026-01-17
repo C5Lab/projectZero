@@ -4,7 +4,22 @@
       "vid": "10c4",
       "pid": "ea60",
       "serial": "ae6b425fe199ef1190ca0d7161ce3355"
-    }
+    },
+    "clients": [
+      {
+        "name": "client1",
+        "vid": "10c4",
+        "pid": "ea60",
+        "serial": "",
+        "mac": ""
+      }
+    ]
+  },
+  "target_ap": {
+    "ssid": "",
+    "bssid": "",
+    "ip": "",
+    "password": ""
   },
   "settings": {
     "flash_baud": 460800,
@@ -16,7 +31,7 @@
     "scan_cmd": "scan_networks",
     "scan_timeout": 60,
     "scan_min_networks": 10,
-    "scan_repeat_count": 10,
+    "scan_repeat_count": 3,
     "scan_repeat_max_variation_pct": 25,
     "scan_channel_min_low": 10,
     "scan_channel_max_low": 30,
