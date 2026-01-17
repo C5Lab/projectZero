@@ -53,6 +53,32 @@ flowchart TD
 3) `flash_validate`  
    - Wait for `BOARD READY`, send `ota_info`, validate OTA info output
 
+#### Flash flows
+
+`flash_base`
+```mermaid
+flowchart TD
+    A[Preflight OK] --> B[Erase base flash]
+    B --> C[Write base firmware]
+    C --> D[Flash base done]
+```
+
+`flash_target`
+```mermaid
+flowchart TD
+    A[Preflight OK] --> B[Erase target flash]
+    B --> C[Write target firmware]
+    C --> D[Flash target done]
+```
+
+`flash_validate`
+```mermaid
+flowchart TD
+    A[Wait for BOARD READY] --> B[Send ota_info]
+    B --> C[Read output until prompt]
+    C --> D[Validate OTA fields]
+```
+
 ### Scan (mandatory)
 
 1) `scan_networks_basic`  
@@ -68,14 +94,52 @@ flowchart TD
 6) `scan_networks_output_fields`  
    - Validate CSV rows have 8 fields
 
-### Scan flow
+#### Scan flows
 
+`scan_networks_basic`
 ```mermaid
 flowchart TD
     A[Wait for BOARD READY] --> B[Send scan_networks]
     B --> C[Wait for Scan results printed.]
-    C --> D[Parse summary + CSV lines]
-    D --> E[Validate counts/status/fields]
+    C --> D[Parse summary]
+    D --> E[Validate counts + status]
+```
+
+`scan_networks_repeatability`
+```mermaid
+flowchart TD
+    A[Wait for BOARD READY] --> B[Send scan_networks (1)]
+    B --> C[Send scan_networks (2)]
+    C --> D[Validate both summaries]
+```
+
+`show_scan_results_after_scan`
+```mermaid
+flowchart TD
+    A[Send show_scan_results] --> B[Read until prompt]
+    B --> C[Validate CSV output]
+```
+
+`scan_channel_time_defaults`
+```mermaid
+flowchart TD
+    A[Send channel_time read min] --> B[Read value]
+    B --> C[Send channel_time read max]
+    C --> D[Read value]
+    D --> E[Validate values >= 1]
+```
+
+`scan_networks_timeout_guard`
+```mermaid
+flowchart TD
+    A[Start scan] --> B[Measure elapsed]
+    B --> C[Validate within timeout]
+```
+
+`scan_networks_output_fields`
+```mermaid
+flowchart TD
+    A[Parse CSV lines] --> B[Check 8 fields per row]
 ```
 
 ## Device configuration

@@ -141,6 +141,34 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         for line in summaries:
             terminalreporter.write_line(line)
 
+    stats = terminalreporter.stats or {}
+    suite_totals = {}
+
+    def _suite_from_nodeid(nodeid):
+        path = nodeid.split("::", 1)[0]
+        parts = Path(path).parts
+        if "flash" in parts:
+            return "flash"
+        if "scan" in parts:
+            return "scan"
+        return "other"
+
+    for outcome, reports in stats.items():
+        if outcome not in {"passed", "failed", "skipped"}:
+            continue
+        for report in reports:
+            suite = _suite_from_nodeid(report.nodeid)
+            suite_totals.setdefault(suite, {"passed": 0, "failed": 0, "skipped": 0})
+            suite_totals[suite][outcome] += 1
+
+    if suite_totals:
+        terminalreporter.write_line("Suite summary:")
+        for suite in sorted(suite_totals.keys()):
+            totals = suite_totals[suite]
+            terminalreporter.write_line(
+                f"{suite}: {totals['passed']} passed, {totals['failed']} failed, {totals['skipped']} skipped"
+            )
+
 @pytest.fixture(scope="session")
 def dut_port(devices_config):
     env_port = os.environ.get("ESP32C5_DUT_PORT")
