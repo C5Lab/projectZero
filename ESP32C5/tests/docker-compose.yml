@@ -15,5 +15,3 @@ services:
       ESP32C5_BASE_SW_DIR: /workspace/ESP32C5/tests/SW
     command:
       - pytest
-      - -m
-      - flash
