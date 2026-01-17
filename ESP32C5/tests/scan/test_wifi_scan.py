@@ -28,8 +28,6 @@ def _wait_for_ready(ser, marker, timeout):
     return _read_until_marker(ser, marker, timeout)
 
 
-@pytest.mark.mandatory
-@pytest.mark.scan
 def _report(pytestconfig, message):
     reporter = pytestconfig.pluginmanager.get_plugin("terminalreporter")
     if reporter:
@@ -38,6 +36,8 @@ def _report(pytestconfig, message):
         print(message)
 
 
+@pytest.mark.mandatory
+@pytest.mark.scan
 def test_wifi_scan(dut_port, settings_config, pytestconfig):
     baud = int(settings_config.get("uart_baud", 115200))
     command = settings_config.get("scan_cmd", "scan_networks")
