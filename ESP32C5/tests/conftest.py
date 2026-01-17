@@ -1,8 +1,11 @@
 import json
 import os
+import re
+import time
 from pathlib import Path
 
 import pytest
+import serial
 from serial.tools import list_ports
 
 
@@ -10,6 +13,8 @@ THIS_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = THIS_DIR / "config" / "devices.json"
 REQUIRED_BASE_FILES = ["bootloader.bin", "partition-table.bin", "projectZero.bin"]
 REQUIRED_TARGET_FILES = ["bootloader.bin", "partition-table.bin", "projectZero.bin"]
+RESULTS_DIR = Path(os.environ.get("ESP32C5_RESULTS_DIR", THIS_DIR / "results"))
+PROMPT = ">"
 
 
 def _normalize_hex(value):
@@ -98,6 +103,55 @@ def _check_target_files(target_dir):
         pytest.exit("Missing target firmware files: " + ", ".join(missing))
 
 
+def _read_until_marker(ser, marker, timeout):
+    end = time.time() + timeout
+    buffer = ""
+    while time.time() < end:
+        chunk = ser.read(1024)
+        if chunk:
+            buffer += chunk.decode(errors="replace")
+            if marker in buffer:
+                break
+        else:
+            time.sleep(0.05)
+    return buffer
+
+
+def _capture_ota_info(port, settings):
+    baud = int(settings.get("uart_baud", 115200))
+    ready_marker = settings.get("ready_marker", "BOARD READY")
+    ready_timeout = float(settings.get("ready_timeout", 20))
+    response_timeout = float(settings.get("ota_info_timeout", 6))
+    command = settings.get("ota_info_cmd", "ota_info")
+
+    with serial.Serial(port, baud, timeout=0.2) as ser:
+        ser.reset_input_buffer()
+        if ready_marker:
+            _read_until_marker(ser, ready_marker, ready_timeout)
+        ser.write((command + "\n").encode("ascii"))
+        ser.flush()
+        output = _read_until_marker(ser, PROMPT, response_timeout)
+
+    return output
+
+
+def _write_results_files(output, config):
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ota_path = RESULTS_DIR / "ota_info.txt"
+    ota_path.write_text(output, encoding="utf-8")
+
+    build_match = re.search(r"ver=([^\s]+)\s+build=([^\r\n]+)", output)
+    if build_match:
+        version = build_match.group(1)
+        build = build_match.group(2).strip()
+        meta_path = RESULTS_DIR / "metadata.txt"
+        meta_path.write_text(f"version={version}\nbuild={build}\n", encoding="utf-8")
+        _write_line(config, f"Preflight: build version: {version}")
+        _write_line(config, f"Preflight: build time: {build}")
+    else:
+        _write_line(config, "Preflight: ota_info build line not found")
+
+
 def pytest_sessionstart(session):
     config = session.config
     devices_config = _load_devices_config()
@@ -127,6 +181,12 @@ def pytest_sessionstart(session):
     _write_line(config, f"Preflight: target dir: {target_dir}")
     _write_line(config, f"Preflight: flash baud: {settings.get('flash_baud', 460800)}")
     _write_line(config, f"Preflight: uart baud: {settings.get('uart_baud', 115200)}")
+
+    try:
+        output = _capture_ota_info(port, settings)
+        _write_results_files(output, config)
+    except Exception as exc:
+        _write_line(config, f"Preflight: ota_info capture failed: {exc}")
 
 
 def pytest_configure(config):

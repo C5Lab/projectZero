@@ -13,6 +13,24 @@
 docker compose -f ESP32C5/tests/docker-compose.yml run --rm tests
 ```
 
+## Alternate runs
+
+Run without pytest-sugar:
+```bash
+docker compose -f ESP32C5/tests/docker-compose.yml run --rm \
+  -e ESP32C5_DUT_PORT=/dev/ttyUSB0 \
+  -e PYTEST_ADDOPTS="-p no:sugar" \
+  tests
+```
+
+Generate HTML report:
+```bash
+docker compose -f ESP32C5/tests/docker-compose.yml run --rm \
+  -e ESP32C5_DUT_PORT=/dev/ttyUSB0 \
+  -e PYTEST_ADDOPTS="--html=/workspace/ESP32C5/tests/results/report.html --self-contained-html" \
+  tests
+```
+
 ## Hardware
 
 Primary test device (master):
@@ -108,8 +126,8 @@ flowchart TD
 `scan_networks_repeatability`
 ```mermaid
 flowchart TD
-    A[Wait for BOARD READY] --> B[Send scan_networks (1)]
-    B --> C[Send scan_networks (2)]
+    A[Wait for BOARD READY] --> B["Send scan_networks 1"]
+    B --> C["Send scan_networks 2"]
     C --> D[Validate both summaries]
 ```
 
