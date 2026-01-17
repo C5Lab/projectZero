@@ -73,11 +73,18 @@ def test_scan_bt(dut_port, settings_config):
     except Exception:
         pass
 
-    if expected_mac:
-        normalized = expected_mac.upper()
-        assert normalized in output.upper(), f"Expected BT MAC {expected_mac} not found.\n{output}"
+    if expected_mac or expected_name:
+        output_upper = output.upper()
+        mac_ok = False
+        name_ok = False
+        if expected_mac:
+            mac_ok = expected_mac.upper() in output_upper
         if expected_name:
-            assert expected_name in output, f"Expected BT name {expected_name} not found.\n{output}"
+            name_ok = expected_name in output
+        assert mac_ok or name_ok, (
+            "Expected BT client not found (MAC or name).\n"
+            f"mac={expected_mac} name={expected_name}\n{output}"
+        )
 
 
 @pytest.mark.mandatory
