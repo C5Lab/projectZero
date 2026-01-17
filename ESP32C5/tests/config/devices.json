@@ -14,6 +14,7 @@
     "ota_info_timeout": 6,
     "ota_info_cmd": "ota_info",
     "scan_cmd": "scan_networks",
-    "scan_timeout": 60
+    "scan_timeout": 60,
+    "ble_scan_timeout": 20
   }
 }

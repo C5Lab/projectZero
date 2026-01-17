@@ -6,6 +6,7 @@ import time
 import pytest
 import serial
 
+from conftest import write_results_file
 
 RESULT_MARKER = "Scan results printed."
 PROMPT = ">"
@@ -67,6 +68,21 @@ def _parse_first_int(output):
     return int(match.group(1)) if match else None
 
 
+def _ensure_vendor_enabled(ser):
+    output = _send_vendor_command(ser, "vendor set on")
+    if "Vendor scan: on" not in output:
+        pytest.fail(f"Vendor did not enable.\n{output}")
+    if "Vendor file: available" not in output:
+        pytest.fail(f"Vendor file not available.\n{output}")
+    write_results_file("vendor.txt", output)
+
+
+def _send_vendor_command(ser, command):
+    ser.write((command + "\n").encode("ascii"))
+    ser.flush()
+    return _read_until_marker(ser, PROMPT, 6.0)
+
+
 @pytest.fixture(scope="session")
 def scan_once_result(dut_port, settings_config):
     baud = int(settings_config.get("uart_baud", 115200))
@@ -77,9 +93,11 @@ def scan_once_result(dut_port, settings_config):
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
         _wait_for_ready(ser, ready_marker, ready_timeout)
+        _ensure_vendor_enabled(ser)
         output, elapsed = _run_scan(ser, command, RESULT_MARKER, scan_timeout)
 
     summary = _parse_scan_summary(output)
+    write_results_file("scan_networks.txt", output)
     return {
         "output": output,
         "elapsed": elapsed,
@@ -142,6 +160,7 @@ def test_show_scan_results_after_scan(scan_once_result, dut_port, settings_confi
         ser.write(b"show_scan_results\n")
         ser.flush()
         output = _read_until_prompt(ser, response_timeout)
+    write_results_file("show_scan_results.txt", output)
 
     csv_lines = _extract_csv_lines(output)
     assert csv_lines, f"No CSV scan results found.\n{output}"
@@ -187,3 +206,50 @@ def test_scan_networks_output_fields(scan_once_result):
     for line in csv_lines[:3]:
         row = next(csv.reader(io.StringIO(line)))
         assert len(row) == 8, f"Unexpected CSV field count ({len(row)}).\n{line}"
+
+    has_vendor = False
+    for line in csv_lines:
+        row = next(csv.reader(io.StringIO(line)))
+        if len(row) >= 3 and row[2].strip():
+            has_vendor = True
+            break
+    assert has_vendor, f"No vendor names found in scan output.\n{output}"
+
+
+@pytest.mark.mandatory
+@pytest.mark.scan
+def test_vendor_toggle_affects_scan(dut_port, settings_config):
+    baud = int(settings_config.get("uart_baud", 115200))
+    command = settings_config.get("scan_cmd", "scan_networks")
+    ready_marker = settings_config.get("ready_marker", "BOARD READY")
+    ready_timeout = float(settings_config.get("ready_timeout", 20))
+    scan_timeout = float(settings_config.get("scan_timeout", 60))
+
+    with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _wait_for_ready(ser, ready_marker, ready_timeout)
+
+        on_out = _send_vendor_command(ser, "vendor set on")
+        assert "Vendor scan: on" in on_out, f"Vendor on failed.\n{on_out}"
+
+        scan_on, _ = _run_scan(ser, command, RESULT_MARKER, scan_timeout)
+        csv_lines_on = _extract_csv_lines(scan_on)
+        has_vendor = False
+        for line in csv_lines_on:
+            row = next(csv.reader(io.StringIO(line)))
+            if len(row) >= 3 and row[2].strip():
+                has_vendor = True
+                break
+        assert has_vendor, f"No vendor names found with vendor on.\n{scan_on}"
+
+        off_out = _send_vendor_command(ser, "vendor set off")
+        assert "Vendor scan: off" in off_out, f"Vendor off failed.\n{off_out}"
+
+        scan_off, _ = _run_scan(ser, command, RESULT_MARKER, scan_timeout)
+        csv_lines_off = _extract_csv_lines(scan_off)
+        has_vendor_off = False
+        for line in csv_lines_off:
+            row = next(csv.reader(io.StringIO(line)))
+            if len(row) >= 3 and row[2].strip():
+                has_vendor_off = True
+                break
+        assert not has_vendor_off, f"Vendor names present with vendor off.\n{scan_off}"

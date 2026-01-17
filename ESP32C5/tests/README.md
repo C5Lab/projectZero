@@ -160,6 +160,55 @@ flowchart TD
     A[Parse CSV lines] --> B[Check 8 fields per row]
 ```
 
+### System (mandatory)
+
+1) `vendor_read`  
+   - Run `vendor read`, verify vendor status output
+2) `led_set_and_read`  
+   - Toggle LED on/off and verify `led read` output
+3) `list_sd`  
+   - Run `list_sd`, verify SD is mounted and output is valid
+
+#### System flows
+
+`vendor_read`
+```mermaid
+flowchart TD
+    A[Wait for BOARD READY] --> B[Send vendor read]
+    B --> C[Read until prompt]
+    C --> D[Validate Vendor scan output]
+```
+
+`led_set_and_read`
+```mermaid
+flowchart TD
+    A[Send led set on] --> B[Read LED status]
+    B --> C[Send led set off]
+    C --> D[Read LED status]
+```
+
+`list_sd`
+```mermaid
+flowchart TD
+    A[Send list_sd] --> B[Read until prompt]
+    B --> C[Validate SD output]
+```
+
+### BLE (mandatory)
+
+1) `scan_bt`  
+   - Run `scan_bt`, verify BLE scan summary output
+
+#### BLE flow
+
+`scan_bt`
+```mermaid
+flowchart TD
+    A[Wait for BOARD READY] --> B[Send scan_bt]
+    B --> C[Wait for Summary line]
+    C --> D[Validate BLE summary]
+```
+
 ## Device configuration
 
 Default detection uses `ESP32C5/tests/config/devices.json` and looks for a

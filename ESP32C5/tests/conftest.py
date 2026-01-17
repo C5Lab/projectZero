@@ -152,6 +152,12 @@ def _write_results_files(output, config):
         _write_line(config, "Preflight: ota_info build line not found")
 
 
+def write_results_file(name, content):
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = RESULTS_DIR / name
+    path.write_text(content, encoding="utf-8")
+
+
 def pytest_sessionstart(session):
     config = session.config
     devices_config = _load_devices_config()
@@ -211,6 +217,8 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             return "flash"
         if "scan" in parts:
             return "scan"
+        if "system" in parts:
+            return "system"
         return "other"
 
     for outcome, reports in stats.items():
