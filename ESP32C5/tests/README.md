@@ -40,6 +40,9 @@ All `.txt` and `.html` files are removed after zipping; only the zip remains.
 The full pytest console output is saved as `pytest_raw.txt` and included in the
 zip artifact.
 
+On test start, old zip artifacts are moved to `results/archive/` and any loose
+`.txt`/`.html` files are removed to keep the run clean.
+
 ## After git pull (rebuild image)
 
 If you pulled new changes, rebuild the test image before running:

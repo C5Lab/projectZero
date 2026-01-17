@@ -230,6 +230,22 @@ def pytest_configure(config):
     reporter = config.pluginmanager.get_plugin("terminalreporter")
     if reporter and not hasattr(config, "_raw_log_file"):
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        archive_dir = RESULTS_DIR / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        # Move old zip artifacts to archive and clean loose files
+        for path in RESULTS_DIR.glob("results_*.zip"):
+            try:
+                path.replace(archive_dir / path.name)
+            except OSError:
+                pass
+        for ext in ("*.txt", "*.html"):
+            for path in RESULTS_DIR.glob(ext):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
         raw_path = RESULTS_DIR / "pytest_raw.txt"
         raw_file = raw_path.open("w", encoding="utf-8")
         config._raw_log_file = raw_file
