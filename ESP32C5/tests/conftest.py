@@ -179,12 +179,12 @@ def pytest_runtest_makereport(item, call):
     if not pytest_html:
         return
 
-    extras = getattr(report, "extra", [])
+    extras = getattr(report, "extras", [])
     for key, value in item.user_properties:
         if key == "cli_log":
             name, content = value
             extras.append(pytest_html.extras.text(content, name))
-    report.extra = extras
+    report.extras = extras
 
 
 def pytest_sessionstart(session):
