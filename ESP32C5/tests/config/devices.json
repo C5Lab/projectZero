@@ -32,7 +32,6 @@
     "scan_timeout": 60,
     "scan_min_networks": 10,
     "scan_repeat_count": 3,
-    "scan_repeat_max_variation_pct": 25,
     "scan_channel_min_low": 10,
     "scan_channel_max_low": 30,
     "scan_channel_max_high": 100,

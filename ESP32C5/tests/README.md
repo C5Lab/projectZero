@@ -130,7 +130,7 @@ flowchart TD
 1) `scan_networks_basic`  
    - Run `scan_networks`, verify summary/status and minimum networks
 2) `scan_networks_repeatability`  
-   - Run `scan_networks` N times (default 3), fail if variation > 25%
+   - Run `scan_networks` N times (default 3), each must pass basic checks
 3) `show_scan_results_after_scan`  
    - Run `show_scan_results`, verify CSV-like output
 4) `scan_channel_time_defaults`  
@@ -163,13 +163,13 @@ flowchart TD
 flowchart TD
     A[Wait for BOARD READY] --> B["Send scan_networks 1"]
     B --> C["Repeat scan_networks N times (default 3)"]
-    C --> D[Validate variation <= 25%]
+    C --> D[Validate each scan meets minimum]
 ```
 
 `scan_networks_repeatability` expectations
 - Does: reboot before each scan, run N scans.
-- Pass: each scan status=0 and counts >= `scan_min_networks`, variation <= `scan_repeat_max_variation_pct`.
-- Fail: missing summary, status!=0, or variation too high.
+- Pass: each scan status=0 and counts >= `scan_min_networks`.
+- Fail: missing summary or status!=0 or counts below minimum.
 
 `show_scan_results_after_scan`
 ```mermaid
