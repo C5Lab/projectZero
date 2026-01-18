@@ -43,11 +43,17 @@ def _run_scan(ser, timeout):
     ser.reset_input_buffer()
     ser.write(b"scan_networks\r\n")
     ser.flush()
-    return _read_until_marker(ser, RESULT_MARKER, timeout)
+    first = _read_until_marker(ser, RESULT_MARKER, timeout)
+    if RESULT_MARKER in first:
+        return first
+    ser.write(b"scan_networks\r\n")
+    ser.flush()
+    second = _read_until_marker(ser, RESULT_MARKER, timeout)
+    return first + "\n" + second
 
 
 def _ensure_prompt(ser, prompt, timeout):
-    ser.write(b"\n")
+    ser.write(b"\r\n")
     ser.flush()
     return _read_until_prompt(ser, prompt, timeout)
 
@@ -129,9 +135,6 @@ def test_deauth_disconnects_client(
             cli_log("deauth_reboot.txt", reboot_out)
 
             scan_output = _run_scan(dut_ser, scan_timeout)
-            if "Unrecognized command" in scan_output:
-                _ensure_prompt(dut_ser, DUT_PROMPT, 4.0)
-                scan_output = _run_scan(dut_ser, scan_timeout)
             if RESULT_MARKER not in scan_output:
                 _ensure_prompt(dut_ser, DUT_PROMPT, 4.0)
                 scan_output = _run_scan(dut_ser, scan_timeout)
