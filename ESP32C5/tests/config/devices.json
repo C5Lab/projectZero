@@ -48,6 +48,6 @@
     "channel_view_timeout": 20,
     "probes_min_entries": 1,
     "sniffer_wait_seconds": 0,
-    "sniffer_min_packets": 200
+    "sniffer_min_packets": 600
   }
 }
