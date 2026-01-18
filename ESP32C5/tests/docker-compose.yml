@@ -10,8 +10,10 @@ services:
       - ./results:/workspace/ESP32C5/tests/results
     devices:
       - ${ESP32C5_TEST_DEVICE:-/dev/ttyUSB0}:/dev/ttyUSB0
+      - ${ESP32C5_CLIENT_DEVICE:-/dev/ttyACM0}:/dev/ttyACM0
     environment:
       ESP32C5_DUT_PORT: /dev/ttyUSB0
+      ESP32C5_CLIENT_JANOSMINI_PORT: /dev/ttyACM0
       ESP32C5_DEVICES_CONFIG: /workspace/ESP32C5/tests/config/devices.json
       ESP32C5_BASE_SW_DIR: /workspace/ESP32C5/tests/SW
     command:

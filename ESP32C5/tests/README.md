@@ -28,6 +28,21 @@ docker compose -f ESP32C5/tests/docker-compose.yml run --rm \
   tests
 ```
 
+Run with JanOSmini client (deauth/handshake tests):
+```bash
+docker compose -f ESP32C5/tests/docker-compose.yml run --rm \
+  -e ESP32C5_DUT_PORT=/dev/ttyUSB0 \
+  -e ESP32C5_CLIENT_JANOSMINI_PORT=/dev/ttyACM0 \
+  -e ESP32C5_CLIENT_DEVICE=/dev/ttyACM0 \
+  tests pytest -m deauth
+```
+
+Or use the helper script to auto-map ports from `devices.json`:
+```bash
+ESP32C5_DEVICES_CONFIG=ESP32C5/tests/config/devices.json \
+ESP32C5/tests/run_tests.sh pytest -m deauth
+```
+
 Generate HTML report:
 ```bash
 docker compose -f ESP32C5/tests/docker-compose.yml run --rm \
