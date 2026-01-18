@@ -96,6 +96,7 @@ def test_handshake_capture_selected(dut_port, client_janosmini_port, devices_con
         pytest.fail("Missing target_ap.ssid/password/bssid in devices config.")
 
     with serial.Serial(client_janosmini_port, baud, timeout=0.2) as client_ser:
+        _read_until_prompt(client_ser, 6.0)
         client_ser.reset_input_buffer()
         client_ser.write(b"sta_hold on\n")
         client_ser.flush()
@@ -116,6 +117,7 @@ def test_handshake_capture_selected(dut_port, client_janosmini_port, devices_con
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
         _wait_for_ready(ser, ready_marker, ready_timeout)
         _reboot_and_wait(ser, ready_marker, ready_timeout)
+        _read_until_prompt(ser, 6.0)
 
         scan_output = _run_scan(ser, scan_timeout)
         cli_log("handshake_scan.txt", scan_output)

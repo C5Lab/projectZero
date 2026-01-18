@@ -1,5 +1,32 @@
 # ESP32C5 tests
 
+## Environment setup
+
+1) Install host dependency for port auto-detection:
+```bash
+sudo apt install python3-serial
+```
+2) Find connected ports:
+```bash
+ls -l /dev/ttyUSB* /dev/ttyACM*
+```
+3) Update `ESP32C5/tests/config/devices.json` with correct `port` values.
+
+### Debug console (manual)
+
+Connect to a device to verify boot logs and CLI:
+
+```bash
+screen /dev/ttyUSB0 115200
+# exit: Ctrl+A, then K, then Y
+```
+
+```bash
+sudo minicom -D /dev/ttyUSB0 -b 115200
+# help: Ctrl+A, then Z
+# exit: Ctrl+A, then X
+```
+
 ## Quick start (flash suite)
 
 1) Put base firmware binaries into `ESP32C5/tools/SW/`:

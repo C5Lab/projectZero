@@ -100,6 +100,7 @@ def test_deauth_disconnects_client(
         pytest.fail("Missing target_ap.ssid/password/bssid in devices config.")
 
     with serial.Serial(client_janosmini_port, baud, timeout=0.2) as client_ser:
+        _read_until_prompt(client_ser, client_prompt, 6.0)
         hold_out = _client_send(client_ser, "sta_hold on", client_prompt, 4.0)
         cli_log("deauth_client_hold.txt", hold_out)
 
@@ -113,6 +114,7 @@ def test_deauth_disconnects_client(
         with serial.Serial(dut_port, baud, timeout=0.2) as dut_ser:
             _wait_for_ready(dut_ser, ready_marker, ready_timeout)
             _reboot_and_wait(dut_ser, ready_marker, ready_timeout)
+            _read_until_prompt(dut_ser, DUT_PROMPT, 6.0)
             scan_output = _run_scan(dut_ser, scan_timeout)
             cli_log("deauth_scan.txt", scan_output)
 
