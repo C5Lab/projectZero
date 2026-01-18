@@ -333,6 +333,19 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             )
 
 
+def pytest_collection_modifyitems(session, config, items):
+    order = ["flash", "scan", "deauth", "handshake", "system", "ble"]
+    order_index = {name: idx for idx, name in enumerate(order)}
+
+    def _priority(item):
+        for name in order:
+            if item.get_closest_marker(name):
+                return order_index[name]
+        return len(order)
+
+    items.sort(key=lambda item: (_priority(item), item.nodeid))
+
+
 @pytest.hookimpl(hookwrapper=True, trylast=True)
 def pytest_sessionfinish(session, exitstatus):
     yield
