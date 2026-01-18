@@ -59,6 +59,9 @@ def match_port(port_info, spec):
     return True
 
 def find_port(spec):
+    port_override = spec.get("port")
+    if port_override:
+        return port_override
     matches = [p.device for p in list_ports.comports() if match_port(p, spec)]
     if not matches:
         return None

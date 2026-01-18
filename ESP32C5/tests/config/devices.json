@@ -3,7 +3,8 @@
     "dut": {
       "vid": "10c4",
       "pid": "ea60",
-      "serial": "ae6b425fe199ef1190ca0d7161ce3355"
+      "serial": "ae6b425fe199ef1190ca0d7161ce3355",
+      "port": "/dev/ttyUSB0"
     },
     "clients": [
       {
@@ -12,7 +13,8 @@
         "vid": "303a",
         "pid": "1001",
         "serial": "48:CA:43:38:E0:74",
-        "mac": "48:CA:43:38:E0:74"
+        "mac": "48:CA:43:38:E0:74",
+        "port": "/dev/ttyACM0"
       },
       {
         "name": "client_bt",

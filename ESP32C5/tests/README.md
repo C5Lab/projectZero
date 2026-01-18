@@ -43,6 +43,11 @@ ESP32C5_DEVICES_CONFIG=ESP32C5/tests/config/devices.json \
 ESP32C5/tests/run_tests.sh pytest -m deauth
 ```
 
+Requires host dependency:
+```bash
+sudo apt install python3-serial
+```
+
 Generate HTML report:
 ```bash
 docker compose -f ESP32C5/tests/docker-compose.yml run --rm \
@@ -628,10 +633,10 @@ Look for your CP2102N device and copy the `SerialNumber` into `devices.json`.
 ```json
 {
   "devices": {
-    "dut": {"vid": "10c4", "pid": "ea60", "serial": "..." },
+    "dut": {"vid": "10c4", "pid": "ea60", "serial": "...", "port": "/dev/ttyUSB0" },
     "clients": [
-      {"name": "client1", "role": "test_unit", "vid": "10c4", "pid": "ea60", "serial": "...", "mac": "..."},
-      {"name": "client2", "role": "test_unit", "vid": "10c4", "pid": "ea60", "serial": "...", "mac": "..."},
+      {"name": "client1", "role": "test_unit", "vid": "10c4", "pid": "ea60", "serial": "...", "mac": "...", "port": "/dev/ttyACM0"},
+      {"name": "client2", "role": "test_unit", "vid": "10c4", "pid": "ea60", "serial": "...", "mac": "...", "port": "/dev/ttyACM1"},
       {"name": "client_bt", "mac": "5E:A4:1F:54:AA:2B", "name_hint": "SHIELD"}
     ]
   },
@@ -653,6 +658,7 @@ Look for your CP2102N device and copy the `SerialNumber` into `devices.json`.
 
 Naming for clients: use `client1`, `client2`, etc. Add MAC addresses now if
 you plan to validate client behavior later.
+`port` can be set to a fixed `/dev/tty*` path to bypass auto-detection.
 `role` can be used to describe the client purpose (for example `test_unit`).
 
 `sniffer_min_packets` is the minimum packet count required before probe/sniffer
