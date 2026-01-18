@@ -69,6 +69,13 @@ Common files included in the zip:
 - `scan_bt.txt`, `scan_airtag.txt`
 - `show_scan_results_no_scan.txt`
 - `show_scan_results_vendor.txt`, `show_scan_results_during_scan.txt`
+- `deauth_scan.txt`, `deauth_select.txt`, `deauth_start.txt`, `deauth_stop.txt`
+- `deauth_client_hold.txt`, `deauth_client_connect.txt`, `deauth_client_status.txt`
+- `deauth_client_disconnect.txt`, `deauth_client_status_after.txt`
+- `handshake_scan.txt`, `handshake_select.txt`, `handshake_start.txt`
+- `handshake_list_dir.txt`, `handshake_delete.txt`
+- `handshake_client_hold.txt`, `handshake_client_connect.txt`, `handshake_client_status.txt`
+- `handshake_client_disconnect.txt`, `handshake_client_status_after.txt`
 
 HTML report shows CLI logs inline under each test (expand the test row).
 
@@ -110,8 +117,10 @@ flowchart TD
     B --> C[Flash target firmware]
     C --> D[Validate OTA info]
     D --> E[WiFi scan tests]
-    E --> F[System tests (vendor/LED/SD)]
-    F --> G[BLE tests]
+    E --> F[Deauth tests]
+    F --> G[Handshake tests]
+    G --> H[System tests (vendor/LED/SD)]
+    H --> I[BLE tests]
 ```
 
 ## Test suites
@@ -403,6 +412,50 @@ flowchart TD
 - Pass: output shows sniffer monitoring and stop confirmation.
 - Fail: missing start or stop output.
 
+### Deauth (mandatory)
+
+1) `deauth_disconnects_client`  
+   - Client connects to `target_ap`, DUT runs `scan_networks` → `select_networks` → `start_deauth`, verify disconnect/reconnect
+
+#### Deauth flow
+
+`deauth_disconnects_client`
+```mermaid
+flowchart TD
+    A[Client sta_hold on + sta_connect] --> B[DUT scan_networks]
+    B --> C[DUT select_networks <index>]
+    C --> D[DUT start_deauth]
+    D --> E[Client wait_disconnect]
+    E --> F[DUT stop]
+    F --> G[Client sta_status reconnect]
+```
+
+`deauth_disconnects_client` expectations
+- Does: client connects to `target_ap`, DUT starts deauth after scan+select.
+- Pass: client disconnects and reconnects after stop.
+- Fail: no disconnect or no reconnect.
+
+### Handshake (mandatory)
+
+1) `handshake_capture_selected`  
+   - Run `scan_networks`, select `target_ap`, start `start_handshake` and wait for capture
+
+#### Handshake flow
+
+`handshake_capture_selected`
+```mermaid
+flowchart TD
+    A[Run scan_networks] --> B[Find target_ap index]
+    B --> C[select_networks <index>]
+    C --> D[start_handshake]
+    D --> E[Wait for handshake completion]
+```
+
+`handshake_capture_selected` expectations
+- Does: client connects to `target_ap`, DUT scans/selects then runs `start_handshake`, then delete saved `.pcap`/`.hccapx` from SD.
+- Pass: output contains "HANDSHAKE IS COMPLETE AND VALID" (or "Handshake #1 captured"/"All selected networks captured"), saved paths found, files removed, client reconnects.
+- Fail: target AP not found in scan output, "SAVE FAILED", missing saved paths, delete verification fails, or client does not reconnect.
+
 ### System (mandatory)
 
 1) `vendor_read`  
@@ -562,8 +615,8 @@ Look for your CP2102N device and copy the `SerialNumber` into `devices.json`.
   "devices": {
     "dut": {"vid": "10c4", "pid": "ea60", "serial": "..." },
     "clients": [
-      {"name": "client1", "vid": "10c4", "pid": "ea60", "serial": "...", "mac": "..."},
-      {"name": "client2", "vid": "10c4", "pid": "ea60", "serial": "...", "mac": "..."},
+      {"name": "client1", "role": "test_unit", "vid": "10c4", "pid": "ea60", "serial": "...", "mac": "..."},
+      {"name": "client2", "role": "test_unit", "vid": "10c4", "pid": "ea60", "serial": "...", "mac": "..."},
       {"name": "client_bt", "mac": "5E:A4:1F:54:AA:2B", "name_hint": "SHIELD"}
     ]
   },
@@ -574,19 +627,27 @@ Look for your CP2102N device and copy the `SerialNumber` into `devices.json`.
     "sniffer_min_packets": 600,
     "sniffer_wait_seconds": 0,
     "ble_min_devices": 1,
-    "list_dir_path": "lab"
+    "list_dir_path": "lab",
+    "handshake_timeout": 180,
+    "client_prompt": "JanOSmini>",
+    "client_disconnect_timeout": 20,
+    "client_reconnect_timeout": 20
   }
 }
 ```
 
 Naming for clients: use `client1`, `client2`, etc. Add MAC addresses now if
 you plan to validate client behavior later.
+`role` can be used to describe the client purpose (for example `test_unit`).
 
 `sniffer_min_packets` is the minimum packet count required before probe/sniffer
 results are queried. `sniffer_wait_seconds` is the maximum wait time for
 reaching that count; set `0` to wait until the packet count is reached.
 `ble_min_devices` is the minimum BLE device count required in `scan_bt`.
 `list_dir_path` defines the SD directory to list in the `list_dir` test.
+`handshake_timeout` sets the maximum time to wait for `start_handshake` to finish.
+`client_prompt` is the JanOSmini console prompt. `client_disconnect_timeout` and
+`client_reconnect_timeout` control client wait windows.
 
 ## Flash manifest
 

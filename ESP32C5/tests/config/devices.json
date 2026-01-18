@@ -7,11 +7,12 @@
     },
     "clients": [
       {
-        "name": "client1",
-        "vid": "10c4",
-        "pid": "ea60",
-        "serial": "",
-        "mac": ""
+        "name": "client_janosmini",
+        "role": "test_unit",
+        "vid": "303a",
+        "pid": "1001",
+        "serial": "48:CA:43:38:E0:74",
+        "mac": "48:CA:43:38:E0:74"
       },
       {
         "name": "client_bt",
@@ -21,10 +22,10 @@
     ]
   },
   "target_ap": {
-    "ssid": "",
-    "bssid": "",
+    "ssid": "HackMyMyBoy",
+    "bssid": "dc:2c:6e:be:29:56",
     "ip": "",
-    "password": ""
+    "password": "FAC90FD654EE"
   },
   "settings": {
     "flash_baud": 460800,
@@ -50,6 +51,10 @@
     "list_dir_path": "lab",
     "probes_min_entries": 1,
     "sniffer_wait_seconds": 0,
-    "sniffer_min_packets": 600
+    "sniffer_min_packets": 600,
+    "handshake_timeout": 180,
+    "client_prompt": "JanOSmini>",
+    "client_disconnect_timeout": 20,
+    "client_reconnect_timeout": 20
   }
 }

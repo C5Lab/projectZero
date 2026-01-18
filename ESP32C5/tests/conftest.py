@@ -68,6 +68,31 @@ def _find_matching_ports(spec):
     return matches
 
 
+def _find_client_spec(devices_config, name):
+    clients = devices_config.get("devices", {}).get("clients", [])
+    for client in clients:
+        if client.get("name") == name:
+            return client
+    return None
+
+
+def _resolve_client_port(devices_config, name, env_var):
+    env_port = os.environ.get(env_var)
+    if env_port:
+        return env_port
+
+    spec = _find_client_spec(devices_config, name)
+    if not spec:
+        pytest.fail(f"Missing '{name}' in devices config.")
+
+    matches = _find_matching_ports(spec)
+    if not matches:
+        pytest.fail(f"No matching {name} device found. Check USB connection and devices config.")
+    if len(matches) > 1:
+        pytest.fail(f"Multiple {name} ports matched: {matches}. Use {env_var}.")
+    return matches[0]
+
+
 @pytest.fixture(scope="session")
 def devices_config():
     return _load_devices_config()
@@ -371,3 +396,8 @@ def dut_port(devices_config):
             "Specify ESP32C5_DUT_PORT or tighten devices config."
         )
     return matches[0]
+
+
+@pytest.fixture(scope="session")
+def client_janosmini_port(devices_config):
+    return _resolve_client_port(devices_config, "client_janosmini", "ESP32C5_CLIENT_JANOSMINI_PORT")
