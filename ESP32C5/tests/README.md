@@ -117,6 +117,7 @@ Common files included in the zip:
 - `show_scan_results_no_scan.txt`
 - `show_scan_results_vendor.txt`, `show_scan_results_during_scan.txt`
 - `deauth_scan.txt`, `deauth_select.txt`, `deauth_start.txt`, `deauth_stop.txt`
+- `deauth_reboot.txt`
 - `deauth_client_hold.txt`, `deauth_client_connect.txt`, `deauth_client_status.txt`
 - `deauth_client_disconnect.txt`, `deauth_client_status_after.txt`
 - `handshake_scan.txt`, `handshake_select.txt`, `handshake_start.txt`

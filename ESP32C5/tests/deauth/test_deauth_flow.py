@@ -113,9 +113,14 @@ def test_deauth_disconnects_client(
 
         with serial.Serial(dut_port, baud, timeout=0.2) as dut_ser:
             _wait_for_ready(dut_ser, ready_marker, ready_timeout)
-            _reboot_and_wait(dut_ser, ready_marker, ready_timeout)
+            reboot_out = _reboot_and_wait(dut_ser, ready_marker, ready_timeout)
             _read_until_prompt(dut_ser, DUT_PROMPT, 6.0)
+            cli_log("deauth_reboot.txt", reboot_out)
+
             scan_output = _run_scan(dut_ser, scan_timeout)
+            if not scan_output.strip():
+                time.sleep(1.0)
+                scan_output = _run_scan(dut_ser, scan_timeout)
             cli_log("deauth_scan.txt", scan_output)
 
             csv_lines = _extract_csv_lines(scan_output)
