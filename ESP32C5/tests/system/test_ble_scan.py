@@ -117,4 +117,5 @@ def test_scan_airtag(dut_port, settings_config, cli_log):
         output += "\n" + _read_until_marker(ser, "All operations stopped.", 6.0)
 
     cli_log("scan_airtag.txt", output + "\n" + "\n".join(samples))
+    assert "AirTag scanner stopped." in output, f"Missing stop confirmation.\n{output}"
     assert samples, f"No AirTag samples received.\n{output}"

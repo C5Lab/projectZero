@@ -164,6 +164,10 @@ flowchart TD
    - Validate CSV rows have 8 fields
 7) `vendor_toggle_affects_scan`  
    - Vendor on -> CSV has vendor names, vendor off -> CSV has no vendor names
+8) `channel_view`  
+   - Run `channel_view`, validate output for ch6 and ch36, then stop
+9) `list_probes_after_sniffer`  
+   - Run `start_sniffer`, wait, stop, then `list_probes`
 
 #### Scan flows
 
@@ -247,6 +251,16 @@ flowchart TD
 - Does: vendor on + scan, vendor off + scan.
 - Pass: vendor on -> at least one vendor name; vendor off -> no vendor names.
 - Fail: vendor state not applied or vendor names present in off mode.
+
+`channel_view` expectations
+- Does: run `channel_view`, wait for start/end markers, then `stop`.
+- Pass: output contains `channel_view_start`, `channel_view_end`, `ch6:`, `ch36:`.
+- Fail: missing markers or channels.
+
+`list_probes_after_sniffer` expectations
+- Does: `start_sniffer`, wait `probes_wait_seconds`, `stop`, then `list_probes`.
+- Pass: at least `probes_min_entries` probe entries.
+- Fail: "No probe requests captured" or too few entries.
 
 ### System (mandatory)
 
