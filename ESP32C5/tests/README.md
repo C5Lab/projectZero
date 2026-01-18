@@ -482,6 +482,7 @@ flowchart TD
 - Does: client connects to `target_ap`, DUT starts deauth after scan+select.
 - Pass: client disconnects and reconnects after stop.
 - Fail: no disconnect or no reconnect.
+- Notes: DUT scan retries once if the CLI prompt is not ready yet.
 
 ### Handshake (mandatory)
 
