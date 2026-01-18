@@ -297,7 +297,7 @@ flowchart TD
 `show_sniffer_results_and_clear`
 ```mermaid
 flowchart TD
-    A[Start sniffer] --> B[Wait sniffer_wait_seconds]
+    A[Start sniffer] --> B[Wait sniffer_min_packets]
     B --> C[Stop sniffer]
     C --> D[show_sniffer_results]
     D --> E[clear_sniffer_results]
@@ -467,7 +467,8 @@ Naming for clients: use `client1`, `client2`, etc. Add MAC addresses now if
 you plan to validate client behavior later.
 
 `sniffer_min_packets` is the minimum packet count required before probe/sniffer
-results are queried.
+results are queried. `sniffer_wait_seconds` is the maximum wait time for
+reaching that count.
 
 ## Flash manifest
 
