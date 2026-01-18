@@ -215,6 +215,23 @@ def test_show_scan_results_after_scan(scan_once_result, dut_port, settings_confi
 
 @pytest.mark.mandatory
 @pytest.mark.scan
+def test_show_scan_results_without_scan(dut_port, settings_config, cli_log):
+    baud = int(settings_config.get("uart_baud", 115200))
+    ready_marker = settings_config.get("ready_marker", "BOARD READY")
+    ready_timeout = float(settings_config.get("ready_timeout", 20))
+    response_timeout = float(settings_config.get("scan_timeout", 60))
+
+    with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _wait_for_ready(ser, ready_marker, ready_timeout)
+        _reboot_and_wait(ser, ready_marker, ready_timeout)
+        output = _send_and_read(ser, "show_scan_results", response_timeout)
+
+    cli_log("show_scan_results_no_scan.txt", output)
+    assert "No scan has been performed yet." in output, f"Expected no-scan message.\n{output}"
+
+
+@pytest.mark.mandatory
+@pytest.mark.scan
 def test_scan_channel_time_defaults(dut_port, settings_config, cli_log):
     baud = int(settings_config.get("uart_baud", 115200))
     ready_marker = settings_config.get("ready_marker", "BOARD READY")

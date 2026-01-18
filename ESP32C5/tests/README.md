@@ -56,10 +56,12 @@ Common files included in the zip:
 - `scan_timeout_guard.txt`, `scan_output_fields.txt`
 - `channel_view.txt`, `list_probes.txt`
 - `show_probes_vendor.txt`, `list_probes_vendor.txt`
-- `show_sniffer_results.txt`, `clear_sniffer_results.txt`
-- `vendor_read.txt`, `vendor_persistence.txt`
-- `led_set_and_read.txt`, `list_sd.txt`, `select_html.txt`
+- `show_sniffer_results.txt`, `show_sniffer_results_vendor.txt`, `clear_sniffer_results.txt`
+- `sniffer_debug.txt`
+- `vendor_read.txt`, `vendor_persistence.txt`, `vendor_persistence_off.txt`
+- `led_set_and_read.txt`, `list_sd.txt`, `select_html.txt`, `list_dir.txt`
 - `scan_bt.txt`, `scan_airtag.txt`
+- `show_scan_results_no_scan.txt`
 
 HTML report shows CLI logs inline under each test (expand the test row).
 
@@ -185,6 +187,12 @@ flowchart TD
    - Run `start_sniffer`, wait, stop, then `list_probes_vendor`
 12) `show_sniffer_results_and_clear`  
    - Run `start_sniffer`, wait, stop, then `show_sniffer_results`, `clear_sniffer_results`
+13) `show_scan_results_without_scan`  
+   - Run `show_scan_results` after reboot (no scan), expect no-scan message
+14) `show_sniffer_results_vendor`  
+   - Run `start_sniffer`, wait, stop, then `show_sniffer_results_vendor`
+15) `sniffer_debug_toggle`  
+   - Toggle `sniffer_debug 1` then `sniffer_debug 0`
 
 #### Scan flows
 
@@ -226,6 +234,18 @@ flowchart TD
 - Does: reboot, `scan_networks`, then `show_scan_results`.
 - Pass: CSV lines exist and count matches `Retrieved N`.
 - Fail: no CSV output or count mismatch.
+
+`show_scan_results_without_scan`
+```mermaid
+flowchart TD
+    A[Reboot] --> B[show_scan_results]
+    B --> C[Expect no-scan message]
+```
+
+`show_scan_results_without_scan` expectations
+- Does: reboot and run `show_scan_results` before any scan.
+- Pass: output contains "No scan has been performed yet."
+- Fail: missing no-scan message.
 
 `scan_channel_time_defaults`
 ```mermaid
@@ -322,6 +342,25 @@ flowchart TD
 - Pass: `show_sniffer_results` returns data, packet minimum reached, and clear confirms "Sniffer results cleared." then shows no data.
 - Fail: no sniffer data, packet minimum not reached, or clear did not reset results.
 
+`show_sniffer_results_vendor`
+```mermaid
+flowchart TD
+    A[Start sniffer] --> B[Wait sniffer_min_packets]
+    B --> C[Stop sniffer]
+    C --> D[show_sniffer_results_vendor]
+    D --> E[Validate vendor tags]
+```
+
+`show_sniffer_results_vendor` expectations
+- Does: `vendor set on`, `start_sniffer`, wait until `sniffer_min_packets`, then `show_sniffer_results_vendor`.
+- Pass: output includes vendor tags in brackets.
+- Fail: missing vendor tags or packet minimum not reached.
+
+`sniffer_debug_toggle` expectations
+- Does: `sniffer_debug 1`, then `sniffer_debug 0`.
+- Pass: outputs include "ENABLED" and "DISABLED".
+- Fail: toggle output missing.
+
 ### System (mandatory)
 
 1) `vendor_read`  
@@ -334,6 +373,10 @@ flowchart TD
    - Pick a file from `list_sd` and load it with `select_html`
 5) `vendor_persistence`  
    - Enable vendor scan, reboot, and verify it stays on
+6) `vendor_persistence_off`  
+   - Disable vendor scan, reboot, and verify it stays off
+7) `list_dir`  
+   - List a configured SD directory and verify output
 
 #### System flows
 
@@ -378,6 +421,21 @@ flowchart TD
     C --> D[Validate vendor stays on]
 ```
 
+`vendor_persistence_off`
+```mermaid
+flowchart TD
+    A[Send vendor set off] --> B[Reboot]
+    B --> C[Send vendor read]
+    C --> D[Validate vendor stays off]
+```
+
+`list_dir`
+```mermaid
+flowchart TD
+    A[Send list_dir] --> B[Read until prompt]
+    B --> C[Validate output]
+```
+
 `list_sd` expectations
 - Does: `list_sd`.
 - Pass: no SD init error; either “No HTML files” or list of HTML files.
@@ -392,6 +450,16 @@ flowchart TD
 - Does: `vendor set on`, reboot, then `vendor read`.
 - Pass: vendor remains enabled and vendor file is available.
 - Fail: vendor resets to off or vendor file missing.
+
+`vendor_persistence_off` expectations
+- Does: `vendor set off`, reboot, then `vendor read`.
+- Pass: vendor remains disabled.
+- Fail: vendor shows enabled after reboot.
+
+`list_dir` expectations
+- Does: `list_dir <path>`.
+- Pass: output contains "Files in".
+- Fail: list_dir command fails or missing output.
 
 ### BLE (mandatory)
 
@@ -461,7 +529,10 @@ Look for your CP2102N device and copy the `SerialNumber` into `devices.json`.
   "settings": {
     "flash_baud": 460800,
     "uart_baud": 115200,
-    "sniffer_min_packets": 200
+    "sniffer_min_packets": 600,
+    "sniffer_wait_seconds": 0,
+    "ble_min_devices": 1,
+    "list_dir_path": "lab"
   }
 }
 ```
@@ -472,6 +543,8 @@ you plan to validate client behavior later.
 `sniffer_min_packets` is the minimum packet count required before probe/sniffer
 results are queried. `sniffer_wait_seconds` is the maximum wait time for
 reaching that count; set `0` to wait until the packet count is reached.
+`ble_min_devices` is the minimum BLE device count required in `scan_bt`.
+`list_dir_path` defines the SD directory to list in the `list_dir` test.
 
 ## Flash manifest
 

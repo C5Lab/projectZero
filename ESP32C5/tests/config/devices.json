@@ -42,10 +42,12 @@
     "scan_channel_max_high": 100,
     "scan_channel_min_default": 100,
     "scan_channel_max_default": 300,
+    "ble_min_devices": 1,
     "ble_scan_timeout": 20,
     "airtag_poll_count": 5,
     "airtag_poll_timeout": 25,
     "channel_view_timeout": 20,
+    "list_dir_path": "lab",
     "probes_min_entries": 1,
     "sniffer_wait_seconds": 0,
     "sniffer_min_packets": 600

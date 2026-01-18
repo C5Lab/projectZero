@@ -55,7 +55,8 @@ def test_scan_bt(dut_port, settings_config, cli_log):
     assert summary_match, f"Missing BLE summary line.\n{output}"
 
     total_devices = int(summary_match.group(3))
-    assert total_devices >= 0, f"Invalid BLE device count.\n{output}"
+    min_devices = int(settings_config.get("ble_min_devices", 1))
+    assert total_devices >= min_devices, f"BLE device count below {min_devices}.\n{output}"
 
     # Optional expected BT client from devices.json
     expected_mac = None

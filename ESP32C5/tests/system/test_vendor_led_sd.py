@@ -152,3 +152,36 @@ def test_vendor_persistence(dut_port, settings_config, cli_log):
     cli_log("vendor_persistence.txt", output)
     assert "Vendor scan: on" in output, f"Vendor not persisted.\n{output}"
     assert "Vendor file: available" in output, f"Vendor file not available.\n{output}"
+
+
+@pytest.mark.mandatory
+@pytest.mark.system
+def test_vendor_persistence_off(dut_port, settings_config, cli_log):
+    baud = int(settings_config.get("uart_baud", 115200))
+    ready_marker = settings_config.get("ready_marker", "BOARD READY")
+    ready_timeout = float(settings_config.get("ready_timeout", 20))
+
+    with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _wait_for_ready(ser, ready_marker, ready_timeout)
+        _send_and_read(ser, "vendor set off", 6.0)
+        _reboot_and_wait(ser, ready_marker, ready_timeout)
+        output = _send_and_read(ser, "vendor read", 6.0)
+
+    cli_log("vendor_persistence_off.txt", output)
+    assert "Vendor scan: off" in output, f"Vendor did not persist off.\n{output}"
+
+
+@pytest.mark.mandatory
+@pytest.mark.system
+def test_list_dir(dut_port, settings_config, cli_log):
+    baud = int(settings_config.get("uart_baud", 115200))
+    ready_marker = settings_config.get("ready_marker", "BOARD READY")
+    ready_timeout = float(settings_config.get("ready_timeout", 20))
+    dir_path = settings_config.get("list_dir_path", "lab").strip() or "lab"
+
+    with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _wait_for_ready(ser, ready_marker, ready_timeout)
+        output = _send_and_read(ser, f"list_dir {dir_path}", 6.0)
+
+    cli_log("list_dir.txt", output)
+    assert "Files in" in output, f"list_dir failed.\n{output}"

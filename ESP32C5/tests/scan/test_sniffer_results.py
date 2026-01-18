@@ -88,3 +88,40 @@ def test_show_sniffer_results_and_clear(dut_port, settings_config, cli_log):
     assert "No sniffer data available" not in show_out, f"No sniffer data captured.\n{show_out}"
     assert "Sniffer results cleared." in clear_out, f"Clear sniffer failed.\n{clear_out}"
     assert "No sniffer data available" in show_after, f"Sniffer results not cleared.\n{show_after}"
+
+
+@pytest.mark.mandatory
+@pytest.mark.scan
+def test_show_sniffer_results_vendor(dut_port, settings_config, cli_log):
+    baud = int(settings_config.get("uart_baud", 115200))
+    ready_marker = settings_config.get("ready_marker", "BOARD READY")
+    ready_timeout = float(settings_config.get("ready_timeout", 20))
+    min_packets = int(settings_config.get("sniffer_min_packets", 600))
+    wait_seconds = float(settings_config.get("sniffer_wait_seconds", 0))
+
+    with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _wait_for_ready(ser, ready_marker, ready_timeout)
+        _send_and_read(ser, "vendor set on", 6.0)
+        last_count = _run_sniffer(ser, min_packets, wait_seconds)
+        show_out = _send_and_read(ser, "show_sniffer_results_vendor", 8.0)
+
+    cli_log("show_sniffer_results_vendor.txt", show_out)
+    assert last_count >= min_packets, f"Sniffer packets below minimum ({min_packets})."
+    assert "[" in show_out and "]" in show_out, f"Missing vendor info in sniffer results.\n{show_out}"
+
+
+@pytest.mark.mandatory
+@pytest.mark.scan
+def test_sniffer_debug_toggle(dut_port, settings_config, cli_log):
+    baud = int(settings_config.get("uart_baud", 115200))
+    ready_marker = settings_config.get("ready_marker", "BOARD READY")
+    ready_timeout = float(settings_config.get("ready_timeout", 20))
+
+    with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _wait_for_ready(ser, ready_marker, ready_timeout)
+        on_out = _send_and_read(ser, "sniffer_debug 1", 4.0)
+        off_out = _send_and_read(ser, "sniffer_debug 0", 4.0)
+
+    cli_log("sniffer_debug.txt", on_out + "\n" + off_out)
+    assert "Sniffer debug mode ENABLED" in on_out, f"sniffer_debug enable failed.\n{on_out}"
+    assert "Sniffer debug mode DISABLED" in off_out, f"sniffer_debug disable failed.\n{off_out}"

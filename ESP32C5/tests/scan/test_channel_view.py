@@ -46,5 +46,6 @@ def test_channel_view(dut_port, settings_config, cli_log):
     cli_log("channel_view.txt", output)
     assert "channel_view_start" in output, f"Missing channel_view_start.\n{output}"
     assert "channel_view_end" in output, f"Missing channel_view_end.\n{output}"
+    assert "channel_view_error:timeout" not in output, f"channel_view timeout.\n{output}"
     assert "ch6:" in output, f"Missing 2.4GHz channel 6.\n{output}"
     assert "ch36:" in output, f"Missing 5GHz channel 36.\n{output}"
