@@ -186,6 +186,7 @@ def pytest_runtest_makereport(item, call):
             name, content = value
             escaped = html.escape(content)
             extras.append(pytest_html.extras.html(f"<h4>{name}</h4><pre>{escaped}</pre>"))
+            report.sections.append((f"CLI log: {name}", content))
     report.extras = extras
 
 

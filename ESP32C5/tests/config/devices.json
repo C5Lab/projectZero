@@ -47,7 +47,7 @@
     "airtag_poll_timeout": 25,
     "channel_view_timeout": 20,
     "probes_min_entries": 1,
-    "sniffer_wait_seconds": 12,
+    "sniffer_wait_seconds": 0,
     "sniffer_min_packets": 200
   }
 }

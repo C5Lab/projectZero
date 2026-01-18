@@ -468,7 +468,7 @@ you plan to validate client behavior later.
 
 `sniffer_min_packets` is the minimum packet count required before probe/sniffer
 results are queried. `sniffer_wait_seconds` is the maximum wait time for
-reaching that count.
+reaching that count; set `0` to wait until the packet count is reached.
 
 ## Flash manifest
 

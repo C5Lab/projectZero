@@ -35,10 +35,10 @@ def _send_and_read(ser, command, timeout):
 
 
 def _wait_for_packet_count(ser, min_packets, timeout):
-    end = time.time() + timeout
+    deadline = None if timeout <= 0 else (time.time() + timeout)
     buffer = ""
     last_count = 0
-    while time.time() < end:
+    while True:
         chunk = ser.read(1024)
         if chunk:
             buffer += chunk.decode(errors="replace")
@@ -50,7 +50,8 @@ def _wait_for_packet_count(ser, min_packets, timeout):
                 buffer = buffer[-4096:]
         else:
             time.sleep(0.05)
-    return last_count, buffer
+        if deadline is not None and time.time() >= deadline:
+            return last_count, buffer
 
 
 def _run_sniffer(ser, min_packets, timeout):
