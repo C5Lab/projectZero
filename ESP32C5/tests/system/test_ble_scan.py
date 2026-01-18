@@ -32,7 +32,7 @@ def _wait_for_ready(ser, marker, timeout):
 
 @pytest.mark.mandatory
 @pytest.mark.ble
-def test_scan_bt(dut_port, settings_config):
+def test_scan_bt(dut_port, settings_config, cli_log):
     baud = int(settings_config.get("uart_baud", 115200))
     ready_marker = settings_config.get("ready_marker", READY_MARKER_DEFAULT)
     ready_timeout = float(settings_config.get("ready_timeout", 20))
@@ -44,6 +44,8 @@ def test_scan_bt(dut_port, settings_config):
         ser.write(b"scan_bt\n")
         ser.flush()
         output = _read_until_marker(ser, "Summary:", scan_timeout + 5)
+
+    cli_log("scan_bt.txt", output)
 
     assert "BLE scan starting" in output, f"Missing BLE scan start.\n{output}"
     assert "=== BLE Scan Results ===" in output, f"Missing BLE results header.\n{output}"

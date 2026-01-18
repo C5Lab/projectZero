@@ -305,7 +305,9 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             )
 
 
+@pytest.hookimpl(hookwrapper=True, trylast=True)
 def pytest_sessionfinish(session, exitstatus):
+    yield
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     meta_path = RESULTS_DIR / "metadata.txt"
     version = "unknown"
@@ -328,6 +330,13 @@ def pytest_sessionfinish(session, exitstatus):
     for ext in ("*.txt", "*.html"):
         files.extend(RESULTS_DIR.glob(ext))
 
+    raw_file = getattr(session.config, "_raw_log_file", None)
+    if raw_file:
+        try:
+            raw_file.close()
+        except OSError:
+            pass
+
     if files:
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for path in files:
@@ -337,12 +346,6 @@ def pytest_sessionfinish(session, exitstatus):
                 path.unlink()
             except OSError:
                 pass
-    raw_file = getattr(session.config, "_raw_log_file", None)
-    if raw_file:
-        try:
-            raw_file.close()
-        except OSError:
-            pass
 
 @pytest.fixture(scope="session")
 def dut_port(devices_config):
