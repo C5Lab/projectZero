@@ -13,6 +13,11 @@
 docker compose -f ESP32C5/tests/docker-compose.yml run --rm tests
 ```
 
+## Regression suite
+
+This suite is treated as a full regression gate after each commit. It validates
+end-to-end device behavior over UART (flash, scan, system, BLE).
+
 ## Alternate runs
 
 Run without pytest-sugar:
@@ -58,10 +63,12 @@ Common files included in the zip:
 - `show_probes_vendor.txt`, `list_probes_vendor.txt`
 - `show_sniffer_results.txt`, `show_sniffer_results_vendor.txt`, `clear_sniffer_results.txt`
 - `sniffer_debug.txt`
+- `sniffer_noscan.txt`
 - `vendor_read.txt`, `vendor_persistence.txt`, `vendor_persistence_off.txt`
 - `led_set_and_read.txt`, `list_sd.txt`, `select_html.txt`, `list_dir.txt`
 - `scan_bt.txt`, `scan_airtag.txt`
 - `show_scan_results_no_scan.txt`
+- `show_scan_results_vendor.txt`, `show_scan_results_during_scan.txt`
 
 HTML report shows CLI logs inline under each test (expand the test row).
 
@@ -193,6 +200,12 @@ flowchart TD
    - Run `start_sniffer`, wait, stop, then `show_sniffer_results_vendor`
 15) `sniffer_debug_toggle`  
    - Toggle `sniffer_debug 1` then `sniffer_debug 0`
+16) `show_scan_results_vendor_after_scan`  
+   - Run `scan_networks`, then `show_scan_results` and verify vendor names
+17) `show_scan_results_during_scan`  
+   - Run `scan_networks`, query `show_scan_results` while scan is in progress
+18) `start_sniffer_noscan`  
+   - Start sniffer without scan and stop
 
 #### Scan flows
 
@@ -246,6 +259,30 @@ flowchart TD
 - Does: reboot and run `show_scan_results` before any scan.
 - Pass: output contains "No scan has been performed yet."
 - Fail: missing no-scan message.
+
+`show_scan_results_vendor_after_scan`
+```mermaid
+flowchart TD
+    A[Run scan_networks] --> B[show_scan_results]
+    B --> C[Validate vendor names]
+```
+
+`show_scan_results_vendor_after_scan` expectations
+- Does: `vendor set on`, `scan_networks`, then `show_scan_results`.
+- Pass: output includes vendor names in CSV column 3.
+- Fail: no CSV output or vendor names missing.
+
+`show_scan_results_during_scan`
+```mermaid
+flowchart TD
+    A[Start scan_networks] --> B[show_scan_results]
+    B --> C[Expect in-progress message]
+```
+
+`show_scan_results_during_scan` expectations
+- Does: start `scan_networks`, call `show_scan_results` while scan is running.
+- Pass: output contains "Scan still in progress".
+- Fail: missing in-progress message.
 
 `scan_channel_time_defaults`
 ```mermaid
@@ -360,6 +397,11 @@ flowchart TD
 - Does: `sniffer_debug 1`, then `sniffer_debug 0`.
 - Pass: outputs include "ENABLED" and "DISABLED".
 - Fail: toggle output missing.
+
+`start_sniffer_noscan` expectations
+- Does: `start_sniffer_noscan`, then `stop`.
+- Pass: output shows sniffer monitoring and stop confirmation.
+- Fail: missing start or stop output.
 
 ### System (mandatory)
 

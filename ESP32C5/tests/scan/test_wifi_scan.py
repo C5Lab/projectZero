@@ -165,7 +165,7 @@ def test_scan_networks_repeatability(dut_port, settings_config, cli_log):
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
         _wait_for_ready(ser, ready_marker, ready_timeout)
         results = []
-        outputs = []
+        summaries = []
         for _ in range(repeat_count):
             _reboot_and_wait(ser, ready_marker, ready_timeout)
             _set_channel_time_defaults(ser, settings_config)
@@ -177,9 +177,13 @@ def test_scan_networks_repeatability(dut_port, settings_config, cli_log):
             assert retrieved_count >= _min_networks(settings_config), f"Retrieved count below minimum.\n{output}"
             assert status == 0, f"Scan status not zero.\n{output}"
             results.append(found_count)
-            outputs.append(output)
+            summaries.append(summary)
 
-    report = f"counts={results}\n"
+    summary_lines = [
+        f"{idx+1}: found={s[0]} retrieved={s[1]} time={s[2]:.1f}s status={s[3]}"
+        for idx, s in enumerate(summaries)
+    ]
+    report = "counts=" + str(results) + "\n" + "\n".join(summary_lines) + "\n"
     cli_log("scan_repeatability.txt", report)
 
 
@@ -211,6 +215,60 @@ def test_show_scan_results_after_scan(scan_once_result, dut_port, settings_confi
     assert retrieved_count == len(csv_lines), (
         f"Retrieved count mismatch: scan={retrieved_count} show_scan_results={len(csv_lines)}"
     )
+
+
+@pytest.mark.mandatory
+@pytest.mark.scan
+def test_show_scan_results_vendor_after_scan(dut_port, settings_config, cli_log):
+    baud = int(settings_config.get("uart_baud", 115200))
+    ready_marker = settings_config.get("ready_marker", "BOARD READY")
+    ready_timeout = float(settings_config.get("ready_timeout", 20))
+    scan_timeout = float(settings_config.get("scan_timeout", 60))
+
+    with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _wait_for_ready(ser, ready_marker, ready_timeout)
+        _reboot_and_wait(ser, ready_marker, ready_timeout)
+        _set_channel_time_defaults(ser, settings_config)
+        _send_vendor_command(ser, "vendor set on")
+        scan_output, _ = _run_scan(ser, "scan_networks", RESULT_MARKER, scan_timeout)
+
+        ser.write(b"show_scan_results\n")
+        ser.flush()
+        output = _read_until_prompt(ser, scan_timeout)
+
+    cli_log("show_scan_results_vendor.txt", output)
+    csv_lines = _extract_csv_lines(output)
+    assert csv_lines, f"No CSV scan results found.\n{output}"
+    has_vendor = False
+    for line in csv_lines:
+        row = next(csv.reader(io.StringIO(line)))
+        if len(row) >= 3 and row[2].strip():
+            has_vendor = True
+            break
+    assert has_vendor, f"No vendor names found in show_scan_results.\n{output}"
+
+
+@pytest.mark.mandatory
+@pytest.mark.scan
+def test_show_scan_results_during_scan(dut_port, settings_config, cli_log):
+    baud = int(settings_config.get("uart_baud", 115200))
+    ready_marker = settings_config.get("ready_marker", "BOARD READY")
+    ready_timeout = float(settings_config.get("ready_timeout", 20))
+    scan_timeout = float(settings_config.get("scan_timeout", 60))
+
+    with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _wait_for_ready(ser, ready_marker, ready_timeout)
+        _reboot_and_wait(ser, ready_marker, ready_timeout)
+        _set_channel_time_defaults(ser, settings_config)
+        ser.reset_input_buffer()
+        ser.write(b"scan_networks\n")
+        ser.flush()
+        time.sleep(0.5)
+        output = _send_and_read(ser, "show_scan_results", 4.0)
+        _read_until_marker(ser, RESULT_MARKER, scan_timeout)
+
+    cli_log("show_scan_results_during_scan.txt", output)
+    assert "Scan still in progress" in output, f"Missing in-progress message.\n{output}"
 
 
 @pytest.mark.mandatory

@@ -125,3 +125,20 @@ def test_sniffer_debug_toggle(dut_port, settings_config, cli_log):
     cli_log("sniffer_debug.txt", on_out + "\n" + off_out)
     assert "Sniffer debug mode ENABLED" in on_out, f"sniffer_debug enable failed.\n{on_out}"
     assert "Sniffer debug mode DISABLED" in off_out, f"sniffer_debug disable failed.\n{off_out}"
+
+
+@pytest.mark.mandatory
+@pytest.mark.scan
+def test_start_sniffer_noscan(dut_port, settings_config, cli_log):
+    baud = int(settings_config.get("uart_baud", 115200))
+    ready_marker = settings_config.get("ready_marker", "BOARD READY")
+    ready_timeout = float(settings_config.get("ready_timeout", 20))
+
+    with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _wait_for_ready(ser, ready_marker, ready_timeout)
+        start_out = _send_and_read(ser, "start_sniffer_noscan", 6.0)
+        stop_out = _send_and_read(ser, "stop", 6.0)
+
+    cli_log("sniffer_noscan.txt", start_out + "\n" + stop_out)
+    assert "Sniffer: Now monitoring" in start_out, f"start_sniffer_noscan failed.\n{start_out}"
+    assert "All operations stopped." in stop_out, f"stop failed.\n{stop_out}"
