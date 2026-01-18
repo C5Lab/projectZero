@@ -28,6 +28,12 @@ def _wait_for_ready(ser, marker, timeout):
     return _read_until_marker(ser, marker, timeout)
 
 
+def _reboot_and_wait(ser, marker, timeout):
+    ser.write(b"reboot\n")
+    ser.flush()
+    return _read_until_marker(ser, marker, timeout)
+
+
 def _send_and_read(ser, command, timeout):
     ser.write((command + "\n").encode("ascii"))
     ser.flush()
@@ -160,3 +166,28 @@ def test_list_probes_vendor_after_sniffer(dut_port, settings_config, cli_log):
     entries = [line for line in lines if line[0].isdigit() and "[" in line and "]" in line]
     assert entries, f"No vendor-formatted probe entries found.\n{output}"
     assert len(entries) >= min_entries, f"Probe entries below minimum ({min_entries}).\n{output}"
+
+
+@pytest.mark.mandatory
+@pytest.mark.scan
+def test_show_probes_after_sniffer(dut_port, settings_config, cli_log):
+    baud = int(settings_config.get("uart_baud", 115200))
+    ready_marker = settings_config.get("ready_marker", "BOARD READY")
+    ready_timeout = float(settings_config.get("ready_timeout", 20))
+    min_packets = int(settings_config.get("sniffer_min_packets", 200))
+    wait_seconds = float(settings_config.get("sniffer_wait_seconds", 12))
+
+    with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("show_probes: wait for ready")
+        _wait_for_ready(ser, ready_marker, ready_timeout)
+        _step("show_probes: reboot")
+        _reboot_and_wait(ser, ready_marker, ready_timeout)
+        _step("show_probes: start_sniffer")
+        last_count = _run_sniffer(ser, min_packets, wait_seconds)
+        _step("show_probes: show_probes")
+        output = _send_and_read(ser, "show_probes", 6.0)
+
+    cli_log("show_probes.txt", output)
+    assert last_count >= min_packets, f"Sniffer packets below minimum ({min_packets})."
+    assert "No probe requests captured" not in output, f"No probes captured.\n{output}"
+    assert "(" in output and ")" in output, f"Probe lines missing MAC format.\n{output}"

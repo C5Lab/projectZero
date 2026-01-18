@@ -459,10 +459,14 @@ def test_deauth_repeat_cycles(
         _step("client: sta_connect")
         connect_out = _client_send(client_ser, f"sta_connect {ssid} {password}", client_prompt, 8.0)
         cli_log("deauth_repeat_client_connect.txt", connect_out)
+        _step("client: wait initial reconnect")
+        initial_status = _client_wait_reconnect(client_ser, client_prompt, reconnect_timeout + 5)
+        cli_log("deauth_repeat_client_status_initial.txt", initial_status)
+        assert "connected=1" in initial_status, f"Client not connected.\n{initial_status}"
 
         for idx in range(cycles):
-            _step(f"cycle {idx+1}: sta_status")
-            status_out = _client_send(client_ser, "sta_status", client_prompt, 6.0)
+            _step(f"cycle {idx+1}: ensure connected")
+            status_out = _client_wait_reconnect(client_ser, client_prompt, reconnect_timeout + 5)
             assert "connected=1" in status_out, f"Client not connected.\n{status_out}"
 
             with serial.Serial(dut_port, baud, timeout=0.2) as dut_ser:

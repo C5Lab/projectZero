@@ -114,15 +114,17 @@ Common files included in the zip:
 - `scan_channel_time_low.txt`, `scan_channel_time_high.txt`, `scan_channel_time_default.txt`
 - `scan_timeout_guard.txt`, `scan_output_fields.txt`
 - `channel_view.txt`, `list_probes.txt`
-- `show_probes_vendor.txt`, `list_probes_vendor.txt`
+- `show_probes.txt`, `show_probes_vendor.txt`, `list_probes_vendor.txt`
 - `show_sniffer_results.txt`, `show_sniffer_results_vendor.txt`, `clear_sniffer_results.txt`
 - `sniffer_debug.txt`
 - `sniffer_noscan.txt`
 - `vendor_read.txt`, `vendor_persistence.txt`, `vendor_persistence_off.txt`
-- `led_set_and_read.txt`, `list_sd.txt`, `select_html.txt`, `list_dir.txt`
+- `led_set_and_read.txt`, `list_sd.txt`, `select_html.txt`, `list_dir.txt`, `list_ssid.txt`
+- `gps_raw.txt`, `gps_m5.txt`
 - `scan_bt.txt`, `scan_airtag.txt`
 - `show_scan_results_no_scan.txt`
 - `show_scan_results_vendor.txt`, `show_scan_results_during_scan.txt`
+- `packet_monitor.txt`
 - `deauth_scan.txt`, `deauth_select.txt`, `deauth_start.txt`, `deauth_stop.txt`
 - `deauth_reboot.txt`
 - `deauth_client_hold.txt`, `deauth_client_connect.txt`, `deauth_client_status.txt`
@@ -136,7 +138,10 @@ Common files included in the zip:
 - `deauth_hold_connect.txt`, `deauth_hold_status.txt`, `deauth_hold_status_after.txt`, `deauth_hold_reconnect.txt`
 - `deauth_hold_scan.txt`, `deauth_hold_select.txt`, `deauth_hold_start.txt`, `deauth_hold_stop.txt`, `deauth_hold_reboot.txt`
 - `deauth_repeat_client_reboot.txt`, `deauth_repeat_client_hold.txt`, `deauth_repeat_client_connect.txt`
+- `deauth_repeat_client_status_initial.txt`
 - `deauth_repeat_cycles.txt`, `deauth_repeat_scan_*.txt`, `deauth_repeat_select_*.txt`
+- `unselect_networks_scan.txt`, `unselect_networks_select.txt`, `unselect_networks_clear.txt`
+- `select_stations.txt`, `unselect_stations.txt`
 - `handshake_scan.txt`, `handshake_select.txt`, `handshake_start.txt`
 - `handshake_list_dir.txt`, `handshake_delete.txt`
 - `handshake_client_hold.txt`, `handshake_client_connect.txt`, `handshake_client_status.txt`
@@ -266,20 +271,24 @@ flowchart TD
    - Run `start_sniffer`, wait, stop, then `show_probes_vendor`
 11) `list_probes_vendor_after_sniffer`  
    - Run `start_sniffer`, wait, stop, then `list_probes_vendor`
-12) `show_sniffer_results_and_clear`  
+12) `show_probes_after_sniffer`  
+   - Run `start_sniffer`, wait, stop, then `show_probes`
+13) `show_sniffer_results_and_clear`  
    - Run `start_sniffer`, wait, stop, then `show_sniffer_results`, `clear_sniffer_results`
-13) `show_scan_results_without_scan`  
+14) `show_scan_results_without_scan`  
    - Run `show_scan_results` after reboot (no scan), expect no-scan message
-14) `show_sniffer_results_vendor`  
+15) `show_sniffer_results_vendor`  
    - Run `start_sniffer`, wait, stop, then `show_sniffer_results_vendor`
-15) `sniffer_debug_toggle`  
+16) `sniffer_debug_toggle`  
    - Toggle `sniffer_debug 1` then `sniffer_debug 0`
-16) `show_scan_results_vendor_after_scan`  
+17) `show_scan_results_vendor_after_scan`  
    - Run `scan_networks`, then `show_scan_results` and verify vendor names
-17) `show_scan_results_during_scan`  
+18) `show_scan_results_during_scan`  
    - Run `scan_networks`, query `show_scan_results` while scan is in progress
-18) `start_sniffer_noscan`  
+19) `start_sniffer_noscan`  
    - Start sniffer without scan and stop
+20) `packet_monitor_basic`  
+   - Run `packet_monitor 6`, wait briefly, then `stop`
 
 #### Scan flows
 
@@ -410,6 +419,11 @@ flowchart TD
 - Pass: at least `probes_min_entries` probe entries and sniffer reached `sniffer_min_packets`.
 - Fail: "No probe requests captured", too few entries, or packet minimum not reached.
 
+`show_probes_after_sniffer` expectations
+- Does: `start_sniffer`, wait until `sniffer_min_packets` (or timeout), `stop`, then `show_probes`.
+- Pass: output includes `SSID (MAC)` formatted lines and packet minimum reached.
+- Fail: "No probe requests captured" or missing MAC format.
+
 `show_probes_vendor_after_sniffer`
 ```mermaid
 flowchart TD
@@ -477,6 +491,11 @@ flowchart TD
 - Pass: output shows sniffer monitoring and stop confirmation.
 - Fail: missing start or stop output.
 
+`packet_monitor_basic` expectations
+- Does: `packet_monitor 6`, wait briefly, then `stop`.
+- Pass: no usage/invalid channel errors and stop confirmation.
+- Fail: usage/invalid channel output or missing stop confirmation.
+
 ### Deauth (mandatory)
 
 1) `deauth_disconnects_client`  
@@ -487,6 +506,10 @@ flowchart TD
    - Ensure `sta_hold on` blocks reconnect until `sta_hold off`
 4) `deauth_repeat_cycles`  
    - Run 3 deauth cycles back-to-back, each must disconnect and reconnect
+5) `unselect_networks_clears_selection`  
+   - After selecting a network, run `unselect_networks` and verify it clears selection
+6) `select_unselect_stations`  
+   - Select a station MAC, then `unselect_stations` and verify it clears
 
 #### Deauth flow
 
@@ -521,6 +544,16 @@ flowchart TD
 - Does: run 3 deauth cycles (scan/select/start/stop each time).
 - Pass: every cycle disconnects and reconnects.
 - Fail: any cycle fails to disconnect or reconnect.
+
+`unselect_networks_clears_selection` expectations
+- Does: `scan_networks`, `select_networks`, then `unselect_networks`.
+- Pass: output contains "Network selection cleared".
+- Fail: missing clear output.
+
+`select_unselect_stations` expectations
+- Does: `select_stations <MAC>`, then `unselect_stations`.
+- Pass: output contains "Added station" and "Station selection cleared".
+- Fail: missing selection or clear output.
 
 ### Handshake (mandatory)
 
@@ -559,6 +592,12 @@ flowchart TD
    - Disable vendor scan, reboot, and verify it stays off
 7) `list_dir`  
    - List a configured SD directory and verify output
+8) `list_ssid`  
+   - List SSIDs from `/sdcard/lab/ssid.txt`
+9) `gps_raw_mode_outputs_nmea`  
+   - Set `gps_set raw`, start `start_gps_raw`, expect NMEA output
+10) `gps_m5_mode_is_quiet`  
+   - Set `gps_set m5`, start `start_gps_raw`, expect no NMEA output
 
 #### System flows
 
@@ -642,6 +681,21 @@ flowchart TD
 - Does: `list_dir <path>`.
 - Pass: output contains "Files in".
 - Fail: list_dir command fails or missing output.
+
+`list_ssid` expectations
+- Does: `list_ssid`.
+- Pass: either SSIDs are listed, or `ssid.txt` not found/empty is reported.
+- Fail: SD init failed.
+
+`gps_raw_mode_outputs_nmea` expectations
+- Does: `gps_set raw`, `start_gps_raw`, collect output, then `stop`.
+- Pass: at least one NMEA sentence (`$GN`, `$GP`, `$BD`) is seen.
+- Fail: no NMEA output or missing start message.
+
+`gps_m5_mode_is_quiet` expectations
+- Does: `gps_set m5`, `start_gps_raw`, collect output, then `stop`.
+- Pass: no NMEA sentences in output.
+- Fail: any NMEA sentence detected.
 
 ### BLE (mandatory)
 

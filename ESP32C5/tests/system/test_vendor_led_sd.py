@@ -40,6 +40,10 @@ def _send_and_read(ser, command, timeout):
     return _read_until_marker(ser, PROMPT, timeout)
 
 
+def _step(message):
+    print(f"[system] {message}", flush=True)
+
+
 @pytest.mark.mandatory
 @pytest.mark.system
 def test_vendor_read(dut_port, settings_config, cli_log):
@@ -102,6 +106,30 @@ def test_list_sd(dut_port, settings_config, cli_log):
         "No HTML files found on SD card." in output
         or "HTML files found on SD card:" in output
     ), f"Unexpected list_sd output.\n{output}"
+
+
+@pytest.mark.mandatory
+@pytest.mark.system
+def test_list_ssid(dut_port, settings_config, cli_log):
+    baud = int(settings_config.get("uart_baud", 115200))
+    ready_marker = settings_config.get("ready_marker", "BOARD READY")
+    ready_timeout = float(settings_config.get("ready_timeout", 20))
+
+    with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("list_ssid: wait for ready")
+        _wait_for_ready(ser, ready_marker, ready_timeout)
+        _step("list_ssid: reboot")
+        _reboot_and_wait(ser, ready_marker, ready_timeout)
+        _step("list_ssid: list_ssid")
+        output = _send_and_read(ser, "list_ssid", 6.0)
+
+    cli_log("list_ssid.txt", output)
+    assert "Failed to initialize SD card" not in output, f"SD init failed.\n{output}"
+    assert (
+        "ssid.txt not found" in output
+        or "ssid.txt is empty" in output
+        or "SSID" in output
+    ), f"Unexpected list_ssid output.\n{output}"
 
 
 @pytest.mark.mandatory
