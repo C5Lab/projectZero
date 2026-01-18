@@ -54,6 +54,8 @@ Common files included in the zip:
 - `scan_channel_time_low.txt`, `scan_channel_time_high.txt`, `scan_channel_time_default.txt`
 - `scan_bt.txt`, `scan_airtag.txt`
 
+HTML report shows CLI logs inline under each test (expand the test row).
+
 ## After git pull (rebuild image)
 
 If you pulled new changes, rebuild the test image before running:

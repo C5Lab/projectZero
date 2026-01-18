@@ -1,5 +1,6 @@
 import json
 import os
+import html
 import re
 import time
 from pathlib import Path
@@ -183,7 +184,8 @@ def pytest_runtest_makereport(item, call):
     for key, value in item.user_properties:
         if key == "cli_log":
             name, content = value
-            extras.append(pytest_html.extras.text(content, name))
+            escaped = html.escape(content)
+            extras.append(pytest_html.extras.html(f"<h4>{name}</h4><pre>{escaped}</pre>"))
     report.extras = extras
 
 
