@@ -43,6 +43,17 @@ zip artifact.
 On test start, old zip artifacts are moved to `results/archive/` and any loose
 `.txt`/`.html` files are removed to keep the run clean.
 
+### Artifact files
+
+Common files included in the zip:
+- `metadata.txt`, `ota_info.txt`
+- `pytest_raw.txt`, `report.html`
+- `vendor.txt`, `scan_networks.txt`, `show_scan_results.txt`
+- `scan_repeatability.txt`
+- `scan_vendor_on.txt`, `scan_vendor_off.txt`
+- `scan_channel_time_low.txt`, `scan_channel_time_high.txt`, `scan_channel_time_default.txt`
+- `scan_bt.txt`, `scan_airtag.txt`
+
 ## After git pull (rebuild image)
 
 If you pulled new changes, rebuild the test image before running:
