@@ -75,6 +75,13 @@ Requires host dependency:
 sudo apt install python3-serial
 ```
 
+Live debug output (shows step-by-step progress in long tests):
+```bash
+ESP32C5_DEVICES_CONFIG=ESP32C5/tests/config/devices.json \
+ESP32C5/tests/run_tests.sh pytest -m deauth -vv -s
+```
+`-s` turns off pytest output capture, so `print()` in tests is visible.
+
 Generate HTML report:
 ```bash
 docker compose -f ESP32C5/tests/docker-compose.yml run --rm \

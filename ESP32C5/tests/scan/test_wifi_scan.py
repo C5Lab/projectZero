@@ -12,6 +12,10 @@ RESULT_MARKER = "Scan results printed."
 PROMPT = ">"
 
 
+def _step(message):
+    print(f"[scan] {message}", flush=True)
+
+
 def _read_until_marker(ser, marker, timeout):
     end = time.time() + timeout
     buffer = ""
@@ -115,10 +119,15 @@ def scan_once_result(dut_port, settings_config):
     scan_timeout = float(settings_config.get("scan_timeout", 60))
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("scan_once: wait for ready")
         _wait_for_ready(ser, ready_marker, ready_timeout)
+        _step("scan_once: reboot")
         _reboot_and_wait(ser, ready_marker, ready_timeout)
+        _step("scan_once: set channel defaults")
         _set_channel_time_defaults(ser, settings_config)
+        _step("scan_once: vendor set on")
         vendor_output = _ensure_vendor_enabled(ser)
+        _step("scan_once: scan_networks")
         output, elapsed = _run_scan(ser, command, RESULT_MARKER, scan_timeout)
 
     summary = _parse_scan_summary(output)
@@ -134,6 +143,7 @@ def scan_once_result(dut_port, settings_config):
 @pytest.mark.mandatory
 @pytest.mark.scan
 def test_scan_networks_basic(scan_once_result, pytestconfig, settings_config, cli_log):
+    _step("scan_networks_basic")
     output = scan_once_result["output"]
     vendor_output = scan_once_result["vendor_output"]
     cli_log("vendor.txt", vendor_output)
@@ -155,6 +165,7 @@ def test_scan_networks_basic(scan_once_result, pytestconfig, settings_config, cl
 @pytest.mark.mandatory
 @pytest.mark.scan
 def test_scan_networks_repeatability(dut_port, settings_config, cli_log):
+    _step("scan_networks_repeatability")
     baud = int(settings_config.get("uart_baud", 115200))
     command = settings_config.get("scan_cmd", "scan_networks")
     ready_marker = settings_config.get("ready_marker", "BOARD READY")
@@ -167,6 +178,7 @@ def test_scan_networks_repeatability(dut_port, settings_config, cli_log):
         results = []
         summaries = []
         for _ in range(repeat_count):
+            _step("scan_repeat: reboot + defaults + scan")
             _reboot_and_wait(ser, ready_marker, ready_timeout)
             _set_channel_time_defaults(ser, settings_config)
             output, _ = _run_scan(ser, command, RESULT_MARKER, scan_timeout)
@@ -190,6 +202,7 @@ def test_scan_networks_repeatability(dut_port, settings_config, cli_log):
 @pytest.mark.mandatory
 @pytest.mark.scan
 def test_show_scan_results_after_scan(scan_once_result, dut_port, settings_config, cli_log):
+    _step("show_scan_results_after_scan")
     baud = int(settings_config.get("uart_baud", 115200))
     ready_marker = settings_config.get("ready_marker", "BOARD READY")
     ready_timeout = float(settings_config.get("ready_timeout", 20))
@@ -199,6 +212,7 @@ def test_show_scan_results_after_scan(scan_once_result, dut_port, settings_confi
         _wait_for_ready(ser, ready_marker, ready_timeout)
         _reboot_and_wait(ser, ready_marker, ready_timeout)
         _set_channel_time_defaults(ser, settings_config)
+        _step("show_scan_results_after_scan: scan_networks")
         scan_output, _ = _run_scan(ser, "scan_networks", RESULT_MARKER, response_timeout)
         scan_summary = _parse_scan_summary(scan_output)
         assert scan_summary, f"Missing scan summary.\n{scan_output}"
@@ -220,6 +234,7 @@ def test_show_scan_results_after_scan(scan_once_result, dut_port, settings_confi
 @pytest.mark.mandatory
 @pytest.mark.scan
 def test_show_scan_results_vendor_after_scan(dut_port, settings_config, cli_log):
+    _step("show_scan_results_vendor_after_scan")
     baud = int(settings_config.get("uart_baud", 115200))
     ready_marker = settings_config.get("ready_marker", "BOARD READY")
     ready_timeout = float(settings_config.get("ready_timeout", 20))
@@ -230,6 +245,7 @@ def test_show_scan_results_vendor_after_scan(dut_port, settings_config, cli_log)
         _reboot_and_wait(ser, ready_marker, ready_timeout)
         _set_channel_time_defaults(ser, settings_config)
         _send_vendor_command(ser, "vendor set on")
+        _step("show_scan_results_vendor_after_scan: scan_networks")
         scan_output, _ = _run_scan(ser, "scan_networks", RESULT_MARKER, scan_timeout)
 
         ser.write(b"show_scan_results\n")
@@ -251,6 +267,7 @@ def test_show_scan_results_vendor_after_scan(dut_port, settings_config, cli_log)
 @pytest.mark.mandatory
 @pytest.mark.scan
 def test_show_scan_results_during_scan(dut_port, settings_config, cli_log):
+    _step("show_scan_results_during_scan")
     baud = int(settings_config.get("uart_baud", 115200))
     ready_marker = settings_config.get("ready_marker", "BOARD READY")
     ready_timeout = float(settings_config.get("ready_timeout", 20))
@@ -261,9 +278,11 @@ def test_show_scan_results_during_scan(dut_port, settings_config, cli_log):
         _reboot_and_wait(ser, ready_marker, ready_timeout)
         _set_channel_time_defaults(ser, settings_config)
         ser.reset_input_buffer()
+        _step("show_scan_results_during_scan: scan_networks")
         ser.write(b"scan_networks\n")
         ser.flush()
         time.sleep(0.5)
+        _step("show_scan_results_during_scan: show_scan_results")
         output = _send_and_read(ser, "show_scan_results", 4.0)
         _read_until_marker(ser, RESULT_MARKER, scan_timeout)
 
@@ -274,6 +293,7 @@ def test_show_scan_results_during_scan(dut_port, settings_config, cli_log):
 @pytest.mark.mandatory
 @pytest.mark.scan
 def test_show_scan_results_without_scan(dut_port, settings_config, cli_log):
+    _step("show_scan_results_without_scan")
     baud = int(settings_config.get("uart_baud", 115200))
     ready_marker = settings_config.get("ready_marker", "BOARD READY")
     ready_timeout = float(settings_config.get("ready_timeout", 20))
@@ -282,6 +302,7 @@ def test_show_scan_results_without_scan(dut_port, settings_config, cli_log):
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
         _wait_for_ready(ser, ready_marker, ready_timeout)
         _reboot_and_wait(ser, ready_marker, ready_timeout)
+        _step("show_scan_results_without_scan: show_scan_results")
         output = _send_and_read(ser, "show_scan_results", response_timeout)
 
     cli_log("show_scan_results_no_scan.txt", output)
@@ -291,6 +312,7 @@ def test_show_scan_results_without_scan(dut_port, settings_config, cli_log):
 @pytest.mark.mandatory
 @pytest.mark.scan
 def test_scan_channel_time_defaults(dut_port, settings_config, cli_log):
+    _step("scan_channel_time_defaults")
     baud = int(settings_config.get("uart_baud", 115200))
     ready_marker = settings_config.get("ready_marker", "BOARD READY")
     ready_timeout = float(settings_config.get("ready_timeout", 20))
@@ -304,6 +326,7 @@ def test_scan_channel_time_defaults(dut_port, settings_config, cli_log):
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
         _wait_for_ready(ser, ready_marker, ready_timeout)
         _reboot_and_wait(ser, ready_marker, ready_timeout)
+        _step("scan_channel_time_defaults: read min/max")
         min_out = _send_and_read(ser, "channel_time read min", 4.0)
         max_out = _send_and_read(ser, "channel_time read max", 4.0)
 
@@ -312,6 +335,7 @@ def test_scan_channel_time_defaults(dut_port, settings_config, cli_log):
         assert min_val is not None and min_val >= 1, f"Invalid min channel time.\n{min_out}"
         assert max_val is not None and max_val >= 1, f"Invalid max channel time.\n{max_out}"
 
+        _step("scan_channel_time_defaults: low scan")
         _send_and_read(ser, f"channel_time set min {min_low}", 4.0)
         _send_and_read(ser, f"channel_time set max {max_low}", 4.0)
         _reboot_and_wait(ser, ready_marker, ready_timeout)
@@ -321,6 +345,7 @@ def test_scan_channel_time_defaults(dut_port, settings_config, cli_log):
         low_count, _retrieved_count, _retrieved_time, status = low_summary
         assert status == 0, f"Scan status not zero.\n{low_output}"
 
+        _step("scan_channel_time_defaults: high scan")
         _send_and_read(ser, f"channel_time set max {max_high}", 4.0)
         _reboot_and_wait(ser, ready_marker, ready_timeout)
         high_output, _ = _run_scan(ser, "scan_networks", RESULT_MARKER, scan_timeout)
@@ -332,6 +357,7 @@ def test_scan_channel_time_defaults(dut_port, settings_config, cli_log):
             f"Expected more or equal networks with higher max time. low={low_count} high={high_count}"
         )
 
+        _step("scan_channel_time_defaults: restore defaults")
         _send_and_read(ser, f"channel_time set max {max_default}", 4.0)
         _send_and_read(ser, f"channel_time set min {min_default}", 4.0)
         _reboot_and_wait(ser, ready_marker, ready_timeout)
@@ -347,6 +373,7 @@ def test_scan_channel_time_defaults(dut_port, settings_config, cli_log):
 @pytest.mark.mandatory
 @pytest.mark.scan
 def test_scan_networks_timeout_guard(scan_once_result, settings_config, cli_log):
+    _step("scan_networks_timeout_guard")
     scan_timeout = float(settings_config.get("scan_timeout", 60))
     elapsed = scan_once_result["elapsed"]
     cli_log("scan_timeout_guard.txt", f"elapsed={elapsed:.2f}s timeout={scan_timeout:.2f}s\n")
@@ -356,6 +383,7 @@ def test_scan_networks_timeout_guard(scan_once_result, settings_config, cli_log)
 @pytest.mark.mandatory
 @pytest.mark.scan
 def test_scan_networks_output_fields(scan_once_result, cli_log):
+    _step("scan_networks_output_fields")
     output = scan_once_result["output"]
     csv_lines = scan_once_result["csv_lines"]
     cli_log("scan_output_fields.txt", output)
@@ -377,6 +405,7 @@ def test_scan_networks_output_fields(scan_once_result, cli_log):
 @pytest.mark.mandatory
 @pytest.mark.scan
 def test_vendor_toggle_affects_scan(dut_port, settings_config, cli_log):
+    _step("vendor_toggle_affects_scan")
     baud = int(settings_config.get("uart_baud", 115200))
     command = settings_config.get("scan_cmd", "scan_networks")
     ready_marker = settings_config.get("ready_marker", "BOARD READY")
@@ -386,9 +415,11 @@ def test_vendor_toggle_affects_scan(dut_port, settings_config, cli_log):
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
         _wait_for_ready(ser, ready_marker, ready_timeout)
 
+        _step("vendor_toggle: on")
         on_out = _send_vendor_command(ser, "vendor set on")
         assert "Vendor scan: on" in on_out, f"Vendor on failed.\n{on_out}"
 
+        _step("vendor_toggle: scan on")
         _reboot_and_wait(ser, ready_marker, ready_timeout)
         _set_channel_time_defaults(ser, settings_config)
         scan_on, _ = _run_scan(ser, command, RESULT_MARKER, scan_timeout)
@@ -401,9 +432,11 @@ def test_vendor_toggle_affects_scan(dut_port, settings_config, cli_log):
                 break
         assert has_vendor, f"No vendor names found with vendor on.\n{scan_on}"
 
+        _step("vendor_toggle: off")
         off_out = _send_vendor_command(ser, "vendor set off")
         assert "Vendor scan: off" in off_out, f"Vendor off failed.\n{off_out}"
 
+        _step("vendor_toggle: scan off")
         _reboot_and_wait(ser, ready_marker, ready_timeout)
         _set_channel_time_defaults(ser, settings_config)
         scan_off, _ = _run_scan(ser, command, RESULT_MARKER, scan_timeout)

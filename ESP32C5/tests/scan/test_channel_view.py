@@ -24,6 +24,10 @@ def _wait_for_ready(ser, marker, timeout):
     return _read_until_marker(ser, marker, timeout)
 
 
+def _step(message):
+    print(f"[scan] {message}", flush=True)
+
+
 @pytest.mark.mandatory
 @pytest.mark.scan
 def test_channel_view(dut_port, settings_config, cli_log):
@@ -33,12 +37,15 @@ def test_channel_view(dut_port, settings_config, cli_log):
     timeout = float(settings_config.get("channel_view_timeout", 20))
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("channel_view: wait for ready")
         _wait_for_ready(ser, ready_marker, ready_timeout)
         ser.reset_input_buffer()
+        _step("channel_view: start")
         ser.write(b"channel_view\n")
         ser.flush()
 
         output = _read_until_marker(ser, "channel_view_end", timeout)
+        _step("channel_view: stop")
         ser.write(b"stop\n")
         ser.flush()
         output += "\n" + _read_until_marker(ser, "All operations stopped.", 6.0)

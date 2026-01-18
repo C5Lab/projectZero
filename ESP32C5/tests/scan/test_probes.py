@@ -65,6 +65,10 @@ def _run_sniffer(ser, min_packets, timeout):
     return last_count
 
 
+def _step(message):
+    print(f"[scan] {message}", flush=True)
+
+
 @pytest.mark.mandatory
 @pytest.mark.scan
 def test_list_probes_after_sniffer(dut_port, settings_config, cli_log):
@@ -76,8 +80,11 @@ def test_list_probes_after_sniffer(dut_port, settings_config, cli_log):
     min_entries = int(settings_config.get("probes_min_entries", 1))
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("probes: wait for ready")
         _wait_for_ready(ser, ready_marker, ready_timeout)
+        _step("probes: start_sniffer")
         last_count = _run_sniffer(ser, min_packets, wait_seconds)
+        _step("probes: list_probes")
         output = _send_and_read(ser, "list_probes", 6.0)
 
     cli_log("list_probes.txt", output)
@@ -103,9 +110,13 @@ def test_show_probes_vendor_after_sniffer(dut_port, settings_config, cli_log):
     wait_seconds = float(settings_config.get("sniffer_wait_seconds", 12))
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("probes_vendor: wait for ready")
         _wait_for_ready(ser, ready_marker, ready_timeout)
+        _step("probes_vendor: vendor set on")
         _send_and_read(ser, "vendor set on", 6.0)
+        _step("probes_vendor: start_sniffer")
         last_count = _run_sniffer(ser, min_packets, wait_seconds)
+        _step("probes_vendor: show_probes_vendor")
         output = _send_and_read(ser, "show_probes_vendor", 6.0)
 
     cli_log("show_probes_vendor.txt", output)
@@ -131,9 +142,13 @@ def test_list_probes_vendor_after_sniffer(dut_port, settings_config, cli_log):
     min_entries = int(settings_config.get("probes_min_entries", 1))
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("list_probes_vendor: wait for ready")
         _wait_for_ready(ser, ready_marker, ready_timeout)
+        _step("list_probes_vendor: vendor set on")
         _send_and_read(ser, "vendor set on", 6.0)
+        _step("list_probes_vendor: start_sniffer")
         last_count = _run_sniffer(ser, min_packets, wait_seconds)
+        _step("list_probes_vendor: list_probes_vendor")
         output = _send_and_read(ser, "list_probes_vendor", 6.0)
 
     cli_log("list_probes_vendor.txt", output)

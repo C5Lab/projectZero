@@ -30,6 +30,10 @@ def _wait_for_ready(ser, marker, timeout):
     return _read_until_marker(ser, marker, timeout)
 
 
+def _step(message):
+    print(f"[ble] {message}", flush=True)
+
+
 @pytest.mark.mandatory
 @pytest.mark.ble
 def test_scan_bt(dut_port, settings_config, cli_log):
@@ -39,8 +43,10 @@ def test_scan_bt(dut_port, settings_config, cli_log):
     scan_timeout = float(settings_config.get("ble_scan_timeout", 20))
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("scan_bt: wait for ready")
         _wait_for_ready(ser, ready_marker, ready_timeout)
         ser.reset_input_buffer()
+        _step("scan_bt: start")
         ser.write(b"scan_bt\n")
         ser.flush()
         output = _read_until_marker(ser, "Summary:", scan_timeout + 5)
@@ -100,8 +106,10 @@ def test_scan_airtag(dut_port, settings_config, cli_log):
     poll_timeout = float(settings_config.get("airtag_poll_timeout", 25))
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("scan_airtag: wait for ready")
         _wait_for_ready(ser, ready_marker, ready_timeout)
         ser.reset_input_buffer()
+        _step("scan_airtag: start")
         ser.write(b"scan_airtag\n")
         ser.flush()
 
@@ -113,6 +121,7 @@ def test_scan_airtag(dut_port, settings_config, cli_log):
             if re.match(r"^\d+,\d+$", line):
                 samples.append(line)
 
+        _step("scan_airtag: stop")
         ser.write(b"stop\n")
         ser.flush()
         output += "\n" + _read_until_marker(ser, "All operations stopped.", 6.0)

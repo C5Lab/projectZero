@@ -76,6 +76,10 @@ def _extract_saved_paths(output):
     return pcap_path, hccapx_path
 
 
+def _step(message):
+    print(f"[handshake] {message}", flush=True)
+
+
 @pytest.mark.mandatory
 @pytest.mark.handshake
 def test_handshake_capture_selected(dut_port, client_janosmini_port, devices_config, settings_config, cli_log):
@@ -96,18 +100,22 @@ def test_handshake_capture_selected(dut_port, client_janosmini_port, devices_con
         pytest.fail("Missing target_ap.ssid/password/bssid in devices config.")
 
     with serial.Serial(client_janosmini_port, baud, timeout=0.2) as client_ser:
+        _step("client: wait for prompt")
         _read_until_prompt(client_ser, 6.0)
         client_ser.reset_input_buffer()
+        _step("client: sta_hold on")
         client_ser.write(b"sta_hold on\n")
         client_ser.flush()
         hold_out = _read_until_prompt(client_ser, 4.0)
         cli_log("handshake_client_hold.txt", hold_out)
 
+        _step("client: sta_connect")
         client_ser.write(f"sta_connect {ssid} {password}\n".encode("ascii"))
         client_ser.flush()
         connect_out = _read_until_prompt(client_ser, 8.0)
         cli_log("handshake_client_connect.txt", connect_out)
 
+        _step("client: sta_status")
         client_ser.write(b"sta_status\n")
         client_ser.flush()
         status_out = _read_until_prompt(client_ser, 6.0)
@@ -115,10 +123,13 @@ def test_handshake_capture_selected(dut_port, client_janosmini_port, devices_con
         assert "connected=1" in status_out, f"Client not connected.\n{status_out}"
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("dut: wait for ready")
         _wait_for_ready(ser, ready_marker, ready_timeout)
+        _step("dut: reboot")
         _reboot_and_wait(ser, ready_marker, ready_timeout)
         _read_until_prompt(ser, 6.0)
 
+        _step("dut: scan_networks")
         scan_output = _run_scan(ser, scan_timeout)
         cli_log("handshake_scan.txt", scan_output)
         csv_lines = _extract_csv_lines(scan_output)
@@ -127,6 +138,7 @@ def test_handshake_capture_selected(dut_port, client_janosmini_port, devices_con
         index = _select_target_index(csv_lines, ssid, bssid)
         assert index, f"Target AP not found in scan output (ssid={ssid} bssid={bssid}).\n{scan_output}"
 
+        _step(f"dut: select_networks {index}")
         ser.write(f"select_networks {index}\n".encode("ascii"))
         ser.flush()
         select_out = _read_until_prompt(ser, 6.0)
@@ -134,10 +146,12 @@ def test_handshake_capture_selected(dut_port, client_janosmini_port, devices_con
         assert "Selected Networks" in select_out, f"Missing selection output.\n{select_out}"
         assert ssid in select_out, f"Selected network does not include target SSID.\n{select_out}"
 
+        _step("dut: start_handshake")
         ser.write(b"start_handshake\n")
         ser.flush()
         handshake_out = _read_until_marker(ser, "Handshake attack task finished.", handshake_timeout)
         if "Handshake attack task finished." not in handshake_out:
+            _step("dut: stop (handshake timeout)")
             ser.write(b"stop\n")
             ser.flush()
             stop_out = _read_until_prompt(ser, 8.0)
@@ -155,12 +169,14 @@ def test_handshake_capture_selected(dut_port, client_janosmini_port, devices_con
     assert success, f"Handshake did not complete.\n{handshake_out}"
 
     with serial.Serial(client_janosmini_port, baud, timeout=0.2) as client_ser:
+        _step("client: wait_disconnect")
         client_ser.write(f"wait_disconnect {int(disconnect_timeout)}\n".encode("ascii"))
         client_ser.flush()
         disconnect_out = _read_until_prompt(client_ser, disconnect_timeout + 5)
         cli_log("handshake_client_disconnect.txt", disconnect_out)
 
         time.sleep(2.0)
+        _step("client: sta_status after handshake")
         client_ser.write(b"sta_status\n")
         client_ser.flush()
         status_after = _read_until_prompt(client_ser, reconnect_timeout + 5)
@@ -173,6 +189,7 @@ def test_handshake_capture_selected(dut_port, client_janosmini_port, devices_con
 
     dir_path = pcap_path.rsplit("/", 1)[0]
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("dut: list_dir handshakes")
         _wait_for_ready(ser, ready_marker, ready_timeout)
         ser.write(f"list_dir {dir_path}\n".encode("ascii"))
         ser.flush()
@@ -180,10 +197,12 @@ def test_handshake_capture_selected(dut_port, client_janosmini_port, devices_con
 
         delete_out = ""
         for path in (hccapx_path, pcap_path):
+            _step(f"dut: file_delete {path}")
             ser.write(f"file_delete {path}\n".encode("ascii"))
             ser.flush()
             delete_out += _read_until_prompt(ser, 6.0)
 
+        _step("dut: list_dir handshakes after delete")
         ser.write(f"list_dir {dir_path}\n".encode("ascii"))
         ser.flush()
         list_after = _read_until_prompt(ser, 8.0)

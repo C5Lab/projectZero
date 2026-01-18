@@ -65,6 +65,10 @@ def _run_sniffer(ser, min_packets, timeout):
     return last_count
 
 
+def _step(message):
+    print(f"[scan] {message}", flush=True)
+
+
 @pytest.mark.mandatory
 @pytest.mark.scan
 def test_show_sniffer_results_and_clear(dut_port, settings_config, cli_log):
@@ -75,10 +79,15 @@ def test_show_sniffer_results_and_clear(dut_port, settings_config, cli_log):
     wait_seconds = float(settings_config.get("sniffer_wait_seconds", 12))
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("sniffer_results: wait for ready")
         _wait_for_ready(ser, ready_marker, ready_timeout)
+        _step("sniffer_results: start_sniffer")
         last_count = _run_sniffer(ser, min_packets, wait_seconds)
+        _step("sniffer_results: show_sniffer_results")
         show_out = _send_and_read(ser, "show_sniffer_results", 8.0)
+        _step("sniffer_results: clear_sniffer_results")
         clear_out = _send_and_read(ser, "clear_sniffer_results", 6.0)
+        _step("sniffer_results: show_sniffer_results (after clear)")
         show_after = _send_and_read(ser, "show_sniffer_results", 6.0)
 
     cli_log("show_sniffer_results.txt", show_out)
@@ -100,9 +109,13 @@ def test_show_sniffer_results_vendor(dut_port, settings_config, cli_log):
     wait_seconds = float(settings_config.get("sniffer_wait_seconds", 0))
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("sniffer_results_vendor: wait for ready")
         _wait_for_ready(ser, ready_marker, ready_timeout)
+        _step("sniffer_results_vendor: vendor set on")
         _send_and_read(ser, "vendor set on", 6.0)
+        _step("sniffer_results_vendor: start_sniffer")
         last_count = _run_sniffer(ser, min_packets, wait_seconds)
+        _step("sniffer_results_vendor: show_sniffer_results_vendor")
         show_out = _send_and_read(ser, "show_sniffer_results_vendor", 8.0)
 
     cli_log("show_sniffer_results_vendor.txt", show_out)
@@ -118,8 +131,11 @@ def test_sniffer_debug_toggle(dut_port, settings_config, cli_log):
     ready_timeout = float(settings_config.get("ready_timeout", 20))
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("sniffer_debug: wait for ready")
         _wait_for_ready(ser, ready_marker, ready_timeout)
+        _step("sniffer_debug: enable")
         on_out = _send_and_read(ser, "sniffer_debug 1", 4.0)
+        _step("sniffer_debug: disable")
         off_out = _send_and_read(ser, "sniffer_debug 0", 4.0)
 
     cli_log("sniffer_debug.txt", on_out + "\n" + off_out)
@@ -135,8 +151,11 @@ def test_start_sniffer_noscan(dut_port, settings_config, cli_log):
     ready_timeout = float(settings_config.get("ready_timeout", 20))
 
     with serial.Serial(dut_port, baud, timeout=0.2) as ser:
+        _step("sniffer_noscan: wait for ready")
         _wait_for_ready(ser, ready_marker, ready_timeout)
+        _step("sniffer_noscan: start_sniffer_noscan")
         start_out = _send_and_read(ser, "start_sniffer_noscan", 6.0)
+        _step("sniffer_noscan: stop")
         stop_out = _send_and_read(ser, "stop", 6.0)
 
     cli_log("sniffer_noscan.txt", start_out + "\n" + stop_out)
