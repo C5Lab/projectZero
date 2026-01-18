@@ -271,17 +271,19 @@ def test_scan_channel_time_defaults(dut_port, settings_config, cli_log):
 
 @pytest.mark.mandatory
 @pytest.mark.scan
-def test_scan_networks_timeout_guard(scan_once_result, settings_config):
+def test_scan_networks_timeout_guard(scan_once_result, settings_config, cli_log):
     scan_timeout = float(settings_config.get("scan_timeout", 60))
     elapsed = scan_once_result["elapsed"]
+    cli_log("scan_timeout_guard.txt", f"elapsed={elapsed:.2f}s timeout={scan_timeout:.2f}s\n")
     assert elapsed <= scan_timeout + 5, f"Scan took too long: {elapsed:.1f}s"
 
 
 @pytest.mark.mandatory
 @pytest.mark.scan
-def test_scan_networks_output_fields(scan_once_result):
+def test_scan_networks_output_fields(scan_once_result, cli_log):
     output = scan_once_result["output"]
     csv_lines = scan_once_result["csv_lines"]
+    cli_log("scan_output_fields.txt", output)
     assert csv_lines, f"No CSV lines found.\n{output}"
 
     for line in csv_lines[:3]:

@@ -30,7 +30,7 @@ def _wait_for_ready(ser, marker, timeout):
 
 @pytest.mark.mandatory
 @pytest.mark.flash
-def test_flash_validate_ota_info(dut_port, settings_config):
+def test_flash_validate_ota_info(dut_port, settings_config, cli_log):
     baud = int(settings_config.get("uart_baud", 115200))
     command = settings_config.get("ota_info_cmd", "ota_info")
     ready_marker = settings_config.get("ready_marker", "BOARD READY")
@@ -51,4 +51,5 @@ def test_flash_validate_ota_info(dut_port, settings_config):
         and "OTA: running partition=" in output
         and "OTA: next update partition=" in output
     )
+    cli_log("ota_info.txt", output)
     assert has_legacy or has_new, f"Missing OTA info.\n{output}"

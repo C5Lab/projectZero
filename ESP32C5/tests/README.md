@@ -48,14 +48,17 @@ On test start, old zip artifacts are moved to `results/archive/` and any loose
 Common files included in the zip:
 - `metadata.txt`, `ota_info.txt`
 - `pytest_raw.txt`, `report.html`
+- `flash_base.txt`, `flash_target.txt`
 - `vendor.txt`, `scan_networks.txt`, `show_scan_results.txt`
 - `scan_repeatability.txt`
 - `scan_vendor_on.txt`, `scan_vendor_off.txt`
 - `scan_channel_time_low.txt`, `scan_channel_time_high.txt`, `scan_channel_time_default.txt`
+- `scan_timeout_guard.txt`, `scan_output_fields.txt`
 - `channel_view.txt`, `list_probes.txt`
 - `show_probes_vendor.txt`, `list_probes_vendor.txt`
 - `show_sniffer_results.txt`, `clear_sniffer_results.txt`
-- `vendor_persistence.txt`
+- `vendor_read.txt`, `vendor_persistence.txt`
+- `led_set_and_read.txt`, `list_sd.txt`, `select_html.txt`
 - `scan_bt.txt`, `scan_airtag.txt`
 
 HTML report shows CLI logs inline under each test (expand the test row).

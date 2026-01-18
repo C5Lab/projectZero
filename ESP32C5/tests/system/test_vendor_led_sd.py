@@ -42,7 +42,7 @@ def _send_and_read(ser, command, timeout):
 
 @pytest.mark.mandatory
 @pytest.mark.system
-def test_vendor_read(dut_port, settings_config):
+def test_vendor_read(dut_port, settings_config, cli_log):
     baud = int(settings_config.get("uart_baud", 115200))
     ready_marker = settings_config.get("ready_marker", "BOARD READY")
     ready_timeout = float(settings_config.get("ready_timeout", 20))
@@ -54,13 +54,14 @@ def test_vendor_read(dut_port, settings_config):
             output = _send_and_read(ser, "vendor set on", 6.0)
         output = _send_and_read(ser, "vendor read", 4.0)
 
+    cli_log("vendor_read.txt", output)
     assert "Vendor scan: on" in output, f"Vendor not enabled.\n{output}"
     assert "Vendor file: available" in output, f"Vendor file not available.\n{output}"
 
 
 @pytest.mark.mandatory
 @pytest.mark.system
-def test_led_set_and_read(dut_port, settings_config):
+def test_led_set_and_read(dut_port, settings_config, cli_log):
     baud = int(settings_config.get("uart_baud", 115200))
     ready_marker = settings_config.get("ready_marker", "BOARD READY")
     ready_timeout = float(settings_config.get("ready_timeout", 20))
@@ -75,6 +76,7 @@ def test_led_set_and_read(dut_port, settings_config):
         off_out = _send_and_read(ser, "led set off", 4.0)
         read_off = _send_and_read(ser, "led read", 4.0)
 
+    cli_log("led_set_and_read.txt", "\n".join([on_out, read_on, level_out, read_level, off_out, read_off]))
     assert "LED turned on" in on_out, f"LED did not turn on.\n{on_out}"
     assert "LED status: on" in read_on, f"LED read not on.\n{read_on}"
     assert "LED brightness set to" in level_out, f"LED level not set.\n{level_out}"
@@ -85,7 +87,7 @@ def test_led_set_and_read(dut_port, settings_config):
 
 @pytest.mark.mandatory
 @pytest.mark.system
-def test_list_sd(dut_port, settings_config):
+def test_list_sd(dut_port, settings_config, cli_log):
     baud = int(settings_config.get("uart_baud", 115200))
     ready_marker = settings_config.get("ready_marker", "BOARD READY")
     ready_timeout = float(settings_config.get("ready_timeout", 20))
@@ -94,6 +96,7 @@ def test_list_sd(dut_port, settings_config):
         _wait_for_ready(ser, ready_marker, ready_timeout)
         output = _send_and_read(ser, "list_sd", 6.0)
 
+    cli_log("list_sd.txt", output)
     assert "Failed to initialize SD card" not in output, f"SD init failed.\n{output}"
     assert (
         "No HTML files found on SD card." in output
@@ -103,7 +106,7 @@ def test_list_sd(dut_port, settings_config):
 
 @pytest.mark.mandatory
 @pytest.mark.system
-def test_select_html(dut_port, settings_config):
+def test_select_html(dut_port, settings_config, cli_log):
     baud = int(settings_config.get("uart_baud", 115200))
     ready_marker = settings_config.get("ready_marker", "BOARD READY")
     ready_timeout = float(settings_config.get("ready_timeout", 20))
@@ -128,6 +131,7 @@ def test_select_html(dut_port, settings_config):
 
         select_out = _send_and_read(ser, f"select_html {index}", 6.0)
 
+    cli_log("select_html.txt", output + "\n" + select_out)
     assert "Loaded HTML file:" in select_out, f"select_html failed.\n{select_out}"
     assert "Portal will now use this custom HTML." in select_out, f"Missing portal update.\n{select_out}"
 
@@ -148,4 +152,3 @@ def test_vendor_persistence(dut_port, settings_config, cli_log):
     cli_log("vendor_persistence.txt", output)
     assert "Vendor scan: on" in output, f"Vendor not persisted.\n{output}"
     assert "Vendor file: available" in output, f"Vendor file not available.\n{output}"
-
