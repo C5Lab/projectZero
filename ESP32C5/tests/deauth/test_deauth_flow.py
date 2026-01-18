@@ -41,9 +41,15 @@ def _reboot_and_wait(ser, ready_marker, ready_timeout):
 
 def _run_scan(ser, timeout):
     ser.reset_input_buffer()
-    ser.write(b"scan_networks\n")
+    ser.write(b"scan_networks\r\n")
     ser.flush()
     return _read_until_marker(ser, RESULT_MARKER, timeout)
+
+
+def _ensure_prompt(ser, prompt, timeout):
+    ser.write(b"\n")
+    ser.flush()
+    return _read_until_prompt(ser, prompt, timeout)
 
 
 def _extract_csv_lines(output):
@@ -114,12 +120,20 @@ def test_deauth_disconnects_client(
         with serial.Serial(dut_port, baud, timeout=0.2) as dut_ser:
             _wait_for_ready(dut_ser, ready_marker, ready_timeout)
             reboot_out = _reboot_and_wait(dut_ser, ready_marker, ready_timeout)
-            _read_until_prompt(dut_ser, DUT_PROMPT, 6.0)
+            if ready_marker and ready_marker not in reboot_out:
+                reboot_out += "\n\n--- no ready marker ---\n"
+            prompt_out = _read_until_prompt(dut_ser, DUT_PROMPT, 6.0)
+            if not prompt_out.strip():
+                prompt_out = _ensure_prompt(dut_ser, DUT_PROMPT, 6.0)
+            reboot_out += "\n\n--- prompt ---\n" + prompt_out
             cli_log("deauth_reboot.txt", reboot_out)
 
             scan_output = _run_scan(dut_ser, scan_timeout)
-            if not scan_output.strip():
-                time.sleep(1.0)
+            if "Unrecognized command" in scan_output:
+                _ensure_prompt(dut_ser, DUT_PROMPT, 4.0)
+                scan_output = _run_scan(dut_ser, scan_timeout)
+            if RESULT_MARKER not in scan_output:
+                _ensure_prompt(dut_ser, DUT_PROMPT, 4.0)
                 scan_output = _run_scan(dut_ser, scan_timeout)
             cli_log("deauth_scan.txt", scan_output)
 
