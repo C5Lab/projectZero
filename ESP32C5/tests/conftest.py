@@ -296,12 +296,6 @@ def pytest_configure(config):
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
-    summaries = getattr(config, "_scan_summaries", [])
-    if summaries:
-        terminalreporter.write_line("Scan summaries:")
-        for line in summaries:
-            terminalreporter.write_line(line)
-
     stats = terminalreporter.stats or {}
     suite_totals = {}
 

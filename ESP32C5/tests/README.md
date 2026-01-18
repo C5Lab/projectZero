@@ -127,6 +127,16 @@ Common files included in the zip:
 - `deauth_reboot.txt`
 - `deauth_client_hold.txt`, `deauth_client_connect.txt`, `deauth_client_status.txt`
 - `deauth_client_disconnect.txt`, `deauth_client_status_after.txt`
+- `deauth_client_reboot.txt`
+- `deauth_latency.txt`, `deauth_latency_scan.txt`, `deauth_latency_select.txt`, `deauth_latency_reboot.txt`
+- `deauth_latency_client_reboot.txt`, `deauth_latency_client_hold.txt`, `deauth_latency_client_connect.txt`
+- `deauth_latency_client_status.txt`, `deauth_latency_client_disconnect.txt`, `deauth_latency_client_reconnect.txt`
+- `deauth_latency_start.txt`, `deauth_latency_stop.txt`
+- `deauth_hold_client_reboot.txt`, `deauth_hold_on.txt`, `deauth_hold_off.txt`
+- `deauth_hold_connect.txt`, `deauth_hold_status.txt`, `deauth_hold_status_after.txt`, `deauth_hold_reconnect.txt`
+- `deauth_hold_scan.txt`, `deauth_hold_select.txt`, `deauth_hold_start.txt`, `deauth_hold_stop.txt`, `deauth_hold_reboot.txt`
+- `deauth_repeat_client_reboot.txt`, `deauth_repeat_client_hold.txt`, `deauth_repeat_client_connect.txt`
+- `deauth_repeat_cycles.txt`, `deauth_repeat_scan_*.txt`, `deauth_repeat_select_*.txt`
 - `handshake_scan.txt`, `handshake_select.txt`, `handshake_start.txt`
 - `handshake_list_dir.txt`, `handshake_delete.txt`
 - `handshake_client_hold.txt`, `handshake_client_connect.txt`, `handshake_client_status.txt`
@@ -471,6 +481,12 @@ flowchart TD
 
 1) `deauth_disconnects_client`  
    - Client connects to `target_ap`, DUT runs `scan_networks` → `select_networks` → `start_deauth`, verify disconnect/reconnect
+2) `deauth_disconnect_reconnect_latency`  
+   - Same flow as above, logs disconnect/reconnect timing
+3) `deauth_client_hold_mode`  
+   - Ensure `sta_hold on` blocks reconnect until `sta_hold off`
+4) `deauth_repeat_cycles`  
+   - Run 3 deauth cycles back-to-back, each must disconnect and reconnect
 
 #### Deauth flow
 
@@ -490,6 +506,21 @@ flowchart TD
 - Pass: client disconnects and reconnects after stop.
 - Fail: no disconnect or no reconnect.
 - Notes: DUT scan retries once if the CLI prompt is not ready yet.
+
+`deauth_disconnect_reconnect_latency` expectations
+- Does: measure time to disconnect and time to reconnect.
+- Pass: disconnect/reconnect completes within configured timeouts.
+- Fail: missing disconnect or reconnect.
+
+`deauth_client_hold_mode` expectations
+- Does: hold on + deauth, ensure client stays disconnected until hold off.
+- Pass: no reconnect while hold on; reconnects after hold off.
+- Fail: reconnects early or never reconnects.
+
+`deauth_repeat_cycles` expectations
+- Does: run 3 deauth cycles (scan/select/start/stop each time).
+- Pass: every cycle disconnects and reconnects.
+- Fail: any cycle fails to disconnect or reconnect.
 
 ### Handshake (mandatory)
 
