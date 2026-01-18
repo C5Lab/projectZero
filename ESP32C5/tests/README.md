@@ -52,6 +52,10 @@ Common files included in the zip:
 - `scan_repeatability.txt`
 - `scan_vendor_on.txt`, `scan_vendor_off.txt`
 - `scan_channel_time_low.txt`, `scan_channel_time_high.txt`, `scan_channel_time_default.txt`
+- `channel_view.txt`, `list_probes.txt`
+- `show_probes_vendor.txt`, `list_probes_vendor.txt`
+- `show_sniffer_results.txt`, `clear_sniffer_results.txt`
+- `vendor_persistence.txt`
 - `scan_bt.txt`, `scan_airtag.txt`
 
 HTML report shows CLI logs inline under each test (expand the test row).
@@ -94,6 +98,8 @@ flowchart TD
     B --> C[Flash target firmware]
     C --> D[Validate OTA info]
     D --> E[WiFi scan tests]
+    E --> F[System tests (vendor/LED/SD)]
+    F --> G[BLE tests]
 ```
 
 ## Test suites
@@ -170,6 +176,12 @@ flowchart TD
    - Run `channel_view`, validate output for ch6 and ch36, then stop
 9) `list_probes_after_sniffer`  
    - Run `start_sniffer`, wait, stop, then `list_probes`
+10) `show_probes_vendor_after_sniffer`  
+   - Run `start_sniffer`, wait, stop, then `show_probes_vendor`
+11) `list_probes_vendor_after_sniffer`  
+   - Run `start_sniffer`, wait, stop, then `list_probes_vendor`
+12) `show_sniffer_results_and_clear`  
+   - Run `start_sniffer`, wait, stop, then `show_sniffer_results`, `clear_sniffer_results`
 
 #### Scan flows
 
@@ -260,9 +272,52 @@ flowchart TD
 - Fail: missing markers or channels.
 
 `list_probes_after_sniffer` expectations
-- Does: `start_sniffer`, wait `probes_wait_seconds`, `stop`, then `list_probes`.
-- Pass: at least `probes_min_entries` probe entries.
-- Fail: "No probe requests captured" or too few entries.
+- Does: `start_sniffer`, wait until `sniffer_min_packets` (or timeout), `stop`, then `list_probes`.
+- Pass: at least `probes_min_entries` probe entries and sniffer reached `sniffer_min_packets`.
+- Fail: "No probe requests captured", too few entries, or packet minimum not reached.
+
+`show_probes_vendor_after_sniffer`
+```mermaid
+flowchart TD
+    A[Start sniffer] --> B[Wait sniffer_min_packets]
+    B --> C[Stop sniffer]
+    C --> D[show_probes_vendor]
+    D --> E[Validate vendor format]
+```
+
+`list_probes_vendor_after_sniffer`
+```mermaid
+flowchart TD
+    A[Start sniffer] --> B[Wait sniffer_min_packets]
+    B --> C[Stop sniffer]
+    C --> D[list_probes_vendor]
+    D --> E[Validate vendor format]
+```
+
+`show_sniffer_results_and_clear`
+```mermaid
+flowchart TD
+    A[Start sniffer] --> B[Wait sniffer_wait_seconds]
+    B --> C[Stop sniffer]
+    C --> D[show_sniffer_results]
+    D --> E[clear_sniffer_results]
+    E --> F[show_sniffer_results]
+```
+
+`show_probes_vendor_after_sniffer` expectations
+- Does: `vendor set on`, `start_sniffer`, wait until `sniffer_min_packets` (or timeout), `stop`, then `show_probes_vendor`.
+- Pass: at least one line includes MAC and vendor `[Vendor]` and packet minimum reached.
+- Fail: "No probe requests captured", missing vendor format, or packet minimum not reached.
+
+`list_probes_vendor_after_sniffer` expectations
+- Does: `vendor set on`, `start_sniffer`, wait until `sniffer_min_packets` (or timeout), `stop`, then `list_probes_vendor`.
+- Pass: at least `probes_min_entries` entries with `[Vendor]` and packet minimum reached.
+- Fail: "No probe requests captured", missing vendor format, or packet minimum not reached.
+
+`show_sniffer_results_and_clear` expectations
+- Does: `start_sniffer`, wait until `sniffer_min_packets` (or timeout), `stop`, `show_sniffer_results`, then `clear_sniffer_results`.
+- Pass: `show_sniffer_results` returns data, packet minimum reached, and clear confirms "Sniffer results cleared." then shows no data.
+- Fail: no sniffer data, packet minimum not reached, or clear did not reset results.
 
 ### System (mandatory)
 
@@ -272,6 +327,10 @@ flowchart TD
    - Toggle LED on/off and verify `led read` output
 3) `list_sd`  
    - Run `list_sd`, verify SD is mounted and output is valid
+4) `select_html`  
+   - Pick a file from `list_sd` and load it with `select_html`
+5) `vendor_persistence`  
+   - Enable vendor scan, reboot, and verify it stays on
 
 #### System flows
 
@@ -308,6 +367,14 @@ flowchart TD
     B --> C[Validate SD output]
 ```
 
+`vendor_persistence`
+```mermaid
+flowchart TD
+    A[Send vendor set on] --> B[Reboot]
+    B --> C[Send vendor read]
+    C --> D[Validate vendor stays on]
+```
+
 `list_sd` expectations
 - Does: `list_sd`.
 - Pass: no SD init error; either “No HTML files” or list of HTML files.
@@ -317,6 +384,11 @@ flowchart TD
 - Does: `list_sd`, pick first index, run `select_html <index>`.
 - Pass: “Loaded HTML file” + “Portal will now use this custom HTML.”
 - Fail: missing index or missing success lines.
+
+`vendor_persistence` expectations
+- Does: `vendor set on`, reboot, then `vendor read`.
+- Pass: vendor remains enabled and vendor file is available.
+- Fail: vendor resets to off or vendor file missing.
 
 ### BLE (mandatory)
 
@@ -383,12 +455,19 @@ Look for your CP2102N device and copy the `SerialNumber` into `devices.json`.
     ]
   },
   "target_ap": {"ssid": "HackMyMyBoy", "bssid": "AA:BB:CC:DD:EE:FF", "ip": "192.168.1.1", "password": "..." },
-  "settings": { "flash_baud": 460800, "uart_baud": 115200 }
+  "settings": {
+    "flash_baud": 460800,
+    "uart_baud": 115200,
+    "sniffer_min_packets": 200
+  }
 }
 ```
 
 Naming for clients: use `client1`, `client2`, etc. Add MAC addresses now if
 you plan to validate client behavior later.
+
+`sniffer_min_packets` is the minimum packet count required before probe/sniffer
+results are queried.
 
 ## Flash manifest
 
