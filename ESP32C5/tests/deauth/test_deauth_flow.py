@@ -96,6 +96,10 @@ def _client_send(ser, command, prompt, timeout):
     return _read_until_prompt(ser, prompt, timeout)
 
 
+def _step(message):
+    print(f"[deauth] {message}", flush=True)
+
+
 @pytest.mark.mandatory
 @pytest.mark.deauth
 def test_deauth_disconnects_client(
@@ -122,25 +126,33 @@ def test_deauth_disconnects_client(
         pytest.fail("Missing target_ap.ssid/password/bssid in devices config.")
 
     with serial.Serial(client_janosmini_port, baud, timeout=0.2) as client_ser:
+        _step("client: wait for prompt")
         _read_until_prompt(client_ser, client_prompt, 6.0)
+        _step("client: sta_hold on")
         hold_out = _client_send(client_ser, "sta_hold on", client_prompt, 4.0)
         cli_log("deauth_client_hold.txt", hold_out)
 
+        _step("client: sta_connect")
         connect_out = _client_send(client_ser, f"sta_connect {ssid} {password}", client_prompt, 8.0)
         cli_log("deauth_client_connect.txt", connect_out)
 
+        _step("client: sta_status")
         status_out = _client_send(client_ser, "sta_status", client_prompt, 6.0)
         cli_log("deauth_client_status.txt", status_out)
         assert "connected=1" in status_out, f"Client not connected.\n{status_out}"
 
         with serial.Serial(dut_port, baud, timeout=0.2) as dut_ser:
+            _step("dut: wait for ready")
             _wait_for_ready(dut_ser, ready_marker, ready_timeout)
             dut_ser.reset_input_buffer()
+            _step("dut: wait for prompt")
             prompt_out = _ensure_prompt(dut_ser, DUT_PROMPT, 6.0)
             cli_log("deauth_reboot.txt", prompt_out)
 
+            _step("dut: scan_networks")
             scan_output = _run_scan(dut_ser, scan_timeout)
             if RESULT_MARKER not in scan_output:
+                _step("dut: retry scan_networks")
                 _ensure_prompt(dut_ser, DUT_PROMPT, 4.0)
                 scan_output = _run_scan(dut_ser, scan_timeout)
             cli_log("deauth_scan.txt", scan_output)
@@ -152,16 +164,19 @@ def test_deauth_disconnects_client(
 
             dut_ser.write(f"select_networks {index}\n".encode("ascii"))
             dut_ser.flush()
+            _step(f"dut: select_networks {index}")
             select_out = _read_until_prompt(dut_ser, DUT_PROMPT, 6.0)
             cli_log("deauth_select.txt", select_out)
             assert "Selected Networks" in select_out, f"Missing selection output.\n{select_out}"
 
             dut_ser.write(b"start_deauth\n")
             dut_ser.flush()
+            _step("dut: start_deauth")
             start_out = _read_until_prompt(dut_ser, DUT_PROMPT, 6.0)
             cli_log("deauth_start.txt", start_out)
             assert "Deauth attack started" in start_out, f"Missing deauth start.\n{start_out}"
 
+        _step("client: wait_disconnect")
         disconnect_out = _client_send(client_ser, f"wait_disconnect {int(disconnect_timeout)}", client_prompt, disconnect_timeout + 5)
         cli_log("deauth_client_disconnect.txt", disconnect_out)
         assert "DISCONNECTED" in disconnect_out, f"Client did not disconnect.\n{disconnect_out}"
@@ -169,11 +184,13 @@ def test_deauth_disconnects_client(
         with serial.Serial(dut_port, baud, timeout=0.2) as dut_ser:
             dut_ser.write(b"stop\n")
             dut_ser.flush()
+            _step("dut: stop")
             stop_out = _read_until_prompt(dut_ser, DUT_PROMPT, 10.0)
             cli_log("deauth_stop.txt", stop_out)
             assert "All operations stopped" in stop_out, f"Missing stop confirmation.\n{stop_out}"
 
         time.sleep(2.0)
+        _step("client: sta_status after deauth")
         status_after = _client_send(client_ser, "sta_status", client_prompt, reconnect_timeout + 5)
         cli_log("deauth_client_status_after.txt", status_after)
         assert "connected=1" in status_after, f"Client did not reconnect.\n{status_after}"
