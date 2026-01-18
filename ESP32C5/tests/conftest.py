@@ -328,7 +328,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 
 
 def pytest_collection_modifyitems(session, config, items):
-    order = ["flash", "scan", "deauth", "handshake", "system", "ble"]
+    order = ["flash", "scan", "deauth", "handshake", "portal", "system", "ble"]
     order_index = {name: idx for idx, name in enumerate(order)}
 
     def _priority(item):

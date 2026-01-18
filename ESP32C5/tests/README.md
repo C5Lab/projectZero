@@ -120,11 +120,14 @@ Common files included in the zip:
 - `sniffer_noscan.txt`
 - `vendor_read.txt`, `vendor_persistence.txt`, `vendor_persistence_off.txt`
 - `led_set_and_read.txt`, `list_sd.txt`, `select_html.txt`, `list_dir.txt`, `list_ssid.txt`
-- `gps_raw.txt`, `gps_m5.txt`
+- `gps_raw.txt`, `gps_wrong_module.txt`
 - `scan_bt.txt`, `scan_airtag.txt`
 - `show_scan_results_no_scan.txt`
 - `show_scan_results_vendor.txt`, `show_scan_results_during_scan.txt`
 - `packet_monitor.txt`
+- `portal_list_sd.txt`, `portal_select_html.txt`, `portal_start.txt`
+- `portal_client_connect.txt`, `portal_client_status.txt`, `portal_client_post.txt`
+- `portal_dut_post.txt`, `portal_stop.txt`
 - `deauth_scan.txt`, `deauth_select.txt`, `deauth_start.txt`, `deauth_stop.txt`
 - `deauth_reboot.txt`
 - `deauth_client_hold.txt`, `deauth_client_connect.txt`, `deauth_client_status.txt`
@@ -135,11 +138,12 @@ Common files included in the zip:
 - `deauth_latency_client_status.txt`, `deauth_latency_client_disconnect.txt`, `deauth_latency_client_reconnect.txt`
 - `deauth_latency_start.txt`, `deauth_latency_stop.txt`
 - `deauth_hold_client_reboot.txt`, `deauth_hold_on.txt`, `deauth_hold_off.txt`
+- `deauth_hold_autoreconnect_off.txt`, `deauth_hold_autoreconnect_on.txt`
 - `deauth_hold_connect.txt`, `deauth_hold_status.txt`, `deauth_hold_status_after.txt`, `deauth_hold_reconnect.txt`
 - `deauth_hold_scan.txt`, `deauth_hold_select.txt`, `deauth_hold_start.txt`, `deauth_hold_stop.txt`, `deauth_hold_reboot.txt`
 - `deauth_repeat_client_reboot.txt`, `deauth_repeat_client_hold.txt`, `deauth_repeat_client_connect.txt`
 - `deauth_repeat_client_status_initial.txt`
-- `deauth_repeat_cycles.txt`, `deauth_repeat_scan_*.txt`, `deauth_repeat_select_*.txt`
+- `deauth_repeat_cycles.txt`, `deauth_repeat_scan_*.txt`, `deauth_repeat_select_*.txt`, `deauth_repeat_disconnect_*.txt`
 - `unselect_networks_scan.txt`, `unselect_networks_select.txt`, `unselect_networks_clear.txt`
 - `select_stations.txt`, `unselect_stations.txt`
 - `handshake_scan.txt`, `handshake_select.txt`, `handshake_start.txt`
@@ -165,6 +169,16 @@ docker compose -f ESP32C5/tests/docker-compose.yml run --rm \
 Primary test device (master):
 - ESP32C5 Dev Kit with SD card attached
 - Connected to Linux host via USB (CP2102N)
+
+Test AP:
+- SSID: HackMyMyBoy
+- Hardware: MikroTik mAP lite
+- BSSID (example): dc:2c:6e:be:29:56
+
+Wi-Fi client device:
+- M5Stack AtomS3 running JanOSmini
+- Connected via USB JTAG/serial (`/dev/ttyACM0`)
+- MAC (example): 48:CA:43:38:E0:74
 
 ## Flow (current: flash)
 
@@ -576,6 +590,28 @@ flowchart TD
 - Pass: output contains "HANDSHAKE IS COMPLETE AND VALID" (or "Handshake #1 captured"/"All selected networks captured"), saved paths found, files removed, client reconnects.
 - Fail: target AP not found in scan output, "SAVE FAILED", missing saved paths, delete verification fails, or client does not reconnect.
 
+### Portal (mandatory)
+
+1) `portal_post_flow`  
+   - List SD, select HTML, start portal, connect JanOSmini to open SSID, send HTTP POST, verify DUT receives data
+
+#### Portal flow
+
+`portal_post_flow`
+```mermaid
+flowchart TD
+    A[DUT list_sd + select_html] --> B[DUT start_portal SSID]
+    B --> C[Client sta_connect open SSID]
+    C --> D[Client http_post]
+    D --> E[DUT logs POST + save]
+    E --> F[DUT stop]
+```
+
+`portal_post_flow` expectations
+- Does: select portal HTML, start `start_portal`, connect client to open SSID, POST credentials, stop portal.
+- Pass: DUT logs `Received POST data` and `Portal data saved to portals.txt`, client POST returns HTTP 200.
+- Fail: portal not started, client not connected, or POST not received.
+
 ### System (mandatory)
 
 1) `vendor_read`  
@@ -595,9 +631,9 @@ flowchart TD
 8) `list_ssid`  
    - List SSIDs from `/sdcard/lab/ssid.txt`
 9) `gps_raw_mode_outputs_nmea`  
-   - Set `gps_set raw`, start `start_gps_raw`, expect NMEA output
-10) `gps_m5_mode_is_quiet`  
-   - Set `gps_set m5`, start `start_gps_raw`, expect no NMEA output
+   - Set `gps_set <gps_raw_module>`, start `start_gps_raw`, expect NMEA output
+10) `gps_wrong_mode_is_quiet`  
+   - Set `gps_set <gps_wrong_module>`, start `start_gps_raw`, expect no NMEA output
 
 #### System flows
 
@@ -688,12 +724,12 @@ flowchart TD
 - Fail: SD init failed.
 
 `gps_raw_mode_outputs_nmea` expectations
-- Does: `gps_set raw`, `start_gps_raw`, collect output, then `stop`.
+- Does: `gps_set <gps_raw_module>`, `start_gps_raw`, collect output, then `stop`.
 - Pass: at least one NMEA sentence (`$GN`, `$GP`, `$BD`) is seen.
 - Fail: no NMEA output or missing start message.
 
-`gps_m5_mode_is_quiet` expectations
-- Does: `gps_set m5`, `start_gps_raw`, collect output, then `stop`.
+`gps_wrong_mode_is_quiet` expectations
+- Does: `gps_set <gps_wrong_module>`, `start_gps_raw`, collect output, then `stop`.
 - Pass: no NMEA sentences in output.
 - Fail: any NMEA sentence detected.
 
@@ -770,6 +806,13 @@ Look for your CP2102N device and copy the `SerialNumber` into `devices.json`.
     "ble_min_devices": 1,
     "list_dir_path": "lab",
     "handshake_timeout": 180,
+    "gps_raw_module": "m5",
+    "gps_wrong_module": "atgm",
+    "portal_ssid": "openweb",
+    "portal_html_index": 1,
+    "portal_http_url": "http://172.0.0.1/login",
+    "portal_user": "test_user",
+    "portal_password": "test_pass",
     "client_prompt": "JanOSmini>",
     "client_disconnect_timeout": 20,
     "client_reconnect_timeout": 20
@@ -789,7 +832,15 @@ reaching that count; set `0` to wait until the packet count is reached.
 `list_dir_path` defines the SD directory to list in the `list_dir` test.
 `handshake_timeout` sets the maximum time to wait for `start_handshake` to finish.
 `client_prompt` is the JanOSmini console prompt. `client_disconnect_timeout` and
-`client_reconnect_timeout` control client wait windows.
+`client_reconnect_timeout` control client wait windows. `gps_raw_module` should
+match the installed GPS module (for example `m5` or `atgm`). `gps_wrong_module`
+is used to validate that the other module mode is quiet.
+
+## JanOSmini client helpers
+
+JanOSmini commands (e.g. `sta_connect`, `sta_status`, `ping_gw`, `traffic_burst`)
+are used as helpers to drive DUT tests. We do not run separate test cases that
+validate the client itself.
 
 ## Flash manifest
 

@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 
 #include "argtable3/argtable3.h"
+#include "esp_http_client.h"
 #include "esp_console.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -21,6 +22,13 @@ static const char *APP_VERSION = "1.0";
 static esp_netif_t *s_netif = NULL;
 static bool s_sta_connected = false;
 static bool s_hold_enabled = false;
+
+static bool get_ip_info(esp_netif_ip_info_t *info) {
+    if (!s_netif || !info) {
+        return false;
+    }
+    return esp_netif_get_ip_info(s_netif, info) == ESP_OK;
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -63,21 +71,26 @@ static int cmd_sta_connect(int argc, char **argv) {
         struct arg_end *end;
     } args;
     args.ssid = arg_str1(NULL, NULL, "<ssid>", "SSID");
-    args.pass = arg_str1(NULL, NULL, "<pass>", "Password");
+    args.pass = arg_str0(NULL, NULL, "[pass]", "Password (optional for OPEN)");
     args.end = arg_end(2);
 
     int nerrors = arg_parse(argc, argv, (void **)&args);
     if (nerrors != 0) {
         arg_print_errors(stderr, args.end, argv[0]);
-        ESP_LOGI(TAG, "Usage: sta_connect <ssid> <pass>");
+        ESP_LOGI(TAG, "Usage: sta_connect <ssid> [pass]");
         arg_freetable((void **)&args, sizeof(args) / sizeof(args.ssid));
         return 1;
     }
 
     wifi_config_t wifi_config = {0};
     snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%s", args.ssid->sval[0]);
-    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s", args.pass->sval[0]);
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    const char *pass = (args.pass->count > 0) ? args.pass->sval[0] : "";
+    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s", pass);
+    if (pass[0] == '\0') {
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    } else {
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    }
     wifi_config.sta.pmf_cfg.capable = true;
     wifi_config.sta.pmf_cfg.required = false;
 
@@ -94,6 +107,15 @@ static int cmd_sta_disconnect(int argc, char **argv) {
     (void)argv;
     ESP_ERROR_CHECK(esp_wifi_disconnect());
     ESP_LOGI(TAG, "DISCONNECTED");
+    return 0;
+}
+
+static int cmd_sta_reconnect(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    ESP_LOGI(TAG, "RECONNECTING");
+    esp_wifi_disconnect();
+    esp_wifi_connect();
     return 0;
 }
 
@@ -115,6 +137,18 @@ static int cmd_sta_status(int argc, char **argv) {
              has_ap ? ap_info.rssi : 0,
              ap_info.bssid[0], ap_info.bssid[1], ap_info.bssid[2],
              ap_info.bssid[3], ap_info.bssid[4], ap_info.bssid[5]);
+    return 0;
+}
+
+static int cmd_sta_ip(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    esp_netif_ip_info_t ip = {0};
+    if (!get_ip_info(&ip)) {
+        ESP_LOGI(TAG, "ip=0.0.0.0 gw=0.0.0.0");
+        return 1;
+    }
+    ESP_LOGI(TAG, "ip=" IPSTR " gw=" IPSTR, IP2STR(&ip.ip), IP2STR(&ip.gw));
     return 0;
 }
 
@@ -142,6 +176,36 @@ static int cmd_sta_hold(int argc, char **argv) {
         ESP_LOGI(TAG, "HOLD=OFF");
     } else {
         ESP_LOGI(TAG, "Usage: sta_hold <on|off>");
+    }
+
+    arg_freetable((void **)&args, sizeof(args) / sizeof(args.mode));
+    return 0;
+}
+
+static int cmd_set_autoreconnect(int argc, char **argv) {
+    struct {
+        struct arg_str *mode;
+        struct arg_end *end;
+    } args;
+    args.mode = arg_str1(NULL, NULL, "<on|off>", "Enable auto-reconnect");
+    args.end = arg_end(1);
+
+    int nerrors = arg_parse(argc, argv, (void **)&args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, args.end, argv[0]);
+        ESP_LOGI(TAG, "Usage: set_autoreconnect <on|off>");
+        arg_freetable((void **)&args, sizeof(args) / sizeof(args.mode));
+        return 1;
+    }
+
+    if (strcasecmp(args.mode->sval[0], "on") == 0) {
+        s_hold_enabled = true;
+        ESP_LOGI(TAG, "AUTO-RECONNECT=ON");
+    } else if (strcasecmp(args.mode->sval[0], "off") == 0) {
+        s_hold_enabled = false;
+        ESP_LOGI(TAG, "AUTO-RECONNECT=OFF");
+    } else {
+        ESP_LOGI(TAG, "Usage: set_autoreconnect <on|off>");
     }
 
     arg_freetable((void **)&args, sizeof(args) / sizeof(args.mode));
@@ -216,6 +280,199 @@ static int cmd_udp_flood(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_http_post(int argc, char **argv) {
+    struct {
+        struct arg_str *url;
+        struct arg_str *user;
+        struct arg_str *password;
+        struct arg_end *end;
+    } args;
+    args.url = arg_str1(NULL, NULL, "<url>", "Target URL (http://...)");
+    args.user = arg_str1(NULL, NULL, "<user>", "Username");
+    args.password = arg_str1(NULL, NULL, "<password>", "Password");
+    args.end = arg_end(3);
+
+    int nerrors = arg_parse(argc, argv, (void **)&args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, args.end, argv[0]);
+        ESP_LOGI(TAG, "Usage: http_post <url> <user> <password>");
+        arg_freetable((void **)&args, sizeof(args) / sizeof(args.url));
+        return 1;
+    }
+
+    const char *url = args.url->sval[0];
+    const char *user = args.user->sval[0];
+    const char *password = args.password->sval[0];
+    char body[192];
+    int written = snprintf(body, sizeof(body), "user=%s&password=%s&submit=1", user, password);
+    if (written < 0 || written >= (int)sizeof(body)) {
+        ESP_LOGI(TAG, "POST body too long.");
+        arg_freetable((void **)&args, sizeof(args) / sizeof(args.url));
+        return 1;
+    }
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 8000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGI(TAG, "Failed to init http client.");
+        arg_freetable((void **)&args, sizeof(args) / sizeof(args.url));
+        return 1;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "application/x-www-form-urlencoded");
+    esp_http_client_set_post_field(client, body, written);
+    esp_err_t err = esp_http_client_perform(client);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "HTTP POST failed: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        arg_freetable((void **)&args, sizeof(args) / sizeof(args.url));
+        return 1;
+    }
+
+    int status = esp_http_client_get_status_code(client);
+    int length = esp_http_client_get_content_length(client);
+    ESP_LOGI(TAG, "HTTP POST status=%d content_length=%d", status, length);
+    esp_http_client_cleanup(client);
+    arg_freetable((void **)&args, sizeof(args) / sizeof(args.url));
+    return 0;
+}
+
+static int cmd_ping_gw(int argc, char **argv) {
+    struct {
+        struct arg_int *count;
+        struct arg_int *port;
+        struct arg_end *end;
+    } args;
+    args.count = arg_int0(NULL, NULL, "<count>", "Packets to send (default 4)");
+    args.port = arg_int0(NULL, NULL, "<port>", "Target port (default 12345)");
+    args.end = arg_end(2);
+
+    int nerrors = arg_parse(argc, argv, (void **)&args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, args.end, argv[0]);
+        ESP_LOGI(TAG, "Usage: ping_gw [count] [port]");
+        arg_freetable((void **)&args, sizeof(args) / sizeof(args.count));
+        return 1;
+    }
+
+    esp_netif_ip_info_t ip = {0};
+    if (!get_ip_info(&ip) || ip.gw.addr == 0) {
+        ESP_LOGI(TAG, "Gateway not available (connect first).");
+        arg_freetable((void **)&args, sizeof(args) / sizeof(args.count));
+        return 1;
+    }
+
+    int count = (args.count->count > 0) ? args.count->ival[0] : 4;
+    int port = (args.port->count > 0) ? args.port->ival[0] : 12345;
+    if (count <= 0) {
+        count = 1;
+    }
+    if (port <= 0 || port > 65535) {
+        port = 12345;
+    }
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGI(TAG, "socket failed: %d", errno);
+        arg_freetable((void **)&args, sizeof(args) / sizeof(args.count));
+        return 1;
+    }
+
+    struct sockaddr_in dest = {0};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons((uint16_t)port);
+    dest.sin_addr.s_addr = ip.gw.addr;
+
+    const char payload[] = "janosmini_ping";
+    int sent = 0;
+    for (int i = 0; i < count; i++) {
+        int rc = sendto(sock, payload, sizeof(payload), 0, (struct sockaddr *)&dest, sizeof(dest));
+        if (rc > 0) {
+            sent++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    close(sock);
+    ESP_LOGI(TAG, "ping_gw sent=%d/%d gw=" IPSTR " port=%d", sent, count, IP2STR(&ip.gw), port);
+    arg_freetable((void **)&args, sizeof(args) / sizeof(args.count));
+    return (sent > 0) ? 0 : 1;
+}
+
+static int cmd_traffic_burst(int argc, char **argv) {
+    struct {
+        struct arg_int *seconds;
+        struct arg_int *pps;
+        struct arg_int *port;
+        struct arg_end *end;
+    } args;
+    args.seconds = arg_int0(NULL, NULL, "<seconds>", "Duration (default 3)");
+    args.pps = arg_int0(NULL, NULL, "<pps>", "Packets per second (default 20)");
+    args.port = arg_int0(NULL, NULL, "<port>", "Target port (default 12345)");
+    args.end = arg_end(3);
+
+    int nerrors = arg_parse(argc, argv, (void **)&args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, args.end, argv[0]);
+        ESP_LOGI(TAG, "Usage: traffic_burst [seconds] [pps] [port]");
+        arg_freetable((void **)&args, sizeof(args) / sizeof(args.seconds));
+        return 1;
+    }
+
+    esp_netif_ip_info_t ip = {0};
+    if (!get_ip_info(&ip) || ip.gw.addr == 0) {
+        ESP_LOGI(TAG, "Gateway not available (connect first).");
+        arg_freetable((void **)&args, sizeof(args) / sizeof(args.seconds));
+        return 1;
+    }
+
+    int seconds = (args.seconds->count > 0) ? args.seconds->ival[0] : 3;
+    int pps = (args.pps->count > 0) ? args.pps->ival[0] : 20;
+    int port = (args.port->count > 0) ? args.port->ival[0] : 12345;
+    if (seconds <= 0) {
+        seconds = 1;
+    }
+    if (pps <= 0) {
+        pps = 1;
+    }
+    if (port <= 0 || port > 65535) {
+        port = 12345;
+    }
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGI(TAG, "socket failed: %d", errno);
+        arg_freetable((void **)&args, sizeof(args) / sizeof(args.seconds));
+        return 1;
+    }
+
+    struct sockaddr_in dest = {0};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons((uint16_t)port);
+    dest.sin_addr.s_addr = ip.gw.addr;
+
+    const char payload[] = "janosmini_ping";
+    int total = pps * seconds;
+    int delay_ms = 1000 / pps;
+    if (delay_ms <= 0) {
+        delay_ms = 1;
+    }
+
+    for (int i = 0; i < total; i++) {
+        sendto(sock, payload, sizeof(payload), 0, (struct sockaddr *)&dest, sizeof(dest));
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+
+    close(sock);
+    ESP_LOGI(TAG, "traffic_burst sent=%d gw=" IPSTR " port=%d", total, IP2STR(&ip.gw), port);
+    arg_freetable((void **)&args, sizeof(args) / sizeof(args.seconds));
+    return 0;
+}
+
 static int cmd_wait_disconnect(int argc, char **argv) {
     struct {
         struct arg_int *timeout;
@@ -267,7 +524,7 @@ static void register_console(void) {
 
     esp_console_cmd_t cmd = {
         .command = "sta_connect",
-        .help = "Connect STA to AP: sta_connect <ssid> <pass>",
+        .help = "Connect STA to AP: sta_connect <ssid> [pass]",
         .func = &cmd_sta_connect,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
@@ -280,9 +537,23 @@ static void register_console(void) {
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 
     cmd = (esp_console_cmd_t){
+        .command = "sta_reconnect",
+        .help = "Reconnect STA (disconnect + connect)",
+        .func = &cmd_sta_reconnect,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+
+    cmd = (esp_console_cmd_t){
         .command = "sta_status",
         .help = "Show STA status",
         .func = &cmd_sta_status,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+
+    cmd = (esp_console_cmd_t){
+        .command = "sta_ip",
+        .help = "Show IP and gateway",
+        .func = &cmd_sta_ip,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 
@@ -294,9 +565,37 @@ static void register_console(void) {
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 
     cmd = (esp_console_cmd_t){
+        .command = "set_autoreconnect",
+        .help = "Alias for auto-reconnect: set_autoreconnect <on|off>",
+        .func = &cmd_set_autoreconnect,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+
+    cmd = (esp_console_cmd_t){
         .command = "udp_flood",
         .help = "Generate UDP traffic: udp_flood <ip> <port> [pps] [seconds]",
         .func = &cmd_udp_flood,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+
+    cmd = (esp_console_cmd_t){
+        .command = "http_post",
+        .help = "HTTP form POST: http_post <url> <user> <password>",
+        .func = &cmd_http_post,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+
+    cmd = (esp_console_cmd_t){
+        .command = "ping_gw",
+        .help = "Send UDP ping to gateway: ping_gw [count] [port]",
+        .func = &cmd_ping_gw,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+
+    cmd = (esp_console_cmd_t){
+        .command = "traffic_burst",
+        .help = "Send UDP traffic burst to gateway: traffic_burst [seconds] [pps] [port]",
+        .func = &cmd_traffic_burst,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 

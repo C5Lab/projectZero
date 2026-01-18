@@ -130,6 +130,13 @@ def _client_wait_reconnect(ser, prompt, timeout):
     return last_output
 
 
+def _client_wait_disconnect(ser, prompt, timeout):
+    output = _client_send(ser, f"wait_disconnect {int(timeout)}", prompt, timeout + 5)
+    if "DISCONNECTED" in output or "STA disconnected" in output:
+        return output, True
+    return output, False
+
+
 def _dut_scan_select_target(ser, scan_timeout, ssid, bssid):
     scan_output = _run_scan(ser, scan_timeout)
     if RESULT_MARKER not in scan_output:
@@ -239,9 +246,13 @@ def test_deauth_disconnects_client(
             cli_log("deauth_start.txt", start_out)
 
         _step("client: wait_disconnect")
-        disconnect_out = _client_send(client_ser, f"wait_disconnect {int(disconnect_timeout)}", client_prompt, disconnect_timeout + 5)
+        disconnect_out, disconnected = _client_wait_disconnect(
+            client_ser,
+            client_prompt,
+            disconnect_timeout,
+        )
         cli_log("deauth_client_disconnect.txt", disconnect_out)
-        assert "DISCONNECTED" in disconnect_out, f"Client did not disconnect.\n{disconnect_out}"
+        assert disconnected, f"Client did not disconnect.\n{disconnect_out}"
 
         with serial.Serial(dut_port, baud, timeout=0.2) as dut_ser:
             _step("dut: stop")
@@ -310,15 +321,14 @@ def test_deauth_disconnect_reconnect_latency(
 
         _step("client: wait_disconnect")
         start = time.time()
-        disconnect_out = _client_send(
+        disconnect_out, disconnected = _client_wait_disconnect(
             client_ser,
-            f"wait_disconnect {int(disconnect_timeout)}",
             client_prompt,
-            disconnect_timeout + 5,
+            disconnect_timeout,
         )
         disconnect_seconds = time.time() - start
         cli_log("deauth_latency_client_disconnect.txt", disconnect_out)
-        assert "DISCONNECTED" in disconnect_out, f"Client did not disconnect.\n{disconnect_out}"
+        assert disconnected, f"Client did not disconnect.\n{disconnect_out}"
 
         with serial.Serial(dut_port, baud, timeout=0.2) as dut_ser:
             _step("dut: stop")
@@ -367,6 +377,9 @@ def test_deauth_client_hold_mode(
         _step("client: reboot")
         reboot_out = _client_reboot_and_wait(client_ser, client_prompt, 10.0)
         cli_log("deauth_hold_client_reboot.txt", reboot_out)
+        _step("client: set_autoreconnect off")
+        autoreconnect_off = _client_send(client_ser, "set_autoreconnect off", client_prompt, 4.0)
+        cli_log("deauth_hold_autoreconnect_off.txt", autoreconnect_off)
         _step("client: sta_hold on")
         hold_on_out = _client_send(client_ser, "sta_hold on", client_prompt, 4.0)
         cli_log("deauth_hold_on.txt", hold_on_out)
@@ -393,14 +406,13 @@ def test_deauth_client_hold_mode(
             cli_log("deauth_hold_start.txt", start_out)
 
         _step("client: wait_disconnect")
-        disconnect_out = _client_send(
+        disconnect_out, disconnected = _client_wait_disconnect(
             client_ser,
-            f"wait_disconnect {int(disconnect_timeout)}",
             client_prompt,
-            disconnect_timeout + 5,
+            disconnect_timeout,
         )
         cli_log("deauth_hold_disconnect.txt", disconnect_out)
-        assert "DISCONNECTED" in disconnect_out, f"Client did not disconnect.\n{disconnect_out}"
+        assert disconnected, f"Client did not disconnect.\n{disconnect_out}"
 
         with serial.Serial(dut_port, baud, timeout=0.2) as dut_ser:
             _step("dut: stop")
@@ -416,6 +428,9 @@ def test_deauth_client_hold_mode(
         _step("client: sta_hold off")
         hold_off_out = _client_send(client_ser, "sta_hold off", client_prompt, 4.0)
         cli_log("deauth_hold_off.txt", hold_off_out)
+        _step("client: set_autoreconnect on")
+        autoreconnect_on = _client_send(client_ser, "set_autoreconnect on", client_prompt, 4.0)
+        cli_log("deauth_hold_autoreconnect_on.txt", autoreconnect_on)
 
         _step("client: wait reconnect")
         status_reconnect = _client_wait_reconnect(client_ser, client_prompt, reconnect_timeout + 5)
@@ -482,13 +497,13 @@ def test_deauth_repeat_cycles(
                 _dut_start_deauth(dut_ser)
 
             _step(f"cycle {idx+1}: client wait_disconnect")
-            disconnect_out = _client_send(
+            disconnect_out, disconnected = _client_wait_disconnect(
                 client_ser,
-                f"wait_disconnect {int(disconnect_timeout)}",
                 client_prompt,
-                disconnect_timeout + 5,
+                disconnect_timeout,
             )
-            assert "DISCONNECTED" in disconnect_out, f"Client did not disconnect.\n{disconnect_out}"
+            cli_log(f"deauth_repeat_disconnect_{idx+1}.txt", disconnect_out)
+            assert disconnected, f"Client did not disconnect.\n{disconnect_out}"
 
             with serial.Serial(dut_port, baud, timeout=0.2) as dut_ser:
                 _step(f"cycle {idx+1}: dut stop")
