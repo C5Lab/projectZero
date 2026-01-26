@@ -6,6 +6,6 @@
   "parts": [
     { "path": "https://raw.githubusercontent.com/C5Lab/projectZero/main/ESP32C5/binaries-esp32c5/bootloader.bin", "offset": 8192 },
     { "path": "https://raw.githubusercontent.com/C5Lab/projectZero/main/ESP32C5/binaries-esp32c5/partition-table.bin", "offset": 32768 },
-    { "path": "https://raw.githubusercontent.com/C5Lab/projectZero/main/ESP32C5/binaries-esp32c5/projectZero.bin", "offset": 65536 }
+    { "path": "https://raw.githubusercontent.com/C5Lab/projectZero/main/ESP32C5/binaries-esp32c5/projectZero.bin", "offset": 131072 }
   ]
 }

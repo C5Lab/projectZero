@@ -34,7 +34,8 @@ REQUIRED_FILES = ["bootloader.bin", "partition-table.bin", "projectZero.bin"]
 OFFSETS = {
     "bootloader.bin": "0x2000",       # as requested
     "partition-table.bin": "0x8000",
-    "projectZero.bin": "0x10000",
+    # partitions.csv defines ota_0 at 0x20000, so app must be flashed there
+    "projectZero.bin": "0x20000",
 }
 
 def check_files():
