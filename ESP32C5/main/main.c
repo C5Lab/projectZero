@@ -101,7 +101,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.2.1"
+#define JANOS_VERSION "1.3.0"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -10573,7 +10573,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t beacon_spam_cmd = {
         .command = "start_beacon_spam",
-        .help = "Spam beacon frames with fake SSIDs on channel 1",
+        .help = "Spam beacon frames with fake SSIDs on various channels",
         .hint = "\"SSID1\" \"SSID2\" ...",
         .func = &cmd_start_beacon_spam,
         .argtable = NULL
