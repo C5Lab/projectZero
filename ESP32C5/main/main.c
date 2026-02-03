@@ -579,7 +579,7 @@ void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size) {
  * Build a beacon frame with specified SSID
  * Returns the size of the beacon frame
  */
-static int build_beacon_frame(uint8_t *frame_buffer, size_t buffer_size, const char *ssid, const uint8_t *bssid) {
+static int build_beacon_frame(uint8_t *frame_buffer, size_t buffer_size, const char *ssid, const uint8_t *bssid, uint8_t channel) {
     if (!frame_buffer || !ssid || !bssid || buffer_size < 200) {
         return 0;
     }
@@ -651,7 +651,7 @@ static int build_beacon_frame(uint8_t *frame_buffer, size_t buffer_size, const c
     // DS Parameter Set (channel)
     frame_buffer[pos++] = 0x03; // Tag: DS Parameter
     frame_buffer[pos++] = 0x01; // Length
-    frame_buffer[pos++] = 0x01; // Channel 1
+    frame_buffer[pos++] = channel; // Channel from parameter
 
     return pos;
 }
@@ -673,11 +673,12 @@ static void send_beacon_frame(const uint8_t *frame_buffer, int size) {
 
 /**
  * Beacon spam task - continuously sends beacon frames for configured SSIDs
+ * Sends on all 2.4GHz channels (1-13) with channel hopping
  */
 static void beacon_spam_task(void *pvParameters) {
     (void)pvParameters;
     
-    MY_LOG_INFO(TAG, "Beacon spam task started with %d SSIDs", beacon_ssid_count);
+    MY_LOG_INFO(TAG, "Beacon spam task started with %d SSIDs on channels 1-13", beacon_ssid_count);
     
     // Static BSSID for all fake APs
     const uint8_t bssid[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
@@ -685,19 +686,37 @@ static void beacon_spam_task(void *pvParameters) {
     // Frame buffer
     uint8_t frame_buffer[256];
     
+    // 2.4GHz channels to use
+    const uint8_t channels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
+    const int num_channels = sizeof(channels) / sizeof(channels[0]);
+    
     while (beacon_spam_active && !operation_stop_requested) {
-        // Iterate through all configured SSIDs
-        for (int i = 0; i < beacon_ssid_count && beacon_spam_active && !operation_stop_requested; i++) {
-            // Build beacon frame for this SSID
-            int frame_size = build_beacon_frame(frame_buffer, sizeof(frame_buffer), beacon_ssids[i], bssid);
+        // Iterate through all channels
+        for (int ch_idx = 0; ch_idx < num_channels && beacon_spam_active && !operation_stop_requested; ch_idx++) {
+            uint8_t current_channel = channels[ch_idx];
             
-            if (frame_size > 0) {
-                // Send the beacon frame
-                send_beacon_frame(frame_buffer, frame_size);
+            // Set WiFi channel
+            esp_err_t err = esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+            if (err != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to set channel %d: %s", current_channel, esp_err_to_name(err));
             }
             
-            // Delay between beacons (100ms per SSID)
-            vTaskDelay(pdMS_TO_TICKS(100));
+            // Small delay to allow channel switch
+            vTaskDelay(pdMS_TO_TICKS(10));
+            
+            // Send beacons for all SSIDs on this channel
+            for (int i = 0; i < beacon_ssid_count && beacon_spam_active && !operation_stop_requested; i++) {
+                // Build beacon frame for this SSID on current channel
+                int frame_size = build_beacon_frame(frame_buffer, sizeof(frame_buffer), beacon_ssids[i], bssid, current_channel);
+                
+                if (frame_size > 0) {
+                    // Send the beacon frame
+                    send_beacon_frame(frame_buffer, frame_size);
+                }
+                
+                // Fast delay between beacons (10ms for faster transmission)
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
         }
     }
     
@@ -4521,6 +4540,22 @@ static int cmd_start_beacon_spam(int argc, char **argv) {
         return 1;
     }
 
+    // Hide the default AP SSID (avoid ESP_[MAC] showing up)
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "",
+            .ssid_len = 0,
+            .ssid_hidden = 1,
+            .password = "",
+            .max_connection = 0,
+            .authmode = WIFI_AUTH_OPEN
+        },
+    };
+    esp_err_t ap_err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (ap_err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set hidden AP config: %s", esp_err_to_name(ap_err));
+    }
+
     // Start WiFi
     err = esp_wifi_start();
     if (err != ESP_OK) {
@@ -4530,13 +4565,13 @@ static int cmd_start_beacon_spam(int argc, char **argv) {
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Set channel to 1
+    // Set initial channel to 1 (task will hop through all channels)
     err = esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     if (err != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to set channel 1: %s", esp_err_to_name(err));
     }
 
-    MY_LOG_INFO(TAG, "WiFi configured for beacon spam on channel 1");
+    MY_LOG_INFO(TAG, "WiFi configured for beacon spam on channels 1-13");
 
     // Start beacon spam task
     beacon_spam_active = true;
