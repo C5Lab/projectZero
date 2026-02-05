@@ -1,0 +1,116 @@
+#include "screen_main_menu.h"
+#include "screen.h"
+#include "screen_wifi_scan.h"
+#include <stdlib.h>
+
+typedef struct {
+    WiFiApp* app;
+    uint8_t selected;
+} MainMenuModel;
+
+static void main_menu_draw(Canvas* canvas, void* model) {
+    MainMenuModel* m = (MainMenuModel*)model;
+    if(!m) return;
+    
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    screen_draw_title(canvas, "C5Lab");
+    
+    const char* items[] = {
+        "WiFi Scan & Attack",
+        "Global WiFi Attacks",
+        "WiFi Sniff&Karma",
+        "WiFi Monitor",
+        "Bluetooth"
+    };
+    const uint8_t item_count = 5;
+    const uint8_t item_height = 10;
+    const uint8_t start_y = 22;
+    
+    canvas_set_font(canvas, FontSecondary);
+    for(uint8_t i = 0; i < item_count; i++) {
+        uint8_t y = start_y + (i * item_height);
+        if(i == m->selected) {
+            canvas_draw_box(canvas, 0, y - 8, 128, 10);
+            canvas_set_color(canvas, ColorWhite);
+            canvas_draw_str(canvas, 2, y, items[i]);
+            canvas_set_color(canvas, ColorBlack);
+        } else {
+            canvas_draw_str(canvas, 2, y, items[i]);
+        }
+    }
+}
+
+static bool main_menu_input(InputEvent* event, void* context) {
+    View* view = (View*)context;
+    if(!view) return false;
+    
+    MainMenuModel* m = view_get_model(view);
+    if(!m) return false;
+    
+    WiFiApp* app = m->app;
+    
+    if(event->type != InputTypePress && event->type != InputTypeRepeat) {
+        view_commit_model(view, false);
+        return false;
+    }
+    
+    bool handled = true;
+    
+    if(event->key == InputKeyUp) {
+        if(m->selected > 0) {
+            m->selected--;
+        }
+    } else if(event->key == InputKeyDown) {
+        if(m->selected < 4) {
+            m->selected++;
+        }
+    } else if(event->key == InputKeyOk) {
+        if(m->selected == 0) {
+            // WiFi Scan & Attack - release lock before creating new view
+            view_commit_model(view, true);
+            View* next_screen = screen_wifi_scan_create(app);
+            if(next_screen) {
+                screen_push(app, next_screen);
+            }
+            return true;
+        } else if(m->selected == 1) {
+            // Global WiFi Attacks - mock screen for now
+        }
+        // TODO: Other menu items
+    } else if(event->key == InputKeyBack) {
+        // Exit app - stop the view dispatcher
+        view_commit_model(view, false);
+        view_dispatcher_stop(app->view_dispatcher);
+        return true;
+    }
+
+    view_commit_model(view, true);
+    return handled;
+}
+
+View* screen_main_menu_create(WiFiApp* app) {
+    View* view = view_alloc();
+    if(!view) return NULL;
+    
+    view_allocate_model(view, ViewModelTypeLocking, sizeof(MainMenuModel));
+    
+    MainMenuModel* m = view_get_model(view);
+    if(!m) {
+        view_free(view);
+        return NULL;
+    }
+    m->app = app;
+    m->selected = 0;
+    view_commit_model(view, true);
+    
+    view_set_draw_callback(view, main_menu_draw);
+    view_set_input_callback(view, main_menu_input);
+    view_set_context(view, view);  // Pass view as context so input can access model
+    
+    return view;
+}
+
+void screen_main_menu_destroy(View* view) {
+    view_free(view);
+}
