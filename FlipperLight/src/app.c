@@ -38,6 +38,14 @@ int32_t wifi_attacks_app(void* p) {
     memset(app->selected_networks, 0, sizeof(app->selected_networks));
     app->selected_count = 0;
     
+    // Initialize scanning state
+    app->scan_results = NULL;
+    app->scan_result_count = 0;
+    app->scan_result_capacity = 0;
+    app->scanning_in_progress = false;
+    app->scan_bytes_received = 0;
+    app->last_scan_line = furi_string_alloc();
+    
     app->attack_status = furi_string_alloc();
     app->attack_log = furi_string_alloc();
     app->current_ssid = furi_string_alloc();
@@ -62,13 +70,12 @@ int32_t wifi_attacks_app(void* p) {
     }
     screen_push(app, main_menu);
     
-    // Main event loop
-    while(1) {
-        furi_delay_ms(100);
-        // TODO: Handle events
-    }
+    // Run the ViewDispatcher event loop
+    view_dispatcher_run(app->view_dispatcher);
     
-    // Cleanup
+    // Cleanup - remove all views first
+    screen_pop_all(app);
+    
     uart_comm_deinit(app);
     
     furi_string_free(app->attack_status);
@@ -76,6 +83,9 @@ int32_t wifi_attacks_app(void* p) {
     furi_string_free(app->current_ssid);
     furi_string_free(app->current_password);
     furi_string_free(app->evil_twin_password);
+    furi_string_free(app->last_scan_line);
+    
+    if(app->scan_results) free(app->scan_results);
     
     for(uint32_t i = 0; i < app->network_count; i++) {
         free(app->networks[i]);
