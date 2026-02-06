@@ -473,14 +473,35 @@ static int32_t rogue_ap_thread(void* context) {
                 if(data->client_count > 0) data->client_count--;
             }
 
-            // Password captured
-            const char* pwd = strstr(line, "Password:");
-            if(pwd && !strstr(line, "AP Name")) {
-                pwd += 9;
-                while(*pwd == ' ') pwd++;
-                strncpy(data->last_password, pwd, sizeof(data->last_password) - 1);
-                data->last_password[sizeof(data->last_password) - 1] = '\0';
-                FURI_LOG_I(TAG, "Password captured: %s", data->last_password);
+            // Password captured - case insensitive search for "password[anything]:<value>"
+            if(data->client_count > 0) {
+                const char* p = line;
+                while(*p == ' ' || *p == '\t') p++;
+                
+                // Case insensitive search for "password"
+                const char* pass_pos = NULL;
+                const char* search_pos = p;
+                while(*search_pos) {
+                    if(strncasecmp(search_pos, "password", 8) == 0) {
+                        pass_pos = search_pos + 8;
+                        break;
+                    }
+                    search_pos++;
+                }
+                
+                if(pass_pos) {
+                    // Find the colon after "password[anything]"
+                    const char* colon = strchr(pass_pos, ':');
+                    if(colon) {
+                        colon++; // skip ':'
+                        while(*colon == ' ') colon++; // skip spaces after ':'
+                        if(*colon) {
+                            strncpy(data->last_password, colon, sizeof(data->last_password) - 1);
+                            data->last_password[sizeof(data->last_password) - 1] = '\0';
+                            FURI_LOG_I(TAG, "Password captured: %s", data->last_password);
+                        }
+                    }
+                }
             }
 
             // Portal data saved
