@@ -1,9 +1,9 @@
 /**
  * Sniffer Screen
  * 
- * Memory lifecycle:
- * - screen_sniffer_create(): Allocates SnifferData, FuriStrings, FuriThread, View
- * - sniffer_cleanup(): Called by screen_pop, frees all allocated resources
+ * Passive packet capture with Results and Probes views.
+ * Sends: select_networks [nums...] -> start_sniffer
+ * Left = Results (show_sniffer_results), Right = Probes (show_probes)
  */
 
 #include "screen_attacks.h"
@@ -17,13 +17,25 @@
 // Data Structures
 // ============================================================================
 
+#define MAX_RESULTS_LINES 20
+#define MAX_LINE_LEN 40
+
 typedef struct {
     WiFiApp* app;
-    volatile bool sniffer_running;
+    volatile bool running;
+    volatile bool attack_finished;
     uint32_t packet_count;
-    FuriString* results;
-    FuriString* probes;
     uint8_t display_mode;       // 0 = counter, 1 = results, 2 = probes
+    
+    // Results/Probes storage
+    char results[MAX_RESULTS_LINES][MAX_LINE_LEN];
+    uint8_t results_count;
+    char probes[MAX_RESULTS_LINES][MAX_LINE_LEN];
+    uint8_t probes_count;
+    uint8_t scroll_offset;
+    uint8_t selected_result;    // For Results list selection
+    uint8_t selected_probe;     // For Probes list selection
+    
     FuriThread* thread;
 } SnifferData;
 
@@ -32,7 +44,7 @@ typedef struct {
 } SnifferModel;
 
 // ============================================================================
-// Cleanup - Frees all screen resources
+// Cleanup
 // ============================================================================
 
 static void sniffer_cleanup_internal(View* view, void* data) {
@@ -40,18 +52,25 @@ static void sniffer_cleanup_internal(View* view, void* data) {
     SnifferData* d = (SnifferData*)data;
     if(!d) return;
     
-    // Signal thread to stop and wait
-    d->sniffer_running = false;
+    d->running = false;
+    d->attack_finished = true;
     if(d->thread) {
         furi_thread_join(d->thread);
         furi_thread_free(d->thread);
     }
-    
-    // Free string resources
-    if(d->results) furi_string_free(d->results);
-    if(d->probes) furi_string_free(d->probes);
-    
     free(d);
+}
+
+// ============================================================================
+// Helper - Get network name
+// ============================================================================
+
+static const char* get_network_name(WiFiApp* app, uint32_t idx_one_based) {
+    if(!app || !app->scan_results || idx_one_based == 0 || idx_one_based > app->scan_result_count) {
+        return "(unknown)";
+    }
+    const char* name = app->scan_results[idx_one_based - 1].ssid;
+    return (name && name[0]) ? name : "(hidden)";
 }
 
 // ============================================================================
@@ -65,21 +84,176 @@ static void sniffer_draw(Canvas* canvas, void* model) {
     
     canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
-    screen_draw_title(canvas, "Sniffer");
-    
-    canvas_set_font(canvas, FontSecondary);
     
     if(data->display_mode == 0) {
-        char status[64];
-        snprintf(status, sizeof(status), "Packets: %lu", data->packet_count);
-        screen_draw_centered_text(canvas, status, 32);
-        screen_draw_centered_text(canvas, "Sniffing...", 48);
+        // Counter mode
+        screen_draw_title(canvas, "Sniffer");
+        
+        canvas_set_font(canvas, FontSecondary);
+        
+        // Show target networks (first 2)
+        uint8_t y = 20;
+        uint8_t shown = 0;
+        for(uint32_t i = 0; i < data->app->selected_count && shown < 2; i++) {
+            const char* name = get_network_name(data->app, data->app->selected_networks[i]);
+            canvas_draw_str(canvas, 2, y, name);
+            y += 9;
+            shown++;
+        }
+        
+        // Packet counter - large centered
+        canvas_set_font(canvas, FontBigNumbers);
+        char count_str[16];
+        snprintf(count_str, sizeof(count_str), "%lu", data->packet_count);
+        uint8_t count_width = strlen(count_str) * 10;
+        canvas_draw_str(canvas, (128 - count_width) / 2, 48, count_str);
+        
+        // Navigation hints
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str(canvas, 2, 62, "<Results");
+        canvas_draw_str(canvas, 88, 62, "Probes>");
+        
     } else if(data->display_mode == 1) {
-        screen_draw_status(canvas, "APs & Clients:", 22);
-        canvas_draw_str(canvas, 2, 32, furi_string_get_cstr(data->results));
+        // Results mode - selectable list
+        screen_draw_title(canvas, "Results");
+        
+        canvas_set_font(canvas, FontSecondary);
+        
+        if(data->results_count == 0) {
+            screen_draw_centered_text(canvas, "No APs with clients", 32);
+        } else {
+            uint8_t y = 21;  // 1px more spacing under title
+            uint8_t max_lines = 5;
+            
+            // Adjust scroll to keep selection visible
+            if(data->selected_result < data->scroll_offset) {
+                data->scroll_offset = data->selected_result;
+            } else if(data->selected_result >= data->scroll_offset + max_lines) {
+                data->scroll_offset = data->selected_result - max_lines + 1;
+            }
+            
+            for(uint8_t i = data->scroll_offset; i < data->results_count && (i - data->scroll_offset) < max_lines; i++) {
+                uint8_t display_y = y + ((i - data->scroll_offset) * 9);
+                
+                if(i == data->selected_result) {
+                    // Highlight selected result
+                    canvas_set_color(canvas, ColorBlack);
+                    canvas_draw_box(canvas, 0, display_y - 7, 128, 9);
+                    canvas_set_color(canvas, ColorWhite);
+                    canvas_draw_str(canvas, 2, display_y, data->results[i]);
+                    canvas_set_color(canvas, ColorBlack);
+                } else {
+                    canvas_draw_str(canvas, 2, display_y, data->results[i]);
+                }
+            }
+        }
+        
+        canvas_draw_str(canvas, 2, 62, "<Back");
+        
     } else {
-        screen_draw_status(canvas, "Probe Requests:", 22);
-        canvas_draw_str(canvas, 2, 32, furi_string_get_cstr(data->probes));
+        // Probes mode - selectable list for future Karma attack
+        screen_draw_title(canvas, "Probes");
+        
+        canvas_set_font(canvas, FontSecondary);
+        
+        if(data->probes_count == 0) {
+            screen_draw_centered_text(canvas, "No probe requests", 32);
+        } else {
+            uint8_t y = 21;  // 1px more spacing under title
+            uint8_t max_lines = 5;
+            
+            // Adjust scroll to keep selection visible
+            if(data->selected_probe < data->scroll_offset) {
+                data->scroll_offset = data->selected_probe;
+            } else if(data->selected_probe >= data->scroll_offset + max_lines) {
+                data->scroll_offset = data->selected_probe - max_lines + 1;
+            }
+            
+            for(uint8_t i = data->scroll_offset; i < data->probes_count && (i - data->scroll_offset) < max_lines; i++) {
+                uint8_t display_y = y + ((i - data->scroll_offset) * 9);
+                
+                if(i == data->selected_probe) {
+                    // Highlight selected probe
+                    canvas_set_color(canvas, ColorBlack);
+                    canvas_draw_box(canvas, 0, display_y - 7, 128, 9);
+                    canvas_set_color(canvas, ColorWhite);
+                    canvas_draw_str(canvas, 2, display_y, data->probes[i]);
+                    canvas_set_color(canvas, ColorBlack);
+                } else {
+                    canvas_draw_str(canvas, 2, display_y, data->probes[i]);
+                }
+            }
+        }
+        
+        canvas_draw_str(canvas, 2, 62, "<Back");
+    }
+}
+
+// ============================================================================
+// Load Results from UART
+// ============================================================================
+
+static void load_results(SnifferData* data) {
+    WiFiApp* app = data->app;
+    
+    data->results_count = 0;
+    uart_clear_buffer(app);
+    uart_send_command(app, "show_sniffer_results");
+    furi_delay_ms(200);
+    
+    // Parse output
+    // Format: "SSID, CH#: count" followed by MAC addresses
+    uint32_t start = furi_get_tick();
+    while((furi_get_tick() - start) < 3000 && data->results_count < MAX_RESULTS_LINES) {
+        const char* line = uart_read_line(app, 500);
+        if(!line) continue;
+        
+        // Skip command echo and prompt
+        if(strstr(line, "show_sniffer") || line[0] == '>') continue;
+        if(strstr(line, "No APs")) {
+            strncpy(data->results[0], "No APs with clients", MAX_LINE_LEN - 1);
+            data->results_count = 1;
+            break;
+        }
+        
+        // Store line (truncate if needed)
+        strncpy(data->results[data->results_count], line, MAX_LINE_LEN - 1);
+        data->results[data->results_count][MAX_LINE_LEN - 1] = '\0';
+        data->results_count++;
+    }
+}
+
+static void load_probes(SnifferData* data) {
+    WiFiApp* app = data->app;
+    
+    data->probes_count = 0;
+    uart_clear_buffer(app);
+    uart_send_command(app, "show_probes");
+    furi_delay_ms(200);
+    
+    // Parse output
+    // Format: "Probe requests: N" followed by "SSID (MAC)"
+    uint32_t start = furi_get_tick();
+    bool past_header = false;
+    while((furi_get_tick() - start) < 3000 && data->probes_count < MAX_RESULTS_LINES) {
+        const char* line = uart_read_line(app, 500);
+        if(!line) continue;
+        
+        // Skip command echo and prompt
+        if(strstr(line, "show_probes") || line[0] == '>') continue;
+        
+        // Skip header line "Probe requests: N"
+        if(strstr(line, "Probe requests:")) {
+            past_header = true;
+            continue;
+        }
+        
+        if(!past_header) continue;
+        
+        // Store line (truncate if needed)
+        strncpy(data->probes[data->probes_count], line, MAX_LINE_LEN - 1);
+        data->probes[data->probes_count][MAX_LINE_LEN - 1] = '\0';
+        data->probes_count++;
     }
 }
 
@@ -103,30 +277,66 @@ static bool sniffer_input(InputEvent* event, void* context) {
         return false;
     }
     
-    if(event->key == InputKeyBack) {
-        if(data->display_mode > 0) {
-            data->display_mode = 0;
-            uart_send_command(data->app, "start_sniffer");
-            data->sniffer_running = true;
-        } else {
-            data->sniffer_running = false;
+    if(data->display_mode == 0) {
+        // Counter mode
+        if(event->key == InputKeyBack) {
+            data->running = false;
+            data->attack_finished = true;
             uart_send_command(data->app, "stop");
             view_commit_model(view, false);
             screen_pop_to_main(data->app);
             return true;
-        }
-    } else if(event->key == InputKeyLeft && data->display_mode > 0) {
-        data->display_mode = 0;
-        uart_send_command(data->app, "start_sniffer");
-        data->sniffer_running = true;
-    } else if(event->key == InputKeyRight) {
-        if(data->display_mode == 0) {
+        } else if(event->key == InputKeyLeft) {
+            // Results
+            data->running = false;
             uart_send_command(data->app, "stop");
-            furi_delay_ms(500);
-            uart_clear_buffer(data->app);
-            uart_send_command(data->app, "show_sniffer_results");
+            furi_delay_ms(300);
+            load_results(data);
+            data->scroll_offset = 0;
+            data->selected_result = 0;
             data->display_mode = 1;
-            data->sniffer_running = false;
+        } else if(event->key == InputKeyRight) {
+            // Probes
+            data->running = false;
+            uart_send_command(data->app, "stop");
+            furi_delay_ms(300);
+            load_probes(data);
+            data->scroll_offset = 0;
+            data->selected_probe = 0;
+            data->display_mode = 2;
+        }
+    } else if(data->display_mode == 1) {
+        // Results mode - selectable list
+        if(event->key == InputKeyBack || event->key == InputKeyLeft) {
+            // Back to counter, restart sniffer
+            data->scroll_offset = 0;
+            data->selected_result = 0;
+            data->display_mode = 0;
+            uart_send_command(data->app, "start_sniffer");
+            data->running = true;
+        } else if(event->key == InputKeyUp) {
+            if(data->selected_result > 0) data->selected_result--;
+        } else if(event->key == InputKeyDown) {
+            if(data->selected_result + 1 < data->results_count) data->selected_result++;
+        } else if(event->key == InputKeyOk) {
+            // TODO: Future use - for now just acknowledge selection
+        }
+    } else {
+        // Probes mode - selectable list
+        if(event->key == InputKeyBack || event->key == InputKeyLeft) {
+            // Back to counter, restart sniffer
+            data->scroll_offset = 0;
+            data->selected_probe = 0;
+            data->display_mode = 0;
+            uart_send_command(data->app, "start_sniffer");
+            data->running = true;
+        } else if(event->key == InputKeyUp) {
+            if(data->selected_probe > 0) data->selected_probe--;
+        } else if(event->key == InputKeyDown) {
+            if(data->selected_probe + 1 < data->probes_count) data->selected_probe++;
+        } else if(event->key == InputKeyOk) {
+            // TODO: Karma attack - for now just acknowledge selection
+            // The selected probe SSID is: data->probes[data->selected_probe]
         }
     }
 
@@ -142,6 +352,9 @@ static int32_t sniffer_thread(void* context) {
     SnifferData* data = (SnifferData*)context;
     WiFiApp* app = data->app;
     
+    furi_delay_ms(200);
+    uart_clear_buffer(app);
+    
     // Build select_networks command
     char cmd[256];
     size_t pos = snprintf(cmd, sizeof(cmd), "select_networks");
@@ -155,47 +368,23 @@ static int32_t sniffer_thread(void* context) {
     
     // Start sniffer
     uart_send_command(app, "start_sniffer");
-    data->sniffer_running = true;
+    data->running = true;
     
     // Monitor for packet count updates
-    while(data->sniffer_running) {
-        const char* line = uart_read_line(app, 1000);
-        if(line) {
-            if(strstr(line, "Sniffer packet count:")) {
-                sscanf(line, "Sniffer packet count: %lu", &data->packet_count);
+    // Format: "Sniffer packet count: N"
+    while(!data->attack_finished) {
+        if(data->running) {
+            const char* line = uart_read_line(app, 500);
+            if(line) {
+                const char* count_marker = strstr(line, "Sniffer packet count:");
+                if(count_marker) {
+                    count_marker += 21; // Skip marker
+                    while(*count_marker == ' ') count_marker++;
+                    data->packet_count = (uint32_t)strtol(count_marker, NULL, 10);
+                }
             }
         }
         furi_delay_ms(100);
-    }
-    
-    // After stopping, get results
-    const char* result_line = NULL;
-    bool reading_results = false;
-    while((result_line = uart_read_line(app, 1000)) != NULL) {
-        if(strstr(result_line, "show_sniffer_results") || strstr(result_line, ">")) {
-            reading_results = true;
-            continue;
-        }
-        if(reading_results) {
-            furi_string_cat_str(data->results, result_line);
-            furi_string_cat_str(data->results, "\n");
-            if(strstr(result_line, "No APs") || strstr(result_line, "^")) {
-                break;
-            }
-        }
-    }
-    
-    // Get probes
-    uart_send_command(app, "show_probes");
-    bool reading_probes = false;
-    while((result_line = uart_read_line(app, 1000)) != NULL) {
-        if(strstr(result_line, "Probe requests:") || strstr(result_line, "Probe")) {
-            reading_probes = true;
-        }
-        if(reading_probes) {
-            furi_string_cat_str(data->probes, result_line);
-            furi_string_cat_str(data->probes, "\n");
-        }
     }
     
     return 0;
@@ -206,28 +395,29 @@ static int32_t sniffer_thread(void* context) {
 // ============================================================================
 
 View* screen_sniffer_create(WiFiApp* app, void** out_data) {
-    // Allocate screen data
     SnifferData* data = (SnifferData*)malloc(sizeof(SnifferData));
     if(!data) return NULL;
     
     data->app = app;
-    data->sniffer_running = false;
+    data->running = false;
+    data->attack_finished = false;
     data->packet_count = 0;
     data->display_mode = 0;
-    data->results = furi_string_alloc();
-    data->probes = furi_string_alloc();
+    data->results_count = 0;
+    data->probes_count = 0;
+    data->scroll_offset = 0;
+    data->selected_result = 0;
+    data->selected_probe = 0;
+    memset(data->results, 0, sizeof(data->results));
+    memset(data->probes, 0, sizeof(data->probes));
     data->thread = NULL;
     
-    // Allocate view
     View* view = view_alloc();
     if(!view) {
-        furi_string_free(data->results);
-        furi_string_free(data->probes);
         free(data);
         return NULL;
     }
     
-    // Setup view model
     view_allocate_model(view, ViewModelTypeLocking, sizeof(SnifferModel));
     SnifferModel* m = view_get_model(view);
     m->data = data;

@@ -1,8 +1,8 @@
 /**
- * Global Handshaker Attack Screen
+ * Wardrive Screen
  * 
- * Captures handshakes from all visible networks (no select_networks).
- * Command: start_handshake
+ * GPS-based network logging.
+ * Command: start_wardrive
  */
 
 #include "app.h"
@@ -19,22 +19,23 @@
 typedef struct {
     WiFiApp* app;
     volatile bool attack_finished;
-    uint32_t handshake_count;
-    char last_ssid[33];
+    bool gps_fix;
+    char last_log_line[64];
+    uint32_t network_count;
     FuriThread* thread;
-} GlobalHandshakerData;
+} WardriveData;
 
 typedef struct {
-    GlobalHandshakerData* data;
-} GlobalHandshakerModel;
+    WardriveData* data;
+} WardriveModel;
 
 // ============================================================================
 // Cleanup
 // ============================================================================
 
-void global_handshaker_screen_cleanup(View* view, void* data) {
+void wardrive_screen_cleanup(View* view, void* data) {
     UNUSED(view);
-    GlobalHandshakerData* d = (GlobalHandshakerData*)data;
+    WardriveData* d = (WardriveData*)data;
     if(!d) return;
     
     d->attack_finished = true;
@@ -49,25 +50,29 @@ void global_handshaker_screen_cleanup(View* view, void* data) {
 // Drawing
 // ============================================================================
 
-static void global_handshaker_draw(Canvas* canvas, void* model) {
-    GlobalHandshakerModel* m = (GlobalHandshakerModel*)model;
+static void wardrive_draw(Canvas* canvas, void* model) {
+    WardriveModel* m = (WardriveModel*)model;
     if(!m || !m->data) return;
-    GlobalHandshakerData* data = m->data;
+    WardriveData* data = m->data;
     
     canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
-    screen_draw_title(canvas, "Global Handshaker");
+    screen_draw_title(canvas, "Wardrive");
     
     canvas_set_font(canvas, FontSecondary);
-    screen_draw_centered_text(canvas, "Attack Running", 26);
     
-    char line[48];
-    snprintf(line, sizeof(line), "Total: %lu", data->handshake_count);
-    screen_draw_centered_text(canvas, line, 40);
-    
-    if(data->last_ssid[0]) {
-        snprintf(line, sizeof(line), "Last: %.20s", data->last_ssid);
-        screen_draw_centered_text(canvas, line, 54);
+    if(!data->gps_fix) {
+        screen_draw_centered_text(canvas, "Acquiring GPS Fix", 32);
+        screen_draw_centered_text(canvas, "Need clear sky view", 44);
+    } else {
+        char line[48];
+        snprintf(line, sizeof(line), "Networks: %lu", data->network_count);
+        screen_draw_centered_text(canvas, line, 28);
+        
+        // Show last log line (truncated)
+        if(data->last_log_line[0]) {
+            canvas_draw_str(canvas, 2, 44, data->last_log_line);
+        }
     }
 }
 
@@ -75,16 +80,16 @@ static void global_handshaker_draw(Canvas* canvas, void* model) {
 // Input Handling
 // ============================================================================
 
-static bool global_handshaker_input(InputEvent* event, void* context) {
+static bool wardrive_input(InputEvent* event, void* context) {
     View* view = (View*)context;
     if(!view) return false;
     
-    GlobalHandshakerModel* m = view_get_model(view);
+    WardriveModel* m = view_get_model(view);
     if(!m || !m->data) {
         view_commit_model(view, false);
         return false;
     }
-    GlobalHandshakerData* data = m->data;
+    WardriveData* data = m->data;
     
     if(event->type != InputTypeShort) {
         view_commit_model(view, false);
@@ -107,35 +112,32 @@ static bool global_handshaker_input(InputEvent* event, void* context) {
 // Attack Thread
 // ============================================================================
 
-static int32_t global_handshaker_thread(void* context) {
-    GlobalHandshakerData* data = (GlobalHandshakerData*)context;
+static int32_t wardrive_thread(void* context) {
+    WardriveData* data = (WardriveData*)context;
     WiFiApp* app = data->app;
     
     furi_delay_ms(200);
     uart_clear_buffer(app);
+    uart_send_command(app, "start_wardrive");
     
-    // No select_networks - attack all networks
-    uart_send_command(app, "start_handshake");
-    
-    // Monitor for handshakes
-    // Looking for: "Complete 4-way handshake saved for SSID: [SSID]"
+    // Wait for GPS fix and parse logs
     while(!data->attack_finished) {
         const char* line = uart_read_line(app, 500);
         if(line) {
-            const char* marker = strstr(line, "Complete 4-way handshake saved for SSID:");
-            if(marker) {
-                marker += 41;
-                while(*marker == ' ') marker++;
+            // Check for GPS fix
+            if(strstr(line, "GPS fix obtained")) {
+                data->gps_fix = true;
+            }
+            
+            // Parse "Logged N networks to /path/file.log"
+            const char* logged = strstr(line, "Logged ");
+            if(logged) {
+                logged += 7;
+                data->network_count = (uint32_t)strtol(logged, NULL, 10);
                 
-                // Copy SSID until space or parenthesis
-                size_t i = 0;
-                while(*marker && *marker != '(' && i < 32) {
-                    data->last_ssid[i++] = *marker++;
-                }
-                while(i > 0 && data->last_ssid[i-1] == ' ') i--;
-                data->last_ssid[i] = '\0';
-                
-                data->handshake_count++;
+                // Copy the whole line for display
+                strncpy(data->last_log_line, line, sizeof(data->last_log_line) - 1);
+                data->last_log_line[sizeof(data->last_log_line) - 1] = '\0';
             }
         }
         furi_delay_ms(100);
@@ -148,14 +150,15 @@ static int32_t global_handshaker_thread(void* context) {
 // Screen Creation
 // ============================================================================
 
-View* global_handshaker_screen_create(WiFiApp* app, void** out_data) {
-    GlobalHandshakerData* data = (GlobalHandshakerData*)malloc(sizeof(GlobalHandshakerData));
+View* wardrive_screen_create(WiFiApp* app, void** out_data) {
+    WardriveData* data = (WardriveData*)malloc(sizeof(WardriveData));
     if(!data) return NULL;
     
     data->app = app;
     data->attack_finished = false;
-    data->handshake_count = 0;
-    memset(data->last_ssid, 0, sizeof(data->last_ssid));
+    data->gps_fix = false;
+    memset(data->last_log_line, 0, sizeof(data->last_log_line));
+    data->network_count = 0;
     data->thread = NULL;
     
     View* view = view_alloc();
@@ -164,19 +167,19 @@ View* global_handshaker_screen_create(WiFiApp* app, void** out_data) {
         return NULL;
     }
     
-    view_allocate_model(view, ViewModelTypeLocking, sizeof(GlobalHandshakerModel));
-    GlobalHandshakerModel* m = view_get_model(view);
+    view_allocate_model(view, ViewModelTypeLocking, sizeof(WardriveModel));
+    WardriveModel* m = view_get_model(view);
     m->data = data;
     view_commit_model(view, true);
     
-    view_set_draw_callback(view, global_handshaker_draw);
-    view_set_input_callback(view, global_handshaker_input);
+    view_set_draw_callback(view, wardrive_draw);
+    view_set_input_callback(view, wardrive_input);
     view_set_context(view, view);
     
     data->thread = furi_thread_alloc();
-    furi_thread_set_name(data->thread, "GHandshaker");
+    furi_thread_set_name(data->thread, "Wardrive");
     furi_thread_set_stack_size(data->thread, 2048);
-    furi_thread_set_callback(data->thread, global_handshaker_thread);
+    furi_thread_set_callback(data->thread, wardrive_thread);
     furi_thread_set_context(data->thread, data);
     furi_thread_start(data->thread);
     

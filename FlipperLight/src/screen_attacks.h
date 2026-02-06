@@ -41,9 +41,6 @@ View* screen_handshaker_create(WiFiApp* app, void** out_data);
 // Sniffer - passive packet capture
 View* screen_sniffer_create(WiFiApp* app, void** out_data);
 
-// Global Handshaker - captures handshakes from all visible networks
-View* screen_global_handshaker_create(WiFiApp* app, void** out_data);
-
 // ============================================================================
 // Cleanup Functions (for use with screen_push_with_cleanup)
 // ============================================================================
@@ -53,4 +50,3 @@ void evil_twin_cleanup(View* view, void* data);
 void sae_overflow_cleanup(View* view, void* data);
 void handshaker_cleanup(View* view, void* data);
 void sniffer_cleanup(View* view, void* data);
-void global_handshaker_cleanup(View* view, void* data);

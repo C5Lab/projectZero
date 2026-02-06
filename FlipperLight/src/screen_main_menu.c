@@ -2,6 +2,14 @@
 #include "screen.h"
 #include "screen_wifi_scan.h"
 #include <stdlib.h>
+#include <furi.h>
+
+#define TAG "MainMenu"
+
+// External menu create functions
+extern View* screen_global_attacks_menu_create(WiFiApp* app);
+extern View* screen_sniff_karma_menu_create(WiFiApp* app);
+extern View* screen_bluetooth_menu_create(WiFiApp* app);
 
 typedef struct {
     WiFiApp* app;
@@ -66,18 +74,40 @@ static bool main_menu_input(InputEvent* event, void* context) {
             m->selected++;
         }
     } else if(event->key == InputKeyOk) {
-        if(m->selected == 0) {
-            // WiFi Scan & Attack - release lock before creating new view
-            view_commit_model(view, true);
-            View* next_screen = screen_wifi_scan_create(app);
-            if(next_screen) {
-                screen_push(app, next_screen);
-            }
-            return true;
-        } else if(m->selected == 1) {
-            // Global WiFi Attacks - mock screen for now
+        uint8_t sel = m->selected;
+        FURI_LOG_I(TAG, "OK pressed, selected=%u", sel);
+        view_commit_model(view, true);
+        
+        View* next_screen = NULL;
+        
+        if(sel == 0) {
+            // WiFi Scan & Attack
+            FURI_LOG_I(TAG, "Creating WiFi Scan screen");
+            next_screen = screen_wifi_scan_create(app);
+        } else if(sel == 1) {
+            // Global WiFi Attacks
+            FURI_LOG_I(TAG, "Creating Global Attacks menu");
+            next_screen = screen_global_attacks_menu_create(app);
+        } else if(sel == 2) {
+            // WiFi Sniff & Karma
+            FURI_LOG_I(TAG, "Creating Sniff & Karma menu");
+            next_screen = screen_sniff_karma_menu_create(app);
+        } else if(sel == 3) {
+            // WiFi Monitor - TODO
+            FURI_LOG_I(TAG, "WiFi Monitor - not implemented");
+        } else if(sel == 4) {
+            // Bluetooth
+            FURI_LOG_I(TAG, "Creating Bluetooth menu");
+            next_screen = screen_bluetooth_menu_create(app);
         }
-        // TODO: Other menu items
+        
+        if(next_screen) {
+            FURI_LOG_I(TAG, "Pushing screen %p", (void*)next_screen);
+            screen_push(app, next_screen);
+        } else {
+            FURI_LOG_W(TAG, "next_screen is NULL for sel=%u", sel);
+        }
+        return true;
     } else if(event->key == InputKeyBack) {
         // Exit app - stop the view dispatcher
         view_commit_model(view, false);

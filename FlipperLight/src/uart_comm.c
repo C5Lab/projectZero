@@ -3,7 +3,9 @@
 #include <furi_hal_serial_control.h>
 #include <string.h>
 #include <stdlib.h>
+#include <furi.h>
 
+#define TAG "UART"
 #define UART_BUFFER_SIZE 4096
 #define UART_LINE_TIMEOUT_MS 5000  // 5 seconds per line - overall scan has its own timeout
 
@@ -235,7 +237,11 @@ void uart_comm_deinit(WiFiApp* app) {
 }
 
 void uart_send_command(WiFiApp* app, const char* command) {
-    if(!app || !app->serial) return;
+    if(!app || !app->serial) {
+        FURI_LOG_E(TAG, "uart_send_command: app or serial is NULL");
+        return;
+    }
+    FURI_LOG_I(TAG, "TX: %s", command);
     furi_hal_serial_tx(app->serial, (const uint8_t*)command, strlen(command));
     furi_hal_serial_tx(app->serial, (const uint8_t*)"\n", 1);
     furi_hal_serial_tx_wait_complete(app->serial);
