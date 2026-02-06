@@ -172,3 +172,10 @@ void screen_draw_status(Canvas* canvas, const char* status, uint8_t y) {
     canvas_set_color(canvas, ColorBlack);
     canvas_draw_str(canvas, 2, y, status);
 }
+
+uint32_t screen_get_current_view_id(void) {
+    if(screen_view_stack_size > 0) {
+        return screen_view_stack[screen_view_stack_size - 1];
+    }
+    return 0;
+}

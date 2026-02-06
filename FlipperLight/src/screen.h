@@ -19,3 +19,6 @@ void screen_pop_all(WiFiApp* app);
 void screen_draw_title(Canvas* canvas, const char* title);
 void screen_draw_centered_text(Canvas* canvas, const char* text, uint8_t y);
 void screen_draw_status(Canvas* canvas, const char* status, uint8_t y);
+
+// Get current view ID (for temporary view switches like TextInput)
+uint32_t screen_get_current_view_id(void);
