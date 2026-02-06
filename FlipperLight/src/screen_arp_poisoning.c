@@ -509,9 +509,17 @@ static int32_t arp_poisoning_thread(void* context) {
     data->state = 4;
     FURI_LOG_I(TAG, "Found %u hosts", data->host_count);
 
-    // Wait while user interacts with host list
+    // Wait while user interacts with host list or ARP poisoning is active
     while(!data->attack_finished) {
-        furi_delay_ms(100);
+        // If ARP poisoning is active (state 5), read and log UART output
+        if(data->state == 5) {
+            const char* line = uart_read_line(app, 100);
+            if(line) {
+                FURI_LOG_I(TAG, "arp_ban output: %s", line);
+            }
+        } else {
+            furi_delay_ms(100);
+        }
     }
 
     FURI_LOG_I(TAG, "Thread finished");
