@@ -300,10 +300,13 @@ static bool arp_poisoning_input(InputEvent* event, void* context) {
         }
 
     } else if(data->state == 5) {
-        // ARP Poisoning active popup
+        // ARP Poisoning active
         if(event->key == InputKeyBack) {
+            data->attack_finished = true;
             uart_send_command(data->app, "stop");
-            data->state = 4; // Back to host list
+            view_commit_model(view, false);
+            screen_pop_to_main(data->app);
+            return true;
         }
     }
 
