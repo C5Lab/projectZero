@@ -32,6 +32,10 @@ int32_t wifi_attacks_app(void* p) {
     // Initialize UART
     uart_comm_init(app);
     
+    // Check initial board connection
+    furi_delay_ms(500); // Give board time to initialize
+    app->board_connected = uart_check_board_connection(app);
+    
     // Initialize app state
     app->networks = NULL;
     app->network_count = 0;

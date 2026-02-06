@@ -47,6 +47,7 @@ struct WiFiApp {
     FuriString* uart_line_buffer;
     volatile bool uart_running;
     volatile uint32_t last_uart_activity;
+    volatile bool board_connected;
     
     // WiFi scanning state
     WiFiNetwork* scan_results;

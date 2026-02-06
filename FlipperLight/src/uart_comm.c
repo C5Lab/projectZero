@@ -181,6 +181,34 @@ static int32_t uart_worker(void* context) {
 }
 
 //=============================================================================
+// Board Connection Check
+//=============================================================================
+
+bool uart_check_board_connection(WiFiApp* app) {
+    if(!app || !app->serial) return false;
+    
+    uart_clear_buffer(app);
+    uart_send_command(app, "ping");
+    
+    uint32_t timeout = furi_get_tick() + 1000; // 1 second timeout
+    FuriString* line = furi_string_alloc();
+    
+    while(furi_get_tick() < timeout) {
+        if(uart_read_line_internal(app, line)) {
+            const char* line_str = furi_string_get_cstr(line);
+            if(strstr(line_str, "pong")) {
+                furi_string_free(line);
+                FURI_LOG_I(TAG, "Board connected");
+                return true;
+            }
+        }
+    }
+    
+    furi_string_free(line);
+    return false;
+}
+
+//=============================================================================
 // UART Init / Deinit
 //=============================================================================
 
@@ -196,6 +224,7 @@ void uart_comm_init(WiFiApp* app) {
     app->uart_line_buffer = furi_string_alloc();
     app->uart_running = true;
     app->last_uart_activity = furi_get_tick();
+    app->board_connected = false;
     
     furi_stream_buffer_reset(app->uart_rx_buffer);
     furi_hal_serial_async_rx_start(app->serial, uart_serial_irq, app, false);
