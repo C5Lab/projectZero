@@ -1,5 +1,6 @@
 #include "screen.h"
 #include <stdlib.h>
+#include <string.h>
 #include <stdio.h>
 #include <furi.h>
 
@@ -9,13 +10,15 @@ typedef struct {
     void* context;
 } ScreenData;
 
-// Cleanup function type for views
-typedef void (*ViewCleanupFunc)(View* view, void* data);
+// Cleanup callback storage per stack entry
+typedef struct {
+    uint32_t view_id;
+    void (*cleanup)(View*, void*);
+    void* cleanup_data;
+    View* view;
+} ScreenStackEntry;
 
-static uint32_t screen_view_stack[16];
-static View* screen_view_ptrs[16];
-static ViewCleanupFunc screen_cleanup_funcs[16];
-static void* screen_cleanup_data[16];
+static ScreenStackEntry screen_view_stack[16];
 static uint8_t screen_view_stack_size = 0;
 static uint32_t screen_next_view_id = 1;
 
@@ -36,13 +39,7 @@ static bool screen_input_callback(InputEvent* event, void* context) {
 
 View* screen_create(WiFiApp* app, ScreenDrawCallback draw, ScreenInputCallback input) {
     View* view = view_alloc();
-    if(!view) return NULL;
-    
     ScreenData* data = (ScreenData*)malloc(sizeof(ScreenData));
-    if(!data) {
-        view_free(view);
-        return NULL;
-    }
     
     data->draw_callback = draw;
     data->input_callback = input;
@@ -56,49 +53,53 @@ View* screen_create(WiFiApp* app, ScreenDrawCallback draw, ScreenInputCallback i
 }
 
 void screen_push(WiFiApp* app, View* view) {
-    screen_push_with_cleanup(app, view, NULL, NULL);
+    if(!app || !view) return;
+    uint32_t view_id = screen_next_view_id++;
+    view_dispatcher_add_view(app->view_dispatcher, view_id, view);
+    if(screen_view_stack_size < (sizeof(screen_view_stack) / sizeof(screen_view_stack[0]))) {
+        ScreenStackEntry* entry = &screen_view_stack[screen_view_stack_size++];
+        entry->view_id = view_id;
+        entry->cleanup = NULL;
+        entry->cleanup_data = NULL;
+        entry->view = view;
+    }
+    view_dispatcher_switch_to_view(app->view_dispatcher, view_id);
 }
 
 void screen_push_with_cleanup(WiFiApp* app, View* view, void (*cleanup)(View*, void*), void* cleanup_data) {
     if(!app || !view) return;
     uint32_t view_id = screen_next_view_id++;
     view_dispatcher_add_view(app->view_dispatcher, view_id, view);
-    if(screen_view_stack_size < 16) {
-        screen_view_stack[screen_view_stack_size] = view_id;
-        screen_view_ptrs[screen_view_stack_size] = view;
-        screen_cleanup_funcs[screen_view_stack_size] = cleanup;
-        screen_cleanup_data[screen_view_stack_size] = cleanup_data;
-        screen_view_stack_size++;
+    if(screen_view_stack_size < (sizeof(screen_view_stack) / sizeof(screen_view_stack[0]))) {
+        ScreenStackEntry* entry = &screen_view_stack[screen_view_stack_size++];
+        entry->view_id = view_id;
+        entry->cleanup = cleanup;
+        entry->cleanup_data = cleanup_data;
+        entry->view = view;
     }
     view_dispatcher_switch_to_view(app->view_dispatcher, view_id);
 }
 
 void screen_pop(WiFiApp* app) {
     if(screen_view_stack_size > 1) {
-        // Get current view info
-        uint8_t idx = screen_view_stack_size - 1;
-        uint32_t current_id = screen_view_stack[idx];
-        View* current_view = screen_view_ptrs[idx];
-        ViewCleanupFunc cleanup = screen_cleanup_funcs[idx];
-        void* cleanup_data = screen_cleanup_data[idx];
-        
         screen_view_stack_size--;
+        ScreenStackEntry popped = screen_view_stack[screen_view_stack_size];
         
-        // Switch to previous view first
-        uint32_t prev_id = screen_view_stack[screen_view_stack_size - 1];
+        // Switch to previous view FIRST (safe to call from inside input handler)
+        uint32_t prev_id = screen_view_stack[screen_view_stack_size - 1].view_id;
         view_dispatcher_switch_to_view(app->view_dispatcher, prev_id);
         
         // Remove from dispatcher
-        view_dispatcher_remove_view(app->view_dispatcher, current_id);
+        view_dispatcher_remove_view(app->view_dispatcher, popped.view_id);
         
-        // Call cleanup function if set
-        if(cleanup) {
-            cleanup(current_view, cleanup_data);
+        // Call cleanup if registered
+        if(popped.cleanup) {
+            popped.cleanup(popped.view, popped.cleanup_data);
         }
         
         // Free the view
-        if(current_view) {
-            view_free(current_view);
+        if(popped.view) {
+            view_free(popped.view);
         }
     }
 }
@@ -118,27 +119,27 @@ void screen_pop_to_main(WiFiApp* app) {
 }
 
 void screen_pop_all(WiFiApp* app) {
-    // Remove all views from stack (for cleanup on exit)
     while(screen_view_stack_size > 0) {
-        uint8_t idx = screen_view_stack_size - 1;
-        uint32_t view_id = screen_view_stack[idx];
-        View* view = screen_view_ptrs[idx];
-        ViewCleanupFunc cleanup = screen_cleanup_funcs[idx];
-        void* cleanup_data = screen_cleanup_data[idx];
-        
         screen_view_stack_size--;
+        ScreenStackEntry popped = screen_view_stack[screen_view_stack_size];
         
-        view_dispatcher_remove_view(app->view_dispatcher, view_id);
+        view_dispatcher_remove_view(app->view_dispatcher, popped.view_id);
         
-        // Call cleanup function if set
-        if(cleanup) {
-            cleanup(view, cleanup_data);
+        if(popped.cleanup) {
+            popped.cleanup(popped.view, popped.cleanup_data);
         }
         
-        if(view) {
-            view_free(view);
+        if(popped.view) {
+            view_free(popped.view);
         }
     }
+}
+
+uint32_t screen_get_current_view_id(void) {
+    if(screen_view_stack_size > 0) {
+        return screen_view_stack[screen_view_stack_size - 1].view_id;
+    }
+    return 0;
 }
 
 void screen_draw_title(Canvas* canvas, const char* title) {
@@ -171,11 +172,4 @@ void screen_draw_centered_text(Canvas* canvas, const char* text, uint8_t y) {
 void screen_draw_status(Canvas* canvas, const char* status, uint8_t y) {
     canvas_set_color(canvas, ColorBlack);
     canvas_draw_str(canvas, 2, y, status);
-}
-
-uint32_t screen_get_current_view_id(void) {
-    if(screen_view_stack_size > 0) {
-        return screen_view_stack[screen_view_stack_size - 1];
-    }
-    return 0;
 }

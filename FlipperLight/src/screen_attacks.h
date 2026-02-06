@@ -41,6 +41,12 @@ View* screen_handshaker_create(WiFiApp* app, void** out_data);
 // Sniffer - passive packet capture
 View* screen_sniffer_create(WiFiApp* app, void** out_data);
 
+// Rogue AP - creates fake AP with known password + captive portal
+View* screen_rogue_ap_create(WiFiApp* app, void** out_data);
+
+// ARP Poisoning - connects to network, scans hosts, poisons ARP
+View* screen_arp_poisoning_create(WiFiApp* app, void** out_data);
+
 // ============================================================================
 // Cleanup Functions (for use with screen_push_with_cleanup)
 // ============================================================================
@@ -50,3 +56,5 @@ void evil_twin_cleanup(View* view, void* data);
 void sae_overflow_cleanup(View* view, void* data);
 void handshaker_cleanup(View* view, void* data);
 void sniffer_cleanup(View* view, void* data);
+void rogue_ap_cleanup_internal(View* view, void* data);
+void arp_poisoning_cleanup_internal(View* view, void* data);

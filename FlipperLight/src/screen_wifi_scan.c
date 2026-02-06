@@ -336,14 +336,22 @@ static void attack_selection_draw(Canvas* canvas, void* model) {
         "Evil Twin",
         "SAE Overflow",
         "Handshaker",
-        "Sniffer"
+        "Sniffer",
+        "Rogue AP",
+        "ARP Poisoning"
     };
-    const uint8_t attack_count = 5;
+    const uint8_t attack_count = 7;
     
     canvas_set_font(canvas, FontSecondary);
     uint8_t y = 22;
-    for(uint8_t i = 0; i < attack_count; i++) {
-        uint8_t display_y = y + (i * 10);
+    const uint8_t max_visible = 5;
+    uint8_t start = 0;
+    if(m->attack_type >= max_visible) {
+        start = m->attack_type - max_visible + 1;
+    }
+    
+    for(uint8_t i = start; i < attack_count && (i - start) < max_visible; i++) {
+        uint8_t display_y = y + ((i - start) * 10);
         if(i == m->attack_type) {
             canvas_draw_box(canvas, 0, display_y - 8, 128, 10);
             canvas_set_color(canvas, ColorWhite);
@@ -378,13 +386,19 @@ static bool attack_selection_input(InputEvent* event, void* context) {
             m->attack_type--;
         }
     } else if(event->key == InputKeyDown) {
-        if(m->attack_type < 4) {
+        if(m->attack_type < 6) {
             m->attack_type++;
         }
     } else if(event->key == InputKeyOk) {
         // Start selected attack - release lock before creating new view
         uint8_t attack_type = m->attack_type;
         view_commit_model(view, false);
+        
+        // Rogue AP and ARP Poisoning require exactly 1 selected network
+        if((attack_type == 5 || attack_type == 6) && app->selected_count != 1) {
+            // Cannot launch - need exactly 1 network
+            return true;
+        }
         
         View* attack_view = NULL;
         void (*cleanup_func)(View*, void*) = NULL;
@@ -409,6 +423,12 @@ static bool attack_selection_input(InputEvent* event, void* context) {
         } else if(attack_type == 4) {
             attack_view = screen_sniffer_create(app, &cleanup_data);
             cleanup_func = sniffer_cleanup;
+        } else if(attack_type == 5) {
+            attack_view = screen_rogue_ap_create(app, &cleanup_data);
+            cleanup_func = rogue_ap_cleanup_internal;
+        } else if(attack_type == 6) {
+            attack_view = screen_arp_poisoning_create(app, &cleanup_data);
+            cleanup_func = arp_poisoning_cleanup_internal;
         }
         if(attack_view) {
             screen_push_with_cleanup(app, attack_view, cleanup_func, cleanup_data);

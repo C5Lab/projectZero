@@ -111,6 +111,20 @@ static void portal_ssid_result_callback(void* context) {
     view_dispatcher_switch_to_view(data->app->view_dispatcher, main_view_id);
 }
 
+static void portal_show_text_input(PortalData* data) {
+    if(!data || !data->text_input || data->text_input_shown) return;
+
+    FURI_LOG_I(TAG, "Showing TextInput");
+    data->text_input_shown = true;
+
+    // Add TextInput view to dispatcher
+    View* ti_view = text_input_get_view(data->text_input);
+    view_dispatcher_add_view(data->app->view_dispatcher, PORTAL_TEXT_INPUT_VIEW_ID, ti_view);
+
+    // Switch to TextInput
+    view_dispatcher_switch_to_view(data->app->view_dispatcher, PORTAL_TEXT_INPUT_VIEW_ID);
+}
+
 // ============================================================================
 // Drawing
 // ============================================================================
@@ -124,6 +138,12 @@ static void portal_draw(Canvas* canvas, void* model) {
     canvas_set_font(canvas, FontPrimary);
     
     if(data->state == 0) {
+        // Auto-show TextInput on first entry
+        if(!data->text_input_shown) {
+            portal_show_text_input(data);
+            return;
+        }
+
         // Prompt to enter SSID
         screen_draw_title(canvas, "Portal");
         canvas_set_font(canvas, FontSecondary);
@@ -211,18 +231,7 @@ static bool portal_input(InputEvent* event, void* context) {
     if(data->state == 0) {
         // Waiting for SSID input
         if(event->key == InputKeyOk) {
-            // Show TextInput
-            if(data->text_input && !data->text_input_shown) {
-                FURI_LOG_I(TAG, "Showing TextInput");
-                data->text_input_shown = true;
-                
-                // Add TextInput view to dispatcher
-                View* ti_view = text_input_get_view(data->text_input);
-                view_dispatcher_add_view(data->app->view_dispatcher, PORTAL_TEXT_INPUT_VIEW_ID, ti_view);
-                
-                // Switch to TextInput
-                view_dispatcher_switch_to_view(data->app->view_dispatcher, PORTAL_TEXT_INPUT_VIEW_ID);
-            }
+            portal_show_text_input(data);
             view_commit_model(view, false);
             return true;
         } else if(event->key == InputKeyBack) {

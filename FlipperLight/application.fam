@@ -28,6 +28,8 @@ App(
         "src/screen_sniffer_dog.c",
         "src/screen_wardrive.c",
         "src/screen_wifi_scan.c",
+        "src/screen_rogue_ap.c",
+        "src/screen_arp_poisoning.c",
         "src/uart_comm.c",
     ],
 )
