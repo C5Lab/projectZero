@@ -149,9 +149,10 @@ static void sniffer_draw(Canvas* canvas, void* model) {
         }
         
         canvas_draw_str(canvas, 2, 62, "<Back");
+        canvas_draw_str(canvas, 76, 62, "OK:Deauth");
         
     } else {
-        // Probes mode - selectable list for future Karma attack
+        // Probes mode - selectable list for Karma attack
         screen_draw_title(canvas, "Probes");
         
         canvas_set_font(canvas, FontSecondary);
@@ -186,6 +187,7 @@ static void sniffer_draw(Canvas* canvas, void* model) {
         }
         
         canvas_draw_str(canvas, 2, 62, "<Back");
+        canvas_draw_str(canvas, 78, 62, "OK:Karma");
     }
 }
 
@@ -319,7 +321,61 @@ static bool sniffer_input(InputEvent* event, void* context) {
         } else if(event->key == InputKeyDown) {
             if(data->selected_result + 1 < data->results_count) data->selected_result++;
         } else if(event->key == InputKeyOk) {
-            // TODO: Future use - for now just acknowledge selection
+            // Deauth single client - check if selected line is a client MAC
+            const char* sel_line = data->results[data->selected_result];
+            if(sel_line && !strstr(sel_line, ", CH")) {
+                // This is a client MAC line - find parent network
+                char ssid[33] = {0};
+                uint8_t channel = 0;
+                uint8_t net_ordinal = 0;
+
+                // Walk backwards to find parent network header
+                for(int j = (int)data->selected_result - 1; j >= 0; j--) {
+                    const char* ch_marker = strstr(data->results[j], ", CH");
+                    if(ch_marker) {
+                        // Extract SSID (everything before ", CH")
+                        size_t ssid_len = ch_marker - data->results[j];
+                        if(ssid_len >= sizeof(ssid)) ssid_len = sizeof(ssid) - 1;
+                        strncpy(ssid, data->results[j], ssid_len);
+                        ssid[ssid_len] = '\0';
+
+                        // Extract channel (number after "CH" before ":")
+                        channel = (uint8_t)atoi(ch_marker + 4);
+
+                        // Count ordinal (how many network headers up to j)
+                        for(int k = 0; k <= j; k++) {
+                            if(strstr(data->results[k], ", CH")) {
+                                net_ordinal++;
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                if(net_ordinal > 0) {
+                    // Extract MAC from the client line (trim spaces)
+                    const char* mac_str = sel_line;
+                    while(*mac_str == ' ') mac_str++;
+                    char mac[18] = {0};
+                    strncpy(mac, mac_str, sizeof(mac) - 1);
+                    // Trim trailing spaces/newlines
+                    size_t ml = strlen(mac);
+                    while(ml > 0 && (mac[ml-1] == ' ' || mac[ml-1] == '\n' || mac[ml-1] == '\r')) {
+                        mac[--ml] = '\0';
+                    }
+
+                    WiFiApp* app = data->app;
+                    view_commit_model(view, false);
+
+                    void* deauth_data = NULL;
+                    View* next = screen_deauth_client_create(
+                        app, net_ordinal, mac, ssid, channel, &deauth_data);
+                    if(next) {
+                        screen_push_with_cleanup(app, next, deauth_client_cleanup_internal, deauth_data);
+                    }
+                    return true;
+                }
+            }
         }
     } else {
         // Probes mode - selectable list
@@ -335,8 +391,32 @@ static bool sniffer_input(InputEvent* event, void* context) {
         } else if(event->key == InputKeyDown) {
             if(data->selected_probe + 1 < data->probes_count) data->selected_probe++;
         } else if(event->key == InputKeyOk) {
-            // TODO: Karma attack - for now just acknowledge selection
-            // The selected probe SSID is: data->probes[data->selected_probe]
+            // Launch Karma attack with selected probe SSID
+            if(data->probes_count > 0) {
+                // Extract SSID from probe line (format: "SSID (MAC)")
+                char probe_ssid[64] = {0};
+                const char* probe_line = data->probes[data->selected_probe];
+                const char* paren = strstr(probe_line, " (");
+                if(paren) {
+                    size_t len = paren - probe_line;
+                    if(len >= sizeof(probe_ssid)) len = sizeof(probe_ssid) - 1;
+                    strncpy(probe_ssid, probe_line, len);
+                    probe_ssid[len] = '\0';
+                } else {
+                    strncpy(probe_ssid, probe_line, sizeof(probe_ssid) - 1);
+                    probe_ssid[sizeof(probe_ssid) - 1] = '\0';
+                }
+
+                WiFiApp* app = data->app;
+                view_commit_model(view, false);
+
+                void* karma_data = NULL;
+                View* next = screen_karma_probe_create(app, probe_ssid, &karma_data);
+                if(next) {
+                    screen_push_with_cleanup(app, next, karma_probe_cleanup_internal, karma_data);
+                }
+                return true;
+            }
         }
     }
 

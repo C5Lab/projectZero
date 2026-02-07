@@ -8,6 +8,7 @@
  */
 
 #include "app.h"
+#include "screen_attacks.h"
 #include "uart_comm.h"
 #include "screen.h"
 #include <stdlib.h>
@@ -161,6 +162,9 @@ static void evil_twin_pw_draw(Canvas* canvas, void* model) {
         canvas_draw_str(canvas, 4, 46, pw_line);
     }
     
+    // Hint at bottom left
+    canvas_draw_str(canvas, 2, 64, "OK:ARP Poison");
+
     // Counter at bottom right
     char indicator[16];
     snprintf(indicator, sizeof(indicator), "%u/%u", data->selected_idx + 1, data->entry_count);
@@ -211,8 +215,19 @@ static bool evil_twin_pw_input(InputEvent* event, void* context) {
     } else if(event->key == InputKeyDown) {
         if(data->selected_idx < data->entry_count - 1) data->selected_idx++;
     } else if(event->key == InputKeyOk) {
-        // Toggle star selection
-        data->selected_flags[data->selected_idx] = !data->selected_flags[data->selected_idx];
+        // Launch ARP Poisoning with known SSID + password
+        if(data->entry_count > 0) {
+            EvilTwinEntry* entry = &data->entries[data->selected_idx];
+            WiFiApp* app = data->app;
+            view_commit_model(view, false);
+
+            void* arp_data = NULL;
+            View* next = screen_arp_from_creds_create(app, entry->ssid, entry->password, &arp_data);
+            if(next) {
+                screen_push_with_cleanup(app, next, arp_from_creds_cleanup_internal, arp_data);
+            }
+            return true;
+        }
     }
     
     view_commit_model(view, true);

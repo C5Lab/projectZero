@@ -145,11 +145,11 @@ static void wifi_scan_draw(Canvas* canvas, void* model) {
         }
         screen_draw_centered_text(canvas, "Back=Menu", 56);
     } else {
-        // Results with checkboxes - full screen list
+        // Results with checkboxes - list with hint bar
         canvas_set_font(canvas, FontSecondary);
         const uint8_t item_height = 9;   // 9px per row for clear separation
         const uint8_t start_y = 8;       // First text baseline
-        const uint8_t max_visible = 7;   // 7 rows fit cleanly on 64px screen
+        const uint8_t max_visible = 6;   // 6 rows to leave room for hint bar
         
         uint8_t first_idx = 0;
         if(m->selected_idx >= max_visible) {
@@ -172,13 +172,24 @@ static void wifi_scan_draw(Canvas* canvas, void* model) {
             
             bool selected = is_network_selected(app, idx + 1);
             char line[42];
-            snprintf(line, sizeof(line), "%c %.18s [%d]",
-                     selected ? '*' : ' ',
-                     net->ssid[0] ? net->ssid : "(hidden)",
-                     net->rssi);
+            if(net->ssid[0]) {
+                snprintf(line, sizeof(line), "%c %.18s [%d]",
+                         selected ? '*' : ' ',
+                         net->ssid,
+                         net->rssi);
+            } else {
+                snprintf(line, sizeof(line), "%c (%.17s)",
+                         selected ? '*' : ' ',
+                         net->bssid);
+            }
             canvas_draw_str(canvas, 2, y, line);
         }
         
+        // Hint bar at bottom
+        canvas_set_color(canvas, ColorBlack);
+        canvas_draw_str(canvas, 2, 64, "<-info");
+        screen_draw_centered_text(canvas, "ok: select", 64);
+        canvas_draw_str(canvas, 94, 64, "next->");
     }
 }
 

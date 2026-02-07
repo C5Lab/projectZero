@@ -50,6 +50,18 @@ View* screen_arp_poisoning_create(WiFiApp* app, void** out_data);
 // Deauth Detector - monitors for deauthentication attacks
 View* screen_deauth_detector_create(WiFiApp* app, void** out_data);
 
+// Karma Probe - karma attack launched with pre-selected probe SSID
+View* screen_karma_probe_create(WiFiApp* app, const char* probe_ssid, void** out_data);
+
+// Deauth Client - deauthenticates a single client from sniffer results
+View* screen_deauth_client_create(
+    WiFiApp* app, uint8_t net_index, const char* mac,
+    const char* ssid, uint8_t channel, void** out_data);
+
+// ARP from Credentials - ARP poisoning with known SSID + password
+View* screen_arp_from_creds_create(
+    WiFiApp* app, const char* ssid, const char* password, void** out_data);
+
 // ============================================================================
 // Cleanup Functions (for use with screen_push_with_cleanup)
 // ============================================================================
@@ -62,3 +74,6 @@ void sniffer_cleanup(View* view, void* data);
 void rogue_ap_cleanup_internal(View* view, void* data);
 void arp_poisoning_cleanup_internal(View* view, void* data);
 void deauth_detector_cleanup_internal(View* view, void* data);
+void karma_probe_cleanup_internal(View* view, void* data);
+void deauth_client_cleanup_internal(View* view, void* data);
+void arp_from_creds_cleanup_internal(View* view, void* data);

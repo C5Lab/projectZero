@@ -38,6 +38,9 @@ App(
         "src/screen_evil_twin_passwords.c",
         "src/screen_portal_data.c",
         "src/screen_handshakes.c",
+        "src/screen_karma_probe.c",
+        "src/screen_deauth_client.c",
+        "src/screen_arp_from_creds.c",
         "src/uart_comm.c",
     ],
 )
