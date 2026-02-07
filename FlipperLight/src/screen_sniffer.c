@@ -123,7 +123,7 @@ static void sniffer_draw(Canvas* canvas, void* model) {
             screen_draw_centered_text(canvas, "No APs with clients", 32);
         } else {
             uint8_t y = 21;  // 1px more spacing under title
-            uint8_t max_lines = 5;
+            uint8_t max_lines = 4;  // 4 rows to avoid overlap with hint bar
             
             // Adjust scroll to keep selection visible
             if(data->selected_result < data->scroll_offset) {
@@ -161,7 +161,7 @@ static void sniffer_draw(Canvas* canvas, void* model) {
             screen_draw_centered_text(canvas, "No probe requests", 32);
         } else {
             uint8_t y = 21;  // 1px more spacing under title
-            uint8_t max_lines = 5;
+            uint8_t max_lines = 4;  // 4 rows to avoid overlap with hint bar
             
             // Adjust scroll to keep selection visible
             if(data->selected_probe < data->scroll_offset) {
@@ -195,6 +195,18 @@ static void sniffer_draw(Canvas* canvas, void* model) {
 // Load Results from UART
 // ============================================================================
 
+// Helper: check if SSID matches any selected network
+static bool is_ssid_selected(WiFiApp* app, const char* ssid) {
+    if(!app || !ssid || !app->scan_results) return false;
+    for(uint32_t i = 0; i < app->selected_count; i++) {
+        uint32_t idx = app->selected_networks[i];
+        if(idx == 0 || idx > app->scan_result_count) continue;
+        const char* sel_ssid = app->scan_results[idx - 1].ssid;
+        if(sel_ssid && strcmp(sel_ssid, ssid) == 0) return true;
+    }
+    return false;
+}
+
 static void load_results(SnifferData* data) {
     WiFiApp* app = data->app;
     
@@ -205,6 +217,7 @@ static void load_results(SnifferData* data) {
     
     // Parse output
     // Format: "SSID, CH#: count" followed by MAC addresses
+    bool include_current = false;
     uint32_t start = furi_get_tick();
     while((furi_get_tick() - start) < 3000 && data->results_count < MAX_RESULTS_LINES) {
         const char* line = uart_read_line(app, 500);
@@ -218,10 +231,24 @@ static void load_results(SnifferData* data) {
             break;
         }
         
-        // Store line (truncate if needed)
-        strncpy(data->results[data->results_count], line, MAX_LINE_LEN - 1);
-        data->results[data->results_count][MAX_LINE_LEN - 1] = '\0';
-        data->results_count++;
+        // Check if this is a network header line (contains ", CH")
+        const char* ch_marker = strstr(line, ", CH");
+        if(ch_marker) {
+            // Extract SSID (everything before ", CH") and check if selected
+            char ssid[33] = {0};
+            size_t ssid_len = ch_marker - line;
+            if(ssid_len >= sizeof(ssid)) ssid_len = sizeof(ssid) - 1;
+            strncpy(ssid, line, ssid_len);
+            ssid[ssid_len] = '\0';
+            include_current = is_ssid_selected(app, ssid);
+        }
+        
+        // Only store if current network is selected
+        if(include_current) {
+            strncpy(data->results[data->results_count], line, MAX_LINE_LEN - 1);
+            data->results[data->results_count][MAX_LINE_LEN - 1] = '\0';
+            data->results_count++;
+        }
     }
 }
 
@@ -314,7 +341,7 @@ static bool sniffer_input(InputEvent* event, void* context) {
             data->scroll_offset = 0;
             data->selected_result = 0;
             data->display_mode = 0;
-            uart_send_command(data->app, "start_sniffer");
+            uart_send_command(data->app, "start_sniffer_noscan");
             data->running = true;
         } else if(event->key == InputKeyUp) {
             if(data->selected_result > 0) data->selected_result--;
@@ -369,7 +396,7 @@ static bool sniffer_input(InputEvent* event, void* context) {
 
                     void* deauth_data = NULL;
                     View* next = screen_deauth_client_create(
-                        app, net_ordinal, mac, ssid, channel, &deauth_data);
+                        app, 0, mac, ssid, channel, &deauth_data);
                     if(next) {
                         screen_push_with_cleanup(app, next, deauth_client_cleanup_internal, deauth_data);
                     }
@@ -384,7 +411,7 @@ static bool sniffer_input(InputEvent* event, void* context) {
             data->scroll_offset = 0;
             data->selected_probe = 0;
             data->display_mode = 0;
-            uart_send_command(data->app, "start_sniffer");
+            uart_send_command(data->app, "start_sniffer_noscan");
             data->running = true;
         } else if(event->key == InputKeyUp) {
             if(data->selected_probe > 0) data->selected_probe--;
@@ -446,8 +473,8 @@ static int32_t sniffer_thread(void* context) {
     furi_delay_ms(500);
     uart_clear_buffer(app);
     
-    // Start sniffer
-    uart_send_command(app, "start_sniffer");
+    // Start sniffer (noscan - networks already selected above)
+    uart_send_command(app, "start_sniffer_noscan");
     data->running = true;
     
     // Monitor for packet count updates

@@ -159,7 +159,7 @@ void screen_draw_title(Canvas* canvas, const char* title) {
     if(mx > 20) {
         canvas_draw_str(canvas, mx, 10, mem_str);
     }
-    canvas_draw_line(canvas, 0, 12, 128, 12);
+    canvas_draw_line(canvas, 0, 11, 128, 11);
 }
 
 void screen_draw_centered_text(Canvas* canvas, const char* text, uint8_t y) {

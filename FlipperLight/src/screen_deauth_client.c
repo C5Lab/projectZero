@@ -129,17 +129,20 @@ static int32_t deauth_client_thread(void* context) {
     furi_delay_ms(200);
     uart_clear_buffer(app);
 
-    // Step 1: select_networks
+    // Step 1: select_networks (skip if net_index == 0, already selected)
     char cmd[128];
-    snprintf(cmd, sizeof(cmd), "select_networks %u", data->net_index);
-    FURI_LOG_I(TAG, "Sending: %s", cmd);
-    uart_send_command(app, cmd);
-    furi_delay_ms(500);
+    if(data->net_index > 0) {
+        snprintf(cmd, sizeof(cmd), "select_networks %u", data->net_index);
+        FURI_LOG_I(TAG, "Sending: %s", cmd);
+        uart_send_command(app, cmd);
+        furi_delay_ms(500);
 
-    if(data->attack_finished) return 0;
+        if(data->attack_finished) return 0;
+
+        uart_clear_buffer(app);
+    }
 
     // Step 2: select_stations
-    uart_clear_buffer(app);
     snprintf(cmd, sizeof(cmd), "select_stations %s", data->mac);
     FURI_LOG_I(TAG, "Sending: %s", cmd);
     uart_send_command(app, cmd);
