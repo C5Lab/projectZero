@@ -323,24 +323,51 @@ void screen_wifi_scan_destroy(View* view) {
     view_free(view);
 }
 
+// ============================================================================
+// Attack Item Filtering (Red Team mode)
+// ============================================================================
+
+typedef struct {
+    const char* label;
+    uint8_t attack_id; // 0=Deauth,1=EvilTwin,2=SAE,3=Handshaker,4=Sniffer,5=RogueAP,6=ARP
+    bool red_team_only;
+} AttackMenuItem;
+
+static const AttackMenuItem all_attack_items[] = {
+    {"Deauth",        0, true},
+    {"Evil Twin",     1, true},
+    {"SAE Overflow",  2, true},
+    {"Handshaker",    3, true},
+    {"Sniffer",       4, false},
+    {"Rogue AP",      5, true},
+    {"ARP Poisoning", 6, true},
+};
+#define ALL_ATTACK_ITEM_COUNT 7
+
+static uint8_t get_visible_attack_items(WiFiApp* app, AttackMenuItem* out, uint8_t max_out) {
+    uint8_t count = 0;
+    for(uint8_t i = 0; i < ALL_ATTACK_ITEM_COUNT && count < max_out; i++) {
+        if(app->red_team_mode || !all_attack_items[i].red_team_only) {
+            out[count++] = all_attack_items[i];
+        }
+    }
+    return count;
+}
+
+// ============================================================================
+// Attack Selection Screen
+// ============================================================================
+
 static void attack_selection_draw(Canvas* canvas, void* model) {
     AttackSelectionModel* m = (AttackSelectionModel*)model;
     if(!m) return;
     
     canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
-    screen_draw_title(canvas, "Select Attack");
+    screen_draw_title(canvas, m->app->red_team_mode ? "Select Attack" : "Select Test");
     
-    const char* attacks[] = {
-        "Deauth",
-        "Evil Twin",
-        "SAE Overflow",
-        "Handshaker",
-        "Sniffer",
-        "Rogue AP",
-        "ARP Poisoning"
-    };
-    const uint8_t attack_count = 7;
+    AttackMenuItem visible[ALL_ATTACK_ITEM_COUNT];
+    uint8_t attack_count = get_visible_attack_items(m->app, visible, ALL_ATTACK_ITEM_COUNT);
     
     canvas_set_font(canvas, FontSecondary);
     uint8_t y = 22;
@@ -355,10 +382,10 @@ static void attack_selection_draw(Canvas* canvas, void* model) {
         if(i == m->attack_type) {
             canvas_draw_box(canvas, 0, display_y - 8, 128, 10);
             canvas_set_color(canvas, ColorWhite);
-            canvas_draw_str(canvas, 2, display_y, attacks[i]);
+            canvas_draw_str(canvas, 2, display_y, visible[i].label);
             canvas_set_color(canvas, ColorBlack);
         } else {
-            canvas_draw_str(canvas, 2, display_y, attacks[i]);
+            canvas_draw_str(canvas, 2, display_y, visible[i].label);
         }
     }
 }
@@ -376,6 +403,9 @@ static bool attack_selection_input(InputEvent* event, void* context) {
         return false;
     }
     
+    AttackMenuItem visible[ALL_ATTACK_ITEM_COUNT];
+    uint8_t item_count = get_visible_attack_items(app, visible, ALL_ATTACK_ITEM_COUNT);
+    
     if(event->type != InputTypePress && event->type != InputTypeRepeat) {
         view_commit_model(view, false);
         return false;
@@ -386,13 +416,16 @@ static bool attack_selection_input(InputEvent* event, void* context) {
             m->attack_type--;
         }
     } else if(event->key == InputKeyDown) {
-        if(m->attack_type < 6) {
+        if(item_count > 0 && m->attack_type < item_count - 1) {
             m->attack_type++;
         }
     } else if(event->key == InputKeyOk) {
-        // Start selected attack - release lock before creating new view
-        uint8_t attack_type = m->attack_type;
+        // Map visual index to real attack type
+        uint8_t visual_idx = m->attack_type;
         view_commit_model(view, false);
+        
+        if(visual_idx >= item_count) return true;
+        uint8_t attack_type = visible[visual_idx].attack_id;
         
         // Rogue AP and ARP Poisoning require exactly 1 selected network
         if((attack_type == 5 || attack_type == 6) && app->selected_count != 1) {

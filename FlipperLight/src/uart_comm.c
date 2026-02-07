@@ -24,7 +24,7 @@ static void uart_serial_irq(FuriHalSerialHandle* handle, FuriHalSerialRxEvent ev
 // CSV Parsing for network scan results
 //=============================================================================
 
-static bool csv_next_quoted_field(const char** p, char* out, size_t out_size) {
+bool csv_next_quoted_field(const char** p, char* out, size_t out_size) {
     if(!p || !*p || !out || out_size == 0) return false;
 
     const char* s = *p;

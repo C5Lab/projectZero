@@ -82,6 +82,9 @@ struct WiFiApp {
     uint32_t evil_twin_html_selection;
     char** html_files;
     uint32_t html_file_count;
+    
+    // Settings
+    bool red_team_mode;
 };
 
 // App entry point

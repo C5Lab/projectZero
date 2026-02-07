@@ -13,6 +13,10 @@ extern View* screen_sniff_karma_menu_create(WiFiApp* app);
 extern View* screen_bluetooth_menu_create(WiFiApp* app);
 extern View* screen_deauth_detector_create(WiFiApp* app, void** out_data);
 extern void deauth_detector_cleanup_internal(View* view, void* data);
+extern View* screen_settings_menu_create(WiFiApp* app, void** out_data);
+extern void settings_menu_cleanup_internal(View* view, void* data);
+extern View* screen_compromised_data_menu_create(WiFiApp* app, void** out_data);
+extern void compromised_data_menu_cleanup_internal(View* view, void* data);
 
 typedef struct {
     WiFiApp* app;
@@ -38,9 +42,10 @@ static void main_menu_draw(Canvas* canvas, void* model) {
         return;
     }
     
+    bool rt = m->data->app->red_team_mode;
     const char* items[] = {
-        "WiFi Scan & Attack",
-        "Global WiFi Attacks",
+        rt ? "WiFi Scan & Attack" : "WiFi Scan & Test",
+        rt ? "Global WiFi Attacks" : "Global WiFi Tests",
         "WiFi Sniff&Karma",
         "Deauth Detector",
         "Bluetooth",
@@ -140,11 +145,23 @@ static bool main_menu_input(InputEvent* event, void* context) {
             FURI_LOG_I(TAG, "Creating Bluetooth menu");
             next_screen = screen_bluetooth_menu_create(app);
         } else if(sel == 5) {
-            // Compromised Data - TODO
-            FURI_LOG_I(TAG, "Compromised Data - not implemented");
+            // Compromised Data
+            FURI_LOG_I(TAG, "Creating Compromised Data menu");
+            void* cd_data = NULL;
+            next_screen = screen_compromised_data_menu_create(app, &cd_data);
+            if(next_screen && cd_data) {
+                screen_push_with_cleanup(app, next_screen, compromised_data_menu_cleanup_internal, cd_data);
+                return true;
+            }
         } else if(sel == 6) {
-            // Settings - TODO
-            FURI_LOG_I(TAG, "Settings - not implemented");
+            // Settings
+            FURI_LOG_I(TAG, "Creating Settings menu");
+            void* settings_data = NULL;
+            next_screen = screen_settings_menu_create(app, &settings_data);
+            if(next_screen && settings_data) {
+                screen_push_with_cleanup(app, next_screen, settings_menu_cleanup_internal, settings_data);
+                return true;
+            }
         }
         
         if(next_screen) {

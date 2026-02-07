@@ -3,6 +3,7 @@
 #include "screen_main_menu.h"
 #include "screen.h"
 #include <furi_hal.h>
+#include <storage/storage.h>
 #include <string.h>
 
 int32_t wifi_attacks_app(void* p) {
@@ -60,6 +61,22 @@ int32_t wifi_attacks_app(void* p) {
     app->html_files = NULL;
     app->html_file_count = 0;
     app->evil_twin_password = furi_string_alloc();
+    
+    // Load red team mode from persistent storage
+    app->red_team_mode = false;
+    {
+        Storage* storage = furi_record_open(RECORD_STORAGE);
+        File* file = storage_file_alloc(storage);
+        if(storage_file_open(file, APP_DATA_PATH("redteam.conf"), FSAM_READ, FSOM_OPEN_EXISTING)) {
+            uint8_t val = 0;
+            if(storage_file_read(file, &val, 1) == 1) {
+                app->red_team_mode = (val == 1);
+            }
+        }
+        storage_file_close(file);
+        storage_file_free(file);
+        furi_record_close(RECORD_STORAGE);
+    }
     
     // Create and push main menu with cleanup
     void* main_menu_data = NULL;

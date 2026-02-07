@@ -31,6 +31,13 @@ App(
         "src/screen_wifi_scan.c",
         "src/screen_rogue_ap.c",
         "src/screen_arp_poisoning.c",
+        "src/screen_settings.c",
+        "src/screen_settings_scan_time.c",
+        "src/screen_settings_redteam.c",
+        "src/screen_compromised_data.c",
+        "src/screen_evil_twin_passwords.c",
+        "src/screen_portal_data.c",
+        "src/screen_handshakes.c",
         "src/uart_comm.c",
     ],
 )
