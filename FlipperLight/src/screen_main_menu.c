@@ -11,6 +11,8 @@
 extern View* screen_global_attacks_menu_create(WiFiApp* app);
 extern View* screen_sniff_karma_menu_create(WiFiApp* app);
 extern View* screen_bluetooth_menu_create(WiFiApp* app);
+extern View* screen_deauth_detector_create(WiFiApp* app, void** out_data);
+extern void deauth_detector_cleanup_internal(View* view, void* data);
 
 typedef struct {
     WiFiApp* app;
@@ -36,10 +38,11 @@ static void main_menu_draw(Canvas* canvas, void* model) {
         "WiFi Scan & Attack",
         "Global WiFi Attacks",
         "WiFi Sniff&Karma",
+        "Deauth Detector",
         "WiFi Monitor",
         "Bluetooth"
     };
-    const uint8_t item_count = 5;
+    const uint8_t item_count = 6;
     const uint8_t item_height = 10;
     const uint8_t start_y = 22;
     
@@ -89,7 +92,7 @@ static bool main_menu_input(InputEvent* event, void* context) {
             m->selected--;
         }
     } else if(event->key == InputKeyDown) {
-        if(m->selected < 4) {
+        if(m->selected < 5) {
             m->selected++;
         }
     } else if(event->key == InputKeyOk) {
@@ -112,9 +115,18 @@ static bool main_menu_input(InputEvent* event, void* context) {
             FURI_LOG_I(TAG, "Creating Sniff & Karma menu");
             next_screen = screen_sniff_karma_menu_create(app);
         } else if(sel == 3) {
+            // Deauth Detector
+            FURI_LOG_I(TAG, "Creating Deauth Detector screen");
+            void* detector_data = NULL;
+            next_screen = screen_deauth_detector_create(app, &detector_data);
+            if(next_screen && detector_data) {
+                screen_push_with_cleanup(app, next_screen, deauth_detector_cleanup_internal, detector_data);
+                return true;
+            }
+        } else if(sel == 4) {
             // WiFi Monitor - TODO
             FURI_LOG_I(TAG, "WiFi Monitor - not implemented");
-        } else if(sel == 4) {
+        } else if(sel == 5) {
             // Bluetooth
             FURI_LOG_I(TAG, "Creating Bluetooth menu");
             next_screen = screen_bluetooth_menu_create(app);
@@ -151,6 +163,10 @@ static void check_connection_timer_callback(void* context) {
     if(!m->app->board_connected) {
         if(uart_check_board_connection(m->app)) {
             m->app->board_connected = true;
+            // Stop timer once board is connected - no need to keep pinging
+            if(m->check_connection_timer) {
+                furi_timer_stop(m->check_connection_timer);
+            }
             view_commit_model(view, true);
         } else {
             view_commit_model(view, false);

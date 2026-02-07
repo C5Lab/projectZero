@@ -47,6 +47,9 @@ View* screen_rogue_ap_create(WiFiApp* app, void** out_data);
 // ARP Poisoning - connects to network, scans hosts, poisons ARP
 View* screen_arp_poisoning_create(WiFiApp* app, void** out_data);
 
+// Deauth Detector - monitors for deauthentication attacks
+View* screen_deauth_detector_create(WiFiApp* app, void** out_data);
+
 // ============================================================================
 // Cleanup Functions (for use with screen_push_with_cleanup)
 // ============================================================================
@@ -58,3 +61,4 @@ void handshaker_cleanup(View* view, void* data);
 void sniffer_cleanup(View* view, void* data);
 void rogue_ap_cleanup_internal(View* view, void* data);
 void arp_poisoning_cleanup_internal(View* view, void* data);
+void deauth_detector_cleanup_internal(View* view, void* data);

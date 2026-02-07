@@ -16,6 +16,7 @@ App(
         "src/screen_blackout.c",
         "src/screen_bluetooth.c",
         "src/screen_deauth.c",
+        "src/screen_deauth_detector.c",
         "src/screen_evil_twin.c",
         "src/screen_global_attacks.c",
         "src/screen_global_handshaker.c",
