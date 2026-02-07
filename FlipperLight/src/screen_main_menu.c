@@ -16,19 +16,23 @@ extern void deauth_detector_cleanup_internal(View* view, void* data);
 
 typedef struct {
     WiFiApp* app;
-    uint8_t selected;
     FuriTimer* check_connection_timer;
+} MainMenuData;
+
+typedef struct {
+    MainMenuData* data;
+    uint8_t selected;
 } MainMenuModel;
 
 static void main_menu_draw(Canvas* canvas, void* model) {
     MainMenuModel* m = (MainMenuModel*)model;
-    if(!m) return;
+    if(!m || !m->data) return;
     
     canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
     screen_draw_title(canvas, "C5Lab");
     
-    if(!m->app->board_connected) {
+    if(!m->data->app->board_connected) {
         canvas_set_font(canvas, FontSecondary);
         screen_draw_centered_text(canvas, "Connect Board", 32);
         return;
@@ -39,16 +43,24 @@ static void main_menu_draw(Canvas* canvas, void* model) {
         "Global WiFi Attacks",
         "WiFi Sniff&Karma",
         "Deauth Detector",
-        "WiFi Monitor",
-        "Bluetooth"
+        "Bluetooth",
+        "Compromised Data",
+        "Settings"
     };
-    const uint8_t item_count = 6;
-    const uint8_t item_height = 10;
-    const uint8_t start_y = 22;
+    const uint8_t item_count = 7;
+    const uint8_t item_height = 9;
+    const uint8_t start_y = 24;
+    const uint8_t max_visible = 5; // Maximum items that fit on screen
+    
+    // Calculate scroll offset
+    uint8_t scroll_start = 0;
+    if(m->selected >= max_visible) {
+        scroll_start = m->selected - max_visible + 1;
+    }
     
     canvas_set_font(canvas, FontSecondary);
-    for(uint8_t i = 0; i < item_count; i++) {
-        uint8_t y = start_y + (i * item_height);
+    for(uint8_t i = scroll_start; i < item_count && (i - scroll_start) < max_visible; i++) {
+        uint8_t y = start_y + ((i - scroll_start) * item_height);
         if(i == m->selected) {
             canvas_draw_box(canvas, 0, y - 8, 128, 10);
             canvas_set_color(canvas, ColorWhite);
@@ -65,9 +77,9 @@ static bool main_menu_input(InputEvent* event, void* context) {
     if(!view) return false;
     
     MainMenuModel* m = view_get_model(view);
-    if(!m) return false;
+    if(!m || !m->data) return false;
     
-    WiFiApp* app = m->app;
+    WiFiApp* app = m->data->app;
     
     if(event->type != InputTypePress && event->type != InputTypeRepeat) {
         view_commit_model(view, false);
@@ -92,7 +104,7 @@ static bool main_menu_input(InputEvent* event, void* context) {
             m->selected--;
         }
     } else if(event->key == InputKeyDown) {
-        if(m->selected < 5) {
+        if(m->selected < 6) {
             m->selected++;
         }
     } else if(event->key == InputKeyOk) {
@@ -124,12 +136,15 @@ static bool main_menu_input(InputEvent* event, void* context) {
                 return true;
             }
         } else if(sel == 4) {
-            // WiFi Monitor - TODO
-            FURI_LOG_I(TAG, "WiFi Monitor - not implemented");
-        } else if(sel == 5) {
             // Bluetooth
             FURI_LOG_I(TAG, "Creating Bluetooth menu");
             next_screen = screen_bluetooth_menu_create(app);
+        } else if(sel == 5) {
+            // Compromised Data - TODO
+            FURI_LOG_I(TAG, "Compromised Data - not implemented");
+        } else if(sel == 6) {
+            // Settings - TODO
+            FURI_LOG_I(TAG, "Settings - not implemented");
         }
         
         if(next_screen) {
@@ -151,49 +166,64 @@ static bool main_menu_input(InputEvent* event, void* context) {
 }
 
 static void check_connection_timer_callback(void* context) {
-    View* view = (View*)context;
-    if(!view) return;
+    MainMenuData* data = (MainMenuData*)context;
+    if(!data || !data->app) return;
     
-    MainMenuModel* m = view_get_model(view);
-    if(!m) {
-        view_commit_model(view, false);
-        return;
-    }
-    
-    if(!m->app->board_connected) {
-        if(uart_check_board_connection(m->app)) {
-            m->app->board_connected = true;
+    if(!data->app->board_connected) {
+        if(uart_check_board_connection(data->app)) {
+            data->app->board_connected = true;
             // Stop timer once board is connected - no need to keep pinging
-            if(m->check_connection_timer) {
-                furi_timer_stop(m->check_connection_timer);
+            if(data->check_connection_timer) {
+                furi_timer_stop(data->check_connection_timer);
             }
-            view_commit_model(view, true);
-        } else {
-            view_commit_model(view, false);
         }
-    } else {
-        view_commit_model(view, false);
     }
 }
 
-View* screen_main_menu_create(WiFiApp* app) {
+void main_menu_cleanup_internal(View* view, void* data) {
+    UNUSED(view);
+    MainMenuData* d = (MainMenuData*)data;
+    if(!d) return;
+    
+    FURI_LOG_I(TAG, "Main menu cleanup starting");
+    
+    if(d->check_connection_timer) {
+        furi_timer_stop(d->check_connection_timer);
+        furi_timer_free(d->check_connection_timer);
+    }
+    
+    free(d);
+    FURI_LOG_I(TAG, "Main menu cleanup complete");
+}
+
+View* screen_main_menu_create(WiFiApp* app, void** out_data) {
+    MainMenuData* data = (MainMenuData*)malloc(sizeof(MainMenuData));
+    if(!data) return NULL;
+    
+    data->app = app;
+    data->check_connection_timer = NULL;
+    
     View* view = view_alloc();
-    if(!view) return NULL;
+    if(!view) {
+        free(data);
+        return NULL;
+    }
     
     view_allocate_model(view, ViewModelTypeLocking, sizeof(MainMenuModel));
     
     MainMenuModel* m = view_get_model(view);
     if(!m) {
+        free(data);
         view_free(view);
         return NULL;
     }
-    m->app = app;
+    m->data = data;
     m->selected = 0;
     
     // Create timer to check board connection periodically
-    m->check_connection_timer = furi_timer_alloc(check_connection_timer_callback, FuriTimerTypePeriodic, view);
-    if(m->check_connection_timer) {
-        furi_timer_start(m->check_connection_timer, 1000); // Check every second
+    data->check_connection_timer = furi_timer_alloc(check_connection_timer_callback, FuriTimerTypePeriodic, data);
+    if(data->check_connection_timer) {
+        furi_timer_start(data->check_connection_timer, 1000); // Check every second
     }
     
     view_commit_model(view, true);
@@ -202,18 +232,12 @@ View* screen_main_menu_create(WiFiApp* app) {
     view_set_input_callback(view, main_menu_input);
     view_set_context(view, view);  // Pass view as context so input can access model
     
+    if(out_data) *out_data = data;
+    
     return view;
 }
 
 void screen_main_menu_destroy(View* view) {
-    if(!view) return;
-    
-    MainMenuModel* m = view_get_model(view);
-    if(m && m->check_connection_timer) {
-        furi_timer_stop(m->check_connection_timer);
-        furi_timer_free(m->check_connection_timer);
-    }
-    view_commit_model(view, false);
-    
-    view_free(view);
+    // This is never called - cleanup is done via main_menu_cleanup_internal
+    UNUSED(view);
 }

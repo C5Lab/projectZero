@@ -26,7 +26,6 @@ int32_t wifi_attacks_app(void* p) {
     }
     app->view_stack = view_stack_alloc();
     
-    view_dispatcher_enable_queue(app->view_dispatcher);
     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
     
     // Initialize UART
@@ -62,8 +61,9 @@ int32_t wifi_attacks_app(void* p) {
     app->html_file_count = 0;
     app->evil_twin_password = furi_string_alloc();
     
-    // Create and push main menu
-    View* main_menu = screen_main_menu_create(app);
+    // Create and push main menu with cleanup
+    void* main_menu_data = NULL;
+    View* main_menu = screen_main_menu_create(app, &main_menu_data);
     if(!main_menu) {
         uart_comm_deinit(app);
         view_dispatcher_free(app->view_dispatcher);
@@ -72,7 +72,9 @@ int32_t wifi_attacks_app(void* p) {
         free(app);
         return -1;
     }
-    screen_push(app, main_menu);
+    
+    // Use screen_push_with_cleanup for main menu too
+    screen_push_with_cleanup(app, main_menu, main_menu_cleanup_internal, main_menu_data);
     
     // Run the ViewDispatcher event loop
     view_dispatcher_run(app->view_dispatcher);
