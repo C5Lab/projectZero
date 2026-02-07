@@ -47,6 +47,7 @@ struct PortalData {
     bool ssid_entered;
     bool text_input_shown;
     View* main_view;
+    FuriTimer* auto_show_timer;
 };
 
 typedef struct {
@@ -65,6 +66,12 @@ static void portal_cleanup_internal(View* view, void* data) {
     FURI_LOG_I(TAG, "Cleanup starting");
     
     d->attack_finished = true;
+    
+    if(d->auto_show_timer) {
+        furi_timer_stop(d->auto_show_timer);
+        furi_timer_free(d->auto_show_timer);
+    }
+    
     if(d->thread) {
         furi_thread_join(d->thread);
         furi_thread_free(d->thread);
@@ -125,6 +132,13 @@ static void portal_show_text_input(PortalData* data) {
     view_dispatcher_switch_to_view(data->app->view_dispatcher, PORTAL_TEXT_INPUT_VIEW_ID);
 }
 
+static void portal_auto_show_timer_callback(void* context) {
+    PortalData* data = (PortalData*)context;
+    if(data && !data->text_input_shown) {
+        portal_show_text_input(data);
+    }
+}
+
 // ============================================================================
 // Drawing
 // ============================================================================
@@ -138,13 +152,7 @@ static void portal_draw(Canvas* canvas, void* model) {
     canvas_set_font(canvas, FontPrimary);
     
     if(data->state == 0) {
-        // Auto-show TextInput on first entry
-        if(!data->text_input_shown) {
-            portal_show_text_input(data);
-            return;
-        }
-
-        // Prompt to enter SSID
+        // Prompt to enter SSID (TextInput shown on OK press)
         screen_draw_title(canvas, "Portal");
         canvas_set_font(canvas, FontSecondary);
         screen_draw_centered_text(canvas, "Press OK to enter SSID", 32);
@@ -347,7 +355,7 @@ static int32_t portal_thread(void* context) {
     uart_clear_buffer(app);
     
     // Start portal
-    snprintf(cmd, sizeof(cmd), "start_portal %s", data->ssid);
+    snprintf(cmd, sizeof(cmd), "start_portal \"%s\"", data->ssid);
     FURI_LOG_I(TAG, "Sending: %s", cmd);
     uart_send_command(app, cmd);
     
@@ -430,6 +438,10 @@ View* portal_screen_create(WiFiApp* app, void** out_data) {
         );
         FURI_LOG_I(TAG, "TextInput created");
     }
+    
+    // Auto-show TextInput after a short delay (safe - view will be pushed by then)
+    data->auto_show_timer = furi_timer_alloc(portal_auto_show_timer_callback, FuriTimerTypeOnce, data);
+    furi_timer_start(data->auto_show_timer, 100);
     
     // Start thread
     data->thread = furi_thread_alloc();
