@@ -43,6 +43,8 @@ static void main_menu_draw(Canvas* canvas, void* model) {
     }
     
     bool rt = m->data->app->red_team_mode;
+    bool no_sd = m->data->app->sd_card_checked && !m->data->app->sd_card_ok;
+    
     const char* items[] = {
         rt ? "WiFi Scan & Attack" : "WiFi Scan & Test",
         rt ? "Global WiFi Attacks" : "Global WiFi Tests",
@@ -55,7 +57,7 @@ static void main_menu_draw(Canvas* canvas, void* model) {
     const uint8_t item_count = 7;
     const uint8_t item_height = 9;
     const uint8_t start_y = 24;
-    const uint8_t max_visible = 5; // Maximum items that fit on screen
+    const uint8_t max_visible = no_sd ? 4 : 5; // Leave room for SD warning
     
     // Calculate scroll offset
     uint8_t scroll_start = 0;
@@ -74,6 +76,12 @@ static void main_menu_draw(Canvas* canvas, void* model) {
         } else {
             canvas_draw_str(canvas, 2, y, items[i]);
         }
+    }
+    
+    // Show SD card warning at bottom
+    if(no_sd) {
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str(canvas, 2, 64, "! No SD card on board");
     }
 }
 
@@ -189,6 +197,13 @@ static void check_connection_timer_callback(void* context) {
     if(!data->app->board_connected) {
         if(uart_check_board_connection(data->app)) {
             data->app->board_connected = true;
+            
+            // Check SD card on first connection
+            if(!data->app->sd_card_checked) {
+                data->app->sd_card_ok = uart_check_sd_card(data->app);
+                data->app->sd_card_checked = true;
+            }
+            
             // Stop timer once board is connected - no need to keep pinging
             if(data->check_connection_timer) {
                 furi_timer_stop(data->check_connection_timer);

@@ -3,6 +3,7 @@
 #include "screen_main_menu.h"
 #include "screen.h"
 #include <furi_hal.h>
+#include <furi_hal_power.h>
 #include <storage/storage.h>
 #include <string.h>
 
@@ -29,12 +30,25 @@ int32_t wifi_attacks_app(void* p) {
     
     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
     
+    // Enable 5V power output on GPIO to power the ESP32 board
+    if(furi_hal_power_is_otg_enabled()) {
+        // Already enabled, nothing to do
+    } else {
+        furi_hal_power_enable_otg();
+    }
+    
     // Initialize UART
     uart_comm_init(app);
     
     // Check initial board connection
     furi_delay_ms(500); // Give board time to initialize
     app->board_connected = uart_check_board_connection(app);
+    
+    // If board connected, check SD card
+    if(app->board_connected) {
+        app->sd_card_ok = uart_check_sd_card(app);
+        app->sd_card_checked = true;
+    }
     
     // Initialize app state
     app->networks = NULL;
@@ -98,6 +112,11 @@ int32_t wifi_attacks_app(void* p) {
     
     // Cleanup - remove all views first
     screen_pop_all(app);
+    
+    // Disable 5V GPIO power output
+    if(furi_hal_power_is_otg_enabled()) {
+        furi_hal_power_disable_otg();
+    }
     
     uart_comm_deinit(app);
     

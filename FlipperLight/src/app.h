@@ -85,6 +85,10 @@ struct WiFiApp {
     
     // Settings
     bool red_team_mode;
+    
+    // Board SD card status
+    bool sd_card_ok;
+    bool sd_card_checked;
 };
 
 // App entry point

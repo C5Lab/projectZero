@@ -209,6 +209,43 @@ bool uart_check_board_connection(WiFiApp* app) {
 }
 
 //=============================================================================
+// SD Card Check
+//=============================================================================
+
+bool uart_check_sd_card(WiFiApp* app) {
+    if(!app || !app->serial) return false;
+    
+    uart_clear_buffer(app);
+    uart_send_command(app, "list_sd");
+    
+    uint32_t timeout = furi_get_tick() + 3000; // 3 second timeout
+    FuriString* line = furi_string_alloc();
+    bool sd_ok = false;
+    
+    while(furi_get_tick() < timeout) {
+        if(uart_read_line_internal(app, line)) {
+            const char* line_str = furi_string_get_cstr(line);
+            FURI_LOG_I(TAG, "SD check: %s", line_str);
+            
+            // If we see "Failed to initialize SD card" - no SD
+            if(strstr(line_str, "Failed to initialize SD card")) {
+                FURI_LOG_W(TAG, "SD card not found");
+                furi_string_free(line);
+                return false;
+            }
+            // If we see "HTML files" header or a numbered file - SD is OK
+            if(strstr(line_str, "HTML files") || (line_str[0] >= '1' && line_str[0] <= '9')) {
+                sd_ok = true;
+            }
+        }
+    }
+    
+    furi_string_free(line);
+    FURI_LOG_I(TAG, "SD card check result: %s", sd_ok ? "OK" : "not detected");
+    return sd_ok;
+}
+
+//=============================================================================
 // UART Init / Deinit
 //=============================================================================
 

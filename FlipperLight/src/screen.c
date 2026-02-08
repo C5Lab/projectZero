@@ -157,7 +157,7 @@ void screen_draw_title(Canvas* canvas, const char* title) {
     uint8_t mlen = strlen(mem_str);
     uint8_t mx = 126 - (mlen * 6);
     if(mx > 20) {
-        canvas_draw_str(canvas, mx, 10, mem_str);
+        //canvas_draw_str(canvas, mx, 10, mem_str);
     }
     canvas_draw_line(canvas, 0, 11, 128, 11);
 }
