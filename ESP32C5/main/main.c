@@ -102,7 +102,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.3.1"
+#define JANOS_VERSION "1.3.2"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -11475,6 +11475,29 @@ void app_main(void) {
         report_ssid_file_status();
         if (vendor_is_enabled()) {
             ensure_vendor_file_checked();
+        }
+        // Check for wpa-sec API key file on SD card
+        {
+            FILE *wf = fopen("/sdcard/lab/wpa-sec.txt", "r");
+            if (wf) {
+                static char line[256];
+                memset(line, 0, sizeof(line));
+                if (fgets(line, sizeof(line), wf)) {
+                    // Strip trailing newline/carriage return
+                    size_t ln = strlen(line);
+                    while (ln > 0 && (line[ln - 1] == '\n' || line[ln - 1] == '\r')) {
+                        line[--ln] = '\0';
+                    }
+                    if (ln > 0) {
+                        if (wpasec_save_key_to_nvs(line)) {
+                            MY_LOG_INFO(TAG, "wpa-sec key updated from SD card into NVS.");
+                        } else {
+                            MY_LOG_INFO(TAG, "Failed to save wpa-sec key from SD card to NVS.");
+                        }
+                    }
+                }
+                fclose(wf);
+            }
         }
     } else {
         MY_LOG_INFO(TAG, "");
