@@ -52,6 +52,7 @@
 
 #include "esp_http_server.h"
 #include "esp_http_client.h"
+#include "esp_tls.h"
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
 #include "esp_crt_bundle.h"
@@ -101,7 +102,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.3.0"
+#define JANOS_VERSION "1.3.1"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -114,6 +115,13 @@
 #define OTA_NVS_KEY_CHANNEL "channel"
 #define OTA_DEV_BRANCH "development"
 #define OTA_PROJECT_NAME "projectZero"
+
+// WPA-SEC cloud upload
+#define WPASEC_NVS_NAMESPACE "wpasec"
+#define WPASEC_NVS_KEY       "api_key"
+#define WPASEC_URL           "https://wpa-sec.stanev.org/"
+#define WPASEC_KEY_MAX_LEN   65
+
 
 
 #define NEOPIXEL_GPIO      27
@@ -231,6 +239,9 @@ static volatile bool operation_stop_requested = false;
 
 // wifi_connect command state: 0 = pending, 1 = success, -1 = failed
 static volatile int wifi_connect_result = 0;
+
+// WPA-SEC API key (loaded from NVS on boot)
+static char wpasec_api_key[WPASEC_KEY_MAX_LEN] = "";
 
 // ARP ban state
 static volatile bool arp_ban_active = false;
@@ -1079,6 +1090,8 @@ static int cmd_reboot(int argc, char **argv);
 static int cmd_led(int argc, char **argv);
 static int cmd_vendor(int argc, char **argv);
 static int cmd_download(int argc, char **argv);
+static int cmd_wpasec_key(int argc, char **argv);
+static int cmd_wpasec_upload(int argc, char **argv);
 static int cmd_channel_time(int argc, char **argv);
 static int cmd_ota_check(int argc, char **argv);
 static int cmd_ota_list(int argc, char **argv);
@@ -2178,6 +2191,40 @@ static bool ota_save_channel_to_nvs(const char *channel) {
     nvs_close(handle);
     return err == ESP_OK;
 }
+
+// --------------- WPA-SEC NVS helpers ---------------
+
+static void wpasec_load_key_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WPASEC_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return;
+    }
+
+    size_t len = sizeof(wpasec_api_key);
+    err = nvs_get_str(handle, WPASEC_NVS_KEY, wpasec_api_key, &len);
+    if (err != ESP_OK) {
+        wpasec_api_key[0] = '\0';
+    }
+    nvs_close(handle);
+}
+
+static bool wpasec_save_key_to_nvs(const char *key) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WPASEC_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    err = nvs_set_str(handle, WPASEC_NVS_KEY, key);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
+// ---------------------------------------------------
 
 static void ota_mark_valid_if_pending(void) {
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -4043,6 +4090,315 @@ static int cmd_save_handshake(int argc, char **argv) {
     }
 }
 
+// --------------- WPA-SEC commands ---------------
+
+static int cmd_wpasec_key(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: wpasec_key set <key> | wpasec_key read");
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "read") == 0) {
+        if (wpasec_api_key[0] == '\0') {
+            MY_LOG_INFO(TAG, "WPA-SEC key: not set");
+            MY_LOG_INFO(TAG, "Get your key at: https://wpa-sec.stanev.org/?get_key");
+        } else {
+            // Show first 4 chars, mask the rest
+            MY_LOG_INFO(TAG, "WPA-SEC key: %.4s****", wpasec_api_key);
+        }
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "set") == 0) {
+        if (argc < 3) {
+            MY_LOG_INFO(TAG, "Usage: wpasec_key set <key>");
+            MY_LOG_INFO(TAG, "Get your key at: https://wpa-sec.stanev.org/?get_key");
+            return 0;
+        }
+        const char *key = argv[2];
+        if (strlen(key) == 0 || strlen(key) >= WPASEC_KEY_MAX_LEN) {
+            MY_LOG_INFO(TAG, "Invalid key length (max %d chars)", WPASEC_KEY_MAX_LEN - 1);
+            return 1;
+        }
+        if (wpasec_save_key_to_nvs(key)) {
+            strncpy(wpasec_api_key, key, sizeof(wpasec_api_key) - 1);
+            wpasec_api_key[sizeof(wpasec_api_key) - 1] = '\0';
+            MY_LOG_INFO(TAG, "WPA-SEC key saved: %.4s****", wpasec_api_key);
+        } else {
+            MY_LOG_INFO(TAG, "Failed to save WPA-SEC key to NVS");
+            return 1;
+        }
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Usage: wpasec_key set <key> | wpasec_key read");
+    return 0;
+}
+
+/**
+ * @brief Write all data to esp_tls, handling partial writes
+ */
+static int wpasec_tls_write_all(esp_tls_t *tls, const char *buf, int len) {
+    int written = 0;
+    while (written < len) {
+        int ret = esp_tls_conn_write(tls, buf + written, len - written);
+        if (ret < 0) {
+            return ret;
+        }
+        written += ret;
+    }
+    return written;
+}
+
+/**
+ * @brief Upload a single .pcap file to wpa-sec.stanev.org
+ *
+ * Uses esp_tls directly (not esp_http_client) for full control over
+ * TLS settings, specifically to skip server certificate verification.
+ *
+ * @param filepath  Full path to .pcap file on SD card
+ * @param filename  Just the filename (for the Content-Disposition header)
+ * @return 0 on success, 1 on duplicate ("already submitted"), -1 on error
+ */
+static int wpasec_upload_file(const char *filepath, const char *filename) {
+    // Read file into memory
+    FILE *f = fopen(filepath, "rb");
+    if (!f) {
+        MY_LOG_INFO(TAG, "  Failed to open: %s", filepath);
+        return -1;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (file_size <= 0 || file_size > 512 * 1024) {
+        MY_LOG_INFO(TAG, "  Invalid file size: %ld bytes", file_size);
+        fclose(f);
+        return -1;
+    }
+
+    // Prefer PSRAM for file buffer
+    uint8_t *file_buf = NULL;
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > (size_t)file_size + 1024) {
+        file_buf = (uint8_t *)heap_caps_malloc((size_t)file_size, MALLOC_CAP_SPIRAM);
+    }
+    if (!file_buf) {
+        file_buf = (uint8_t *)malloc((size_t)file_size);
+    }
+    if (!file_buf) {
+        MY_LOG_INFO(TAG, "  Memory allocation failed (%ld bytes)", file_size);
+        fclose(f);
+        return -1;
+    }
+
+    size_t bytes_read = fread(file_buf, 1, (size_t)file_size, f);
+    fclose(f);
+
+    if (bytes_read != (size_t)file_size) {
+        MY_LOG_INFO(TAG, "  Read error: got %zu of %ld bytes", bytes_read, file_size);
+        free(file_buf);
+        return -1;
+    }
+
+    // Build multipart body parts
+    char boundary[32];
+    snprintf(boundary, sizeof(boundary), "----WpaSec%lu", (unsigned long)(esp_timer_get_time() / 1000));
+
+    char body_start[256];
+    int start_len = snprintf(body_start, sizeof(body_start),
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+        "Content-Type: application/octet-stream\r\n\r\n",
+        boundary, filename);
+
+    char body_end[48];
+    int end_len = snprintf(body_end, sizeof(body_end), "\r\n--%s--\r\n", boundary);
+
+    int body_total_len = start_len + (int)file_size + end_len;
+
+    // Build HTTP request headers
+    char http_headers[512];
+    int hdr_len = snprintf(http_headers, sizeof(http_headers),
+        "POST / HTTP/1.1\r\n"
+        "Host: wpa-sec.stanev.org\r\n"
+        "Cookie: key=%s\r\n"
+        "Content-Type: multipart/form-data; boundary=%s\r\n"
+        "Content-Length: %d\r\n"
+        "User-Agent: projectZero-wpasec\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        wpasec_api_key, boundary, body_total_len);
+
+    // Open TLS connection - skip server cert verification (insecure, like reference code)
+    esp_tls_cfg_t tls_cfg = {
+        .crt_bundle_attach = NULL,  // Skip certificate verification in ESP-IDF v6.0
+        .timeout_ms = 15000,
+    };
+
+    esp_tls_t *tls = esp_tls_init();
+    if (!tls) {
+        MY_LOG_INFO(TAG, "  TLS init failed");
+        free(file_buf);
+        return -1;
+    }
+
+    int ret = esp_tls_conn_http_new_sync(WPASEC_URL, &tls_cfg, tls);
+    if (ret < 0) {
+        MY_LOG_INFO(TAG, "  TLS connection failed");
+        esp_tls_conn_destroy(tls);
+        free(file_buf);
+        return -1;
+    }
+
+    // Send HTTP headers
+    if (wpasec_tls_write_all(tls, http_headers, hdr_len) < 0) {
+        MY_LOG_INFO(TAG, "  Failed to send HTTP headers");
+        esp_tls_conn_destroy(tls);
+        free(file_buf);
+        return -1;
+    }
+
+    // Send multipart body: start boundary + file data + end boundary
+    int write_ok = 1;
+    if (wpasec_tls_write_all(tls, body_start, start_len) < 0) write_ok = 0;
+    if (write_ok && wpasec_tls_write_all(tls, (const char *)file_buf, (int)file_size) < 0) write_ok = 0;
+    if (write_ok && wpasec_tls_write_all(tls, body_end, end_len) < 0) write_ok = 0;
+    free(file_buf);
+
+    if (!write_ok) {
+        MY_LOG_INFO(TAG, "  Failed to send body");
+        esp_tls_conn_destroy(tls);
+        return -1;
+    }
+
+    // Read response
+    char resp_buf[512] = {0};
+    int total_read = 0;
+    while (total_read < (int)sizeof(resp_buf) - 1) {
+        ret = esp_tls_conn_read(tls, resp_buf + total_read, sizeof(resp_buf) - 1 - total_read);
+        if (ret <= 0) break;
+        total_read += ret;
+    }
+    resp_buf[total_read] = '\0';
+
+    esp_tls_conn_destroy(tls);
+
+    // Parse HTTP status code from response (e.g. "HTTP/1.1 200 OK")
+    int status = 0;
+    if (total_read > 12 && strncmp(resp_buf, "HTTP/", 5) == 0) {
+        const char *sp = strchr(resp_buf, ' ');
+        if (sp) status = atoi(sp + 1);
+    }
+
+    if (status == 200) {
+        if (strstr(resp_buf, "already submitted") != NULL) {
+            return 1; // duplicate
+        }
+        return 0; // success
+    } else {
+        MY_LOG_INFO(TAG, "  HTTP error %d", status);
+        return -1;
+    }
+}
+
+static int cmd_wpasec_upload(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    // 1. Check WiFi STA is connected
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        MY_LOG_INFO(TAG, "Not connected to any AP. Use 'wifi_connect' first.");
+        return 1;
+    }
+
+    // 2. Check API key
+    if (wpasec_api_key[0] == '\0') {
+        MY_LOG_INFO(TAG, "No WPA-SEC API key set. Use 'wpasec_key set <key>' first.");
+        MY_LOG_INFO(TAG, "Get your key at: https://wpa-sec.stanev.org/?get_key");
+        return 1;
+    }
+
+    // 3. Init SD card and open handshakes directory
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    DIR *dir = opendir("/sdcard/lab/handshakes");
+    if (dir == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/handshakes directory");
+        return 1;
+    }
+
+    // Count .pcap files first
+    struct dirent *entry;
+    int total_files = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) continue;
+        size_t nlen = strlen(entry->d_name);
+        if (nlen > 5 && strcasecmp(entry->d_name + nlen - 5, ".pcap") == 0) {
+            total_files++;
+        }
+    }
+
+    if (total_files == 0) {
+        MY_LOG_INFO(TAG, "No .pcap files found in /sdcard/lab/handshakes/");
+        closedir(dir);
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Uploading %d handshake(s) to wpa-sec.stanev.org...", total_files);
+
+    // Rewind and process
+    rewinddir(dir);
+    int current = 0;
+    int uploaded = 0;
+    int duplicates = 0;
+    int failed = 0;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) continue;
+        size_t nlen = strlen(entry->d_name);
+        if (nlen <= 5 || strcasecmp(entry->d_name + nlen - 5, ".pcap") != 0) continue;
+
+        current++;
+        char filepath[280];
+        snprintf(filepath, sizeof(filepath), "/sdcard/lab/handshakes/%s", entry->d_name);
+
+        // Get file size for display
+        struct stat st;
+        long fsize = 0;
+        if (stat(filepath, &st) == 0) {
+            fsize = (long)st.st_size;
+        }
+
+        int result = wpasec_upload_file(filepath, entry->d_name);
+
+        if (result == 0) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", current, total_files, entry->d_name, fsize);
+            uploaded++;
+        } else if (result == 1) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> already submitted", current, total_files, entry->d_name, fsize);
+            duplicates++;
+        } else {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", current, total_files, entry->d_name, fsize);
+            failed++;
+        }
+
+        // Small delay between uploads to let WiFi stack settle
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    closedir(dir);
+
+    MY_LOG_INFO(TAG, "Done: %d uploaded, %d duplicate, %d failed", uploaded, duplicates, failed);
+    return (failed > 0) ? 1 : 0;
+}
+
+// -------------------------------------------------
+
 static int cmd_start_sae_overflow(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
@@ -5048,6 +5404,8 @@ static const cli_hint_t k_cli_hints[] = {
     { "file_delete", " <path>" },
     { "select_html", " <index>" },
     { "set_html", " <html>" },
+    { "wpasec_key", " set <key> | read" },
+    { "wpasec_upload", "" },
 };
 
 static const char *lookup_cli_hint(const char *command) {
@@ -10553,6 +10911,24 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&save_handshake_cmd));
 
+    const esp_console_cmd_t wpasec_key_cmd = {
+        .command = "wpasec_key",
+        .help = "Set/read wpa-sec.stanev.org API key: wpasec_key set <key> | wpasec_key read",
+        .hint = NULL,
+        .func = &cmd_wpasec_key,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wpasec_key_cmd));
+
+    const esp_console_cmd_t wpasec_upload_cmd = {
+        .command = "wpasec_upload",
+        .help = "Upload all .pcap handshakes from SD card to wpa-sec.stanev.org",
+        .hint = NULL,
+        .func = &cmd_wpasec_upload,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wpasec_upload_cmd));
+
        const esp_console_cmd_t sae_overflow_cmd = {
         .command = "sae_overflow",
         .help = "Starts SAE WPA3 Client Overflow attack.",
@@ -10932,6 +11308,7 @@ void app_main(void) {
 //     printf("Step 3: Init NVS\n");
     ESP_ERROR_CHECK(nvs_flash_init());
     ota_load_channel_from_nvs();
+    wpasec_load_key_from_nvs();
     ota_mark_valid_if_pending();
     ota_log_boot_info();
     //printf("NVS initialized OK\n");
@@ -11050,6 +11427,8 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  start_wardrive");
       MY_LOG_INFO(TAG,"  stop");
       MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
+      MY_LOG_INFO(TAG,"  wpasec_key set <key> | wpasec_key read");
+      MY_LOG_INFO(TAG,"  wpasec_upload");
 
     repl_config.prompt = ">";
     repl_config.max_cmdline_length = 100;
