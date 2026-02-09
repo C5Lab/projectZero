@@ -103,12 +103,12 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.3.3"
+#define JANOS_VERSION "1.3.4"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
 #define OTA_ASSET_NAME "projectZero.bin"
-#define OTA_HTTP_MAX_BODY (64 * 1024)
+#define OTA_HTTP_MAX_BODY (256 * 1024)
 #define OTA_TASK_STACK_SIZE 8192
 #define OTA_TASK_PRIORITY 5
 #define OTA_CHANNEL_MAX_LEN 8
@@ -1632,7 +1632,7 @@ static esp_err_t ota_http_get(const char *url, char **out_buf, size_t *out_len) 
         return ESP_FAIL;
     }
 
-    char *buf = calloc(1, OTA_HTTP_MAX_BODY + 1);
+    char *buf = heap_caps_calloc(1, OTA_HTTP_MAX_BODY + 1, MALLOC_CAP_SPIRAM);
     if (!buf) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
