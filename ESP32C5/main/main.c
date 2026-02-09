@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <ctype.h>
 
 #include "esp_heap_caps.h"
@@ -102,7 +103,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.3.2"
+#define JANOS_VERSION "1.3.3"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -950,6 +951,7 @@ static char (*sd_html_files)[MAX_HTML_FILENAME] = NULL;     // ~3.2 KB in PSRAM
 static int sd_html_count = 0;
 static char* custom_portal_html = NULL;
 static bool sd_card_mounted = false;
+static sdmmc_card_t *sd_card_handle = NULL;
 #define MAX_SSID_PRESETS 64
 #define MAX_SSID_NAME_LEN 32
 #define SSID_PRESET_PATH "/sdcard/lab/ssid.txt"
@@ -1170,6 +1172,8 @@ static void gps_load_state_from_nvs(void);
 static void gps_save_state_to_nvs(void);
 static esp_err_t init_sd_card(void);
 static esp_err_t create_sd_directories(void);
+static void sd_sync(void);
+static void safe_restart(void);
 static bool parse_gps_nmea(const char* nmea_sentence);
 static void get_timestamp_string(char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
@@ -2075,7 +2079,9 @@ static void ota_check_task(void *pvParameters) {
     ota_led_stop();
     if (err == ESP_OK) {
         MY_LOG_INFO(TAG, "OTA: update applied, restarting");
-        esp_restart();
+        ota_check_in_progress = false;
+        free(args);
+        safe_restart();  // unmount SD card before restart
     } else {
         MY_LOG_INFO(TAG, "OTA: update failed: %s", esp_err_to_name(err));
     }
@@ -5999,7 +6005,7 @@ static int cmd_ota_boot(int argc, char **argv) {
     }
 
     MY_LOG_INFO(TAG, "OTA: boot set to %s, restarting", target->label);
-    esp_restart();
+    safe_restart();  // unmount SD card before restart
     return 0;
 }
 
@@ -7630,8 +7636,7 @@ static int cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
     MY_LOG_INFO(TAG,"Restart...");
-    vTaskDelay(pdMS_TO_TICKS(100));
-    esp_restart();
+    safe_restart();  // unmount SD card before restart
     return 0;
 }
 
@@ -8304,6 +8309,7 @@ static int cmd_file_delete(int argc, char **argv)
         MY_LOG_INFO(TAG, "Failed to delete %s: %s", full_path, strerror(errno));
         return 1;
     }
+    sd_sync();
 
     MY_LOG_INFO(TAG, "Deleted %s", full_path);
     return 0;
@@ -8652,6 +8658,7 @@ static void wardrive_task(void *pvParameters) {
         
         // Close file to ensure data is written
         fclose(file);
+        sd_sync();
         
         if (scan_count > 0) {
             MY_LOG_INFO(TAG, "Logged %d networks to %s", scan_count, filename);
@@ -13014,6 +13021,31 @@ static void gps_load_state_from_nvs(void) {
     }
 }
 
+// Flush FAT filesystem buffers to SD card to ensure metadata consistency.
+// ESP-IDF newlib does not implement POSIX sync(), so we force a flush by
+// opening a temporary file, calling fsync() on its descriptor (which
+// triggers FatFs f_sync and flushes the FAT table), then removing it.
+static void sd_sync(void) {
+    int fd = open("/sdcard/.sync", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        fsync(fd);
+        close(fd);
+        unlink("/sdcard/.sync");
+    }
+}
+
+// Safely unmount SD card and restart to prevent FAT filesystem corruption
+static void safe_restart(void) {
+    if (sd_card_mounted && sd_card_handle) {
+        MY_LOG_INFO(TAG, "Unmounting SD card before restart...");
+        esp_vfs_fat_sdcard_unmount("/sdcard", sd_card_handle);
+        sd_card_mounted = false;
+        sd_card_handle = NULL;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_restart();
+}
+
 static esp_err_t init_sd_card(void) {
     esp_err_t ret;
     
@@ -13030,7 +13062,6 @@ static esp_err_t init_sd_card(void) {
         .disk_status_check_enable = false
     };
     
-    sdmmc_card_t *card;
     const char mount_point[] = "/sdcard";
     
     // Configure SPI bus (balanced for SD card requirements and memory)
@@ -13057,7 +13088,7 @@ static esp_err_t init_sd_card(void) {
     slot_config.gpio_cs = SD_CS_PIN;
     slot_config.host_id = host.slot;
     
-    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
+    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &sd_card_handle);
     
     if (ret != ESP_OK) {
         return ret;
@@ -13065,7 +13096,7 @@ static esp_err_t init_sd_card(void) {
     
     // Print card info
     MY_LOG_INFO(TAG, "SD card mounted successfully");
-    sdmmc_card_print_info(stdout, card);
+    sdmmc_card_print_info(stdout, sd_card_handle);
     
     // Test file creation to verify write access
     FILE *test_file = fopen("/sdcard/test.txt", "w");
@@ -13075,6 +13106,7 @@ static esp_err_t init_sd_card(void) {
         MY_LOG_INFO(TAG, "SD card write test successful");
         // Clean up test file
         unlink("/sdcard/test.txt");
+        sd_sync();
     } else {
         MY_LOG_INFO(TAG, "SD card write test failed, errno: %d (%s)", errno, strerror(errno));
     }
@@ -13098,6 +13130,7 @@ static esp_err_t create_sd_directories(void) {
             MY_LOG_INFO(TAG, "Failed to create /sdcard/lab directory: %s", strerror(errno));
             return ESP_FAIL;
         }
+        sd_sync();
         MY_LOG_INFO(TAG, "/sdcard/lab created successfully");
     } else {
         MY_LOG_INFO(TAG, "/sdcard/lab already exists");
@@ -13110,6 +13143,7 @@ static esp_err_t create_sd_directories(void) {
             MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/htmls directory: %s", strerror(errno));
             return ESP_FAIL;
         }
+        sd_sync();
         MY_LOG_INFO(TAG, "/sdcard/lab/htmls created successfully");
     } else {
         MY_LOG_INFO(TAG, "/sdcard/lab/htmls already exists");
@@ -13122,6 +13156,7 @@ static esp_err_t create_sd_directories(void) {
             MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/handshakes directory: %s", strerror(errno));
             return ESP_FAIL;
         }
+        sd_sync();
         MY_LOG_INFO(TAG, "/sdcard/lab/handshakes created successfully");
     } else {
         MY_LOG_INFO(TAG, "/sdcard/lab/handshakes already exists");
@@ -13134,6 +13169,7 @@ static esp_err_t create_sd_directories(void) {
             MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/wardrives directory: %s", strerror(errno));
             return ESP_FAIL;
         }
+        sd_sync();
         MY_LOG_INFO(TAG, "/sdcard/lab/wardrives created successfully");
     } else {
         MY_LOG_INFO(TAG, "/sdcard/lab/wardrives already exists");
@@ -13359,6 +13395,7 @@ static void save_evil_twin_password(const char* ssid, const char* password) {
     // Flush and close file to ensure data is written to disk
     fflush(file);
     fclose(file);
+    sd_sync();
     
     MY_LOG_INFO(TAG, "Password saved to eviltwin.txt");
 }
@@ -13408,6 +13445,7 @@ static void save_portal_data(const char* ssid, const char* form_data) {
     char *data_copy = strdup(form_data);
     if (data_copy == NULL) {
         fclose(file);
+        sd_sync();
         return;
     }
     
@@ -13418,6 +13456,7 @@ static void save_portal_data(const char* ssid, const char* form_data) {
         MY_LOG_INFO(TAG, "Memory allocation failed for temp_copy");
         free(data_copy);
         fclose(file);
+        sd_sync();
         return;
     }
     
@@ -13488,6 +13527,7 @@ static void save_portal_data(const char* ssid, const char* form_data) {
     // Flush and close file to ensure data is written to disk
     fflush(file);
     fclose(file);
+    sd_sync();
     
     free(data_copy);
     

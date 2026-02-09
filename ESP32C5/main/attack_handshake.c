@@ -10,6 +10,8 @@
 #include "attack_handshake.h"
 
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
 #define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
 #include "esp_log.h"
 #include "esp_err.h"
@@ -660,6 +662,17 @@ static void format_mac_suffix(const uint8_t *mac_addr, char *output) {
  * @return true if handshake was complete and saved successfully
  * @return false if no complete handshake or save failed
  */
+
+// Flush FAT filesystem buffers to SD card (ESP-IDF has no POSIX sync())
+static void sd_sync(void) {
+    int fd = open("/sdcard/.sync", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        fsync(fd);
+        close(fd);
+        unlink("/sdcard/.sync");
+    }
+}
+
 bool attack_handshake_save_to_sd() {
     printf("=== Attempting to save handshake to SD card ===\n");
     
@@ -701,6 +714,7 @@ bool attack_handshake_save_to_sd() {
     struct stat st = {0};
     if (stat("/sdcard/lab/handshakes", &st) == -1) {
         mkdir("/sdcard/lab/handshakes", 0700);
+        sd_sync();
         printf("Created /sdcard/lab/handshakes directory\n");
     }
     
@@ -733,6 +747,7 @@ bool attack_handshake_save_to_sd() {
     
     size_t written = fwrite(pcap_buf, 1, pcap_size, f);
     fclose(f);
+    sd_sync();
     
     if (written != pcap_size) {
         printf("✗ Failed to write complete PCAP (%zu/%u bytes)\n", written, pcap_size);
@@ -771,6 +786,7 @@ bool attack_handshake_save_to_sd() {
     
     written = fwrite(hccapx, 1, sizeof(hccapx_t), f);
     fclose(f);
+    sd_sync();
     
     if (written != sizeof(hccapx_t)) {
         printf("✗ Failed to write complete HCCAPX\n");
