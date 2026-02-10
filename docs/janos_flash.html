@@ -282,7 +282,7 @@
             <button id="connectBtn">Connect</button>
             <button id="flashBtn" class="ghost" disabled>Flash</button>
             <label class="check" title="Recommended for OTA partitions and clean flashing">
-              <input id="eraseAll" type="checkbox" checked>
+              <input id="eraseAll" type="checkbox">
               Erase
             </label>
             <select id="branchSelect" aria-label="Branch">
@@ -302,7 +302,7 @@
           </div>
           <div class="hint">
             <strong>Erase</strong> does a full flash erase <span class="mono">(esptool erase-flash)</span> before writing the images.
-            Use it when you have OTA partitions / old firmware and you see bootloops or slot errors.
+            Only enable it when you have OTA partitions / old firmware and you see bootloops or slot errors.
             Note: it wipes anything stored in flash (including NVS settings like Wi-Fi creds/config).
           </div>
           <div class="progress" aria-label="Flash progress">
