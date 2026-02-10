@@ -167,6 +167,17 @@
       color: var(--muted);
       font-size: 14px;
     }
+    .hint {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 12.5px;
+      line-height: 1.45;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.10);
+      background: rgba(255,255,255,0.02);
+    }
+    .hint strong { color: var(--text); }
     .pill {
       display: inline-flex;
       align-items: center;
@@ -288,6 +299,11 @@
             <span id="statusText">Ready to connect.</span>
             <span id="chipText" class="pill" style="display:none;"></span>
             <span id="manifestText" class="pill" style="display:none;"></span>
+          </div>
+          <div class="hint">
+            <strong>Erase</strong> does a full flash erase <span class="mono">(esptool erase-flash)</span> before writing the images.
+            Use it when you have OTA partitions / old firmware and you see bootloops or slot errors.
+            Note: it wipes anything stored in flash (including NVS settings like Wi-Fi creds/config).
           </div>
           <div class="progress" aria-label="Flash progress">
             <span id="progressBar"></span>
