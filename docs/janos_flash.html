@@ -361,7 +361,14 @@
       autoFlashTriggered: false,
     };
 
-    const PAGE_VERSION = "1.0.1";
+    const PAGE_VERSION = "1.0.2";
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // How long we keep trying to sync after the user picked a port.
+    // This is the window where you typically press BOOT+RESET / enter ROM mode.
+    const CONNECT_TIMEOUT_MS = 20000;
+    const CONNECT_RETRY_DELAY_MS = 500;
 
     const setFooterVersion = (manifest) => {
       if (!ui.pageVersion) return;
@@ -577,10 +584,30 @@
           },
           debugLogging: false,
         };
-        state.esploader = new ESPLoader(loaderOptions);
-        setStatus("Syncing with chip (hold BOOT + RESET to enter ROM)");
+        setStatus(`Syncing with chip (hold BOOT + RESET). Timeout ${Math.round(CONNECT_TIMEOUT_MS/1000)}s`);
         log("Syncing with chip");
-        state.chip = await state.esploader.main();
+
+        const start = Date.now();
+        let attempt = 0;
+        let lastErr = null;
+        while (Date.now() - start < CONNECT_TIMEOUT_MS) {
+          attempt += 1;
+          try {
+            state.esploader = new ESPLoader(loaderOptions);
+            log("Connecting...");
+            state.chip = await state.esploader.main();
+            lastErr = null;
+            break;
+          } catch (err) {
+            lastErr = err;
+            const remainingMs = Math.max(0, CONNECT_TIMEOUT_MS - (Date.now() - start));
+            const remainingS = Math.ceil(remainingMs / 1000);
+            setStatus(`Failed to connect. Hold BOOT + tap RESET, retrying... (${remainingS}s)`);
+            log(`Error: ${err?.message || err}`);
+            await sleep(CONNECT_RETRY_DELAY_MS);
+          }
+        }
+        if (lastErr) throw lastErr;
         state.connected = true;
         ui.chip.style.display = "inline-flex";
         ui.chip.textContent = `Chip ${state.chip}`;
