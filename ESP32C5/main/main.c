@@ -3864,7 +3864,8 @@ static int hs_add_or_update_ap(const uint8_t *bssid, const char *ssid, uint8_t c
         check_handshake_file_exists_by_bssid(bssid);
     
     if (hs_ap_targets[idx].has_existing_file) {
-        MY_LOG_INFO(TAG, "[HS-SNIFF] Skipping '%s' - handshake already on SD", 
+        // Tab5 parses: strstr("Skipping") && strstr("PCAP already exists")
+        MY_LOG_INFO(TAG, "Skipping '%s' - PCAP already exists", 
                    hs_ap_targets[idx].ssid);
     }
     
@@ -4076,6 +4077,20 @@ static bool hs_save_handshake_to_sd(int ap_idx) {
     int fd = open("/sdcard/.sync", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) { fsync(fd); close(fd); unlink("/sdcard/.sync"); }
     
+    // === Backward-compatible UART messages for CardputerADV / Tab5 / FlipperLight ===
+    // These exact strings are parsed by all 3 client projects.
+    // Tab5 parses "PCAP saved:" and extracts filename from /sdcard/ path.
+    printf("PCAP saved: /sdcard/lab/handshakes/%s_%s_%llu.pcap (%u bytes)\n", 
+           ssid_safe, mac_suffix, (unsigned long long)timestamp, pcap_size);
+    printf("HCCAPX saved: /sdcard/lab/handshakes/%s_%s_%llu.hccapx\n",
+           ssid_safe, mac_suffix, (unsigned long long)timestamp);
+    // Tab5 parses "HANDSHAKE IS COMPLETE AND VALID"
+    printf("HANDSHAKE IS COMPLETE AND VALID\n");
+    // All 3 clients parse "Complete 4-way handshake saved for SSID:"
+    // CardputerADV/FlipperLight extract SSID after marker until space or '('
+    // Tab5 extracts SSID after "SSID:" until space or '('
+    printf("Complete 4-way handshake saved for SSID: %s (MAC: %s)\n", ssid_safe, mac_suffix);
+    
     return true;
 }
 
@@ -4244,7 +4259,8 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
             // Check if complete
             if (ap->captured_m1 && ap->captured_m2 && ap->captured_m3 && ap->captured_m4) {
                 ap->complete = true;
-                MY_LOG_INFO(TAG, "[HS-SNIFF] COMPLETE handshake for '%s'!", ap->ssid);
+                // Tab5 parses: strstr("Handshake captured for") with SSID in quotes
+                MY_LOG_INFO(TAG, "Handshake captured for '%s' - all 4 EAPOL messages!", ap->ssid);
             }
         }
     }
@@ -4443,6 +4459,10 @@ static void handshake_attack_task_sniffer(void) {
     esp_wifi_set_promiscuous(true);
     
     MY_LOG_INFO(TAG, "Promiscuous mode enabled. Sniffing...");
+    // Tab5 parses: strstr("PHASE") && strstr("Attack")
+    MY_LOG_INFO(TAG, "===== PHASE: Sniffer Attack (D-UCB) =====");
+    // Tab5 parses: strstr("Scanning") for progress
+    MY_LOG_INFO(TAG, "Scanning all channels via D-UCB...");
     
     int64_t last_stats_time = esp_timer_get_time();
     int total_handshakes_captured = 0;
@@ -4489,10 +4509,11 @@ static void handshake_attack_task_sniffer(void) {
                 (now - client->last_deauth_us) < HS_DEAUTH_COOLDOWN_US) continue;
             
             // Send targeted deauth to this client
-            MY_LOG_INFO(TAG, "[HS-DEAUTH] Deauthing %02X:%02X:%02X:%02X:%02X:%02X from '%s' (Ch %d)",
+            // Tab5 parses: strstr(">>> [") && strstr("Attacking") with SSID in quotes
+            MY_LOG_INFO(TAG, ">>> Attacking '%s' (Ch %d) - deauth %02X:%02X:%02X:%02X:%02X:%02X <<<",
+                       ap->ssid, ap->channel,
                        client->mac[0], client->mac[1], client->mac[2],
-                       client->mac[3], client->mac[4], client->mac[5],
-                       ap->ssid, ap->channel);
+                       client->mac[3], client->mac[4], client->mac[5]);
             
             // Re-init HCCAPX serializer for this AP (so save works correctly)
             {
@@ -4523,7 +4544,7 @@ static void handshake_attack_task_sniffer(void) {
         for (int i = 0; i < hs_ap_count; i++) {
             hs_ap_target_t *ap = &hs_ap_targets[i];
             if (ap->complete && !ap->has_existing_file) {
-                MY_LOG_INFO(TAG, "[HS-SNIFF] Saving complete handshake for '%s'...", ap->ssid);
+                MY_LOG_INFO(TAG, "Saving complete handshake for '%s'...", ap->ssid);
                 // Re-init HCCAPX for this AP before save
                 size_t ssid_len = strlen(ap->ssid);
                 hccapx_serializer_init((const uint8_t *)ap->ssid, ssid_len);
@@ -4531,7 +4552,8 @@ static void handshake_attack_task_sniffer(void) {
                 if (hs_save_handshake_to_sd(i)) {
                     ap->has_existing_file = true;
                     total_handshakes_captured++;
-                    MY_LOG_INFO(TAG, "[HS-SNIFF] Handshake #%d saved! Total APs: %d, Clients: %d",
+                    // Tab5 parses: strstr("Handshake #") && strstr("captured")
+                    MY_LOG_INFO(TAG, "Handshake #%d captured! (APs: %d, Clients: %d)",
                                total_handshakes_captured, hs_ap_count, hs_client_count);
                     
                     // Re-init PCAP after save to free memory and start fresh
@@ -4542,6 +4564,9 @@ static void handshake_attack_task_sniffer(void) {
                             hs_ap_targets[j].beacon_captured = false; // Will be re-captured
                         }
                     }
+                } else {
+                    // Tab5 parses: strstr("No handshake for")
+                    MY_LOG_INFO(TAG, "No handshake for '%s' - save failed", ap->ssid);
                 }
             }
         }
@@ -4565,9 +4590,14 @@ static void handshake_attack_task_sniffer(void) {
                 }
             }
             
-            MY_LOG_INFO(TAG, "[HS-STATS] APs: %d (WPA: %d), Clients: %d, Handshakes: %d, Skipped: %d",
-                       hs_ap_count, wpa_aps, hs_client_count, completed, skipped);
-            MY_LOG_INFO(TAG, "[HS-STATS] D-UCB top channel: %d (%d pulls), Current: %d",
+            // Tab5 parses: strstr("Attacking") && strstr("networks...")
+            MY_LOG_INFO(TAG, "Attacking %d networks... (WPA: %d, Clients: %d)", 
+                       wpa_aps, wpa_aps, hs_client_count);
+            // Tab5 parses: strstr("Networks attacked this cycle:") -> count after "cycle:"
+            MY_LOG_INFO(TAG, "Networks attacked this cycle: %d", wpa_aps - skipped);
+            // Tab5 parses: strstr("Handshakes captured so far:") -> count after "so far:"
+            MY_LOG_INFO(TAG, "Handshakes captured so far: %d", completed);
+            MY_LOG_INFO(TAG, "D-UCB best channel: %d (%d visits), current: Ch %d",
                        top_ch, top_pulls, channel);
             
             last_stats_time = now;
@@ -4577,7 +4607,10 @@ static void handshake_attack_task_sniffer(void) {
     // Disable promiscuous mode
     esp_wifi_set_promiscuous(false);
     
-    MY_LOG_INFO(TAG, "[HS-SNIFF] Sniffer mode stopped. Total handshakes: %d", total_handshakes_captured);
+    // Tab5 parses: strstr("Attack Cycle Complete")
+    MY_LOG_INFO(TAG, "===== Attack Cycle Complete =====");
+    MY_LOG_INFO(TAG, "Total handshakes captured: %d", total_handshakes_captured);
+    MY_LOG_INFO(TAG, "Sniffer mode stopped.");
 }
 
 // Handshake attack task - dispatches to selected or sniffer mode
