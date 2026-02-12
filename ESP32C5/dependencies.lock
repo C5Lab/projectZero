@@ -23,10 +23,18 @@ dependencies:
     source:
       type: idf
     version: 6.0.0
+  lvgl/lvgl:
+    component_hash: 2409fdc84e9766d2a18afd84b051aef3f838348136cdb1c10ac2e8bcdb012bf6
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 9.2.0
 direct_dependencies:
 - espressif/cjson
 - espressif/led_strip
 - idf
-manifest_hash: 979767af7f6d4a1a54e16980d8da8d72bf0b54ae18d67e220c8307b0069c849c
+- lvgl/lvgl
+manifest_hash: 89e75097ea075918e3fbc38d77518f549464abde71bb4b324ee57eab5d7eca45
 target: esp32c5
 version: 2.0.0

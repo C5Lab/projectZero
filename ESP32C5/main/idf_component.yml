@@ -16,3 +16,4 @@ dependencies:
   #   public: true
   espressif/led_strip: '>=3.0.0,<4.0.0'
   espressif/cjson: '>=1.7.19,<2.0.0'
+  lvgl/lvgl: "9.2.0"

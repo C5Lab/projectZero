@@ -79,6 +79,7 @@
 #include "frame_analyzer_parser.h"
 #include "frame_analyzer_types.h"
 #include "sniffer.h"
+#include "oled_display.h"
 #include <math.h>
 
 // NimBLE includes for BLE scanning
@@ -3289,6 +3290,7 @@ static void print_scan_results(void) {
 // --- CLI: commands ---
 static int cmd_scan_networks(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update("Scan WiFi", "");
     log_memory_info("scan_networks");
     
     // Ensure WiFi is initialized
@@ -3357,6 +3359,7 @@ static int cmd_show_scan_results(int argc, char **argv) {
 }
 
 static int cmd_select_networks(int argc, char **argv) {
+    oled_display_update("Select Net", argc >= 2 ? argv[1] : "");
     if (argc < 2) {
         ESP_LOGW(TAG,"Syntax: select_networks <index1> [index2] ...");
         return 1;
@@ -4640,11 +4643,13 @@ static void handshake_attack_task(void *pvParameters) {
 }
 
 static int cmd_start_deauth(int argc, char **argv) {
+    oled_display_update("Deauth", (g_selected_count > 0) ? (const char *)g_scan_results[g_selected_indices[0]].ssid : "");
     onlyDeauth = 1;
     return cmd_start_evil_twin(argc, argv);
 }
 
 static int cmd_start_handshake(int argc, char **argv) {
+    oled_display_update("Handshake", (g_selected_count > 0) ? (const char *)g_scan_results[g_selected_indices[0]].ssid : "");
     // Ensure WiFi is initialized
     if (!ensure_wifi_mode()) {
         return 1;
@@ -4762,6 +4767,7 @@ static int cmd_start_handshake(int argc, char **argv) {
 }
 
 static int cmd_save_handshake(int argc, char **argv) {
+    oled_display_update("Save PCAP", "");
     // Avoid compiler warnings
     (void)argc; (void)argv;
     
@@ -4992,6 +4998,7 @@ static int wpasec_upload_file(const char *filepath, const char *filename) {
 
 static int cmd_wpasec_upload(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update("WPA-sec", "Upload");
 
     // 1. Check WiFi STA is connected
     wifi_ap_record_t ap_info;
@@ -5090,6 +5097,7 @@ static int cmd_wpasec_upload(int argc, char **argv) {
 static int cmd_start_sae_overflow(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
+    oled_display_update("SAE Flood", (g_selected_count > 0) ? (const char *)g_scan_results[g_selected_indices[0]].ssid : "");
     
     // Ensure WiFi is initialized
     if (!ensure_wifi_mode()) {
@@ -5158,6 +5166,7 @@ static int cmd_start_sae_overflow(int argc, char **argv) {
 static int cmd_start_blackout(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
+    oled_display_update("Blackout", "");
     log_memory_info("start_blackout");
     
     // Ensure WiFi is initialized
@@ -5244,6 +5253,7 @@ static void boot_button_task(void *arg) {
 static int cmd_start_evil_twin(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
+    if (!onlyDeauth) oled_display_update("Evil Twin", (g_selected_count > 0) ? (const char *)g_scan_results[g_selected_indices[0]].ssid : "");
     log_memory_info("start_evil_twin");
     
     // Ensure WiFi is initialized
@@ -5522,6 +5532,7 @@ static int cmd_start_evil_twin(int argc, char **argv) {
  * Starts beacon spam attack with multiple fake SSIDs
  */
 static int cmd_start_beacon_spam(int argc, char **argv) {
+    oled_display_update("Beacon Spam", argc >= 2 ? argv[1] : "");
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: start_beacon_spam \"SSID1\" \"SSID2\" ...");
         return 1;
@@ -5643,6 +5654,7 @@ static int cmd_start_beacon_spam(int argc, char **argv) {
 
 static int cmd_stop(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update("STOPPED", "");
     MY_LOG_INFO(TAG, "Stop command received - stopping all operations...");
     
     // Set global stop flags
@@ -6283,6 +6295,7 @@ static int cmd_wifi_disconnect(int argc, char **argv) {
 }
 
 static int cmd_wifi_connect(int argc, char **argv) {
+    oled_display_update("WiFi Conn", argc >= 2 ? argv[1] : "");
     if (argc < 3 || argc > 9) {
         MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
         return 0;
@@ -6456,6 +6469,7 @@ static int cmd_wifi_connect(int argc, char **argv) {
 }
 
 static int cmd_ota_check(int argc, char **argv) {
+    oled_display_update("OTA Check", "");
     const char *tag = NULL;
     bool force_latest = false;
 
@@ -6693,6 +6707,7 @@ static int cmd_ota_boot(int argc, char **argv) {
 
 static int cmd_list_hosts(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update("ARP Scan", "");
     
     // Check if connected to AP
     wifi_ap_record_t ap_info;
@@ -6996,6 +7011,7 @@ static void arp_ban_task(void *pvParameters) {
 }
 
 static int cmd_arp_ban(int argc, char **argv) {
+    oled_display_update("ARP Ban", argc >= 2 ? argv[1] : "");
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: arp_ban <MAC> [IP]");
         MY_LOG_INFO(TAG, "Example: arp_ban AA:BB:CC:DD:EE:FF 192.168.1.50");
@@ -7210,6 +7226,7 @@ static void packet_monitor_task(void *pvParameters) {
 }
 
 static int cmd_packet_monitor(int argc, char **argv) {
+    oled_display_update("Pkt Monitor", argc >= 2 ? argv[1] : "");
     log_memory_info("packet_monitor");
     
     // Ensure WiFi is initialized
@@ -7445,6 +7462,7 @@ static void channel_view_stop(void) {
 static int cmd_channel_view(int argc, char **argv) {
     (void)argc;
     (void)argv;
+    oled_display_update("Chan View", "");
     log_memory_info("channel_view");
 
     // Ensure WiFi is initialized
@@ -7512,6 +7530,7 @@ static int cmd_channel_view(int argc, char **argv) {
 
 static int cmd_start_sniffer(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update("Sniffer", (g_selected_count > 0 && g_scan_done) ? (const char *)g_scan_results[g_selected_indices[0]].ssid : "All");
     log_memory_info("start_sniffer");
     
     // Ensure WiFi is initialized
@@ -7616,6 +7635,7 @@ static int cmd_start_sniffer(int argc, char **argv) {
 
 static int cmd_start_sniffer_noscan(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update("Sniff NoScan", "");
     log_memory_info("start_sniffer_noscan");
     
     // Ensure WiFi is initialized
@@ -7999,6 +8019,7 @@ static int cmd_sniffer_debug(int argc, char **argv) {
 
 static int cmd_start_sniffer_dog(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update("Sniff Dog", "");
     log_memory_info("start_sniffer_dog");
     
     // Ensure WiFi is initialized
@@ -8075,6 +8096,7 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
 }
 
 static int cmd_deauth_detector(int argc, char **argv) {
+    oled_display_update("Deauth Det", "");
     log_memory_info("deauth_detector");
     
     // Ensure WiFi is initialized
@@ -8317,6 +8339,7 @@ static int cmd_download(int argc, char **argv) {
 static int cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
+    oled_display_update("Reboot", "");
     MY_LOG_INFO(TAG,"Restart...");
     safe_restart();  // unmount SD card before restart
     return 0;
@@ -8620,6 +8643,7 @@ static int cmd_vendor(int argc, char **argv) {
 // Command: start_karma - Starts portal with SSID from probe list
 static int cmd_start_karma(int argc, char **argv)
 {
+    oled_display_update("Karma", argc >= 2 ? argv[1] : "");
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: start_karma <index>");
         MY_LOG_INFO(TAG, "Example: start_karma 2");
@@ -9376,6 +9400,7 @@ static void wardrive_task(void *pvParameters) {
 }
 
 static int cmd_start_gps_raw(int argc, char **argv) {
+    oled_display_update("GPS Raw", "");
     log_memory_info("start_gps_raw");
 
     int baud = gps_get_baud_for_module(current_gps_module);
@@ -9433,6 +9458,7 @@ static int cmd_start_gps_raw(int argc, char **argv) {
 
 static int cmd_start_wardrive(int argc, char **argv) {
     (void)argc; (void)argv;
+    oled_display_update("Wardrive", "");
     log_memory_info("start_wardrive");
     
     // Ensure WiFi is initialized
@@ -10084,6 +10110,7 @@ static void dns_server_task(void *pvParameters) {
 
 // Start portal command
 static int cmd_start_portal(int argc, char **argv) {
+    oled_display_update("Portal", argc >= 2 ? argv[1] : "");
     log_memory_info("start_portal");
     
     // Ensure WiFi is initialized
@@ -10342,6 +10369,7 @@ static int cmd_start_portal(int argc, char **argv) {
 
 // Start password-protected rogue AP with captive portal and optional deauth
 static int cmd_start_rogueap(int argc, char **argv) {
+    oled_display_update("Rogue AP", argc >= 2 ? argv[1] : "");
     log_memory_info("start_rogueap");
     
     // Validate arguments
@@ -11274,6 +11302,7 @@ static void bt_tracking_task(void *pvParameters)
  */
 static int cmd_scan_bt(int argc, char **argv)
 {
+    oled_display_update("BT Scan", "");
     log_memory_info("scan_bt");
     
     // Ensure BLE is initialized (may reboot if WiFi was active)
@@ -11347,6 +11376,7 @@ static int cmd_scan_bt(int argc, char **argv)
 static int cmd_scan_airtag(int argc, char **argv)
 {
     (void)argc; (void)argv;
+    oled_display_update("AirTag Scan", "");
     log_memory_info("scan_airtag");
     
     // Ensure BLE is initialized (may reboot if WiFi was active)
@@ -11994,6 +12024,9 @@ void app_main(void) {
     printf("PSRAM support disabled in config\n");
 #endif
 
+    // Initialize OLED display (SSD1306 128x64 via I2C + LVGL)
+    oled_display_init();
+
 //     printf("Step 3: Init NVS\n");
     ESP_ERROR_CHECK(nvs_flash_init());
     ota_load_channel_from_nvs();
@@ -12198,6 +12231,7 @@ void app_main(void) {
     load_whitelist_from_sd();
     vTaskDelay(pdMS_TO_TICKS(500));
     MY_LOG_INFO(TAG,"BOARD READY");
+    oled_display_update("JanOS " JANOS_VERSION, "Ready");
     vTaskDelay(pdMS_TO_TICKS(100));
     
 }

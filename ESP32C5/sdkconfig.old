@@ -899,7 +899,7 @@ CONFIG_IDF_TARGET_ARCH="riscv"
 # default:
 CONFIG_IDF_TARGET="esp32c5"
 # default:
-CONFIG_IDF_INIT_VERSION="$IDF_INIT_VERSION"
+CONFIG_IDF_INIT_VERSION="6.0.0"
 # default:
 CONFIG_IDF_TARGET_ESP32C5=y
 # default:
@@ -940,8 +940,9 @@ CONFIG_BOOTLOADER_PROJECT_VER=1
 #
 # Application Rollback
 #
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # default:
-# CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE is not set
+# CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK is not set
 # end of Application Rollback
 
 #
@@ -1903,8 +1904,8 @@ CONFIG_ESP_TLS_USE_DS_PERIPHERAL=y
 # CONFIG_ESP_TLS_SERVER_MIN_AUTH_MODE_OPTIONAL is not set
 # default:
 # CONFIG_ESP_TLS_PSK_VERIFICATION is not set
-# default:
-# CONFIG_ESP_TLS_INSECURE is not set
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
 # default:
 CONFIG_ESP_TLS_DYN_BUF_STRATEGY_SUPPORTED=y
 # end of ESP-TLS
@@ -2966,11 +2967,8 @@ CONFIG_ESP_COREDUMP_ENABLE_TO_NONE=y
 #
 # default:
 CONFIG_FATFS_VOLUME_COUNT=2
-# default:
 # CONFIG_FATFS_LFN_NONE is not set
-# default:
 CONFIG_FATFS_LFN_HEAP=y
-# default:
 # CONFIG_FATFS_LFN_STACK is not set
 # default:
 # CONFIG_FATFS_SECTOR_512 is not set
@@ -3022,7 +3020,6 @@ CONFIG_FATFS_CODEPAGE_437=y
 # CONFIG_FATFS_CODEPAGE_950 is not set
 # default:
 CONFIG_FATFS_CODEPAGE=437
-# default:
 CONFIG_FATFS_MAX_LFN=255
 # default:
 CONFIG_FATFS_API_ENCODING_ANSI_OEM=y
@@ -3053,7 +3050,7 @@ CONFIG_FATFS_VFS_FSTAT_BLKSIZE=0
 # default:
 CONFIG_FATFS_LINK_LOCK=y
 # default:
-CONFIG_FATFS_USE_DYN_BUFFERS=y
+# CONFIG_FATFS_USE_DYN_BUFFERS is not set
 
 #
 # File system free space calculation behavior
@@ -3244,7 +3241,7 @@ CONFIG_IEEE802154_CCA_ED=y
 # default:
 CONFIG_IEEE802154_CCA_MODE=1
 # default:
-CONFIG_IEEE802154_CCA_THRESHOLD=-75
+CONFIG_IEEE802154_CCA_THRESHOLD=-60
 # default:
 CONFIG_IEEE802154_PENDING_TABLE_SIZE=20
 # default:
@@ -4403,7 +4400,7 @@ CONFIG_VFS_SUPPRESS_SELECT_DEBUG_OUTPUT=y
 # default:
 # CONFIG_VFS_SELECT_IN_RAM is not set
 # default:
-# CONFIG_VFS_SUPPORT_TERMIOS is not set
+CONFIG_VFS_SUPPORT_TERMIOS=y
 # default:
 CONFIG_VFS_MAX_COUNT=8
 
@@ -4428,6 +4425,631 @@ CONFIG_WL_SECTOR_SIZE_4096=y
 # default:
 CONFIG_WL_SECTOR_SIZE=4096
 # end of Wear Levelling
+
+#
+# LVGL configuration
+#
+CONFIG_LV_CONF_SKIP=y
+# default:
+# CONFIG_LV_CONF_MINIMAL is not set
+
+#
+# Color Settings
+#
+# CONFIG_LV_COLOR_DEPTH_32 is not set
+# CONFIG_LV_COLOR_DEPTH_24 is not set
+# CONFIG_LV_COLOR_DEPTH_16 is not set
+# CONFIG_LV_COLOR_DEPTH_8 is not set
+CONFIG_LV_COLOR_DEPTH_1=y
+# default:
+CONFIG_LV_COLOR_DEPTH=1
+# end of Color Settings
+
+#
+# Memory Settings
+#
+# default:
+CONFIG_LV_USE_BUILTIN_MALLOC=y
+# default:
+# CONFIG_LV_USE_CLIB_MALLOC is not set
+# default:
+# CONFIG_LV_USE_MICROPYTHON_MALLOC is not set
+# default:
+# CONFIG_LV_USE_RTTHREAD_MALLOC is not set
+# default:
+# CONFIG_LV_USE_CUSTOM_MALLOC is not set
+# default:
+CONFIG_LV_USE_BUILTIN_STRING=y
+# default:
+# CONFIG_LV_USE_CLIB_STRING is not set
+# default:
+# CONFIG_LV_USE_CUSTOM_STRING is not set
+# default:
+CONFIG_LV_USE_BUILTIN_SPRINTF=y
+# default:
+# CONFIG_LV_USE_CLIB_SPRINTF is not set
+# default:
+# CONFIG_LV_USE_CUSTOM_SPRINTF is not set
+# default:
+CONFIG_LV_MEM_SIZE_KILOBYTES=64
+# default:
+CONFIG_LV_MEM_POOL_EXPAND_SIZE_KILOBYTES=0
+# default:
+CONFIG_LV_MEM_ADR=0x0
+# end of Memory Settings
+
+#
+# HAL Settings
+#
+# default:
+CONFIG_LV_DEF_REFR_PERIOD=33
+# default:
+CONFIG_LV_DPI_DEF=130
+# end of HAL Settings
+
+#
+# Operating System (OS)
+#
+# default:
+CONFIG_LV_OS_NONE=y
+# default:
+# CONFIG_LV_OS_PTHREAD is not set
+# default:
+# CONFIG_LV_OS_FREERTOS is not set
+# default:
+# CONFIG_LV_OS_CMSIS_RTOS2 is not set
+# default:
+# CONFIG_LV_OS_RTTHREAD is not set
+# default:
+# CONFIG_LV_OS_WINDOWS is not set
+# default:
+# CONFIG_LV_OS_MQX is not set
+# default:
+# CONFIG_LV_OS_CUSTOM is not set
+# default:
+CONFIG_LV_USE_OS=0
+# end of Operating System (OS)
+
+#
+# Rendering Configuration
+#
+# default:
+CONFIG_LV_DRAW_BUF_STRIDE_ALIGN=1
+# default:
+CONFIG_LV_DRAW_BUF_ALIGN=4
+# default:
+CONFIG_LV_DRAW_LAYER_SIMPLE_BUF_SIZE=24576
+# default:
+CONFIG_LV_USE_DRAW_SW=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_RGB565=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_RGB565A8=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_RGB888=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_XRGB8888=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_ARGB8888=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_L8=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_AL88=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_A8=y
+# default:
+CONFIG_LV_DRAW_SW_SUPPORT_I1=y
+# default:
+CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=1
+# default:
+# CONFIG_LV_USE_DRAW_ARM2D_SYNC is not set
+# default:
+# CONFIG_LV_USE_NATIVE_HELIUM_ASM is not set
+# default:
+CONFIG_LV_DRAW_SW_COMPLEX=y
+# default:
+# CONFIG_LV_USE_DRAW_SW_COMPLEX_GRADIENTS is not set
+# default:
+CONFIG_LV_DRAW_SW_SHADOW_CACHE_SIZE=0
+# default:
+CONFIG_LV_DRAW_SW_CIRCLE_CACHE_SIZE=4
+# default:
+CONFIG_LV_DRAW_SW_ASM_NONE=y
+# default:
+# CONFIG_LV_DRAW_SW_ASM_NEON is not set
+# default:
+# CONFIG_LV_DRAW_SW_ASM_HELIUM is not set
+# default:
+# CONFIG_LV_DRAW_SW_ASM_CUSTOM is not set
+# default:
+CONFIG_LV_USE_DRAW_SW_ASM=0
+# default:
+# CONFIG_LV_USE_DRAW_VGLITE is not set
+# default:
+# CONFIG_LV_USE_DRAW_PXP is not set
+# default:
+# CONFIG_LV_USE_DRAW_DAVE2D is not set
+# default:
+# CONFIG_LV_USE_DRAW_SDL is not set
+# default:
+# CONFIG_LV_USE_DRAW_VG_LITE is not set
+# default:
+# CONFIG_LV_USE_VECTOR_GRAPHIC is not set
+# end of Rendering Configuration
+
+#
+# Feature Configuration
+#
+
+#
+# Logging
+#
+# default:
+# CONFIG_LV_USE_LOG is not set
+# end of Logging
+
+#
+# Asserts
+#
+# default:
+CONFIG_LV_USE_ASSERT_NULL=y
+# default:
+CONFIG_LV_USE_ASSERT_MALLOC=y
+# default:
+# CONFIG_LV_USE_ASSERT_STYLE is not set
+# default:
+# CONFIG_LV_USE_ASSERT_MEM_INTEGRITY is not set
+# default:
+# CONFIG_LV_USE_ASSERT_OBJ is not set
+# default:
+CONFIG_LV_ASSERT_HANDLER_INCLUDE="assert.h"
+# end of Asserts
+
+#
+# Debug
+#
+# default:
+# CONFIG_LV_USE_REFR_DEBUG is not set
+# default:
+# CONFIG_LV_USE_LAYER_DEBUG is not set
+# default:
+# CONFIG_LV_USE_PARALLEL_DRAW_DEBUG is not set
+# end of Debug
+
+#
+# Others
+#
+# default:
+# CONFIG_LV_ENABLE_GLOBAL_CUSTOM is not set
+# default:
+CONFIG_LV_CACHE_DEF_SIZE=0
+# default:
+CONFIG_LV_IMAGE_HEADER_CACHE_DEF_CNT=0
+# default:
+CONFIG_LV_GRADIENT_MAX_STOPS=2
+# default:
+CONFIG_LV_COLOR_MIX_ROUND_OFS=128
+# default:
+# CONFIG_LV_OBJ_STYLE_CACHE is not set
+# default:
+# CONFIG_LV_USE_OBJ_ID is not set
+# default:
+# CONFIG_LV_USE_OBJ_PROPERTY is not set
+# end of Others
+# end of Feature Configuration
+
+#
+# Compiler Settings
+#
+# default:
+# CONFIG_LV_BIG_ENDIAN_SYSTEM is not set
+# default:
+CONFIG_LV_ATTRIBUTE_MEM_ALIGN_SIZE=1
+# default:
+# CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM is not set
+# default:
+# CONFIG_LV_USE_FLOAT is not set
+# default:
+# CONFIG_LV_USE_MATRIX is not set
+# default:
+# CONFIG_LV_USE_PRIVATE_API is not set
+# end of Compiler Settings
+
+#
+# Font Usage
+#
+
+#
+# Enable built-in fonts
+#
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_8 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_10 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_12 is not set
+CONFIG_LV_FONT_MONTSERRAT_14=y
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_16 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_18 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_20 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_22 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_24 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_26 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_28 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_30 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_32 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_34 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_36 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_38 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_40 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_42 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_44 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_46 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_48 is not set
+# default:
+# CONFIG_LV_FONT_MONTSERRAT_28_COMPRESSED is not set
+# default:
+# CONFIG_LV_FONT_DEJAVU_16_PERSIAN_HEBREW is not set
+# default:
+# CONFIG_LV_FONT_SIMSUN_14_CJK is not set
+# default:
+# CONFIG_LV_FONT_SIMSUN_16_CJK is not set
+# default:
+# CONFIG_LV_FONT_UNSCII_8 is not set
+# default:
+# CONFIG_LV_FONT_UNSCII_16 is not set
+# end of Enable built-in fonts
+
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_8 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_10 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_12 is not set
+# default:
+CONFIG_LV_FONT_DEFAULT_MONTSERRAT_14=y
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_16 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_18 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_20 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_22 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_24 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_26 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_28 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_30 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_32 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_34 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_36 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_38 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_40 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_42 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_44 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_46 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_48 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_MONTSERRAT_28_COMPRESSED is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_DEJAVU_16_PERSIAN_HEBREW is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_SIMSUN_14_CJK is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_SIMSUN_16_CJK is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_UNSCII_8 is not set
+# default:
+# CONFIG_LV_FONT_DEFAULT_UNSCII_16 is not set
+# default:
+# CONFIG_LV_FONT_FMT_TXT_LARGE is not set
+# default:
+# CONFIG_LV_USE_FONT_COMPRESSED is not set
+# default:
+CONFIG_LV_USE_FONT_PLACEHOLDER=y
+# end of Font Usage
+
+#
+# Text Settings
+#
+# default:
+CONFIG_LV_TXT_ENC_UTF8=y
+# default:
+# CONFIG_LV_TXT_ENC_ASCII is not set
+# default:
+CONFIG_LV_TXT_BREAK_CHARS=" ,.;:-_)}"
+# default:
+CONFIG_LV_TXT_LINE_BREAK_LONG_LEN=0
+# default:
+# CONFIG_LV_USE_BIDI is not set
+# default:
+# CONFIG_LV_USE_ARABIC_PERSIAN_CHARS is not set
+# end of Text Settings
+
+#
+# Widget Usage
+#
+# default:
+CONFIG_LV_WIDGETS_HAS_DEFAULT_VALUE=y
+# default:
+CONFIG_LV_USE_ANIMIMG=y
+# default:
+CONFIG_LV_USE_ARC=y
+# default:
+CONFIG_LV_USE_BAR=y
+# default:
+CONFIG_LV_USE_BUTTON=y
+# default:
+CONFIG_LV_USE_BUTTONMATRIX=y
+# default:
+CONFIG_LV_USE_CALENDAR=y
+# default:
+# CONFIG_LV_CALENDAR_WEEK_STARTS_MONDAY is not set
+# default:
+CONFIG_LV_USE_CALENDAR_HEADER_ARROW=y
+# default:
+CONFIG_LV_USE_CALENDAR_HEADER_DROPDOWN=y
+# default:
+# CONFIG_LV_USE_CALENDAR_CHINESE is not set
+# default:
+CONFIG_LV_USE_CANVAS=y
+# default:
+CONFIG_LV_USE_CHART=y
+# default:
+CONFIG_LV_USE_CHECKBOX=y
+# default:
+CONFIG_LV_USE_DROPDOWN=y
+# default:
+CONFIG_LV_USE_IMAGE=y
+# default:
+CONFIG_LV_USE_IMAGEBUTTON=y
+# default:
+CONFIG_LV_USE_KEYBOARD=y
+# default:
+CONFIG_LV_USE_LABEL=y
+# default:
+CONFIG_LV_LABEL_TEXT_SELECTION=y
+# default:
+CONFIG_LV_LABEL_LONG_TXT_HINT=y
+# default:
+CONFIG_LV_LABEL_WAIT_CHAR_COUNT=3
+# default:
+CONFIG_LV_USE_LED=y
+# default:
+CONFIG_LV_USE_LINE=y
+# default:
+CONFIG_LV_USE_LIST=y
+# default:
+CONFIG_LV_USE_MENU=y
+# default:
+CONFIG_LV_USE_MSGBOX=y
+# default:
+CONFIG_LV_USE_ROLLER=y
+# default:
+CONFIG_LV_USE_SCALE=y
+# default:
+CONFIG_LV_USE_SLIDER=y
+# default:
+CONFIG_LV_USE_SPAN=y
+# default:
+CONFIG_LV_SPAN_SNIPPET_STACK_SIZE=64
+# default:
+CONFIG_LV_USE_SPINBOX=y
+# default:
+CONFIG_LV_USE_SPINNER=y
+# default:
+CONFIG_LV_USE_SWITCH=y
+# default:
+CONFIG_LV_USE_TEXTAREA=y
+# default:
+CONFIG_LV_TEXTAREA_DEF_PWD_SHOW_TIME=1500
+# default:
+CONFIG_LV_USE_TABLE=y
+# default:
+CONFIG_LV_USE_TABVIEW=y
+# default:
+CONFIG_LV_USE_TILEVIEW=y
+# default:
+CONFIG_LV_USE_WIN=y
+# end of Widget Usage
+
+#
+# Themes
+#
+# default:
+# CONFIG_LV_USE_THEME_DEFAULT is not set
+# default:
+# CONFIG_LV_USE_THEME_SIMPLE is not set
+# default:
+CONFIG_LV_USE_THEME_MONO=y
+# end of Themes
+
+#
+# Layouts
+#
+# default:
+CONFIG_LV_USE_FLEX=y
+# default:
+CONFIG_LV_USE_GRID=y
+# end of Layouts
+
+#
+# 3rd Party Libraries
+#
+# default:
+CONFIG_LV_FS_DEFAULT_DRIVE_LETTER=0
+# default:
+# CONFIG_LV_USE_FS_STDIO is not set
+# default:
+# CONFIG_LV_USE_FS_POSIX is not set
+# default:
+# CONFIG_LV_USE_FS_WIN32 is not set
+# default:
+# CONFIG_LV_USE_FS_FATFS is not set
+# default:
+# CONFIG_LV_USE_FS_MEMFS is not set
+# default:
+# CONFIG_LV_USE_FS_LITTLEFS is not set
+# default:
+# CONFIG_LV_USE_FS_ARDUINO_ESP_LITTLEFS is not set
+# default:
+# CONFIG_LV_USE_FS_ARDUINO_SD is not set
+# default:
+# CONFIG_LV_USE_LODEPNG is not set
+# default:
+# CONFIG_LV_USE_LIBPNG is not set
+# default:
+# CONFIG_LV_USE_BMP is not set
+# default:
+# CONFIG_LV_USE_TJPGD is not set
+# default:
+# CONFIG_LV_USE_LIBJPEG_TURBO is not set
+# default:
+# CONFIG_LV_USE_GIF is not set
+# default:
+# CONFIG_LV_BIN_DECODER_RAM_LOAD is not set
+# default:
+# CONFIG_LV_USE_RLE is not set
+# default:
+# CONFIG_LV_USE_QRCODE is not set
+# default:
+# CONFIG_LV_USE_BARCODE is not set
+# default:
+# CONFIG_LV_USE_FREETYPE is not set
+# default:
+# CONFIG_LV_USE_TINY_TTF is not set
+# default:
+# CONFIG_LV_USE_RLOTTIE is not set
+# default:
+# CONFIG_LV_USE_THORVG is not set
+# default:
+# CONFIG_LV_USE_LZ4 is not set
+# default:
+# CONFIG_LV_USE_FFMPEG is not set
+# end of 3rd Party Libraries
+
+#
+# Others
+#
+# default:
+# CONFIG_LV_USE_SNAPSHOT is not set
+CONFIG_LV_USE_SYSMON=y
+# default:
+# CONFIG_LV_USE_PERF_MONITOR is not set
+# default:
+# CONFIG_LV_USE_PROFILER is not set
+# default:
+# CONFIG_LV_USE_MONKEY is not set
+# default:
+# CONFIG_LV_USE_GRIDNAV is not set
+# default:
+# CONFIG_LV_USE_FRAGMENT is not set
+# default:
+# CONFIG_LV_USE_IMGFONT is not set
+CONFIG_LV_USE_OBSERVER=y
+# default:
+# CONFIG_LV_USE_IME_PINYIN is not set
+# default:
+# CONFIG_LV_USE_FILE_EXPLORER is not set
+# end of Others
+
+#
+# Devices
+#
+# default:
+# CONFIG_LV_USE_SDL is not set
+# default:
+# CONFIG_LV_USE_X11 is not set
+# default:
+# CONFIG_LV_USE_WAYLAND is not set
+# default:
+# CONFIG_LV_USE_LINUX_FBDEV is not set
+# default:
+# CONFIG_LV_USE_NUTTX is not set
+# default:
+# CONFIG_LV_USE_LINUX_DRM is not set
+# default:
+# CONFIG_LV_USE_TFT_ESPI is not set
+# default:
+# CONFIG_LV_USE_EVDEV is not set
+# default:
+# CONFIG_LV_USE_LIBINPUT is not set
+# default:
+# CONFIG_LV_USE_ST7735 is not set
+# default:
+# CONFIG_LV_USE_ST7789 is not set
+# default:
+# CONFIG_LV_USE_ST7796 is not set
+# default:
+# CONFIG_LV_USE_ILI9341 is not set
+# default:
+# CONFIG_LV_USE_GENERIC_MIPI is not set
+# default:
+# CONFIG_LV_USE_RENESAS_GLCDC is not set
+# default:
+# CONFIG_LV_USE_OPENGLES is not set
+# default:
+# CONFIG_LV_USE_QNX is not set
+# end of Devices
+
+#
+# Examples
+#
+# default:
+CONFIG_LV_BUILD_EXAMPLES=y
+# end of Examples
+
+#
+# Demos
+#
+# default:
+# CONFIG_LV_USE_DEMO_WIDGETS is not set
+# default:
+# CONFIG_LV_USE_DEMO_KEYPAD_AND_ENCODER is not set
+# default:
+# CONFIG_LV_USE_DEMO_RENDER is not set
+# default:
+# CONFIG_LV_USE_DEMO_SCROLL is not set
+# default:
+# CONFIG_LV_USE_DEMO_STRESS is not set
+# default:
+# CONFIG_LV_USE_DEMO_MUSIC is not set
+# default:
+# CONFIG_LV_USE_DEMO_FLEX_LAYOUT is not set
+# default:
+# CONFIG_LV_USE_DEMO_MULTILANG is not set
+# end of Demos
+# end of LVGL configuration
 # end of Component config
 
 # default:
@@ -4436,7 +5058,8 @@ CONFIG_WL_SECTOR_SIZE=4096
 # Deprecated options for backward compatibility
 # CONFIG_APP_BUILD_TYPE_ELF_RAM is not set
 # CONFIG_NO_BLOBS is not set
-# CONFIG_APP_ROLLBACK_ENABLE is not set
+CONFIG_APP_ROLLBACK_ENABLE=y
+# CONFIG_APP_ANTI_ROLLBACK is not set
 # CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_NONE is not set
 # CONFIG_LOG_BOOTLOADER_LEVEL_NONE is not set
 CONFIG_LOG_BOOTLOADER_LEVEL_ERROR=y
@@ -4638,6 +5261,6 @@ CONFIG_SPI_FLASH_WRITING_DANGEROUS_REGIONS_ABORTS=y
 # CONFIG_SPI_FLASH_WRITING_DANGEROUS_REGIONS_FAILS is not set
 # CONFIG_SPI_FLASH_WRITING_DANGEROUS_REGIONS_ALLOWED is not set
 CONFIG_SUPPRESS_SELECT_DEBUG_OUTPUT=y
-# CONFIG_SUPPORT_TERMIOS is not set
+CONFIG_SUPPORT_TERMIOS=y
 CONFIG_SEMIHOSTFS_MAX_MOUNT_POINTS=1
 # End of deprecated options
