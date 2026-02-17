@@ -1,0 +1,921 @@
+﻿<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>projectZero Web CLI</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #071018;
+      --bg-2: #0b1a26;
+      --card: #102433;
+      --card-2: #122b3c;
+      --text: #ecf3fb;
+      --muted: #9db7cb;
+      --accent: #2ad1b2;
+      --accent-2: #f2a93b;
+      --danger: #ff6f6f;
+      --line: rgba(255, 255, 255, 0.12);
+      --log-bg: #050b12;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      height: 100vh;
+      font-family: "Space Grotesk", system-ui, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 15% 10%, rgba(42, 209, 178, 0.1), transparent 30%),
+        radial-gradient(circle at 85% 0%, rgba(242, 169, 59, 0.08), transparent 34%),
+        linear-gradient(180deg, var(--bg), var(--bg-2));
+      padding: 22px 16px 30px;
+      overflow: hidden;
+    }
+
+    .shell {
+      max-width: 1400px;
+      margin: 0 auto;
+      height: 100%;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      gap: 14px;
+    }
+
+    .hero {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: linear-gradient(130deg, rgba(42, 209, 178, 0.1), rgba(242, 169, 59, 0.08));
+      box-shadow: 0 24px 54px rgba(0, 0, 0, 0.35);
+      padding: 18px 20px;
+    }
+
+    .hero h1 {
+      margin: 8px 0 4px;
+      font-size: clamp(26px, 4vw, 36px);
+      letter-spacing: -0.02em;
+    }
+
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      padding: 5px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--muted);
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.9fr);
+      gap: 14px;
+      align-items: stretch;
+      min-height: 0;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: linear-gradient(180deg, var(--card), var(--card-2));
+      box-shadow: 0 16px 42px rgba(0, 0, 0, 0.3);
+      min-height: 0;
+    }
+
+    .terminal-panel {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .terminal-head {
+      padding: 14px;
+      border-bottom: 1px solid var(--line);
+      display: grid;
+      gap: 10px;
+    }
+
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+
+    button, select, input {
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.04);
+      font: inherit;
+    }
+
+    button {
+      padding: 10px 14px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    button:hover:not(:disabled) {
+      border-color: rgba(42, 209, 178, 0.7);
+    }
+
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .btn-primary {
+      color: #071018;
+      border: none;
+      background: linear-gradient(120deg, var(--accent), #7de9d4);
+    }
+
+    .btn-danger {
+      border-color: rgba(255, 111, 111, 0.65);
+      color: #ffd8d8;
+    }
+
+    .status {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .status.error {
+      color: var(--danger);
+    }
+
+    .terminal {
+      padding: 14px;
+      display: grid;
+      grid-template-rows: minmax(0, 1fr) auto;
+      gap: 10px;
+      min-height: 0;
+    }
+
+    .log {
+      margin: 0;
+      min-height: 0;
+      height: 100%;
+      max-height: none;
+      overflow-y: auto;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 8px 12px 12px;
+      background: var(--log-bg);
+      font-family: "JetBrains Mono", "Consolas", monospace;
+      font-size: 13px;
+      line-height: 1.45;
+      color: #c6d5e4;
+      white-space: pre-wrap;
+      word-break: break-word;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(173, 191, 210, 0.55) rgba(255, 255, 255, 0.06);
+    }
+
+    .input-wrap {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 10px;
+    }
+
+    .input-wrap input {
+      width: 100%;
+      min-width: 0;
+      padding: 12px;
+      font-family: "JetBrains Mono", "Consolas", monospace;
+      font-size: 13px;
+    }
+
+    .sidebar {
+      padding: 14px;
+      display: grid;
+      gap: 10px;
+      min-height: 0;
+      overflow: auto;
+      align-content: start;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(173, 191, 210, 0.45) rgba(255, 255, 255, 0.05);
+    }
+
+    .log::-webkit-scrollbar,
+    .sidebar::-webkit-scrollbar {
+      width: 10px;
+      height: 10px;
+    }
+
+    .log::-webkit-scrollbar-track,
+    .sidebar::-webkit-scrollbar-track {
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .log::-webkit-scrollbar-thumb,
+    .sidebar::-webkit-scrollbar-thumb {
+      background: linear-gradient(180deg, rgba(166, 201, 233, 0.72), rgba(120, 163, 201, 0.72));
+      border-radius: 999px;
+      border: 2px solid rgba(6, 14, 22, 0.65);
+    }
+
+    .log::-webkit-scrollbar-thumb:hover,
+    .sidebar::-webkit-scrollbar-thumb:hover {
+      background: linear-gradient(180deg, rgba(188, 217, 244, 0.82), rgba(140, 181, 217, 0.82));
+    }
+
+    .search {
+      padding: 10px 12px;
+      width: 100%;
+      font-size: 13px;
+    }
+
+    .sidebar-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 13px;
+      color: #d6e8f7;
+    }
+
+    .chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .chip {
+      padding: 6px 10px;
+      font-size: 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .chip.active {
+      border-color: rgba(42, 209, 178, 0.8);
+      color: #defef7;
+      background: rgba(42, 209, 178, 0.15);
+    }
+
+    .sidebar-tools {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .group {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.03);
+      display: grid;
+      overflow: hidden;
+    }
+
+    .group > summary {
+      list-style: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 10px;
+      font-size: 13px;
+      color: #cbe2f4;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .group > summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .summary-right {
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    .group-body {
+      border-top: 1px solid var(--line);
+      padding: 9px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .cmd {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 9px;
+      background: rgba(0, 0, 0, 0.18);
+      display: grid;
+      gap: 6px;
+    }
+
+    .cmd code {
+      font-family: "JetBrains Mono", "Consolas", monospace;
+      font-size: 12px;
+      color: #e6fbf7;
+    }
+
+    .cmd p {
+      margin: 0;
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    .cmd .actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .mini {
+      padding: 6px 9px;
+      font-size: 12px;
+    }
+
+    .hint {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .mono {
+      font-family: "JetBrains Mono", "Consolas", monospace;
+    }
+
+    footer {
+      color: var(--muted);
+      font-size: 13px;
+      text-align: center;
+    }
+
+    footer a {
+      color: inherit;
+      text-decoration: none;
+      border-bottom: 1px solid transparent;
+    }
+
+    footer a:hover {
+      border-bottom-color: currentColor;
+    }
+
+    @media (max-width: 1120px) {
+      body {
+        height: auto;
+        min-height: 100vh;
+        overflow: auto;
+      }
+      .shell {
+        height: auto;
+        grid-template-rows: auto auto auto;
+      }
+      .layout { grid-template-columns: 1fr; }
+      .sidebar { max-height: unset; }
+      .terminal-panel { overflow: visible; }
+      .log { min-height: 360px; }
+      .input-wrap { grid-template-columns: minmax(0, 1fr); }
+      .input-wrap button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="hero">
+      <span class="eyebrow">projectZero ESP32-C5</span>
+      <h1>Web CLI Console</h1>
+      <p>Bi-directional CLI over WebSerial. The center area is a live terminal, and the right panel contains predefined commands from <code>ESP32C5/main/main.c</code>.</p>
+    </header>
+
+    <section class="layout">
+      <article class="panel terminal-panel">
+        <div class="terminal-head">
+          <div class="row">
+            <button id="connectBtn" class="btn-primary">Connect</button>
+            <button id="disconnectBtn" class="btn-danger" disabled>Disconnect</button>
+            <button id="clearBtn">Clear</button>
+            <select id="baudSelect" aria-label="Baud">
+              <option value="115200" selected>115200 baud</option>
+              <option value="460800">460800 baud</option>
+              <option value="921600">921600 baud</option>
+            </select>
+            <select id="lineEnding" aria-label="Line ending">
+              <option value="crlf" selected>CRLF (\r\n)</option>
+              <option value="lf">LF (\n)</option>
+              <option value="none">No ending</option>
+            </select>
+          </div>
+          <div id="status" class="status">Disconnected.</div>
+          <div class="hint">Press Enter to send, use Arrow Up/Down for history, and Ctrl+L to clear the console.</div>
+        </div>
+
+        <div class="terminal">
+          <pre id="log" class="log"></pre>
+          <div class="input-wrap">
+            <input id="input" type="text" autocomplete="off" placeholder="Type a CLI command...">
+            <button id="sendBtn" disabled>Send</button>
+            <button id="saveConsoleBtn">Save console</button>
+          </div>
+        </div>
+      </article>
+
+      <aside class="panel sidebar">
+        <div class="sidebar-head">
+          <strong>Command List</strong>
+          <span id="cmdCount" class="hint"></span>
+        </div>
+        <input id="search" class="search" type="text" placeholder="Filter commands...">
+        <div id="categoryBar" class="chip-row"></div>
+        <div class="sidebar-tools">
+          <button id="expandAllBtn" class="mini">Expand all</button>
+          <button id="collapseAllBtn" class="mini">Collapse all</button>
+          <button id="quickStopBtn" class="mini btn-danger">Stop</button>
+        </div>
+        <div id="groups"></div>
+      </aside>
+    </section>
+
+    <footer>
+      Product of <a href="https://github.com/C5Lab/projectZero/">C5Lab/projectZero</a> -
+      <span id="pageVersion" class="mono">Web CLI v1.0.0</span>.
+    </footer>
+  </div>
+
+  <script>
+    const ui = {
+      connectBtn: document.getElementById("connectBtn"),
+      disconnectBtn: document.getElementById("disconnectBtn"),
+      clearBtn: document.getElementById("clearBtn"),
+      sendBtn: document.getElementById("sendBtn"),
+      baudSelect: document.getElementById("baudSelect"),
+      lineEnding: document.getElementById("lineEnding"),
+      status: document.getElementById("status"),
+      log: document.getElementById("log"),
+      input: document.getElementById("input"),
+      saveConsoleBtn: document.getElementById("saveConsoleBtn"),
+      groups: document.getElementById("groups"),
+      search: document.getElementById("search"),
+      cmdCount: document.getElementById("cmdCount"),
+      categoryBar: document.getElementById("categoryBar"),
+      expandAllBtn: document.getElementById("expandAllBtn"),
+      collapseAllBtn: document.getElementById("collapseAllBtn"),
+      quickStopBtn: document.getElementById("quickStopBtn"),
+      pageVersion: document.getElementById("pageVersion"),
+    };
+
+    const state = {
+      port: null,
+      reader: null,
+      writer: null,
+      decoderPipe: null,
+      connected: false,
+      onDisconnect: null,
+      history: [],
+      historyIndex: -1,
+      activeGroup: "All",
+      expandedGroups: new Set(),
+    };
+
+    const encoder = new TextEncoder();
+    const PAGE_VERSION = "1.0.0";
+
+    function getLogFilename() {
+      const now = new Date();
+      const pad2 = (n) => String(n).padStart(2, "0");
+      const yyyy = now.getFullYear();
+      const mm = pad2(now.getMonth() + 1);
+      const dd = pad2(now.getDate());
+      const hh = pad2(now.getHours());
+      const min = pad2(now.getMinutes());
+      const ss = pad2(now.getSeconds());
+      return `serial_log_${yyyy}-${mm}-${dd}_${hh}-${min}-${ss}.txt`;
+    }
+
+    function saveConsoleLog() {
+      const content = ui.log.textContent || "";
+      if (!content.trim()) {
+        setStatus("Console output is empty.", true);
+        return;
+      }
+      const filename = getLogFilename();
+      const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setStatus(`Saved console log: ${filename}`);
+    }
+
+    const COMMANDS = [
+      { group: "System", cmd: "ping", template: "ping", help: "Connectivity test: prints pong" },
+      { group: "System", cmd: "stop", template: "stop", help: "Stop all running operations" },
+      { group: "System", cmd: "reboot", template: "reboot", help: "Device reboot to start from scratch" },
+      { group: "System", cmd: "download", template: "download", help: "Reboot into ROM download mode" },
+      { group: "System", cmd: "led", template: "led read", help: "LED control: set/level/read" },
+      { group: "System", cmd: "boot_button", template: "boot_button read", help: "Configure boot button actions" },
+      { group: "WiFi / Scan", cmd: "scan_networks", template: "scan_networks", help: "Starts background network scan" },
+      { group: "WiFi / Scan", cmd: "show_scan_results", template: "show_scan_results", help: "Shows results from last network scan" },
+      { group: "WiFi / Scan", cmd: "select_networks", template: "select_networks 0", help: "Select networks by indexes" },
+      { group: "WiFi / Scan", cmd: "unselect_networks", template: "unselect_networks", help: "Clear selected networks" },
+      { group: "WiFi / Scan", cmd: "start_sniffer", template: "start_sniffer", help: "Start sniffer (auto mode)" },
+      { group: "WiFi / Scan", cmd: "start_sniffer_noscan", template: "start_sniffer_noscan", help: "Sniffer without rescanning" },
+      { group: "WiFi / Scan", cmd: "show_sniffer_results", template: "show_sniffer_results", help: "Show sniffer results" },
+      { group: "WiFi / Scan", cmd: "show_sniffer_results_vendor", template: "show_sniffer_results_vendor", help: "Show sniffer results + vendor" },
+      { group: "WiFi / Scan", cmd: "clear_sniffer_results", template: "clear_sniffer_results", help: "Clear captured results" },
+      { group: "WiFi / Scan", cmd: "show_probes", template: "show_probes", help: "Show captured probe requests" },
+      { group: "WiFi / Scan", cmd: "show_probes_vendor", template: "show_probes_vendor", help: "Show probe requests + vendor" },
+      { group: "WiFi / Scan", cmd: "list_probes", template: "list_probes", help: "List probe requests with index" },
+      { group: "WiFi / Scan", cmd: "list_probes_vendor", template: "list_probes_vendor", help: "List probes with vendor" },
+      { group: "WiFi / Scan", cmd: "sniffer_debug", template: "sniffer_debug 1", help: "Enable/disable sniffer debug" },
+      { group: "WiFi / Scan", cmd: "packet_monitor", template: "packet_monitor 1", help: "Packets per second on channel" },
+      { group: "WiFi / Scan", cmd: "channel_view", template: "channel_view", help: "Continuous channel utilization" },
+      { group: "WiFi / Scan", cmd: "start_sniffer_dog", template: "start_sniffer_dog", help: "Sniffer Dog mode" },
+      { group: "WiFi / Scan", cmd: "deauth_detector", template: "deauth_detector", help: "Detect deauth frames" },
+      { group: "Attack", cmd: "start_deauth", template: "start_deauth", help: "Start deauth attack" },
+      { group: "Attack", cmd: "start_blackout", template: "start_blackout", help: "Start blackout attack" },
+      { group: "Attack", cmd: "start_evil_twin", template: "start_evil_twin", help: "Start Evil Twin" },
+      { group: "Attack", cmd: "start_handshake", template: "start_handshake", help: "Start WPA handshake capture" },
+      { group: "Attack", cmd: "save_handshake", template: "save_handshake", help: "Save captured handshake" },
+      { group: "Attack", cmd: "sae_overflow", template: "sae_overflow", help: "Start SAE WPA3 overflow" },
+      { group: "Attack", cmd: "start_beacon_spam", template: "start_beacon_spam \"test\"", help: "Spam fake SSID beacons" },
+      { group: "Attack", cmd: "select_stations", template: "select_stations AA:BB:CC:DD:EE:FF", help: "Target specific station MACs" },
+      { group: "Attack", cmd: "unselect_stations", template: "unselect_stations", help: "Clear selected station MACs" },
+      { group: "Portal", cmd: "start_portal", template: "start_portal FreeWiFi", help: "Start captive portal" },
+      { group: "Portal", cmd: "start_rogueap", template: "start_rogueap FreeWiFi 12345678", help: "Start rogue AP" },
+      { group: "Portal", cmd: "start_karma", template: "start_karma 0", help: "Start Karma from probe index" },
+      { group: "Portal", cmd: "select_html", template: "select_html 0", help: "Select HTML from SD" },
+      { group: "Portal", cmd: "set_html", template: "set_html <html>", help: "Set custom portal HTML string" },
+      { group: "Portal", cmd: "list_sd", template: "list_sd", help: "List HTML files on SD" },
+      { group: "Portal", cmd: "list_dir", template: "list_dir /sdcard", help: "List SD directory" },
+      { group: "Portal", cmd: "list_ssid", template: "list_ssid", help: "List SSID file entries" },
+      { group: "Portal", cmd: "show_pass", template: "show_pass", help: "Print password log" },
+      { group: "Portal", cmd: "file_delete", template: "file_delete /sdcard/path.txt", help: "Delete file on SD" },
+      { group: "Network", cmd: "wifi_connect", template: "wifi_connect SSID PASSWORD", help: "Connect STA to AP" },
+      { group: "Network", cmd: "wifi_disconnect", template: "wifi_disconnect", help: "Disconnect STA" },
+      { group: "Network", cmd: "list_hosts", template: "list_hosts", help: "ARP host discovery" },
+      { group: "Network", cmd: "list_hosts_vendor", template: "list_hosts_vendor", help: "ARP hosts + vendor" },
+      { group: "Network", cmd: "arp_ban", template: "arp_ban AA:BB:CC:DD:EE:FF", help: "ARP poison target" },
+      { group: "Network", cmd: "vendor", template: "vendor read", help: "Vendor lookup control" },
+      { group: "OTA", cmd: "ota_check", template: "ota_check", help: "Check and apply OTA" },
+      { group: "OTA", cmd: "ota_list", template: "ota_list", help: "List GitHub releases" },
+      { group: "OTA", cmd: "ota_channel", template: "ota_channel", help: "Get/set OTA channel" },
+      { group: "OTA", cmd: "ota_info", template: "ota_info", help: "Show OTA partition info" },
+      { group: "OTA", cmd: "ota_boot", template: "ota_boot ota_0", help: "Set boot partition" },
+      { group: "GPS / BLE", cmd: "gps_set", template: "gps_set atgm", help: "Select GPS module" },
+      { group: "GPS / BLE", cmd: "start_gps_raw", template: "start_gps_raw", help: "Print raw GPS NMEA" },
+      { group: "GPS / BLE", cmd: "start_wardrive", template: "start_wardrive", help: "Start wardriving" },
+      { group: "GPS / BLE", cmd: "scan_bt", template: "scan_bt", help: "One-time BLE scan" },
+      { group: "GPS / BLE", cmd: "scan_airtag", template: "scan_airtag", help: "Continuous AirTag scan" },
+      { group: "Config", cmd: "channel_time", template: "channel_time read min", help: "Read/set scan channel time" },
+      { group: "Config", cmd: "wpasec_key", template: "wpasec_key read", help: "Read/set WPA-SEC API key" },
+      { group: "Config", cmd: "wpasec_upload", template: "wpasec_upload", help: "Upload handshakes to WPA-SEC" },
+    ];
+    const GROUPS = ["All", ...new Set(COMMANDS.map((item) => item.group))];
+
+    function setStatus(text, isError = false) {
+      ui.status.textContent = text;
+      ui.status.classList.toggle("error", isError);
+    }
+
+    function setFooterVersion() {
+      if (!ui.pageVersion) return;
+      ui.pageVersion.textContent = `Web CLI v${PAGE_VERSION}`;
+    }
+
+    function appendLog(text) {
+      ui.log.textContent += text;
+      ui.log.scrollTop = ui.log.scrollHeight;
+    }
+
+    function appendLine(line) {
+      const t = new Date().toLocaleTimeString();
+      appendLog(`[${t}] ${line}\n`);
+    }
+
+    function lineEndingForSelection() {
+      if (ui.lineEnding.value === "lf") return "\n";
+      if (ui.lineEnding.value === "none") return "";
+      return "\r\n";
+    }
+
+    function ensureSupport() {
+      if (!("serial" in navigator)) {
+        throw new Error("WebSerial unavailable. Use Chrome/Edge over HTTPS.");
+      }
+    }
+
+    async function readLoop() {
+      try {
+        while (state.connected && state.reader) {
+          const { value, done } = await state.reader.read();
+          if (done) break;
+          if (value) appendLog(value);
+        }
+      } catch (err) {
+        appendLine(`Read error: ${err?.message || err}`);
+      }
+    }
+
+    async function connect() {
+      ensureSupport();
+      ui.connectBtn.disabled = true;
+      try {
+        state.port = await navigator.serial.requestPort({});
+        state.onDisconnect = () => {
+          appendLine("Port disconnected.");
+          disconnect(true).catch(() => {});
+        };
+        try {
+          state.port.addEventListener("disconnect", state.onDisconnect);
+        } catch {}
+
+        const baud = parseInt(ui.baudSelect.value, 10) || 115200;
+        await state.port.open({ baudRate: baud });
+        const decoder = new TextDecoderStream();
+        state.decoderPipe = state.port.readable.pipeTo(decoder.writable).catch(() => {});
+        state.reader = decoder.readable.getReader();
+        state.writer = state.port.writable.getWriter();
+        state.connected = true;
+
+        ui.connectBtn.disabled = true;
+        ui.disconnectBtn.disabled = false;
+        ui.sendBtn.disabled = false;
+        ui.input.focus();
+
+        setStatus(`Connected @ ${baud} baud.`);
+        appendLine(`Connected @ ${baud} baud`);
+        readLoop().catch(() => {});
+      } catch (err) {
+        await disconnect(true);
+        setStatus(err?.message || "Connection failed", true);
+      } finally {
+        if (!state.connected) ui.connectBtn.disabled = false;
+      }
+    }
+
+    async function disconnect(silent = false) {
+      if (state.port && state.onDisconnect) {
+        try { state.port.removeEventListener("disconnect", state.onDisconnect); } catch {}
+      }
+      try { if (state.reader) await state.reader.cancel(); } catch {}
+      try { if (state.reader) state.reader.releaseLock(); } catch {}
+      try { if (state.writer) state.writer.releaseLock(); } catch {}
+      try { if (state.decoderPipe) await state.decoderPipe; } catch {}
+      try { if (state.port) await state.port.close(); } catch {}
+
+      state.port = null;
+      state.reader = null;
+      state.writer = null;
+      state.decoderPipe = null;
+      state.onDisconnect = null;
+      state.connected = false;
+
+      ui.connectBtn.disabled = false;
+      ui.disconnectBtn.disabled = true;
+      ui.sendBtn.disabled = true;
+      setStatus("Disconnected.");
+      if (!silent) appendLine("Disconnected.");
+    }
+
+    async function sendCommand(raw) {
+      if (!state.connected || !state.writer) return;
+      const text = String(raw || "").trim();
+      if (!text) return;
+
+      const payload = `${text}${lineEndingForSelection()}`;
+      await state.writer.write(encoder.encode(payload));
+      appendLine(`> ${text}`);
+
+      if (!state.history.length || state.history[state.history.length - 1] !== text) {
+        state.history.push(text);
+      }
+      state.historyIndex = state.history.length;
+    }
+
+    function fillInput(value) {
+      ui.input.value = value;
+      ui.input.focus();
+      const len = ui.input.value.length;
+      ui.input.setSelectionRange(len, len);
+    }
+
+    function groupCommands(list) {
+      const grouped = new Map();
+      for (const item of list) {
+        if (!grouped.has(item.group)) grouped.set(item.group, []);
+        grouped.get(item.group).push(item);
+      }
+      return grouped;
+    }
+
+    function renderGroupFilterBar() {
+      if (!ui.categoryBar) return;
+      ui.categoryBar.innerHTML = "";
+      for (const groupName of GROUPS) {
+        const button = document.createElement("button");
+        button.className = "chip";
+        if (groupName === state.activeGroup) button.classList.add("active");
+        button.textContent = groupName;
+        button.addEventListener("click", () => {
+          state.activeGroup = groupName;
+          if (groupName !== "All") state.expandedGroups.add(groupName);
+          renderCommands();
+        });
+        ui.categoryBar.appendChild(button);
+      }
+    }
+
+    function getFilteredCommands() {
+      const term = ui.search.value.trim().toLowerCase();
+      const filtered = COMMANDS.filter((c) => {
+        const groupMatches = state.activeGroup === "All" || c.group === state.activeGroup;
+        if (!groupMatches) return false;
+        if (!term) return true;
+        return c.cmd.toLowerCase().includes(term) ||
+               c.help.toLowerCase().includes(term) ||
+               c.template.toLowerCase().includes(term) ||
+               c.group.toLowerCase().includes(term);
+      });
+      return { term, filtered };
+    }
+
+    function renderCommands() {
+      const { term, filtered } = getFilteredCommands();
+
+      const grouped = groupCommands(filtered);
+      ui.groups.innerHTML = "";
+      ui.cmdCount.textContent = `${filtered.length} commands`;
+      ui.quickStopBtn.disabled = !state.connected;
+      renderGroupFilterBar();
+
+      for (const [groupName, items] of grouped) {
+        const group = document.createElement("details");
+        group.className = "group";
+        const shouldOpen = term.length > 0 || state.expandedGroups.has(groupName) || state.activeGroup === groupName;
+        group.open = shouldOpen;
+
+        const summary = document.createElement("summary");
+        summary.innerHTML = `<span>${groupName}</span><span class="summary-right">${items.length} commands</span>`;
+        group.appendChild(summary);
+
+        group.addEventListener("toggle", () => {
+          if (group.open) state.expandedGroups.add(groupName);
+          else state.expandedGroups.delete(groupName);
+        });
+
+        const body = document.createElement("div");
+        body.className = "group-body";
+
+        for (const item of items) {
+          const card = document.createElement("article");
+          card.className = "cmd";
+
+          const code = document.createElement("code");
+          code.textContent = item.template;
+          card.appendChild(code);
+
+          const help = document.createElement("p");
+          help.textContent = item.help;
+          card.appendChild(help);
+
+          const actions = document.createElement("div");
+          actions.className = "actions";
+
+          const insertBtn = document.createElement("button");
+          insertBtn.className = "mini";
+          insertBtn.textContent = "Insert";
+          insertBtn.addEventListener("click", () => fillInput(item.template));
+          actions.appendChild(insertBtn);
+
+          const sendBtn = document.createElement("button");
+          sendBtn.className = "mini";
+          sendBtn.textContent = "Send";
+          sendBtn.disabled = !state.connected;
+          sendBtn.addEventListener("click", () => {
+            sendCommand(item.template).catch((err) => {
+              setStatus(err?.message || "Send failed", true);
+              appendLine(`Send error: ${err?.message || err}`);
+            });
+          });
+          actions.appendChild(sendBtn);
+
+          card.appendChild(actions);
+          body.appendChild(card);
+        }
+
+        group.appendChild(body);
+        ui.groups.appendChild(group);
+      }
+
+      if (!filtered.length) {
+        const empty = document.createElement("p");
+        empty.className = "hint";
+        empty.textContent = "No commands match the filter.";
+        ui.groups.appendChild(empty);
+      }
+    }
+
+    ui.connectBtn.addEventListener("click", () => {
+      connect().then(renderCommands).catch((err) => {
+        setStatus(err?.message || "Connection failed", true);
+      });
+    });
+
+    ui.disconnectBtn.addEventListener("click", () => {
+      disconnect().then(renderCommands).catch(() => {});
+    });
+
+    ui.clearBtn.addEventListener("click", () => {
+      ui.log.textContent = "";
+    });
+
+    ui.sendBtn.addEventListener("click", () => {
+      sendCommand(ui.input.value)
+        .then(() => { ui.input.value = ""; })
+        .catch((err) => {
+          setStatus(err?.message || "Send failed", true);
+          appendLine(`Send error: ${err?.message || err}`);
+        });
+    });
+    ui.saveConsoleBtn.addEventListener("click", saveConsoleLog);
+
+    ui.input.addEventListener("keydown", (event) => {
+      if (event.ctrlKey && event.key.toLowerCase() === "l") {
+        event.preventDefault();
+        ui.log.textContent = "";
+        return;
+      }
+
+      if (event.key === "Enter") {
+        event.preventDefault();
+        sendCommand(ui.input.value)
+          .then(() => { ui.input.value = ""; })
+          .catch((err) => {
+            setStatus(err?.message || "Send failed", true);
+            appendLine(`Send error: ${err?.message || err}`);
+          });
+        return;
+      }
+
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        if (!state.history.length) return;
+        state.historyIndex = Math.max(0, state.historyIndex - 1);
+        ui.input.value = state.history[state.historyIndex] || "";
+        const len = ui.input.value.length;
+        ui.input.setSelectionRange(len, len);
+      }
+
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        if (!state.history.length) return;
+        state.historyIndex = Math.min(state.history.length, state.historyIndex + 1);
+        ui.input.value = state.history[state.historyIndex] || "";
+      }
+    });
+
+    ui.search.addEventListener("input", renderCommands);
+    ui.expandAllBtn.addEventListener("click", () => {
+      const { filtered } = getFilteredCommands();
+      const groups = groupCommands(filtered);
+      state.expandedGroups = new Set([...groups.keys()]);
+      renderCommands();
+    });
+    ui.collapseAllBtn.addEventListener("click", () => {
+      state.expandedGroups.clear();
+      renderCommands();
+    });
+    ui.quickStopBtn.addEventListener("click", () => {
+      sendCommand("stop").catch((err) => {
+        setStatus(err?.message || "Send failed", true);
+        appendLine(`Send error: ${err?.message || err}`);
+      });
+    });
+
+    setFooterVersion();
+    renderCommands();
+  </script>
+</body>
+</html>
+
+
