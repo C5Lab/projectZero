@@ -115,6 +115,27 @@
       border-color: var(--accent);
       box-shadow: 0 0 0 2px rgba(64,240,255,0.2);
     }
+    .check {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      user-select: none;
+      cursor: pointer;
+    }
+    .check input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
     button {
       border: none;
       cursor: pointer;
@@ -146,6 +167,17 @@
       color: var(--muted);
       font-size: 14px;
     }
+    .hint {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 12.5px;
+      line-height: 1.45;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.10);
+      background: rgba(255,255,255,0.02);
+    }
+    .hint strong { color: var(--text); }
     .pill {
       display: inline-flex;
       align-items: center;
@@ -249,6 +281,10 @@
           <div class="actions">
             <button id="connectBtn">Connect</button>
             <button id="flashBtn" class="ghost" disabled>Flash</button>
+            <label class="check" title="Recommended for OTA partitions and clean flashing">
+              <input id="eraseAll" type="checkbox">
+              Erase
+            </label>
             <select id="branchSelect" aria-label="Branch">
               <option value="main" selected>Main</option>
               <option value="development">Development</option>
@@ -263,6 +299,11 @@
             <span id="statusText">Ready to connect.</span>
             <span id="chipText" class="pill" style="display:none;"></span>
             <span id="manifestText" class="pill" style="display:none;"></span>
+          </div>
+          <div class="hint">
+            <strong>Erase</strong> does a full flash erase <span class="mono">(esptool erase-flash)</span> before writing the images.
+            Only enable it when you have OTA partitions / old firmware and you see bootloops or slot errors.
+            Note: it wipes anything stored in flash (including NVS settings like Wi-Fi creds/config).
           </div>
           <div class="progress" aria-label="Flash progress">
             <span id="progressBar"></span>
@@ -300,7 +341,7 @@
   </div>
   <footer>
     Product of <a href="https://github.com/C5Lab/projectZero/">C5Lab/projectZero</a> -
-    <span id="pageVersion" class="mono">Web flasher v1.0.0</span>.
+    <span id="pageVersion" class="mono">Web flasher v1.0.1</span>.
   </footer>
 
   <script type="module">
@@ -314,6 +355,7 @@
       progress: document.getElementById("progressBar"),
       connectBtn: document.getElementById("connectBtn"),
       flashBtn: document.getElementById("flashBtn"),
+      eraseAll: document.getElementById("eraseAll"),
       baud: document.getElementById("baudSelect"),
       branch: document.getElementById("branchSelect"),
       releaseInfo: document.getElementById("releaseInfo"),
@@ -335,7 +377,14 @@
       autoFlashTriggered: false,
     };
 
-    const PAGE_VERSION = "1.0.0";
+    const PAGE_VERSION = "1.0.2";
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // How long we keep trying to sync after the user picked a port.
+    // This is the window where you typically press BOOT+RESET / enter ROM mode.
+    const CONNECT_TIMEOUT_MS = 20000;
+    const CONNECT_RETRY_DELAY_MS = 500;
 
     const setFooterVersion = (manifest) => {
       if (!ui.pageVersion) return;
@@ -415,9 +464,21 @@
 
     const getBranch = () => ui.branch.value || "main";
 
+    const withCacheBust = (url) => {
+      try {
+        const u = new URL(url, window.location.href);
+        // Avoid unbounded growth if someone keeps reloading.
+        u.searchParams.set("cb", Date.now().toString());
+        return u.toString();
+      } catch {
+        const sep = url.includes("?") ? "&" : "?";
+        return `${url}${sep}cb=${Date.now()}`;
+      }
+    };
+
     const getManifestUrl = () => {
       const branch = getBranch();
-      if (branch === "main") return "manifest.json";
+      if (branch === "main") return new URL("manifest.json", window.location.href).toString();
       return `https://raw.githubusercontent.com/C5Lab/projectZero/${branch}/docs/manifest.json`;
     };
 
@@ -445,10 +506,34 @@
 
     const loadManifest = async () => {
       try {
-        const manifestUrl = getManifestUrl();
-        const res = await fetch(manifestUrl, { cache: "no-store" });
-        if (!res.ok) throw new Error("Manifest fetch failed");
-        const manifestRaw = await res.json();
+        const branch = getBranch();
+        const primary = getManifestUrl();
+        const candidates = branch === "main"
+          ? [
+              primary,
+              // Fallbacks in case the page is served from repo root while manifest lives under docs/.
+              new URL("docs/manifest.json", window.location.href).toString(),
+              "https://raw.githubusercontent.com/C5Lab/projectZero/main/docs/manifest.json",
+            ]
+          : [primary];
+
+        let manifestRaw = null;
+        let usedManifestUrl = null;
+        let lastErr = null;
+        for (const candidate of candidates) {
+          try {
+            const url = withCacheBust(candidate);
+            const res = await fetch(url, { cache: "no-store" });
+            if (!res.ok) throw new Error(`Manifest fetch failed: ${res.status} ${res.statusText}`);
+            manifestRaw = await res.json();
+            usedManifestUrl = candidate;
+            break;
+          } catch (err) {
+            lastErr = err;
+          }
+        }
+        if (!manifestRaw) throw lastErr || new Error("Manifest fetch failed");
+        if (usedManifestUrl) log(`Manifest: ${usedManifestUrl}`);
         const manifest = rewritePartsForBranch(manifestRaw, getBranch());
         state.manifest = manifest;
         let releaseLabel = manifest.version || "n/a";
@@ -515,10 +600,30 @@
           },
           debugLogging: false,
         };
-        state.esploader = new ESPLoader(loaderOptions);
-        setStatus("Syncing with chip (hold BOOT + RESET to enter ROM)");
+        setStatus(`Syncing with chip (hold BOOT + RESET). Timeout ${Math.round(CONNECT_TIMEOUT_MS/1000)}s`);
         log("Syncing with chip");
-        state.chip = await state.esploader.main();
+
+        const start = Date.now();
+        let attempt = 0;
+        let lastErr = null;
+        while (Date.now() - start < CONNECT_TIMEOUT_MS) {
+          attempt += 1;
+          try {
+            state.esploader = new ESPLoader(loaderOptions);
+            log("Connecting...");
+            state.chip = await state.esploader.main();
+            lastErr = null;
+            break;
+          } catch (err) {
+            lastErr = err;
+            const remainingMs = Math.max(0, CONNECT_TIMEOUT_MS - (Date.now() - start));
+            const remainingS = Math.ceil(remainingMs / 1000);
+            setStatus(`Failed to connect. Hold BOOT + tap RESET, retrying... (${remainingS}s)`);
+            log(`Error: ${err?.message || err}`);
+            await sleep(CONNECT_RETRY_DELAY_MS);
+          }
+        }
+        if (lastErr) throw lastErr;
         state.connected = true;
         ui.chip.style.display = "inline-flex";
         ui.chip.textContent = `Chip ${state.chip}`;
@@ -611,7 +716,7 @@ const flash = async () => {
         const flashOptions = {
           fileArray: files,
           flashSize: "4MB",
-          eraseAll: false,
+          eraseAll: !!ui.eraseAll?.checked,
           compress: true,
           reportProgress: (fileIndex, written, total) => {
             const pct = Math.min(100, Math.round((written / total) * 100));

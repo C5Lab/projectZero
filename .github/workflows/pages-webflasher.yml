@@ -1,0 +1,100 @@
+name: Pages Web Flasher (Release Assets)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish to GitHub Pages (example: v1.3.4)"
+        required: false
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages-webflasher.yml"
+
+jobs:
+  pages:
+    name: Deploy Web Flasher (Pages)
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: github-pages
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+        with:
+          enablement: true
+
+      - name: Resolve release tag
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-}"
+          if [ -z "$TAG" ]; then
+            TAG="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          fi
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "Could not resolve a release tag. Provide release_tag input or publish a Release." >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using tag: $TAG"
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          rm -rf docs/firmware
+          mkdir -p docs/firmware
+
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" --dir docs/firmware \
+            --pattern "bootloader.bin" \
+            --pattern "partition-table.bin" \
+            --pattern "projectZero*.bin"
+
+          ls -lh docs/firmware
+
+          if [ ! -f docs/firmware/projectZero.bin ]; then
+            alt=$(ls docs/firmware/projectZero-*.bin 2>/dev/null | head -n1 || true)
+            if [ -n "$alt" ]; then
+              cp "$alt" docs/firmware/projectZero.bin
+            fi
+          fi
+
+          for f in bootloader.bin partition-table.bin projectZero.bin; do
+            if [ ! -f "docs/firmware/$f" ]; then
+              echo "Missing $f in release assets for tag ${TAG}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Build manifest.json
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python -c "import os, json; from pathlib import Path; tag=os.getenv('TAG','manual'); manifest={'name':'projectZero ESP32-C5','version':tag,'build':tag,'chipFamily':'ESP32-C5','parts':[{'path':'firmware/bootloader.bin','offset':8192},{'path':'firmware/partition-table.bin','offset':32768},{'path':'firmware/projectZero.bin','offset':131072}]}; Path('docs/manifest.json').write_text(json.dumps(manifest, indent=2) + '\\n')"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

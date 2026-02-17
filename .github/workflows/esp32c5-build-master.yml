@@ -403,7 +403,7 @@ jobs:
           BUILD_TAG: ${{ steps.meta.outputs.tag }}
         run: |
           set -euo pipefail
-          python -c "import os, json; from pathlib import Path; version=os.getenv('FW_VERSION') or os.getenv('BUILD_TAG'); build=os.getenv('BUILD_TAG','manual'); manifest={'name':'projectZero ESP32-C5','version':version,'build':build,'chipFamily':'ESP32-C5','parts':[{'path':'firmware/bootloader.bin','offset':8192},{'path':'firmware/partition-table.bin','offset':32768},{'path':'firmware/projectZero.bin','offset':65536}]}; Path('docs/manifest.json').write_text(json.dumps(manifest, indent=2))"
+          python -c "import os, json; from pathlib import Path; version=os.getenv('FW_VERSION') or os.getenv('BUILD_TAG'); build=os.getenv('BUILD_TAG','manual'); manifest={'name':'projectZero ESP32-C5','version':version,'build':build,'chipFamily':'ESP32-C5','parts':[{'path':'firmware/bootloader.bin','offset':8192},{'path':'firmware/partition-table.bin','offset':32768},{'path':'firmware/projectZero.bin','offset':131072}]}; Path('docs/manifest.json').write_text(json.dumps(manifest, indent=2))"
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
@@ -441,9 +441,14 @@ jobs:
           BUNDLE_ZIP="$BASE_URL/projectZero-${FW_VERSION}-with-fap-${FAP_VER}.zip"
           RELEASE_PAGE="https://github.com/$REPO/releases/tag/$TAG"
           PAGES_LINK="${PAGES_URL:-https://${GITHUB_REPOSITORY%/*}.github.io/${GITHUB_REPOSITORY#*/}/}"
+          RELEASE_BODY=$(gh release view "$TAG" -R "$REPO" --json body --jq .body 2>/dev/null || true)
+          if [ -n "$RELEASE_BODY" ]; then
+            RELEASE_BODY="$(printf '%s' "$RELEASE_BODY" | tr -d '\r' | head -c 1800)"
+          fi
 
           content=$(
             printf '%s\n' \
+              "JanOS" \
               "Release ${TAG} published." \
               "Release page:" \
               "${RELEASE_PAGE}" \
@@ -454,7 +459,8 @@ jobs:
               "FAPs (${FAP_VER}):" \
               "${FAP_ZIP}" \
               "Full package:" \
-              "${BUNDLE_ZIP}"
+              "${BUNDLE_ZIP}" \
+              "${RELEASE_BODY}"
           )
           payload=$(jq -n --arg content "$content" '{content:$content}')
           curl -X POST -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK"
