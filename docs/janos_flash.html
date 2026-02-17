@@ -115,6 +115,22 @@
       border-color: var(--accent);
       box-shadow: 0 0 0 2px rgba(64,240,255,0.2);
     }
+    .text-input {
+      flex: 1;
+      min-width: 220px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      padding: 11px 12px;
+      font-size: 13px;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+    .text-input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(64,240,255,0.2);
+    }
     .check {
       display: inline-flex;
       align-items: center;
@@ -226,6 +242,11 @@
       grid-template-columns: 1.3fr 1fr;
       gap: 14px;
     }
+    .stack {
+      display: grid;
+      gap: 14px;
+      align-content: start;
+    }
     .steps {
       display: grid;
       gap: 8px;
@@ -271,77 +292,102 @@
     <header>
       <div class="eyebrow">projectZero  ESP32-C5</div>
       <h1>Flash projectZero straight from your browser</h1>
-      <p>WebSerial flasher powered by esptool-js. Click Connect, pick the LAB C5 serial port (Chrome/Edge desktop), then Flash to stream bootloader, partition table, and firmware from the latest GitHub Release.</p>
+      <p>WebSerial flasher powered by esptool-js. Use Connect + Flash for firmware, or run Serial Monitor as a separate mode to read/write UART data in browser.</p>
     </header>
 
     <div class="split">
-      <div class="card">
-        <h2>Control</h2>
-        <div class="controls">
-          <div class="actions">
-            <button id="connectBtn">Connect</button>
-            <button id="flashBtn" class="ghost" disabled>Flash</button>
-            <label class="check" title="Recommended for OTA partitions and clean flashing">
-              <input id="eraseAll" type="checkbox">
-              Erase
-            </label>
-            <select id="branchSelect" aria-label="Branch">
-              <option value="main" selected>Main</option>
-              <option value="development">Development</option>
-            </select>
-            <select id="baudSelect" aria-label="Baud rate">
-              <option value="460800">460800 baud</option>
-              <option value="921600">921600 baud</option>
-              <option value="115200">115200 baud</option>
-            </select>
+      <div class="stack">
+        <div class="card">
+          <h2>Control</h2>
+          <div class="controls">
+            <div class="actions">
+              <button id="connectBtn">Connect</button>
+              <button id="flashBtn" class="ghost" disabled>Flash</button>
+              <label class="check" title="Recommended for OTA partitions and clean flashing">
+                <input id="eraseAll" type="checkbox">
+                Erase
+              </label>
+              <select id="branchSelect" aria-label="Branch">
+                <option value="main" selected>Main</option>
+                <option value="development">Development</option>
+              </select>
+              <select id="baudSelect" aria-label="Baud rate">
+                <option value="460800">460800 baud</option>
+                <option value="921600">921600 baud</option>
+                <option value="115200">115200 baud</option>
+              </select>
+            </div>
+            <div class="status-line">
+              <span id="statusText">Ready to connect.</span>
+              <span id="chipText" class="pill" style="display:none;"></span>
+              <span id="manifestText" class="pill" style="display:none;"></span>
+            </div>
+            <div class="hint">
+              <strong>Erase</strong> does a full flash erase <span class="mono">(esptool erase-flash)</span> before writing the images.
+              Only enable it when you have OTA partitions / old firmware and you see bootloops or slot errors.
+              Note: it wipes anything stored in flash (including NVS settings like Wi-Fi creds/config).
+            </div>
+            <div class="progress" aria-label="Flash progress">
+              <span id="progressBar"></span>
+            </div>
+            <div class="log" id="log"></div>
           </div>
-          <div class="status-line">
-            <span id="statusText">Ready to connect.</span>
-            <span id="chipText" class="pill" style="display:none;"></span>
-            <span id="manifestText" class="pill" style="display:none;"></span>
+        </div>
+
+        <div class="card">
+          <h2>Serial monitor</h2>
+          <p>Independent UART terminal mode. You can read and write serial data directly from browser.</p>
+          <div class="controls" style="margin-top:12px;">
+            <div class="actions">
+              <button id="monitorBtn" class="ghost">Monitor</button>
+              <select id="monitorBaudSelect" aria-label="Monitor baud rate">
+                <option value="115200">115200 baud</option>
+                <option value="460800">460800 baud</option>
+                <option value="921600">921600 baud</option>
+              </select>
+              <button id="clearMonitorBtn" class="ghost">Clear</button>
+            </div>
+            <div class="status-line">
+              <span id="monitorStatusText">Monitor disconnected.</span>
+            </div>
+            <div class="log" id="monitorLog"></div>
+            <div class="actions">
+              <input id="monitorInput" class="text-input" type="text" placeholder="Type text to send over UART">
+              <button id="monitorSendBtn" class="ghost" disabled>Send</button>
+            </div>
           </div>
-          <div class="hint">
-            <strong>Erase</strong> does a full flash erase <span class="mono">(esptool erase-flash)</span> before writing the images.
-            Only enable it when you have OTA partitions / old firmware and you see bootloops or slot errors.
-            Note: it wipes anything stored in flash (including NVS settings like Wi-Fi creds/config).
-          </div>
-          <div class="progress" aria-label="Flash progress">
-            <span id="progressBar"></span>
-          </div>
-          <div class="log" id="log"></div>
         </div>
       </div>
 
-      <div class="card">
-        <h2>Release info</h2>
-        <p id="releaseInfo">Loading manifest</p>
-        <div class="steps">
-          <li><strong>ROM mode:</strong> Hold BOOT on the LAB C5, plug the board in, then release.</li>
-          <li><strong>Close serial hogs:</strong> quit qFlipper/monitors or anything holding the COM port.</li>
-          <li><strong>Stuck-</strong> Unplug, re-run Connect, plug again with BOOT held, then Flash.</li>
-          <li><strong>Reset:</strong> after flashing, press RESET on the board if it does not auto-reboot.</li>
+      <div class="stack">
+        <div class="card">
+          <h2>Release info</h2>
+          <p id="releaseInfo">Loading manifest</p>
+          <div class="steps">
+            <li><strong>ROM mode:</strong> Hold BOOT on the LAB C5, plug the board in, then release.</li>
+            <li><strong>Close serial hogs:</strong> quit qFlipper/monitors or anything holding the COM port.</li>
+            <li><strong>Stuck-</strong> Unplug, re-run Connect, plug again with BOOT held, then Flash.</li>
+            <li><strong>Reset:</strong> after flashing, press RESET on the board if it does not auto-reboot.</li>
+          </div>
         </div>
-      </div>
-    </div>
-
-    <div class="grid">
-      <div class="card">
-        <h2>What happens</h2>
-        <p>Using esptool-js directly: enter stub, set baud, then flash each image at the offsets from <code>manifest.json</code>. Progress and MD5 checks mirror the Python esptool flow.</p>
-      </div>
-      <div class="card">
-        <h2>Need offline-</h2>
-        <p>Grab the same assets from Releases and run <code>flash_board.py</code> in <code>ESP32C5/binaries-esp32c5</code> if your browser blocks Web Serial.</p>
-      </div>
-      <div class="card">
-        <h2>Browser support</h2>
-        <p>Chrome or Edge on desktop over HTTPS. Web Serial is required. If you see Web Serial not available, switch browsers.</p>
+        <div class="card">
+          <h2>What happens</h2>
+          <p>Using esptool-js directly: enter stub, set baud, then flash each image at the offsets from <code>manifest.json</code>. Progress and MD5 checks mirror the Python esptool flow.</p>
+        </div>
+        <div class="card">
+          <h2>Need offline-</h2>
+          <p>Grab the same assets from Releases and run <code>flash_board.py</code> in <code>ESP32C5/binaries-esp32c5</code> if your browser blocks Web Serial.</p>
+        </div>
+        <div class="card">
+          <h2>Browser support</h2>
+          <p>Chrome or Edge on desktop over HTTPS. Web Serial is required. If you see Web Serial not available, switch browsers.</p>
+        </div>
       </div>
     </div>
   </div>
   <footer>
     Product of <a href="https://github.com/C5Lab/projectZero/">C5Lab/projectZero</a> -
-    <span id="pageVersion" class="mono">Web flasher v1.0.1</span>.
+    <span id="pageVersion" class="mono">Web flasher v1.0.3</span>.
   </footer>
 
   <script type="module">
@@ -360,6 +406,13 @@
       branch: document.getElementById("branchSelect"),
       releaseInfo: document.getElementById("releaseInfo"),
       pageVersion: document.getElementById("pageVersion"),
+      monitorBtn: document.getElementById("monitorBtn"),
+      clearMonitorBtn: document.getElementById("clearMonitorBtn"),
+      monitorBaud: document.getElementById("monitorBaudSelect"),
+      monitorStatus: document.getElementById("monitorStatusText"),
+      monitorLog: document.getElementById("monitorLog"),
+      monitorInput: document.getElementById("monitorInput"),
+      monitorSendBtn: document.getElementById("monitorSendBtn"),
     };
 
     const state = {
@@ -375,9 +428,16 @@
       isFlashing: false,
       autoFlash: false,
       autoFlashTriggered: false,
+      monitorPort: null,
+      monitorReader: null,
+      monitorWriter: null,
+      monitorOnDisconnect: null,
+      monitorPipe: null,
+      monitorConnected: false,
     };
 
-    const PAGE_VERSION = "1.0.2";
+    const PAGE_VERSION = "1.0.3";
+    const monitorEncoder = new TextEncoder();
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -434,6 +494,27 @@
       } else {
         ui.status.classList.remove("error");
       }
+    };
+
+    const setMonitorStatus = (text, level = "info") => {
+      if (!ui.monitorStatus) return;
+      ui.monitorStatus.textContent = text;
+      if (level === "error") {
+        ui.monitorStatus.classList.add("error");
+      } else {
+        ui.monitorStatus.classList.remove("error");
+      }
+    };
+
+    const monitorLog = (text) => {
+      if (!ui.monitorLog) return;
+      ui.monitorLog.textContent += text;
+      ui.monitorLog.scrollTop = ui.monitorLog.scrollHeight;
+    };
+
+    const monitorLine = (msg) => {
+      const time = new Date().toLocaleTimeString();
+      monitorLog(`[${time}] ${msg}\n`);
     };
 
     const bufferToBinaryString = (buffer) => {
@@ -573,6 +654,10 @@
       if (state.connected) {
         await disconnect();
         return;
+      }
+      if (state.monitorConnected) {
+        monitorLine("Stopping serial monitor to free COM port for flashing.");
+        await disconnectMonitor();
       }
       ui.connectBtn.disabled = true;
       ui.flashBtn.disabled = true;
@@ -741,6 +826,95 @@ const flash = async () => {
       }
     };
 
+    const monitorReadLoop = async () => {
+      try {
+        while (state.monitorConnected && state.monitorReader) {
+          const { value, done } = await state.monitorReader.read();
+          if (done) break;
+          if (value) monitorLog(value);
+        }
+      } catch (err) {
+        monitorLine(`Read error: ${err?.message || err}`);
+      }
+    };
+
+    const disconnectMonitor = async () => {
+      if (state.monitorPort && state.monitorOnDisconnect) {
+        try { state.monitorPort.removeEventListener("disconnect", state.monitorOnDisconnect); } catch {}
+      }
+      try { if (state.monitorReader) await state.monitorReader.cancel(); } catch {}
+      try { if (state.monitorReader) state.monitorReader.releaseLock(); } catch {}
+      try { if (state.monitorWriter) state.monitorWriter.releaseLock(); } catch {}
+      try { if (state.monitorPipe) await state.monitorPipe; } catch {}
+      try { if (state.monitorPort) await state.monitorPort.close(); } catch {}
+      state.monitorPort = null;
+      state.monitorReader = null;
+      state.monitorWriter = null;
+      state.monitorOnDisconnect = null;
+      state.monitorPipe = null;
+      state.monitorConnected = false;
+      ui.monitorBtn.textContent = "Monitor";
+      ui.monitorSendBtn.disabled = true;
+      setMonitorStatus("Monitor disconnected.");
+    };
+
+    const connectMonitor = async () => {
+      ensureSupport();
+      if (state.monitorConnected) {
+        await disconnectMonitor();
+        return;
+      }
+      if (state.isFlashing) {
+        throw new Error("Cannot start monitor while flashing is in progress.");
+      }
+      if (state.connected) {
+        monitorLine("Disconnecting flasher session to start serial monitor.");
+        await disconnect();
+      }
+      ui.monitorBtn.disabled = true;
+      setMonitorStatus("Requesting serial port...");
+      try {
+        state.monitorPort = await navigator.serial.requestPort({});
+        state.monitorOnDisconnect = () => {
+          monitorLine("Monitor port disconnected.");
+          disconnectMonitor().catch(() => {});
+          setMonitorStatus("Monitor disconnected by device.", "error");
+        };
+        try {
+          state.monitorPort.addEventListener("disconnect", state.monitorOnDisconnect);
+        } catch {}
+        const baud = parseInt(ui.monitorBaud.value, 10) || 115200;
+        await state.monitorPort.open({ baudRate: baud });
+        const decoder = new TextDecoderStream();
+        state.monitorPipe = state.monitorPort.readable.pipeTo(decoder.writable).catch(() => {});
+        state.monitorReader = decoder.readable.getReader();
+        state.monitorWriter = state.monitorPort.writable.getWriter();
+        state.monitorConnected = true;
+        ui.monitorBtn.textContent = "Stop monitor";
+        ui.monitorSendBtn.disabled = false;
+        setMonitorStatus(`Monitor connected @ ${baud} baud.`);
+        monitorLine(`Monitor connected @ ${baud} baud.`);
+        monitorReadLoop().catch(() => {});
+      } catch (err) {
+        await disconnectMonitor();
+        setMonitorStatus(err.message || "Monitor connection failed.", "error");
+        monitorLine(`Error: ${err?.message || err}`);
+        throw err;
+      } finally {
+        ui.monitorBtn.disabled = false;
+      }
+    };
+
+    const sendMonitor = async () => {
+      if (!state.monitorConnected || !state.monitorWriter) return;
+      const text = ui.monitorInput.value;
+      if (!text) return;
+      await state.monitorWriter.write(monitorEncoder.encode(`${text}\r\n`));
+      monitorLine(`> ${text}`);
+      ui.monitorInput.value = "";
+      ui.monitorInput.focus();
+    };
+
     const disconnect = async () => {
       if (state.port && state.onDisconnect) {
         try { state.port.removeEventListener("disconnect", state.onDisconnect); } catch {}
@@ -766,6 +940,22 @@ const flash = async () => {
 
     ui.connectBtn.addEventListener("click", () => connect().catch(() => {}));
     ui.flashBtn.addEventListener("click", () => flash().catch(() => {}));
+    ui.monitorBtn.addEventListener("click", () => connectMonitor().catch(() => {}));
+    ui.clearMonitorBtn.addEventListener("click", () => {
+      ui.monitorLog.textContent = "";
+    });
+    ui.monitorSendBtn.addEventListener("click", () => sendMonitor().catch((err) => {
+      setMonitorStatus(err.message || "Send failed.", "error");
+      monitorLine(`Error: ${err?.message || err}`);
+    }));
+    ui.monitorInput.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      sendMonitor().catch((err) => {
+        setMonitorStatus(err.message || "Send failed.", "error");
+        monitorLine(`Error: ${err?.message || err}`);
+      });
+    });
     ui.branch.addEventListener("change", () => {
       state.manifest = null;
       ui.manifest.style.display = "none";
