@@ -5,6 +5,16 @@ Project Zero is an ESP32-C5 firmware that bundles Wi-Fi assessment tooling, cons
 
 The firmware boots into an `esp_console` REPL, so most capabilities are exposed as CLI commands (`start_blackout`, `start_sniffer_dog`, `start_portal`, and more). Refer to the serial console banner for the full list after flashing.
 
+## Build Note: exFAT
+This repo auto-patches your local ESP-IDF `ffconf.h` during CMake configure to force:
+- `FF_FS_EXFAT = 1`
+
+Path patched on each machine:
+- `$IDF_PATH/components/fatfs/src/ffconf.h`
+
+Disable this behavior if needed:
+- `-DPROJECTZERO_PATCH_IDF_EXFAT=OFF`
+
 ## OTA Update Flow
 The firmware uses a dual-slot OTA layout (`ota_0`/`ota_1`) with `otadata` and the IDF bootloader rollback feature enabled. OTA updates overwrite the inactive slot and reboot into it.
 

@@ -3,6 +3,12 @@ cmake_minimum_required(VERSION 3.16)
 # Add linker flag globally (needed for duplicate symbols in ROM)
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-zmuldefs")
 
+# Ensure IDF FatFs has exFAT enabled for all developers building this repo.
+option(PROJECTZERO_PATCH_IDF_EXFAT "Patch IDF ffconf.h to enable exFAT support" ON)
+if(PROJECTZERO_PATCH_IDF_EXFAT)
+  include(${CMAKE_SOURCE_DIR}/tools/patch_idf_exfat.cmake)
+endif()
+
 # Bootstrap ESP-IDF build system
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
