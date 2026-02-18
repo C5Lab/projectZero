@@ -422,13 +422,14 @@ jobs:
         if: success()
         env:
           DISCORD_WEBHOOK: ${{ secrets.GIT_BUILD }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
           FAP_VERSION: ${{ needs.fap.outputs.fap_version }}
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.firmware.outputs.fw_version) }}
           REPO: ${{ github.repository }}
           PAGES_URL: ${{ needs.pages.outputs.page_url || format('https://{0}.github.io/{1}/', github.repository_owner, github.event.repository.name) }}
         run: |
-          set -e
+          set -euo pipefail
           if [ -z "$DISCORD_WEBHOOK" ]; then
             echo "DISCORD_WEBHOOK not configured, skipping notification"
             exit 0
@@ -441,12 +442,16 @@ jobs:
           BUNDLE_ZIP="$BASE_URL/projectZero-${FW_VERSION}-with-fap-${FAP_VER}.zip"
           RELEASE_PAGE="https://github.com/$REPO/releases/tag/$TAG"
           PAGES_LINK="${PAGES_URL:-https://${GITHUB_REPOSITORY%/*}.github.io/${GITHUB_REPOSITORY#*/}/}"
-          RELEASE_BODY=$(gh release view "$TAG" -R "$REPO" --json body --jq .body 2>/dev/null || true)
-          if [ -n "$RELEASE_BODY" ]; then
-            RELEASE_BODY="$(printf '%s' "$RELEASE_BODY" | tr -d '\r' | head -c 1800)"
+
+          RELEASE_BODY=""
+          if [ "${GITHUB_EVENT_NAME:-}" = "release" ] && [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH:-}" ]; then
+            RELEASE_BODY="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH")"
+          fi
+          if [ -z "$(printf '%s' "$RELEASE_BODY" | tr -d '\r\n[:space:]')" ]; then
+            RELEASE_BODY="$(gh release view "$TAG" -R "$REPO" --json body --jq .body 2>/dev/null || true)"
           fi
 
-          content=$(
+          base_content=$(
             printf '%s\n' \
               "JanOS" \
               "Release ${TAG} published." \
@@ -459,8 +464,18 @@ jobs:
               "FAPs (${FAP_VER}):" \
               "${FAP_ZIP}" \
               "Full package:" \
-              "${BUNDLE_ZIP}" \
-              "${RELEASE_BODY}"
+              "${BUNDLE_ZIP}"
           )
+
+          RELEASE_BODY="$(printf '%s' "$RELEASE_BODY" | tr -d '\r')"
+          base_len=$(printf '%s' "$base_content" | wc -c | tr -d ' ')
+          room=$((1990 - base_len))
+          if [ "$room" -gt 0 ] && [ -n "$(printf '%s' "$RELEASE_BODY" | tr -d '\n[:space:]')" ]; then
+            body_trimmed="$(printf '%s' "$RELEASE_BODY" | head -c "$room")"
+            content="$(printf '%s\n%s' "$base_content" "$body_trimmed")"
+          else
+            content="$base_content"
+          fi
+
           payload=$(jq -n --arg content "$content" '{content:$content}')
           curl -X POST -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK"

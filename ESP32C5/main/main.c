@@ -108,7 +108,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.4.0"
+#define JANOS_VERSION "1.4.1"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -12190,6 +12190,7 @@ void app_main(void) {
         }
     } else {
         MY_LOG_INFO(TAG, "");
+        MY_LOG_INFO(TAG, "SD init error: %s", esp_err_to_name(sd_init_ret));
         MY_LOG_INFO(TAG, "SD Card not detected. Custom portals won't be available, results won't be written to files.");
         MY_LOG_INFO(TAG, "");
     }
@@ -13769,10 +13770,28 @@ static esp_err_t init_sd_card(void) {
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot_config.gpio_cs = SD_CS_PIN;
     slot_config.host_id = host.slot;
-    
-    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &sd_card_handle);
+
+    // Some cards are unstable at higher SPI clock rates during init.
+    const int mount_freqs_khz[] = {SDMMC_FREQ_DEFAULT, 10000, 4000};
+    const size_t mount_freqs_count = sizeof(mount_freqs_khz) / sizeof(mount_freqs_khz[0]);
+    for (size_t i = 0; i < mount_freqs_count; i++) {
+        host.max_freq_khz = mount_freqs_khz[i];
+        ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &sd_card_handle);
+        if (ret == ESP_OK) {
+            break;
+        }
+        MY_LOG_INFO(TAG, "SD mount attempt %u failed at %d kHz: %s",
+                    (unsigned)(i + 1), host.max_freq_khz, esp_err_to_name(ret));
+        vTaskDelay(pdMS_TO_TICKS(60));
+    }
     
     if (ret != ESP_OK) {
+        if (ret == ESP_FAIL) {
+            MY_LOG_INFO(TAG, "Failed to mount SD filesystem at /sdcard (unsupported/corrupted FS).");
+        } else {
+            MY_LOG_INFO(TAG, "Failed to initialize SD card (%s). Check wiring, pull-ups, and card compatibility.",
+                        esp_err_to_name(ret));
+        }
         return ret;
     }
     
