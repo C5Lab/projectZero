@@ -109,7 +109,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.5.4"
+#define JANOS_VERSION "1.5.4-W"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
