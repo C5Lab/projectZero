@@ -151,11 +151,12 @@
 #define GPS_BAUD_ATGM336H  9600
 #define GPS_BAUD_M5STACK   115200
 
-// SD Card SPI pins (Marauder compatible)
-#define SD_MISO_PIN        2
-#define SD_MOSI_PIN        7  
-#define SD_CLK_PIN         6
-#define SD_CS_PIN          10
+// SD Card SPI pins (matching pancake project — works on both DevKitC-1 and Waveshare)
+// Old pins: MISO=2 (strapping/MTMS), CLK=6 (BAT_ADC on Waveshare) — broken on Waveshare
+#define SD_MISO_PIN        4
+#define SD_MOSI_PIN        24
+#define SD_CLK_PIN         23
+#define SD_CS_PIN          7
 
 #define MY_LOG_INFO(tag, fmt, ...) printf("" fmt "\n", ##__VA_ARGS__)
 
@@ -14850,6 +14851,13 @@ static esp_err_t init_sd_card(void) {
     
     const char mount_point[] = "/sdcard";
     
+    // Pull-ups on SPI pins (required for Waveshare ESP32-C5-WiFi6-Kit which
+    // lacks external pull-up resistors on these lines)
+    gpio_set_pull_mode(SD_MOSI_PIN, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(SD_MISO_PIN, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(SD_CLK_PIN,  GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(SD_CS_PIN,   GPIO_PULLUP_ONLY);
+
     // Configure SPI bus (balanced for SD card requirements and memory)
     spi_bus_config_t bus_cfg = {
         .mosi_io_num = SD_MOSI_PIN,
