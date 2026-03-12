@@ -3389,7 +3389,9 @@ CONFIG_LWIP_IP_REASS_MAX_PBUFS=10
 # default:
 CONFIG_LWIP_IPV6_DUP_DETECT_ATTEMPTS=1
 # default:
-# CONFIG_LWIP_IP_FORWARD is not set
+CONFIG_LWIP_IP_FORWARD=y
+# default:
+# CONFIG_LWIP_IPV4_NAPT is not set
 # default:
 # CONFIG_LWIP_STATS is not set
 # default:
