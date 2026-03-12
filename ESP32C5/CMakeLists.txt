@@ -14,6 +14,10 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(projectZero)
 
+# ===== MITM: allow lwIP to forward packets back out the same WiFi interface =====
+idf_component_get_property(lwip_lib lwip COMPONENT_LIB)
+target_compile_definitions(${lwip_lib} PRIVATE IP_FORWARD_ALLOW_TX_ON_RX_NETIF=1)
+
 # ===== POST-BUILD: copy binaries to binaries-esp32c5 =====
 set(EXPORT_DIR "${CMAKE_SOURCE_DIR}/binaries-esp32c5")
 file(MAKE_DIRECTORY "${EXPORT_DIR}")

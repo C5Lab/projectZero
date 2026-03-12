@@ -9514,7 +9514,7 @@ static int cmd_start_pcap(int argc, char **argv) {
     pcap_capture_frame_count = 0;
     pcap_capture_drop_count = 0;
 
-    pcap_packet_queue = xQueueCreate(64, sizeof(pcap_queued_frame_t *));
+    pcap_packet_queue = xQueueCreate(256, sizeof(pcap_queued_frame_t *));
     if (!pcap_packet_queue) {
         MY_LOG_INFO(TAG, "Failed to create PCAP packet queue");
         fclose(pcap_capture_file);
@@ -15686,7 +15686,10 @@ static void pcap_arp_spoof_task(void *param) {
 
         round++;
         if (round % 5 == 0) {
-            MY_LOG_INFO(TAG, "ARP spoof: round %lu, %d hosts", (unsigned long)round, pcap_arp_host_count);
+            MY_LOG_INFO(TAG, "ARP spoof: round %lu, %d hosts, captured %lu, dropped %lu",
+                        (unsigned long)round, pcap_arp_host_count,
+                        (unsigned long)pcap_capture_frame_count,
+                        (unsigned long)pcap_capture_drop_count);
         }
 
         vTaskDelay(pdMS_TO_TICKS(2000));
