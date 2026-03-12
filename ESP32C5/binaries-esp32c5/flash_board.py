@@ -26,16 +26,18 @@ import serial.tools.list_ports
 # Colors
 RED = "\033[91m"; GREEN = "\033[92m"; YELLOW = "\033[93m"; CYAN = "\033[96m"; RESET = "\033[0m"
 
-VERSION = "v02"
+VERSION = "v04"
 DEFAULT_BAUD = 460800  # Original default; can be overridden via CLI
 REQUIRED_FILES = ["bootloader.bin", "partition-table.bin", "projectZero.bin"]
 
-# >>> DO NOT CHANGE: keep your original offsets <<<
+# Keep these offsets in sync with partitions.csv.
 OFFSETS = {
     "bootloader.bin": "0x2000",       # as requested
     "partition-table.bin": "0x8000",
     # partitions.csv defines ota_0 at 0x20000, so app must be flashed there
     "projectZero.bin": "0x20000",
+    # Optional: seed ota_1 so both OTA slots are bootable after a UART flash
+    "projectZero_ota1.bin": "0x410000",
 }
 
 def check_files():
@@ -76,7 +78,7 @@ def erase_all(port, baud=DEFAULT_BAUD):
         print(f"{RED}Erase failed with code {res.returncode}.{RESET}")
         sys.exit(res.returncode)
 
-def do_flash(port, baud=DEFAULT_BAUD, flash_mode="dio", flash_freq="80m"):
+def do_flash(port, baud=DEFAULT_BAUD, flash_mode="dio", flash_freq="80m", seed_ota1=True):
     cmd = [
         sys.executable, "-m", "esptool",
         "-p", port,
@@ -92,6 +94,8 @@ def do_flash(port, baud=DEFAULT_BAUD, flash_mode="dio", flash_freq="80m"):
         OFFSETS["partition-table.bin"], "partition-table.bin",
         OFFSETS["projectZero.bin"], "projectZero.bin",
     ]
+    if seed_ota1:
+        cmd.extend([OFFSETS["projectZero_ota1.bin"], "projectZero.bin"])
     print(f"{CYAN}Flashing command:{RESET} {' '.join(cmd)}")
     res = subprocess.run(cmd)
     if res.returncode != 0:
@@ -154,6 +158,8 @@ def main():
                         help=f"Optional baud rate (default: {DEFAULT_BAUD})")
     parser.add_argument("--monitor", action="store_true", help="Open serial monitor after flashing")
     parser.add_argument("--erase", action="store_true", help="Full erase before flashing (fixes stale NVS/partitions)")
+    parser.add_argument("--no-seed-ota1", action="store_true",
+                        help="Do not flash projectZero.bin into ota_1 at 0x410000")
     parser.add_argument("--flash-mode", default="dio", choices=["dio", "qio", "dout", "qout"],
                         help="Flash mode (default: dio)")
     parser.add_argument("--flash-freq", default="80m", choices=["80m", "60m", "40m", "26m", "20m"],
@@ -173,11 +179,15 @@ def main():
 
     print(f"{GREEN}Detected serial port: {port}{RESET}")
     print(f"{YELLOW}Tip: release the BOOT button before programming finishes.{RESET}")
+    seed_ota1 = not args.no_seed_ota1
+    if seed_ota1:
+        print(f"{YELLOW}Seeding both OTA slots: ota_0 @ {OFFSETS['projectZero.bin']} and ota_1 @ {OFFSETS['projectZero_ota1.bin']}{RESET}")
 
     if args.erase:
         erase_all(port, args.baud)
 
-    do_flash(port, baud=args.baud, flash_mode=args.flash_mode, flash_freq=args.flash_freq)
+    do_flash(port, baud=args.baud, flash_mode=args.flash_mode, flash_freq=args.flash_freq,
+             seed_ota1=seed_ota1)
 
     reset_to_app(port)
 

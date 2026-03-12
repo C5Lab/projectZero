@@ -325,6 +325,7 @@
             <div class="hint">
               <strong>Erase</strong> does a full flash erase <span class="mono">(esptool erase-flash)</span> before writing the images.
               Only enable it when you have OTA partitions / old firmware and you see bootloops or slot errors.
+              This web flasher seeds both OTA slots by default by writing the app to <span class="mono">0x20000</span> and <span class="mono">0x410000</span>.
               Note: it wipes anything stored in flash (including NVS settings like Wi-Fi creds/config).
             </div>
             <div class="progress" aria-label="Flash progress">
@@ -387,7 +388,7 @@
   </div>
   <footer>
     Product of <a href="https://github.com/C5Lab/projectZero/">C5Lab/projectZero</a> -
-    <span id="pageVersion" class="mono">Web flasher v1.0.3</span>.
+    <span id="pageVersion" class="mono">Web flasher v1.0.4</span>.
   </footer>
 
   <script type="module">
@@ -800,7 +801,7 @@ const flash = async () => {
         log("Preparing flash writes");
         const flashOptions = {
           fileArray: files,
-          flashSize: "4MB",
+          flashSize: "8MB",
           eraseAll: !!ui.eraseAll?.checked,
           compress: true,
           reportProgress: (fileIndex, written, total) => {
