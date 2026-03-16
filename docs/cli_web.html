@@ -493,7 +493,7 @@
     };
 
     const encoder = new TextEncoder();
-    const PAGE_VERSION = "1.0.0";
+    const PAGE_VERSION = "1.1.0";
 
     function getLogFilename() {
       const now = new Date();
@@ -533,6 +533,7 @@
       { group: "System", cmd: "download", template: "download", help: "Reboot into ROM download mode" },
       { group: "System", cmd: "led", template: "led read", help: "LED control: set/level/read" },
       { group: "System", cmd: "boot_button", template: "boot_button read", help: "Configure boot button actions" },
+      { group: "System", cmd: "display", template: "display read", help: "Display mode: set auto/ssd1306/sh1107/sh1106/unit_lcd or read current mode" },
       { group: "WiFi / Scan", cmd: "scan_networks", template: "scan_networks", help: "Starts background network scan" },
       { group: "WiFi / Scan", cmd: "show_scan_results", template: "show_scan_results", help: "Shows results from last network scan" },
       { group: "WiFi / Scan", cmd: "select_networks", template: "select_networks 0", help: "Select networks by indexes" },
@@ -558,6 +559,7 @@
       { group: "Attack", cmd: "save_handshake", template: "save_handshake", help: "Save captured handshake" },
       { group: "Attack", cmd: "sae_overflow", template: "sae_overflow", help: "Start SAE WPA3 overflow" },
       { group: "Attack", cmd: "start_beacon_spam", template: "start_beacon_spam \"test\"", help: "Spam fake SSID beacons" },
+      { group: "Attack", cmd: "start_beacon_spam_ssids", template: "start_beacon_spam_ssids", help: "Beacon spam with all SSIDs from /sdcard/lab/ssids.txt" },
       { group: "Attack", cmd: "select_stations", template: "select_stations AA:BB:CC:DD:EE:FF", help: "Target specific station MACs" },
       { group: "Attack", cmd: "unselect_stations", template: "unselect_stations", help: "Clear selected station MACs" },
       { group: "Portal", cmd: "start_portal", template: "start_portal FreeWiFi", help: "Start captive portal" },
@@ -568,6 +570,9 @@
       { group: "Portal", cmd: "list_sd", template: "list_sd", help: "List HTML files on SD" },
       { group: "Portal", cmd: "list_dir", template: "list_dir /sdcard", help: "List SD directory" },
       { group: "Portal", cmd: "list_ssid", template: "list_ssid", help: "List SSID file entries" },
+      { group: "Portal", cmd: "list_ssids", template: "list_ssids", help: "List SSIDs from /sdcard/lab/ssids.txt" },
+      { group: "Portal", cmd: "add_ssid", template: "add_ssid FreeWiFi", help: "Add SSID to /sdcard/lab/ssids.txt" },
+      { group: "Portal", cmd: "remove_ssid", template: "remove_ssid 1", help: "Remove SSID by index from /sdcard/lab/ssids.txt" },
       { group: "Portal", cmd: "show_pass", template: "show_pass", help: "Print password log" },
       { group: "Portal", cmd: "file_delete", template: "file_delete /sdcard/path.txt", help: "Delete file on SD" },
       { group: "Network", cmd: "wifi_connect", template: "wifi_connect SSID PASSWORD", help: "Connect STA to AP" },
@@ -581,14 +586,19 @@
       { group: "OTA", cmd: "ota_channel", template: "ota_channel", help: "Get/set OTA channel" },
       { group: "OTA", cmd: "ota_info", template: "ota_info", help: "Show OTA partition info" },
       { group: "OTA", cmd: "ota_boot", template: "ota_boot ota_0", help: "Set boot partition" },
-      { group: "GPS / BLE", cmd: "gps_set", template: "gps_set atgm", help: "Select GPS module" },
+      { group: "GPS / BLE", cmd: "gps_set", template: "gps_set m5", help: "Select GPS module: m5, atgm, external or cap" },
+      { group: "GPS / BLE", cmd: "set_gps_position", template: "set_gps_position 52.2297 21.0122 100 5", help: "Set external GPS fix; no args clears the fix" },
+      { group: "GPS / BLE", cmd: "set_gps_position_cap", template: "set_gps_position_cap 52.2297 21.0122 100 5", help: "Set external CAP GPS fix; no args clears the fix" },
       { group: "GPS / BLE", cmd: "start_gps_raw", template: "start_gps_raw", help: "Print raw GPS NMEA" },
       { group: "GPS / BLE", cmd: "start_wardrive", template: "start_wardrive", help: "Start wardriving" },
+      { group: "GPS / BLE", cmd: "start_wardrive_promisc", template: "start_wardrive_promisc", help: "Start promiscuous wardrive with D-UCB channel selection" },
       { group: "GPS / BLE", cmd: "scan_bt", template: "scan_bt", help: "One-time BLE scan" },
       { group: "GPS / BLE", cmd: "scan_airtag", template: "scan_airtag", help: "Continuous AirTag scan" },
       { group: "Config", cmd: "channel_time", template: "channel_time read min", help: "Read/set scan channel time" },
       { group: "Config", cmd: "wpasec_key", template: "wpasec_key read", help: "Read/set WPA-SEC API key" },
       { group: "Config", cmd: "wpasec_upload", template: "wpasec_upload", help: "Upload handshakes to WPA-SEC" },
+      { group: "Config", cmd: "wigle_key", template: "wigle_key read", help: "Read/set WiGLE API credentials" },
+      { group: "Config", cmd: "wigle_upload", template: "wigle_upload", help: "Upload wardrive files to WiGLE" },
     ];
     const GROUPS = ["All", ...new Set(COMMANDS.map((item) => item.group))];
 
