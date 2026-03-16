@@ -17,38 +17,6 @@ on:
     types: [published, edited]
 
 jobs:
-  changes:
-    name: Detect workflow changes
-    runs-on: ubuntu-24.04
-    outputs:
-      workflow_changed: ${{ steps.filter.outputs.workflow_changed }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Check workflow diff
-        id: filter
-        run: |
-          set -euo pipefail
-          if [ "${GITHUB_EVENT_NAME:-}" != "push" ]; then
-            echo "workflow_changed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          base="${{ github.event.before }}"
-          head="${{ github.sha }}"
-          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
-            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
-          fi
-
-          if git diff --name-only "$base" "$head" | grep -qE '^\.github/workflows/'; then
-            echo "workflow_changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "workflow_changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
   firmware:
     name: JanOS
     permissions:
@@ -60,10 +28,10 @@ jobs:
       fw_version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Cache ESP-IDF artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /root/.espressif
           key: espidf-6.0-${{ runner.os }}-${{ hashFiles('ESP32C5/sdkconfig', 'ESP32C5/dependencies.lock') }}
@@ -115,7 +83,7 @@ jobs:
           echo "bundle_zip=$(pwd)/$out" >> "$GITHUB_OUTPUT"
 
       - name: Upload JanOS artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: esp32c5-firmware
           path: ESP32C5/binaries-esp32c5
@@ -129,7 +97,7 @@ jobs:
       fap_version: ${{ steps.fap_version.outputs.fap_version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install FAP build dependencies (ufbt in venv)
         run: |
@@ -176,28 +144,28 @@ jobs:
 
       - name: Upload FAP artifacts
         if: ${{ hashFiles('FLIPPER/dist/*.fap') != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: flipper-fap
           path: FLIPPER/dist/*.fap
 
   release:
     name: Release
-    needs: [changes, firmware, fap]
+    needs: [firmware, fap]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
       pull-requests: read
-    if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')) && needs.changes.outputs.workflow_changed != 'true'
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     steps:
       - name: Download JanOS artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: esp32c5-firmware
           path: release_artifacts/firmware
 
       - name: Download FAP artifacts (if present)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: flipper-fap
           path: release_artifacts/fap
@@ -305,25 +273,47 @@ jobs:
             fi
           fi
 
-      - name: Upload binaries to GitHub Release (notes)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.firmware.outputs.fw_version) }}
-          name: ${{ format('projectZero {0}', needs.firmware.outputs.fw_version) }}
-          body_path: release_notes.md
-          files: |
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
+          FAP_VERSION: ${{ needs.fap.outputs.fap_version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.firmware.outputs.fw_version) }}
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG:-v${FW_VERSION}}"
+          NAME="projectZero ${FW_VERSION}"
+
+          files=(
             release_artifacts/firmware/bootloader.bin
             release_artifacts/firmware/partition-table.bin
             release_artifacts/firmware/flash_board.py
             release_artifacts/firmware/oui_wifi.bin
             release_artifacts/firmware/projectZero.bin
-            release_artifacts/firmware/projectZero-${{ needs.firmware.outputs.fw_version }}.bin
-            release_artifacts/firmware/projectZero-${{ needs.firmware.outputs.fw_version }}.zip
-            release_artifacts/fap/projectZero-faps-${{ needs.fap.outputs.fap_version }}.zip
+            "release_artifacts/firmware/projectZero-${FW_VERSION}.bin"
+            "release_artifacts/firmware/projectZero-${FW_VERSION}.zip"
+          )
+
+          shopt -s nullglob
+          optional=(
+            "release_artifacts/fap/projectZero-faps-${FAP_VERSION}.zip"
             release_artifacts/bundle/projectZero-*-with-fap-*.zip
             release_artifacts/fap/*.fap
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          )
+
+          for file in "${optional[@]}"; do
+            if [ -e "$file" ]; then
+              files+=("$file")
+            fi
+          done
+
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --title "$NAME" --notes-file release_notes.md
+          else
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$NAME" --notes-file release_notes.md
+          fi
+
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber "${files[@]}"
 
   pages:
     name: Pages Web Flasher
@@ -341,10 +331,10 @@ jobs:
       page_url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Pages
-        uses: actions/configure-pages@v4
+        uses: actions/configure-pages@v5
         with:
           enablement: true
 
@@ -407,7 +397,7 @@ jobs:
           set -euo pipefail
           python -c "import os, json; from pathlib import Path; version=os.getenv('FW_VERSION') or os.getenv('BUILD_TAG'); build=os.getenv('BUILD_TAG','manual'); manifest={'name':'projectZero ESP32-C5','version':version,'build':build,'chipFamily':'ESP32-C5','parts':[{'path':'firmware/bootloader.bin','offset':8192},{'path':'firmware/partition-table.bin','offset':32768},{'path':'firmware/projectZero.bin','offset':131072},{'path':'firmware/projectZero.bin','offset':4259840}]}; Path('docs/manifest.json').write_text(json.dumps(manifest, indent=2))"
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v4
         with:
           path: docs
 
