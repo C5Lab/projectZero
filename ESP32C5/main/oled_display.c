@@ -54,12 +54,15 @@ static const char *TAG = "display";
 /*                     I2C  /  HW  CONFIGURATION                          */
 /* ====================================================================== */
 
+
+
+
 /* --- Bus A: SSD1306 board (0.96" OLED) --- */
 #ifndef OLED_BUS_A_SDA_GPIO
-#define OLED_BUS_A_SDA_GPIO     25
+#define OLED_BUS_A_SDA_GPIO     23
 #endif
 #ifndef OLED_BUS_A_SCL_GPIO
-#define OLED_BUS_A_SCL_GPIO     26
+#define OLED_BUS_A_SCL_GPIO     24
 #endif
 #ifndef OLED_BUS_A_I2C_PORT
 #define OLED_BUS_A_I2C_PORT     I2C_NUM_0

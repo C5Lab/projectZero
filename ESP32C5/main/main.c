@@ -164,10 +164,10 @@
 #define GPS_BAUD_M5STACK   115200
 
 // SD Card SPI pins (Marauder compatible)
-#define SD_MISO_PIN        2
-#define SD_MOSI_PIN        7  
-#define SD_CLK_PIN         6
-#define SD_CS_PIN          10
+#define SD_MISO_PIN        9
+#define SD_MOSI_PIN        10
+#define SD_CLK_PIN         8
+#define SD_CS_PIN          7
 
 #define MY_LOG_INFO(tag, fmt, ...) printf("" fmt "\n", ##__VA_ARGS__)
 
@@ -14332,8 +14332,8 @@ void app_main(void) {
     esp_console_register_help_command();
     register_commands();
 
-    esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
+    esp_console_dev_usb_serial_jtag_config_t hw_config = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&hw_config, &repl_config, &repl));
 
     linenoiseSetHintsCallback((linenoiseHintsCallback *)&janos_console_hint);
 
@@ -14440,7 +14440,9 @@ void app_main(void) {
                             "",
                             "  > Ready _");
     vTaskDelay(pdMS_TO_TICKS(100));
-    
+
+    // Auto-start handshake capture (Sniffer + D-UCB mode)
+    //cmd_start_handshake(1, (char *[]){"start_handshake"});
 }
 
 void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count) {   
