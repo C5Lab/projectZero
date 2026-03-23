@@ -31,7 +31,7 @@
   <a href="https://github.com/C5Lab/projectZero/wiki">
     <img src="https://img.shields.io/badge/docs-wiki-blue?style=flat-square">
   </a>
-  <a href="https://discord.gg/YOUR_DISCORD">
+  <a href="https://discord.gg/vQCqxBMa">
     <img src="https://img.shields.io/badge/community-discord-5865F2?style=flat-square">
   </a>
   <a href="https://github.com/C5Lab/projectZero/releases">
@@ -41,11 +41,15 @@
 
 ---
 
-## ⚡ projectZero
+## ⚡ About
 
 **projectZero** is a lightweight, modular wireless pentesting platform designed for real-world testing scenarios.
-
 Built for all who want full control over their WiFi environment.
+
+ - [projectZero Wiki](https://github.com/C5Lab/projectZero/wiki)
+ - [WEB flasher](https://c5lab.github.io/projectZero/)
+ - [Tindie SHOP](https://www.tindie.com/stores/lab/)
+ - [Discord community & support](https://discord.gg/vQCqxBMa)
 
 ---
 
@@ -64,8 +68,3 @@ Built for all who want full control over their WiFi environment.
 
 ---
 
-## Controll the chaos
-
- - projectZero Wiki
- - web flasher
- - shop
