@@ -1,0 +1,398 @@
+name: ESP32C5 Rebuild Release (No Discord)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional tag name to upload assets to a release (example 'v1.2.3')"
+        required: false
+
+jobs:
+  firmware:
+    name: JanOS
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    container:
+      image: espressif/idf:v6.0-beta1
+    outputs:
+      fw_version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Cache ESP-IDF artifacts
+        uses: actions/cache@v5
+        with:
+          path: /root/.espressif
+          key: espidf-6.0-${{ runner.os }}-${{ hashFiles('ESP32C5/sdkconfig', 'ESP32C5/dependencies.lock') }}
+          restore-keys: |
+            espidf-6.0-${{ runner.os }}-
+            espidf-6.0-
+
+      - name: Build JanOS (IDF 6.0)
+        run: IDF_PY_FLAGS="--preview" bash .github/scripts/container_build.sh --no-docker
+
+      - name: Stamp JanOS with JANOS_VERSION
+        id: version
+        run: |
+          set -e
+          version=$(python - <<'PY'
+          from pathlib import Path
+          import re
+          text = Path("ESP32C5/main/main.c").read_text()
+          m = re.search(r'JANOS_VERSION\s*"([^"]+)"', text)
+          if not m:
+              raise SystemExit("JANOS_VERSION not found")
+          print(m.group(1))
+          PY
+          )
+          src="ESP32C5/binaries-esp32c5/projectZero.bin"
+          dst="ESP32C5/binaries-esp32c5/projectZero-${version}.bin"
+          if [ ! -f "$src" ]; then
+            echo "Missing firmware: $src" >&2
+            exit 1
+          fi
+          cp "$src" "$dst"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "release_asset=${dst}" >> "$GITHUB_OUTPUT"
+
+      - name: Package JanOS zip
+        id: bundle
+        run: |
+          set -e
+          cd ESP32C5/binaries-esp32c5
+          out="projectZero-${{ steps.version.outputs.version }}.zip"
+          rm -f "$out"
+          zip -9 "$out" \
+            bootloader.bin \
+            partition-table.bin \
+            flash_board.py \
+            oui_wifi.bin \
+            "projectZero-${{ steps.version.outputs.version }}.bin" \
+            projectZero.bin
+          echo "bundle_zip=$(pwd)/$out" >> "$GITHUB_OUTPUT"
+
+      - name: Upload JanOS artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: esp32c5-firmware
+          path: ESP32C5/binaries-esp32c5
+          if-no-files-found: error
+
+  fap:
+    name: Flipper FAP
+    needs: firmware
+    runs-on: ubuntu-24.04
+    outputs:
+      fap_version: ${{ steps.fap_version.outputs.fap_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install FAP build dependencies (ufbt in venv)
+        run: |
+          set -e
+          sudo apt-get update && sudo apt-get install -y python3-venv
+          python3 -m venv /tmp/ufbt-venv
+          . /tmp/ufbt-venv/bin/activate
+          pip install -U pip ufbt
+          echo "/tmp/ufbt-venv/bin" >> $GITHUB_PATH
+
+      - name: Download Flipper SDKs
+        run: |
+          set -e
+          mkdir -p FLIPPER/sdk
+          cd FLIPPER/sdk
+          [ -f flipper-z-f7-sdk-unlshd-083.zip ] || curl -L -o flipper-z-f7-sdk-unlshd-083.zip https://github.com/DarkFlippers/unleashed-firmware/releases/download/unlshd-083/flipper-z-f7-sdk-unlshd-083.zip
+          [ -f flipper-z-f7-sdk-mntm-011.zip ] || curl -L -o flipper-z-f7-sdk-mntm-011.zip https://github.com/Next-Flip/Momentum-Firmware/releases/download/mntm-011/flipper-z-f7-sdk-mntm-011.zip
+          [ -f flipper-z-f7-sdk-mntm-dev-22408e4c.zip ] || curl -L -o flipper-z-f7-sdk-mntm-dev-22408e4c.zip https://up.momentum-fw.dev/builds/firmware/dev/flipper-z-f7-sdk-mntm-dev-22408e4c.zip
+
+      - name: Build Flipper FAP
+        run: |
+          set -e
+          python FLIPPER/build_fap.py --no-upload
+
+      - name: Read FAP version
+        id: fap_version
+        run: |
+          set -e
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          text = Path("FLIPPER/Lab_C5.c").read_text(encoding="utf-8", errors="ignore")
+          m = re.search(r'#define\s+LAB_C5_VERSION_TEXT\s+"([^"]+)"', text)
+          if not m:
+            raise SystemExit("LAB_C5_VERSION_TEXT not found")
+
+          version = m.group(1)
+          print(f"fap_version={version}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+            fh.write(f"fap_version={version}\n")
+          PY
+
+      - name: Upload FAP artifacts
+        if: ${{ hashFiles('FLIPPER/dist/*.fap') != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: flipper-fap
+          path: FLIPPER/dist/*.fap
+
+  release:
+    name: Release
+    needs: [firmware, fap]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: read
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    steps:
+      - name: Download JanOS artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: esp32c5-firmware
+          path: release_artifacts/firmware
+
+      - name: Download FAP artifacts (if present)
+        uses: actions/download-artifact@v6
+        with:
+          name: flipper-fap
+          path: release_artifacts/fap
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Package FAP zip
+        if: ${{ hashFiles('release_artifacts/fap/*.fap') != '' }}
+        run: |
+          set -e
+          cd release_artifacts/fap
+          zip -9 "projectZero-faps-${{ needs.fap.outputs.fap_version }}.zip" *.fap
+
+      - name: Package full bundle (JanOS + FAPs)
+        run: |
+          set -e
+          cd release_artifacts
+          mkdir -p bundle
+          FW_VERSION="${{ needs.firmware.outputs.fw_version }}"
+          FAP_VERSION="${{ needs.fap.outputs.fap_version }}"
+
+          shopt -s nullglob
+          faps=(fap/*.fap)
+
+          files=(
+            firmware/bootloader.bin
+            firmware/partition-table.bin
+            firmware/flash_board.py
+            firmware/oui_wifi.bin
+            firmware/projectZero.bin
+            "firmware/projectZero-${FW_VERSION}.bin"
+          )
+
+          # Include existing JanOS zip if present
+          if [ -f "firmware/projectZero-${FW_VERSION}.zip" ]; then
+            files+=("firmware/projectZero-${FW_VERSION}.zip")
+          fi
+
+          # Add all FAPs (if any)
+          if [ ${#faps[@]} -gt 0 ]; then
+            files+=("${faps[@]}")
+          fi
+
+          out="bundle/projectZero-${FW_VERSION}-with-fap-${FAP_VERSION:-unknown}.zip"
+          zip -9 "$out" "${files[@]}"
+
+      - name: Build release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
+          FAP_VERSION: ${{ needs.fap.outputs.fap_version }}
+          REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.firmware.outputs.fw_version) }}
+        run: |
+          set -euo pipefail
+          notes_file="release_notes.md"
+          TAG="${RELEASE_TAG:-$FW_VERSION}"
+          FAP_VER="${FAP_VERSION:-unknown}"
+          BASE_URL="https://github.com/$REPO/releases/download/$TAG"
+          JANOS_ZIP="$BASE_URL/projectZero-${FW_VERSION}.zip"
+          FAP_ZIP="$BASE_URL/projectZero-faps-${FAP_VER}.zip"
+          BUNDLE_ZIP="$BASE_URL/projectZero-${FW_VERSION}-with-fap-${FAP_VER}.zip"
+          RELEASE_PAGE="https://github.com/$REPO/releases/tag/$TAG"
+          PAGES_LINK="https://${REPO%/*}.github.io/${REPO#*/}/"
+
+          {
+            printf '%s\n\n' "Release ${TAG} published."
+            printf '%s\n' "Release page: ${RELEASE_PAGE}"
+            printf '%s\n' "Web flasher: ${PAGES_LINK}"
+            printf '%s\n' "JanOS (${FW_VERSION}): ${JANOS_ZIP}"
+            printf '%s\n' "FAPs (${FAP_VER}): ${FAP_ZIP}"
+            printf '%s\n\n' "Full package: ${BUNDLE_ZIP}"
+          } > "$notes_file"
+
+          if [ "${GITHUB_EVENT_NAME:-}" = "release" ]; then
+            if [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH:-}" ]; then
+              release_body="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH")"
+              if [ -n "$(printf '%s' "$release_body" | tr -d '\r\n[:space:]')" ]; then
+                printf '%s\n' "$release_body" >> "$notes_file"
+              fi
+            fi
+            exit 0
+          fi
+
+          if command -v gh >/dev/null 2>&1; then
+            api="/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls"
+            pr_json="$(gh api -H "Accept: application/vnd.github+json" "$api" 2>/dev/null || echo '[]')"
+            pr_title="$(printf '%s' "$pr_json" | jq -r '.[0].title // ""')"
+            pr_body="$(printf '%s' "$pr_json" | jq -r '.[0].body // ""')"
+
+            if [ -n "$(printf '%s' "$pr_body" | tr -d '\r\n[:space:]')" ]; then
+              if [ -n "$pr_title" ]; then
+                printf '%s\n\n' "$pr_title" >> "$notes_file"
+              fi
+              printf '%s\n' "$pr_body" >> "$notes_file"
+              exit 0
+            fi
+
+            gen_json="$(gh api -X POST -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+              -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" 2>/dev/null || echo '')"
+            gen_body="$(printf '%s' "$gen_json" | jq -r '.body // ""')"
+            if [ -n "$(printf '%s' "$gen_body" | tr -d '\r\n[:space:]')" ]; then
+              printf '%s\n' "$gen_body" >> "$notes_file"
+            fi
+          fi
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
+          FAP_VERSION: ${{ needs.fap.outputs.fap_version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.firmware.outputs.fw_version) }}
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG:-v${FW_VERSION}}"
+          NAME="projectZero ${FW_VERSION}"
+
+          files=(
+            release_artifacts/firmware/bootloader.bin
+            release_artifacts/firmware/partition-table.bin
+            release_artifacts/firmware/flash_board.py
+            release_artifacts/firmware/oui_wifi.bin
+            release_artifacts/firmware/projectZero.bin
+            "release_artifacts/firmware/projectZero-${FW_VERSION}.bin"
+            "release_artifacts/firmware/projectZero-${FW_VERSION}.zip"
+          )
+
+          shopt -s nullglob
+          optional=(
+            "release_artifacts/fap/projectZero-faps-${FAP_VERSION}.zip"
+            release_artifacts/bundle/projectZero-*-with-fap-*.zip
+            release_artifacts/fap/*.fap
+          )
+
+          for file in "${optional[@]}"; do
+            if [ -e "$file" ]; then
+              files+=("$file")
+            fi
+          done
+
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --title "$NAME" --notes-file release_notes.md
+          else
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$NAME" --notes-file release_notes.md
+          fi
+
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber "${files[@]}"
+
+  pages:
+    name: Pages Web Flasher
+    needs: [release, firmware, fap]
+    if: ${{ needs.release.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Resolve release tag
+        id: meta
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
+        run: |
+          set -euo pipefail
+          TAG="${EVENT_TAG:-}"
+          if [ -z "$TAG" ]; then TAG="${INPUT_TAG:-}"; fi
+          if [ -z "$TAG" ]; then TAG="v${FW_VERSION}"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using tag: $TAG"
+
+      - name: Download release assets
+        id: download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          rm -rf docs/firmware
+          mkdir -p docs/firmware
+
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" --dir docs/firmware \
+            --pattern "bootloader.bin" \
+            --pattern "partition-table.bin" \
+            --pattern "projectZero*.bin"
+
+          ls -lh docs/firmware
+
+          if [ ! -f docs/firmware/projectZero.bin ]; then
+            alt=$(ls docs/firmware/projectZero-*.bin 2>/dev/null | head -n1 || true)
+            if [ -n "$alt" ]; then
+              cp "$alt" docs/firmware/projectZero.bin
+            fi
+          fi
+
+          for f in bootloader.bin partition-table.bin projectZero.bin; do
+            if [ ! -f "docs/firmware/$f" ]; then
+              echo "Missing $f in release assets for tag ${TAG}" >&2
+              exit 1
+            fi
+          done
+
+          fw_version=$(ls docs/firmware/projectZero-*.bin 2>/dev/null | head -n1 | xargs -n1 basename | sed -E 's/^projectZero-([^.]*)\\.bin$/\\1/')
+          if [ -z "$fw_version" ]; then
+            fw_version="${TAG}"
+          fi
+          echo "fw_version=$fw_version" >> "$GITHUB_OUTPUT"
+
+      - name: Build manifest.json
+        env:
+          FW_VERSION: ${{ steps.download.outputs.fw_version }}
+          BUILD_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python -c "import os, json; from pathlib import Path; version=os.getenv('FW_VERSION') or os.getenv('BUILD_TAG'); build=os.getenv('BUILD_TAG','manual'); manifest={'name':'projectZero ESP32-C5','version':version,'build':build,'chipFamily':'ESP32-C5','parts':[{'path':'firmware/bootloader.bin','offset':8192},{'path':'firmware/partition-table.bin','offset':32768},{'path':'firmware/projectZero.bin','offset':131072},{'path':'firmware/projectZero.bin','offset':4259840}]}; Path('docs/manifest.json').write_text(json.dumps(manifest, indent=2))"
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
