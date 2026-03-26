@@ -312,9 +312,7 @@
                 <option value="development">Development</option>
               </select>
               <select id="baudSelect" aria-label="Baud rate">
-                <option value="460800">460800 baud</option>
-                <option value="921600">921600 baud</option>
-                <option value="115200">115200 baud</option>
+                <option value="115200" selected>115200 baud (stable)</option>
               </select>
             </div>
             <div class="status-line">
@@ -326,7 +324,7 @@
               <strong>Erase</strong> does a full flash erase <span class="mono">(esptool erase-flash)</span> before writing the images.
               Only enable it when you have OTA partitions / old firmware and you see bootloops or slot errors.
               This web flasher seeds both OTA slots by default by writing the app to <span class="mono">0x20000</span> and <span class="mono">0x410000</span>.
-              If the log shows <span class="mono">Flash ID: 0</span> or an MD5 mismatch, reconnect in ROM mode and retry at <span class="mono">115200</span>.
+              Web flashing is fixed to <span class="mono">115200</span> for reliability. Higher baud changes are currently unstable in <span class="mono">esptool-js</span> over WebSerial on some ESP32-C5 boards.
               Note: it wipes anything stored in flash (including NVS settings like Wi-Fi creds/config).
             </div>
             <div class="progress" aria-label="Flash progress">
@@ -389,11 +387,11 @@
   </div>
   <footer>
     Product of <a href="https://github.com/C5Lab/projectZero/">C5Lab/projectZero</a> -
-    <span id="pageVersion" class="mono">Web flasher v1.0.5</span>.
+    <span id="pageVersion" class="mono">Web flasher v1.0.6</span>.
   </footer>
 
   <script type="module">
-    import { ESPLoader, Transport } from "https://unpkg.com/esptool-js/bundle.js";
+    import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.6.0/bundle.js";
 
     const ui = {
       status: document.getElementById("statusText"),
@@ -439,7 +437,8 @@
       monitorConnected: false,
     };
 
-    const PAGE_VERSION = "1.0.5";
+    const PAGE_VERSION = "1.0.6";
+    const FLASH_BAUD = 115200;
     const monitorEncoder = new TextEncoder();
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -686,7 +685,7 @@
         try {
           state.port.addEventListener("disconnect", state.onDisconnect);
         } catch {}
-        const baud = parseInt(ui.baud.value, 10);
+        const baud = FLASH_BAUD;
         state.transport = new Transport(state.port, true);
         const loaderOptions = {
           transport: state.transport,
@@ -698,6 +697,9 @@
           },
           debugLogging: false,
         };
+        if ((parseInt(ui.baud.value, 10) || FLASH_BAUD) !== FLASH_BAUD) {
+          log(`Selected baud overridden to stable ${FLASH_BAUD} for WebSerial flashing.`);
+        }
         setStatus(`Syncing with chip (hold BOOT + RESET). Timeout ${Math.round(CONNECT_TIMEOUT_MS/1000)}s`);
         log("Syncing with chip");
 
