@@ -387,7 +387,7 @@
   </div>
   <footer>
     Product of <a href="https://github.com/C5Lab/projectZero/">C5Lab/projectZero</a> -
-    <span id="pageVersion" class="mono">Web flasher v1.0.6</span>.
+    <span id="pageVersion" class="mono">Web flasher v1.0.7</span>.
   </footer>
 
   <script type="module">
@@ -429,6 +429,7 @@
       isFlashing: false,
       autoFlash: false,
       autoFlashTriggered: false,
+      usingStub: null,
       monitorPort: null,
       monitorReader: null,
       monitorWriter: null,
@@ -437,7 +438,7 @@
       monitorConnected: false,
     };
 
-    const PAGE_VERSION = "1.0.6";
+    const PAGE_VERSION = "1.0.7";
     const FLASH_BAUD = 115200;
     const monitorEncoder = new TextEncoder();
 
@@ -710,6 +711,18 @@
           attempt += 1;
           try {
             state.esploader = new ESPLoader(loaderOptions);
+            state.usingStub = null;
+            const originalRunStub = state.esploader.runStub.bind(state.esploader);
+            state.esploader.runStub = async () => {
+              const chipName = state.esploader?.chip?.CHIP_NAME || "";
+              if (chipName === "ESP32-C5") {
+                state.usingStub = false;
+                log("Skipping flasher stub for ESP32-C5. Using ROM bootloader path due to known C5 ECO2 stub flash-write failures.");
+                return state.esploader.chip;
+              }
+              state.usingStub = true;
+              return originalRunStub();
+            };
             log("Connecting...");
             state.chip = await state.esploader.main();
             lastErr = null;
@@ -811,8 +824,17 @@ const flash = async () => {
       ui.progress.style.width = "0%";
       try {
         const files = await fetchFiles();
-        setStatus("Uploading stub and flashing");
+        const flashingFromStub = state.usingStub !== false;
+        setStatus(flashingFromStub ? "Uploading stub and flashing" : "Flashing from ROM bootloader");
         log("Preparing flash writes");
+        if (!flashingFromStub) {
+          log("ROM bootloader mode active. Stub is disabled for ESP32-C5 compatibility.");
+          if (ui.eraseAll?.checked) {
+            setStatus("Erasing flash from ROM bootloader");
+            log("Erase requested. Running full flash erase before writes.");
+            await state.esploader.eraseFlash();
+          }
+        }
         const flashOptions = {
           fileArray: files,
           flashSize: "8MB",
