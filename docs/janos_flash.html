@@ -312,7 +312,9 @@
                 <option value="development">Development</option>
               </select>
               <select id="baudSelect" aria-label="Baud rate">
-                <option value="115200" selected>115200 baud (stable)</option>
+                <option value="460800">460800 baud</option>
+                <option value="921600">921600 baud</option>
+                <option value="115200">115200 baud</option>
               </select>
             </div>
             <div class="status-line">
@@ -324,7 +326,7 @@
               <strong>Erase</strong> does a full flash erase <span class="mono">(esptool erase-flash)</span> before writing the images.
               Only enable it when you have OTA partitions / old firmware and you see bootloops or slot errors.
               This web flasher seeds both OTA slots by default by writing the app to <span class="mono">0x20000</span> and <span class="mono">0x410000</span>.
-              Web flashing is fixed to <span class="mono">115200</span> for reliability. Higher baud changes are currently unstable in <span class="mono">esptool-js</span> over WebSerial on some ESP32-C5 boards.
+              If the log shows <span class="mono">Flash ID: 0</span> or an MD5 mismatch, reconnect in ROM mode and retry at <span class="mono">115200</span>.
               Note: it wipes anything stored in flash (including NVS settings like Wi-Fi creds/config).
             </div>
             <div class="progress" aria-label="Flash progress">
@@ -387,7 +389,7 @@
   </div>
   <footer>
     Product of <a href="https://github.com/C5Lab/projectZero/">C5Lab/projectZero</a> -
-    <span id="pageVersion" class="mono">Web flasher v1.0.10</span>.
+    <span id="pageVersion" class="mono">Web flasher v1.0.5</span>.
   </footer>
 
   <script type="module">
@@ -429,7 +431,6 @@
       isFlashing: false,
       autoFlash: false,
       autoFlashTriggered: false,
-      usingStub: null,
       monitorPort: null,
       monitorReader: null,
       monitorWriter: null,
@@ -438,8 +439,7 @@
       monitorConnected: false,
     };
 
-    const PAGE_VERSION = "1.0.10";
-    const FLASH_BAUD = 115200;
+    const PAGE_VERSION = "1.0.5";
     const monitorEncoder = new TextEncoder();
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -520,26 +520,14 @@
       monitorLog(`[${time}] ${msg}\n`);
     };
 
-    const bytesToBinaryString = (bytes) => {
+    const bufferToBinaryString = (buffer) => {
+      const bytes = new Uint8Array(buffer);
       const chunk = 0x8000;
       let result = "";
       for (let i = 0; i < bytes.length; i += chunk) {
         result += String.fromCharCode(...bytes.subarray(i, i + chunk));
       }
       return result;
-    };
-
-    const bufferToBinaryString = (buffer) => bytesToBinaryString(new Uint8Array(buffer));
-
-    const padBytesTo = (data, alignment, padCharacter = 0xff) => {
-      const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-      const padMod = bytes.length % alignment;
-      if (padMod === 0) return bytes;
-      const padding = new Uint8Array(alignment - padMod).fill(padCharacter);
-      const padded = new Uint8Array(bytes.length + padding.length);
-      padded.set(bytes, 0);
-      padded.set(padding, bytes.length);
-      return padded;
     };
 
     const resolveManifestPath = (path) => {
@@ -674,58 +662,6 @@
       }
     };
 
-    const applyEspToolWorkarounds = (loader) => {
-      if (!loader || loader.__projectZeroPatched) return;
-      loader.__projectZeroPatched = true;
-
-      const originalRunStub = loader.runStub.bind(loader);
-      loader.runStub = async () => {
-        const chipName = loader?.chip?.CHIP_NAME || "";
-        if (chipName === "ESP32-C5") {
-          state.usingStub = false;
-          log("Skipping flasher stub for ESP32-C5. Using ROM bootloader path due to known C5 ECO2 stub flash-write failures.");
-          return loader.chip;
-        }
-        state.usingStub = true;
-        return originalRunStub();
-      };
-
-      const originalFlashDeflBegin = loader.flashDeflBegin.bind(loader);
-      loader.flashDeflBegin = async (size, compsize, offset) => {
-        const chipName = loader?.chip?.CHIP_NAME || "";
-        if (loader.IS_STUB || chipName === "ESP32" || chipName === "ESP8266") {
-          return originalFlashDeflBegin(size, compsize, offset);
-        }
-
-        const numBlocks = Math.floor((compsize + loader.FLASH_WRITE_SIZE - 1) / loader.FLASH_WRITE_SIZE);
-        const eraseBlocks = Math.floor((size + loader.FLASH_WRITE_SIZE - 1) / loader.FLASH_WRITE_SIZE);
-        const t1 = Date.now();
-        const writeSize = eraseBlocks * loader.FLASH_WRITE_SIZE;
-        const timeout = loader.timeoutPerMb(loader.ERASE_REGION_TIMEOUT_PER_MB, writeSize);
-
-        loader.info("Compressed " + size + " bytes to " + compsize + "...");
-        let pkt = loader._appendArray(loader._intToByteArray(writeSize), loader._intToByteArray(numBlocks));
-        pkt = loader._appendArray(pkt, loader._intToByteArray(loader.FLASH_WRITE_SIZE));
-        pkt = loader._appendArray(pkt, loader._intToByteArray(offset));
-        pkt = loader._appendArray(pkt, loader._intToByteArray(0));
-
-        await loader.checkCommand(
-          "enter compressed flash mode",
-          loader.ESP_FLASH_DEFL_BEGIN,
-          pkt,
-          undefined,
-          undefined,
-          timeout,
-        );
-
-        if (size !== 0) {
-          const elapsed = Date.now() - t1;
-          loader.info("Took " + elapsed / 1000 + "." + (elapsed % 1000) + "s to erase flash block");
-        }
-        return numBlocks;
-      };
-    };
-
     const connect = async () => {
       ensureSupport();
       if (state.connected) {
@@ -750,7 +686,7 @@
         try {
           state.port.addEventListener("disconnect", state.onDisconnect);
         } catch {}
-        const baud = FLASH_BAUD;
+        const baud = parseInt(ui.baud.value, 10);
         state.transport = new Transport(state.port, true);
         const loaderOptions = {
           transport: state.transport,
@@ -762,9 +698,6 @@
           },
           debugLogging: false,
         };
-        if ((parseInt(ui.baud.value, 10) || FLASH_BAUD) !== FLASH_BAUD) {
-          log(`Selected baud overridden to stable ${FLASH_BAUD} for WebSerial flashing.`);
-        }
         setStatus(`Syncing with chip (hold BOOT + RESET). Timeout ${Math.round(CONNECT_TIMEOUT_MS/1000)}s`);
         log("Syncing with chip");
 
@@ -775,8 +708,6 @@
           attempt += 1;
           try {
             state.esploader = new ESPLoader(loaderOptions);
-            state.usingStub = null;
-            applyEspToolWorkarounds(state.esploader);
             log("Connecting...");
             state.chip = await state.esploader.main();
             lastErr = null;
@@ -862,91 +793,9 @@
         log(`Fetching ${url} @ 0x${part.offset.toString(16)}`);
         const { buf, usedUrl } = await resolveAssetUrl(url);
         log(`Fetched ${usedUrl}`);
-        files.push({ data: bufferToBinaryString(buf), bytes: new Uint8Array(buf), address: part.offset });
+        files.push({ data: bufferToBinaryString(buf), address: part.offset });
       }
       return files;
-    };
-
-    const writeFlashViaRom = async (loader, files, flashOptions) => {
-      if (!loader) throw new Error("ESP loader is not ready");
-
-      loader.info("Using uncompressed ROM flash path for ESP32-C5 to avoid compressed-flash failures.");
-
-      if (flashOptions.flashSize && flashOptions.flashSize !== "keep") {
-        const flashEnd = loader.flashSizeBytes(flashOptions.flashSize);
-        for (let i = 0; i < files.length; i += 1) {
-          const size = files[i]?.bytes?.length ?? files[i]?.data?.length ?? 0;
-          if (size + files[i].address > flashEnd) {
-            throw new Error(`File ${i + 1} doesn't fit in the available flash`);
-          }
-        }
-      }
-
-      for (let i = 0; i < files.length; i += 1) {
-        let image = files[i].bytes instanceof Uint8Array
-          ? new Uint8Array(files[i].bytes)
-          : loader.bstrToUi8(files[i].data || "");
-
-        if (image.length === 0) continue;
-
-        image = padBytesTo(image, 4);
-        const address = files[i].address;
-        image = await loader._updateImageFlashParams(
-          image,
-          address,
-          flashOptions.flashMode,
-          flashOptions.flashFreq,
-          flashOptions.flashSize,
-        );
-
-        const calcmd5 = flashOptions.calculateMD5Hash
-          ? String(flashOptions.calculateMD5Hash(bytesToBinaryString(image)))
-          : null;
-
-        const totalBytes = image.length;
-        const blocks = await loader.flashBegin(totalBytes, address);
-        let seq = 0;
-        let imageOffset = 0;
-        let timeout = loader.DEFAULT_TIMEOUT || 3000;
-        if (flashOptions.reportProgress) flashOptions.reportProgress(i, 0, totalBytes);
-
-        const t1 = Date.now();
-        while (imageOffset < image.length) {
-          const blockSize = Math.min(loader.FLASH_WRITE_SIZE, image.length - imageOffset);
-          const block = image.slice(imageOffset, imageOffset + blockSize);
-          const pct = Math.min(100, Math.floor((100 * (seq + 1)) / Math.max(blocks, 1)));
-          loader.info(`Writing at 0x${(address + imageOffset).toString(16)}... (${pct}%)`);
-
-          if (typeof loader.timeoutPerMb === "function") {
-            timeout = Math.max(loader.DEFAULT_TIMEOUT || 3000, loader.timeoutPerMb(loader.ERASE_WRITE_TIMEOUT_PER_MB, block.length));
-          }
-
-          await loader.flashBlock(block, seq, timeout);
-          imageOffset += blockSize;
-          seq += 1;
-
-          if (flashOptions.reportProgress) {
-            flashOptions.reportProgress(i, imageOffset, totalBytes);
-          }
-        }
-
-        await loader.flashFinish(false, timeout);
-
-        const elapsedSeconds = ((Date.now() - t1) / 1000).toFixed(3);
-        loader.info(`Wrote ${totalBytes} bytes at 0x${address.toString(16)} in ${elapsedSeconds} seconds.`);
-
-        if (calcmd5) {
-          loader.info("File  md5: " + calcmd5);
-          const flashMd5 = await loader.flashMd5sum(address, totalBytes);
-          loader.info("Flash md5: " + flashMd5);
-          if (String(flashMd5) !== calcmd5) {
-            throw new Error("MD5 of file does not match data in flash!");
-          }
-          loader.info("Hash of data verified.");
-        }
-      }
-
-      loader.info("Leaving...");
     };
 
 const flash = async () => {
@@ -960,20 +809,12 @@ const flash = async () => {
       ui.progress.style.width = "0%";
       try {
         const files = await fetchFiles();
-        const flashingFromStub = state.usingStub !== false;
-        setStatus(flashingFromStub ? "Uploading stub and flashing" : "Flashing from ROM bootloader");
+        setStatus("Uploading stub and flashing");
         log("Preparing flash writes");
-        if (!flashingFromStub) {
-          log("ROM bootloader mode active. Stub is disabled for ESP32-C5 compatibility.");
-          if (ui.eraseAll?.checked) {
-            setStatus("ROM bootloader will erase only the regions being flashed.");
-            log("Erase-all requested, but ESP32-C5 ROM mode cannot use stub-only full-chip erase. Proceeding with per-region erase during flash begin.");
-          }
-        }
         const flashOptions = {
           fileArray: files,
           flashSize: "8MB",
-          eraseAll: flashingFromStub && !!ui.eraseAll?.checked,
+          eraseAll: !!ui.eraseAll?.checked,
           compress: true,
           reportProgress: (fileIndex, written, total) => {
             const pct = Math.min(100, Math.round((written / total) * 100));
@@ -982,13 +823,7 @@ const flash = async () => {
           },
           calculateMD5Hash: (image) => CryptoJS.MD5(CryptoJS.enc.Latin1.parse(image)),
         };
-        const romChipName = state.esploader?.chip?.CHIP_NAME || "";
-        if (!flashingFromStub && romChipName === "ESP32-C5") {
-          log("Using uncompressed ROM flash path for ESP32-C5 to bypass FLASH_DEFL failures in esptool-js.");
-          await writeFlashViaRom(state.esploader, files, flashOptions);
-        } else {
-          await state.esploader.writeFlash(flashOptions);
-        }
+        await state.esploader.writeFlash(flashOptions);
         await state.esploader.after();
         ui.progress.style.width = "100%";
         setStatus("Flash complete. Press RESET if the board doesn't reboot.");
