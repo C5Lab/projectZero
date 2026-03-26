@@ -387,7 +387,7 @@
   </div>
   <footer>
     Product of <a href="https://github.com/C5Lab/projectZero/">C5Lab/projectZero</a> -
-    <span id="pageVersion" class="mono">Web flasher v1.0.7</span>.
+    <span id="pageVersion" class="mono">Web flasher v1.0.8</span>.
   </footer>
 
   <script type="module">
@@ -438,7 +438,7 @@
       monitorConnected: false,
     };
 
-    const PAGE_VERSION = "1.0.7";
+    const PAGE_VERSION = "1.0.8";
     const FLASH_BAUD = 115200;
     const monitorEncoder = new TextEncoder();
 
@@ -662,6 +662,58 @@
       }
     };
 
+    const applyEspToolWorkarounds = (loader) => {
+      if (!loader || loader.__projectZeroPatched) return;
+      loader.__projectZeroPatched = true;
+
+      const originalRunStub = loader.runStub.bind(loader);
+      loader.runStub = async () => {
+        const chipName = loader?.chip?.CHIP_NAME || "";
+        if (chipName === "ESP32-C5") {
+          state.usingStub = false;
+          log("Skipping flasher stub for ESP32-C5. Using ROM bootloader path due to known C5 ECO2 stub flash-write failures.");
+          return loader.chip;
+        }
+        state.usingStub = true;
+        return originalRunStub();
+      };
+
+      const originalFlashDeflBegin = loader.flashDeflBegin.bind(loader);
+      loader.flashDeflBegin = async (size, compsize, offset) => {
+        const chipName = loader?.chip?.CHIP_NAME || "";
+        if (loader.IS_STUB || chipName === "ESP32" || chipName === "ESP8266") {
+          return originalFlashDeflBegin(size, compsize, offset);
+        }
+
+        const numBlocks = Math.floor((compsize + loader.FLASH_WRITE_SIZE - 1) / loader.FLASH_WRITE_SIZE);
+        const eraseBlocks = Math.floor((size + loader.FLASH_WRITE_SIZE - 1) / loader.FLASH_WRITE_SIZE);
+        const t1 = Date.now();
+        const writeSize = eraseBlocks * loader.FLASH_WRITE_SIZE;
+        const timeout = loader.timeoutPerMb(loader.ERASE_REGION_TIMEOUT_PER_MB, writeSize);
+
+        loader.info("Compressed " + size + " bytes to " + compsize + "...");
+        let pkt = loader._appendArray(loader._intToByteArray(writeSize), loader._intToByteArray(numBlocks));
+        pkt = loader._appendArray(pkt, loader._intToByteArray(loader.FLASH_WRITE_SIZE));
+        pkt = loader._appendArray(pkt, loader._intToByteArray(offset));
+        pkt = loader._appendArray(pkt, loader._intToByteArray(0));
+
+        await loader.checkCommand(
+          "enter compressed flash mode",
+          loader.ESP_FLASH_DEFL_BEGIN,
+          pkt,
+          undefined,
+          undefined,
+          timeout,
+        );
+
+        if (size !== 0) {
+          const elapsed = Date.now() - t1;
+          loader.info("Took " + elapsed / 1000 + "." + (elapsed % 1000) + "s to erase flash block");
+        }
+        return numBlocks;
+      };
+    };
+
     const connect = async () => {
       ensureSupport();
       if (state.connected) {
@@ -712,17 +764,7 @@
           try {
             state.esploader = new ESPLoader(loaderOptions);
             state.usingStub = null;
-            const originalRunStub = state.esploader.runStub.bind(state.esploader);
-            state.esploader.runStub = async () => {
-              const chipName = state.esploader?.chip?.CHIP_NAME || "";
-              if (chipName === "ESP32-C5") {
-                state.usingStub = false;
-                log("Skipping flasher stub for ESP32-C5. Using ROM bootloader path due to known C5 ECO2 stub flash-write failures.");
-                return state.esploader.chip;
-              }
-              state.usingStub = true;
-              return originalRunStub();
-            };
+            applyEspToolWorkarounds(state.esploader);
             log("Connecting...");
             state.chip = await state.esploader.main();
             lastErr = null;
