@@ -387,11 +387,11 @@
   </div>
   <footer>
     Product of <a href="https://github.com/C5Lab/projectZero/">C5Lab/projectZero</a> -
-    <span id="pageVersion" class="mono">Web flasher v1.0.8</span>.
+    <span id="pageVersion" class="mono">Web flasher v1.0.10</span>.
   </footer>
 
   <script type="module">
-    import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.6.0/bundle.js";
+    import { ESPLoader, Transport } from "https://unpkg.com/esptool-js/bundle.js";
 
     const ui = {
       status: document.getElementById("statusText"),
@@ -438,7 +438,7 @@
       monitorConnected: false,
     };
 
-    const PAGE_VERSION = "1.0.9";
+    const PAGE_VERSION = "1.0.10";
     const FLASH_BAUD = 115200;
     const monitorEncoder = new TextEncoder();
 
@@ -966,15 +966,14 @@ const flash = async () => {
         if (!flashingFromStub) {
           log("ROM bootloader mode active. Stub is disabled for ESP32-C5 compatibility.");
           if (ui.eraseAll?.checked) {
-            setStatus("Erasing flash from ROM bootloader");
-            log("Erase requested. Running full flash erase before writes.");
-            await state.esploader.eraseFlash();
+            setStatus("ROM bootloader will erase only the regions being flashed.");
+            log("Erase-all requested, but ESP32-C5 ROM mode cannot use stub-only full-chip erase. Proceeding with per-region erase during flash begin.");
           }
         }
         const flashOptions = {
           fileArray: files,
           flashSize: "8MB",
-          eraseAll: !!ui.eraseAll?.checked,
+          eraseAll: flashingFromStub && !!ui.eraseAll?.checked,
           compress: true,
           reportProgress: (fileIndex, written, total) => {
             const pct = Math.min(100, Math.round((written / total) * 100));
