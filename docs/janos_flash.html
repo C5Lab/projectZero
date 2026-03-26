@@ -326,6 +326,7 @@
               <strong>Erase</strong> does a full flash erase <span class="mono">(esptool erase-flash)</span> before writing the images.
               Only enable it when you have OTA partitions / old firmware and you see bootloops or slot errors.
               This web flasher seeds both OTA slots by default by writing the app to <span class="mono">0x20000</span> and <span class="mono">0x410000</span>.
+              If the log shows <span class="mono">Flash ID: 0</span> or an MD5 mismatch, reconnect in ROM mode and retry at <span class="mono">115200</span>.
               Note: it wipes anything stored in flash (including NVS settings like Wi-Fi creds/config).
             </div>
             <div class="progress" aria-label="Flash progress">
@@ -388,7 +389,7 @@
   </div>
   <footer>
     Product of <a href="https://github.com/C5Lab/projectZero/">C5Lab/projectZero</a> -
-    <span id="pageVersion" class="mono">Web flasher v1.0.4</span>.
+    <span id="pageVersion" class="mono">Web flasher v1.0.5</span>.
   </footer>
 
   <script type="module">
@@ -418,6 +419,7 @@
 
     const state = {
       manifest: null,
+      manifestUrl: null,
       latestRelease: null,
       files: [],
       port: null,
@@ -437,7 +439,7 @@
       monitorConnected: false,
     };
 
-    const PAGE_VERSION = "1.0.3";
+    const PAGE_VERSION = "1.0.5";
     const monitorEncoder = new TextEncoder();
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -538,10 +540,19 @@
       } catch {}
       let cleaned = path.startsWith("/") ? path.slice(1) : path;
       const branch = getBranch();
-      if (cleaned.startsWith("firmware/")) {
+      const manifestUrl = state.manifestUrl || getManifestUrl();
+      const manifestHost = (() => {
+        try {
+          return new URL(manifestUrl).hostname;
+        } catch {
+          return "";
+        }
+      })();
+      if (manifestHost === "raw.githubusercontent.com" && cleaned.startsWith("firmware/")) {
         cleaned = cleaned.replace(/^firmware\//, "ESP32C5/binaries-esp32c5/");
+        return `https://raw.githubusercontent.com/C5Lab/projectZero/${branch}/${cleaned}`;
       }
-      return `https://raw.githubusercontent.com/C5Lab/projectZero/${branch}/${cleaned}`;
+      return new URL(cleaned, manifestUrl).toString();
     };
 
     const getBranch = () => ui.branch.value || "main";
@@ -618,6 +629,7 @@
         if (usedManifestUrl) log(`Manifest: ${usedManifestUrl}`);
         const manifest = rewritePartsForBranch(manifestRaw, getBranch());
         state.manifest = manifest;
+        state.manifestUrl = usedManifestUrl || primary;
         let releaseLabel = manifest.version || "n/a";
         if (getBranch() === "main") {
           try {
@@ -959,6 +971,7 @@ const flash = async () => {
     });
     ui.branch.addEventListener("change", () => {
       state.manifest = null;
+      state.manifestUrl = null;
       ui.manifest.style.display = "none";
       ui.manifest.textContent = "";
       ui.releaseInfo.textContent = "Loading manifest";
