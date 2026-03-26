@@ -213,7 +213,8 @@ jobs:
         run: |
           set -euo pipefail
           notes_file="release_notes.md"
-          TAG="${RELEASE_TAG:-$FW_VERSION}"
+          TAG="$(printf '%s' "${RELEASE_TAG:-v${FW_VERSION}}" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          if [ -z "$TAG" ]; then TAG="v${FW_VERSION}"; fi
           FAP_VER="${FAP_VERSION:-unknown}"
           BASE_URL="https://github.com/$REPO/releases/download/$TAG"
           JANOS_ZIP="$BASE_URL/projectZero-${FW_VERSION}.zip"
@@ -272,8 +273,11 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.firmware.outputs.fw_version) }}
         run: |
           set -euo pipefail
-          TAG="${RELEASE_TAG:-v${FW_VERSION}}"
+          TAG="$(printf '%s' "${RELEASE_TAG:-v${FW_VERSION}}" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          if [ -z "$TAG" ]; then TAG="v${FW_VERSION}"; fi
           NAME="projectZero ${FW_VERSION}"
+
+          echo "Using release tag: '$TAG'"
 
           files=(
             release_artifacts/firmware/bootloader.bin
@@ -337,11 +341,11 @@ jobs:
           FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
         run: |
           set -euo pipefail
-          TAG="${EVENT_TAG:-}"
-          if [ -z "$TAG" ]; then TAG="${INPUT_TAG:-}"; fi
+          TAG="$(printf '%s' "${EVENT_TAG:-}" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          if [ -z "$TAG" ]; then TAG="$(printf '%s' "${INPUT_TAG:-}" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"; fi
           if [ -z "$TAG" ]; then TAG="v${FW_VERSION}"; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Using tag: $TAG"
+          echo "Using tag: '$TAG'"
 
       - name: Download release assets
         id: download
