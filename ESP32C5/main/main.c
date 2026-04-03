@@ -111,7 +111,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.5.8"
+#define JANOS_VERSION "1.5.9"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -1239,7 +1239,7 @@ static bool init_psram_buffers(void)
 #define BOOTCFG_KEY_LONG_CMD   "long_cmd"
 #define BOOTCFG_KEY_SHORT_EN   "short_en"
 #define BOOTCFG_KEY_LONG_EN    "long_en"
-#define BOOTCFG_CMD_MAX_LEN    32
+#define BOOTCFG_CMD_MAX_LEN    192
 
 typedef struct {
     char command[BOOTCFG_CMD_MAX_LEN];
@@ -1254,9 +1254,18 @@ static const char* boot_allowed_commands[] = {
     "scan_networks",
     "start_gps_raw",
     "start_wardrive",
-    "deauth_detector"
+    "deauth_detector",
+    "list_sd",
+    "select_html",
+    "start_portal"
 };
 static const size_t boot_allowed_command_count = sizeof(boot_allowed_commands) / sizeof(boot_allowed_commands[0]);
+
+typedef enum {
+    BOOT_FLOW_VALID = 0,
+    BOOT_FLOW_INVALID_COMMAND,
+    BOOT_FLOW_MALFORMED
+} boot_flow_validation_result_t;
 
 typedef struct {
     bool enabled;
@@ -3364,6 +3373,220 @@ static bool boot_is_command_allowed(const char* command) {
     return false;
 }
 
+typedef bool (*boot_flow_visitor_t)(char *command_line, void *ctx);
+
+static char* boot_trim_whitespace(char *text) {
+    if (text == NULL) {
+        return NULL;
+    }
+
+    while (*text && isspace((unsigned char)*text)) {
+        text++;
+    }
+
+    char *end = text + strlen(text);
+    while (end > text && isspace((unsigned char)end[-1])) {
+        *--end = '\0';
+    }
+
+    return text;
+}
+
+static bool boot_buffer_append_char(char *dest, size_t dest_size, size_t *pos, char ch) {
+    if (dest == NULL || pos == NULL || *pos + 1 >= dest_size) {
+        return false;
+    }
+
+    dest[*pos] = ch;
+    (*pos)++;
+    dest[*pos] = '\0';
+    return true;
+}
+
+static bool boot_buffer_append_text(char *dest, size_t dest_size, size_t *pos, const char *text) {
+    if (dest == NULL || pos == NULL || text == NULL) {
+        return false;
+    }
+
+    size_t len = strlen(text);
+    if (*pos + len >= dest_size) {
+        return false;
+    }
+
+    memcpy(dest + *pos, text, len);
+    *pos += len;
+    dest[*pos] = '\0';
+    return true;
+}
+
+static bool boot_append_serialized_arg(char *dest, size_t dest_size, size_t *pos, const char *arg) {
+    if (arg == NULL) {
+        arg = "";
+    }
+
+    bool needs_quotes = (arg[0] == '\0');
+    for (const char *p = arg; *p != '\0'; ++p) {
+        if (isspace((unsigned char)*p) || *p == '"' || *p == '\\') {
+            needs_quotes = true;
+            break;
+        }
+    }
+
+    if (!needs_quotes) {
+        return boot_buffer_append_text(dest, dest_size, pos, arg);
+    }
+
+    if (!boot_buffer_append_char(dest, dest_size, pos, '"')) {
+        return false;
+    }
+
+    for (const char *p = arg; *p != '\0'; ++p) {
+        if (*p == '"' || *p == '\\') {
+            if (!boot_buffer_append_char(dest, dest_size, pos, '\\')) {
+                return false;
+            }
+        }
+        if (!boot_buffer_append_char(dest, dest_size, pos, *p)) {
+            return false;
+        }
+    }
+
+    return boot_buffer_append_char(dest, dest_size, pos, '"');
+}
+
+static bool boot_build_command_flow_from_argv(int argc, char **argv, int start_index, char *dest, size_t dest_size) {
+    if (dest == NULL || dest_size == 0 || argc <= start_index || argv == NULL) {
+        return false;
+    }
+
+    dest[0] = '\0';
+
+    if ((argc - start_index) == 1) {
+        return strlcpy(dest, argv[start_index], dest_size) < dest_size;
+    }
+
+    size_t pos = 0;
+    for (int i = start_index; i < argc; ++i) {
+        if (argv[i] == NULL) {
+            continue;
+        }
+        if (pos > 0 && !boot_buffer_append_char(dest, dest_size, &pos, ' ')) {
+            return false;
+        }
+        if (!boot_append_serialized_arg(dest, dest_size, &pos, argv[i])) {
+            return false;
+        }
+    }
+
+    return pos > 0;
+}
+
+static bool boot_visit_command_flow(char *flow, boot_flow_visitor_t visitor, void *ctx) {
+    if (flow == NULL || visitor == NULL) {
+        return false;
+    }
+
+    char *segment_start = flow;
+    bool in_single_quote = false;
+    bool in_double_quote = false;
+    bool escape_next = false;
+    bool saw_command = false;
+
+    for (char *cursor = flow; ; ++cursor) {
+        char ch = *cursor;
+
+        if (escape_next) {
+            escape_next = false;
+        } else if (ch == '\\' && in_double_quote) {
+            escape_next = true;
+        } else if (ch == '"' && !in_single_quote) {
+            in_double_quote = !in_double_quote;
+        } else if (ch == '\'' && !in_double_quote) {
+            in_single_quote = !in_single_quote;
+        }
+
+        bool at_end = (ch == '\0');
+        bool at_separator = (ch == ',' && !in_single_quote && !in_double_quote);
+
+        if (at_end && (in_single_quote || in_double_quote || escape_next)) {
+            return false;
+        }
+
+        if (!at_separator && !at_end) {
+            continue;
+        }
+
+        *cursor = '\0';
+        char *segment = boot_trim_whitespace(segment_start);
+        if (segment == NULL || segment[0] == '\0') {
+            return false;
+        }
+
+        saw_command = true;
+        if (!visitor(segment, ctx)) {
+            return false;
+        }
+
+        if (at_end) {
+            break;
+        }
+
+        segment_start = cursor + 1;
+    }
+
+    return saw_command;
+}
+
+typedef struct {
+    char invalid_command[BOOTCFG_CMD_MAX_LEN];
+} boot_flow_validation_ctx_t;
+
+static bool boot_validate_command_segment(char *command_line, void *ctx) {
+    boot_flow_validation_ctx_t *validation = (boot_flow_validation_ctx_t *)ctx;
+    char *argv_local[16];
+    size_t argc = esp_console_split_argv(command_line, argv_local, sizeof(argv_local) / sizeof(argv_local[0]));
+    if (argc == 0) {
+        return false;
+    }
+
+    if (!boot_is_command_allowed(argv_local[0])) {
+        if (validation != NULL) {
+            strlcpy(validation->invalid_command, argv_local[0], sizeof(validation->invalid_command));
+        }
+        return false;
+    }
+
+    return true;
+}
+
+static boot_flow_validation_result_t boot_validate_command_flow(const char *flow,
+                                                               char *detail,
+                                                               size_t detail_size) {
+    if (detail != NULL && detail_size > 0) {
+        detail[0] = '\0';
+    }
+
+    if (flow == NULL || flow[0] == '\0') {
+        return BOOT_FLOW_MALFORMED;
+    }
+
+    char flow_copy[BOOTCFG_CMD_MAX_LEN];
+    if (strlcpy(flow_copy, flow, sizeof(flow_copy)) >= sizeof(flow_copy)) {
+        return BOOT_FLOW_MALFORMED;
+    }
+
+    boot_flow_validation_ctx_t validation = {0};
+    if (!boot_visit_command_flow(flow_copy, boot_validate_command_segment, &validation)) {
+        if (detail != NULL && detail_size > 0 && validation.invalid_command[0] != '\0') {
+            strlcpy(detail, validation.invalid_command, detail_size);
+            return BOOT_FLOW_INVALID_COMMAND;
+        }
+        return BOOT_FLOW_MALFORMED;
+    }
+
+    return BOOT_FLOW_VALID;
+}
+
 static void boot_config_set_defaults(void) {
     memset(&boot_config, 0, sizeof(boot_config));
     boot_config.short_press.enabled = false;
@@ -3432,8 +3655,8 @@ static void boot_config_load_from_nvs(void) {
         err = nvs_get_str(handle, BOOTCFG_KEY_SHORT_CMD, boot_config.short_press.command, &required);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Boot cfg short cmd read failed: %s", esp_err_to_name(err));
-        } else if (!boot_is_command_allowed(boot_config.short_press.command)) {
-            ESP_LOGW(TAG, "Boot cfg short cmd not allowed (%s), resetting", boot_config.short_press.command);
+        } else if (boot_validate_command_flow(boot_config.short_press.command, NULL, 0) != BOOT_FLOW_VALID) {
+            ESP_LOGW(TAG, "Boot cfg short flow not allowed (%s), resetting", boot_config.short_press.command);
             strlcpy(boot_config.short_press.command, "start_sniffer_dog", sizeof(boot_config.short_press.command));
         }
     }
@@ -3444,8 +3667,8 @@ static void boot_config_load_from_nvs(void) {
         err = nvs_get_str(handle, BOOTCFG_KEY_LONG_CMD, boot_config.long_press.command, &required);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Boot cfg long cmd read failed: %s", esp_err_to_name(err));
-        } else if (!boot_is_command_allowed(boot_config.long_press.command)) {
-            ESP_LOGW(TAG, "Boot cfg long cmd not allowed (%s), resetting", boot_config.long_press.command);
+        } else if (boot_validate_command_flow(boot_config.long_press.command, NULL, 0) != BOOT_FLOW_VALID) {
+            ESP_LOGW(TAG, "Boot cfg long flow not allowed (%s), resetting", boot_config.long_press.command);
             strlcpy(boot_config.long_press.command, "start_blackout", sizeof(boot_config.long_press.command));
         }
     }
@@ -3465,43 +3688,87 @@ static void boot_list_allowed_commands(void) {
     for (size_t i = 0; i < boot_allowed_command_count; i++) {
         MY_LOG_INFO(TAG, "  %s", boot_allowed_commands[i]);
     }
+    MY_LOG_INFO(TAG, "Use commas to run a flow, for example:");
+    MY_LOG_INFO(TAG, "  list_sd, select_html 1, start_portal FreeWifi");
+    MY_LOG_INFO(TAG, "Quote arguments that contain spaces:");
+    MY_LOG_INFO(TAG, "  start_portal \"Free Wifi\"");
 }
 
-static void boot_execute_command(const char* command) {
-    if (command == NULL || command[0] == '\0') {
+static bool boot_execute_command_segment(char *command_line, void *ctx) {
+    (void)ctx;
+
+    char parse_copy[BOOTCFG_CMD_MAX_LEN];
+    if (strlcpy(parse_copy, command_line, sizeof(parse_copy)) >= sizeof(parse_copy)) {
+        return false;
+    }
+
+    char *argv_local[16];
+    size_t argc = esp_console_split_argv(parse_copy, argv_local, sizeof(argv_local) / sizeof(argv_local[0]));
+    if (argc == 0) {
+        return false;
+    }
+
+    const char *run_line = command_line;
+    if (strcasecmp(argv_local[0], "packet_monitor") == 0 && argc == 1) {
+        // Keep backward compatibility with the previous fixed channel=1 behavior.
+        run_line = "packet_monitor 1";
+    }
+
+    MY_LOG_INFO(TAG, "Boot cmd: %s", run_line);
+
+    int cmd_ret = 0;
+    esp_err_t err = esp_console_run(run_line, &cmd_ret);
+    if (err == ESP_ERR_NOT_FOUND) {
+        MY_LOG_INFO(TAG, "Boot cmd not found: %s", argv_local[0]);
+        return false;
+    }
+    if (err == ESP_ERR_INVALID_ARG) {
+        MY_LOG_INFO(TAG, "Boot cmd invalid args: %s", run_line);
+        return false;
+    }
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Boot cmd error %s: %s", esp_err_to_name(err), run_line);
+        return false;
+    }
+    if (cmd_ret != 0) {
+        MY_LOG_INFO(TAG, "Boot cmd returned %d: %s", cmd_ret, run_line);
+        return false;
+    }
+
+    return true;
+}
+
+static void boot_execute_command_flow(const char* flow) {
+    if (flow == NULL || flow[0] == '\0') {
         return;
     }
 
-    if (strcasecmp(command, "start_blackout") == 0) {
-        (void)cmd_start_blackout(0, NULL);
-    } else if (strcasecmp(command, "start_sniffer_dog") == 0) {
-        (void)cmd_start_sniffer_dog(0, NULL);
-    } else if (strcasecmp(command, "channel_view") == 0) {
-        (void)cmd_channel_view(0, NULL);
-    } else if (strcasecmp(command, "packet_monitor") == 0) {
-        char arg0[] = "packet_monitor";
-        char arg1[] = "1";
-        char* argv[] = { arg0, arg1, NULL };
-        (void)cmd_packet_monitor(2, argv);
-    } else if (strcasecmp(command, "start_sniffer") == 0) {
-        (void)cmd_start_sniffer(0, NULL);
-    } else if (strcasecmp(command, "scan_networks") == 0) {
-        (void)cmd_scan_networks(0, NULL);
-    } else if (strcasecmp(command, "start_gps_raw") == 0) {
-        (void)cmd_start_gps_raw(0, NULL);
-    } else if (strcasecmp(command, "start_wardrive") == 0) {
-        (void)cmd_start_wardrive(0, NULL);
-    } else if (strcasecmp(command, "deauth_detector") == 0) {
-        (void)cmd_deauth_detector(0, NULL);
-    } else {
-        MY_LOG_INFO(TAG, "Boot cmd '%s' not recognized", command);
+    char flow_copy[BOOTCFG_CMD_MAX_LEN];
+    if (strlcpy(flow_copy, flow, sizeof(flow_copy)) >= sizeof(flow_copy)) {
+        MY_LOG_INFO(TAG, "Boot flow too long, skipping");
+        return;
+    }
+
+    char detail[BOOTCFG_CMD_MAX_LEN];
+    boot_flow_validation_result_t validation = boot_validate_command_flow(flow, detail, sizeof(detail));
+    if (validation == BOOT_FLOW_INVALID_COMMAND) {
+        MY_LOG_INFO(TAG, "Boot flow blocked by command '%s'", detail);
+        return;
+    }
+    if (validation != BOOT_FLOW_VALID) {
+        MY_LOG_INFO(TAG, "Boot flow malformed: %s", flow);
+        return;
+    }
+
+    if (!boot_visit_command_flow(flow_copy, boot_execute_command_segment, NULL)) {
+        MY_LOG_INFO(TAG, "Boot flow stopped: %s", flow);
     }
 }
 
 static void boot_action_task(void *arg) {
     boot_action_params_t *params = (boot_action_params_t *)arg;
     if (params != NULL) {
-        boot_execute_command(params->command);
+        boot_execute_command_flow(params->command);
         free(params);
     }
     boot_action_task_handle = NULL;
@@ -3515,8 +3782,14 @@ static void boot_handle_action(bool is_long_press) {
         MY_LOG_INFO(TAG, "Boot %s action disabled", label);
         return;
     }
-    if (!boot_is_command_allowed(action->command)) {
-        MY_LOG_INFO(TAG, "Boot %s command '%s' not allowed", label, action->command);
+    char detail[BOOTCFG_CMD_MAX_LEN];
+    boot_flow_validation_result_t validation = boot_validate_command_flow(action->command, detail, sizeof(detail));
+    if (validation == BOOT_FLOW_INVALID_COMMAND) {
+        MY_LOG_INFO(TAG, "Boot %s command '%s' not allowed", label, detail);
+        return;
+    }
+    if (validation != BOOT_FLOW_VALID) {
+        MY_LOG_INFO(TAG, "Boot %s flow malformed: %s", label, action->command);
         return;
     }
     MY_LOG_INFO(TAG, "Boot %s executing: %s", label, action->command);
@@ -7968,7 +8241,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "start_portal", " <SSID>" },
     { "start_karma", " <index>" },
     { "vendor", " set <on|off> | read" },
-    { "boot_button", " read|list|set <short|long> <command> | status <short|long> <on|off>" },
+    { "boot_button", " read|list|set <short|long> <command[, command...]> | status <short|long> <on|off>" },
     { "led", " set <on|off> | level <1-100> | read" },
     { "channel_time", " set <min|max> <ms> | read <min|max>" },
     { "wifi_connect", " <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
@@ -10695,7 +10968,7 @@ static boot_action_config_t* boot_get_action_slot(const char* which) {
 
 static int cmd_boot_button(int argc, char **argv) {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: boot_button read | boot_button list | boot_button set <short|long> <command> | boot_button status <short|long> <on|off>");
+        MY_LOG_INFO(TAG, "Usage: boot_button read | boot_button list | boot_button set <short|long> <command[, command...]> | boot_button status <short|long> <on|off>");
         return 1;
     }
 
@@ -10711,7 +10984,7 @@ static int cmd_boot_button(int argc, char **argv) {
 
     if (strcasecmp(argv[1], "set") == 0) {
         if (argc < 4) {
-            MY_LOG_INFO(TAG, "Usage: boot_button set <short|long> <command>");
+            MY_LOG_INFO(TAG, "Usage: boot_button set <short|long> <command[, command...]>");
             boot_list_allowed_commands();
             return 1;
         }
@@ -10720,12 +10993,27 @@ static int cmd_boot_button(int argc, char **argv) {
             MY_LOG_INFO(TAG, "Unknown target '%s' (use short|long)", argv[2]);
             return 1;
         }
-        if (!boot_is_command_allowed(argv[3])) {
-            MY_LOG_INFO(TAG, "Command '%s' not allowed", argv[3]);
+
+        char flow[BOOTCFG_CMD_MAX_LEN];
+        if (!boot_build_command_flow_from_argv(argc, argv, 3, flow, sizeof(flow))) {
+            MY_LOG_INFO(TAG, "Boot flow too long (max %d chars)", BOOTCFG_CMD_MAX_LEN - 1);
+            return 1;
+        }
+
+        char detail[BOOTCFG_CMD_MAX_LEN];
+        boot_flow_validation_result_t validation = boot_validate_command_flow(flow, detail, sizeof(detail));
+        if (validation == BOOT_FLOW_INVALID_COMMAND) {
+            MY_LOG_INFO(TAG, "Command '%s' not allowed", detail);
             boot_list_allowed_commands();
             return 1;
         }
-        strlcpy(slot->command, argv[3], sizeof(slot->command));
+        if (validation != BOOT_FLOW_VALID) {
+            MY_LOG_INFO(TAG, "Malformed boot flow. Separate commands with commas.");
+            boot_list_allowed_commands();
+            return 1;
+        }
+
+        strlcpy(slot->command, flow, sizeof(slot->command));
         boot_config_persist();
         boot_config_print();
         return 0;
@@ -14974,7 +15262,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t boot_button_cmd = {
         .command = "boot_button",
-        .help = "Configure boot button actions: boot_button read|list|set <short|long> <command>|status <short|long> <on|off>",
+        .help = "Configure boot button actions: boot_button read|list|set <short|long> <command[, command...]>|status <short|long> <on|off>",
         .hint = NULL,
         .func = &cmd_boot_button,
         .argtable = NULL

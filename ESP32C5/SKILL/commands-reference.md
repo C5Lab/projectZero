@@ -630,9 +630,9 @@ SSID removed. 2 SSIDs remaining.
 - **Description**: Sets or reads display mode for attached OLED/LCD.
 
 ### `boot_button`
-- **Syntax**: `boot_button read` | `boot_button list` | `boot_button set <short|long> <command>` | `boot_button status <short|long> <on|off>`
-- **Description**: Configures boot button press actions.
-- **Allowed commands**: `start_blackout`, `start_sniffer_dog`, `channel_view`, `packet_monitor`, `start_sniffer`, `scan_networks`, `start_gps_raw`, `start_wardrive`, `deauth_detector`
+- **Syntax**: `boot_button read` | `boot_button list` | `boot_button set <short|long> <command[, command...]>` | `boot_button status <short|long> <on|off>`
+- **Description**: Configures boot button press actions. Multiple commands can be chained with commas, for example `list_sd, select_html 1, start_portal FreeWifi`.
+- **Allowed commands**: `start_blackout`, `start_sniffer_dog`, `channel_view`, `packet_monitor`, `start_sniffer`, `scan_networks`, `start_gps_raw`, `start_wardrive`, `deauth_detector`, `list_sd`, `select_html`, `start_portal`
 
 ### `led`
 - **Syntax**: `led set <on|off>` | `led level <1-100>` | `led read`
