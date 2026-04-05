@@ -231,6 +231,13 @@ typedef struct {
     uint32_t last_seen;
 } sniffer_ap_t;
 
+typedef struct {
+    uint8_t bssid[6];
+    char ssid[33];
+    uint32_t last_seen;
+    bool active;
+} hidden_ssid_cache_entry_t;
+
 // GPS data structure
 typedef struct {
     float latitude;
@@ -286,6 +293,7 @@ static volatile bool sniffer_active = false;
 static volatile bool sniffer_scan_phase = false;
 static int sniff_debug = 0; // Debug flag for detailed packet logging
 static bool sniffer_selected_mode = false; // Flag for selected networks mode
+static bool sniffer_channel_list_active = false; // Channel list built from selected or scanned networks
 static int sniffer_selected_channels[MAX_AP_CNT]; // Unique channels from selected networks
 static int sniffer_selected_channels_count = 0; // Number of unique channels
 
@@ -985,6 +993,9 @@ static volatile bool g_scan_in_progress = false;
 static volatile bool g_scan_done = false;
 static volatile uint32_t g_last_scan_status = 1; // 0 => success, non-zero => failure/unknown
 static int64_t g_scan_start_time_us = 0;
+static bool g_scan_print_hidden_results_on_complete = false;
+static hidden_ssid_cache_entry_t g_hidden_ssid_cache[MAX_SNIFFER_APS];
+static int g_hidden_ssid_cache_count = 0;
 
 static int g_selected_indices[MAX_AP_CNT];
 static int g_selected_count = 0;
@@ -1292,7 +1303,9 @@ static display_type_t display_forced_mode = DISPLAY_NONE; /* DISPLAY_NONE = auto
 
 // Methods forward declarations
 static int cmd_scan_networks(int argc, char **argv);
+static int cmd_scan_networks_hidden(int argc, char **argv);
 static int cmd_show_scan_results(int argc, char **argv);
+static int cmd_show_scan_results_hidden(int argc, char **argv);
 static int cmd_select_networks(int argc, char **argv);
 static int cmd_unselect_networks(int argc, char **argv);
 static int cmd_select_stations(int argc, char **argv);
@@ -1308,6 +1321,7 @@ static int cmd_set_gps_position_cap(int argc, char **argv);
 static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_start_sniffer(int argc, char **argv);
 static int cmd_start_sniffer_noscan(int argc, char **argv);
+static int cmd_start_sniffer_noscan_hidden(int argc, char **argv);
 static int cmd_packet_monitor(int argc, char **argv);
 static int cmd_channel_view(int argc, char **argv);
 static int cmd_show_sniffer_results(int argc, char **argv);
@@ -1359,6 +1373,17 @@ static int cmd_ota_info(int argc, char **argv);
 static int cmd_ota_boot(int argc, char **argv);
 static esp_err_t start_background_scan(uint32_t min_time, uint32_t max_time);
 static void print_scan_results(void);
+static void print_scan_results_hidden(void);
+static bool hidden_ssid_cache_lookup(const uint8_t *bssid, char *ssid_out, size_t ssid_out_size);
+static const wifi_ap_record_t *find_scan_record_by_bssid(const uint8_t *bssid);
+static bool copy_effective_scan_ssid(const wifi_ap_record_t *ap, char *out, size_t out_size);
+static void build_scan_display_ssid(const wifi_ap_record_t *ap, char *out, size_t out_size);
+static bool copy_effective_ssid_by_bssid(const uint8_t *bssid, char *out, size_t out_size);
+static void copy_scan_record_with_effective_ssid(wifi_ap_record_t *dst, const wifi_ap_record_t *src);
+static bool sniffer_learn_hidden_ssid(const uint8_t *bssid, const char *ssid, const char *source);
+static bool parse_ssid_tag(const uint8_t *ies, int ies_len, char *ssid_out, size_t out_size);
+static void sniffer_try_learn_hidden_ssid_from_mgmt(const uint8_t *frame, int len, uint8_t frame_type);
+static void sniffer_build_hidden_channel_list_from_scan_results(void);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
 // Target BSSID management functions
 static void save_target_bssids(void);
@@ -1683,8 +1708,12 @@ static void wifi_event_handler(void *event_handler_arg,
                 g_selected_count > 0 && target_bssid_count > 0) {
                 int idx = g_selected_indices[0];
                 uint8_t target_channel = target_bssids[0].channel; // Use first target_bssid (corresponds to first selected network)
+                char target_ssid[33];
+                if (!copy_effective_scan_ssid(&g_scan_results[idx], target_ssid, sizeof(target_ssid))) {
+                    snprintf(target_ssid, sizeof(target_ssid), "<hidden>");
+                }
                 MY_LOG_INFO(TAG, "Client connected to portal - switching to channel %d (first selected network: %s)", 
-                           target_channel, g_scan_results[idx].ssid);
+                           target_channel, target_ssid);
                 esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
             }
             
@@ -1732,7 +1761,11 @@ static void wifi_event_handler(void *event_handler_arg,
                     
                     // Automatically display scan results after completion
                     if (g_scan_count > 0 && !sniffer_active) {
-                        print_scan_results();
+                        if (g_scan_print_hidden_results_on_complete) {
+                            print_scan_results_hidden();
+                        } else {
+                            print_scan_results();
+                        }
                     }
                 }
             } else {
@@ -1741,6 +1774,7 @@ static void wifi_event_handler(void *event_handler_arg,
                 }
                 g_scan_count = 0;
             }
+            g_scan_print_hidden_results_on_complete = false;
             
             g_scan_done = true;
             g_scan_in_progress = false;
@@ -2992,8 +3026,11 @@ static void save_target_bssids(void) {
         memcpy(target_bssids[target_bssid_count].bssid, ap->bssid, 6);
         
         // Copy SSID
-        strncpy(target_bssids[target_bssid_count].ssid, (const char*)ap->ssid, 32);
-        target_bssids[target_bssid_count].ssid[32] = '\0';
+        if (!copy_effective_scan_ssid(ap, target_bssids[target_bssid_count].ssid,
+                                      sizeof(target_bssids[target_bssid_count].ssid))) {
+            snprintf(target_bssids[target_bssid_count].ssid,
+                     sizeof(target_bssids[target_bssid_count].ssid), "<hidden>");
+        }
         
         target_bssid_count++;
     }
@@ -3091,16 +3128,24 @@ static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan
         MY_LOG_INFO(TAG, "Current g_selected_indices and BSSIDs:");
         for (int i = 0; i < g_selected_count; ++i) {
             int idx = g_selected_indices[i];
+            char selected_ssid[33];
+            if (!copy_effective_scan_ssid(&g_scan_results[idx], selected_ssid, sizeof(selected_ssid))) {
+                snprintf(selected_ssid, sizeof(selected_ssid), "<hidden>");
+            }
             MY_LOG_INFO(TAG, "  g_selected_indices[%d] = %d -> BSSID: %02X:%02X:%02X:%02X:%02X:%02X, SSID: %s", 
                        i, idx, g_scan_results[idx].bssid[0], g_scan_results[idx].bssid[1], g_scan_results[idx].bssid[2],
                        g_scan_results[idx].bssid[3], g_scan_results[idx].bssid[4], g_scan_results[idx].bssid[5],
-                       g_scan_results[idx].ssid);
+                       selected_ssid);
         }
         
         // Debug: Print all scan results
         for (int i = 0; i < scan_count; ++i) {
+            char scan_ssid[33];
+            if (!copy_effective_scan_ssid(&scan_results[i], scan_ssid, sizeof(scan_ssid))) {
+                snprintf(scan_ssid, sizeof(scan_ssid), "<hidden>");
+            }
             MY_LOG_INFO(TAG, "Scan result[%d]: %s, BSSID: %02X:%02X:%02X:%02X:%02X:%02X, Channel: %d", 
-                       i, scan_results[i].ssid,
+                       i, scan_ssid,
                        scan_results[i].bssid[0], scan_results[i].bssid[1], scan_results[i].bssid[2],
                        scan_results[i].bssid[3], scan_results[i].bssid[4], scan_results[i].bssid[5],
                        scan_results[i].primary);
@@ -3180,6 +3225,276 @@ static void escape_csv_field(const char* input, char* output, size_t output_size
         }
     }
     output[out_pos] = '\0';
+}
+
+static bool scan_record_ssid_is_hidden(const wifi_ap_record_t *ap) {
+    return ap && ap->ssid[0] == '\0';
+}
+
+static int hidden_ssid_cache_find_index(const uint8_t *bssid) {
+    if (!bssid) {
+        return -1;
+    }
+
+    for (int i = 0; i < g_hidden_ssid_cache_count; i++) {
+        if (g_hidden_ssid_cache[i].active &&
+            memcmp(g_hidden_ssid_cache[i].bssid, bssid, 6) == 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static bool hidden_ssid_cache_lookup(const uint8_t *bssid, char *ssid_out, size_t ssid_out_size) {
+    if (!ssid_out || ssid_out_size == 0) {
+        return false;
+    }
+
+    ssid_out[0] = '\0';
+    int idx = hidden_ssid_cache_find_index(bssid);
+    if (idx < 0 || g_hidden_ssid_cache[idx].ssid[0] == '\0') {
+        return false;
+    }
+
+    snprintf(ssid_out, ssid_out_size, "%s", g_hidden_ssid_cache[idx].ssid);
+    return true;
+}
+
+static const wifi_ap_record_t *find_scan_record_by_bssid(const uint8_t *bssid) {
+    if (!bssid) {
+        return NULL;
+    }
+
+    for (int i = 0; i < g_scan_count; i++) {
+        if (memcmp(g_scan_results[i].bssid, bssid, 6) == 0) {
+            return &g_scan_results[i];
+        }
+    }
+
+    return NULL;
+}
+
+static void sniffer_sync_ap_ssid(const uint8_t *bssid, const char *ssid) {
+    if (!bssid || !ssid || ssid[0] == '\0') {
+        return;
+    }
+
+    for (int i = 0; i < sniffer_ap_count; i++) {
+        if (memcmp(sniffer_aps[i].bssid, bssid, 6) != 0) {
+            continue;
+        }
+
+        if (sniffer_aps[i].ssid[0] == '\0' ||
+            strncmp(sniffer_aps[i].ssid, "Unknown_", 8) == 0 ||
+            strncmp(sniffer_aps[i].ssid, "MGMT_", 5) == 0) {
+            snprintf(sniffer_aps[i].ssid, sizeof(sniffer_aps[i].ssid), "%s", ssid);
+        }
+
+        sniffer_aps[i].last_seen = esp_timer_get_time() / 1000;
+    }
+}
+
+static bool copy_effective_scan_ssid(const wifi_ap_record_t *ap, char *out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return false;
+    }
+
+    out[0] = '\0';
+    if (!ap) {
+        return false;
+    }
+
+    if (!scan_record_ssid_is_hidden(ap)) {
+        snprintf(out, out_size, "%s", (const char *)ap->ssid);
+        return true;
+    }
+
+    return hidden_ssid_cache_lookup(ap->bssid, out, out_size);
+}
+
+static void build_scan_display_ssid(const wifi_ap_record_t *ap, char *out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+    if (!ap) {
+        return;
+    }
+
+    char effective_ssid[33];
+    if (!copy_effective_scan_ssid(ap, effective_ssid, sizeof(effective_ssid))) {
+        return;
+    }
+
+    if (scan_record_ssid_is_hidden(ap)) {
+        snprintf(out, out_size, "%s_hidden_ssid", effective_ssid);
+    } else {
+        snprintf(out, out_size, "%s", effective_ssid);
+    }
+}
+
+static bool copy_effective_ssid_by_bssid(const uint8_t *bssid, char *out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return false;
+    }
+
+    out[0] = '\0';
+    if (!bssid) {
+        return false;
+    }
+
+    const wifi_ap_record_t *scan_ap = find_scan_record_by_bssid(bssid);
+    if (scan_ap) {
+        return copy_effective_scan_ssid(scan_ap, out, out_size);
+    }
+
+    return hidden_ssid_cache_lookup(bssid, out, out_size);
+}
+
+static void copy_scan_record_with_effective_ssid(wifi_ap_record_t *dst, const wifi_ap_record_t *src) {
+    if (!dst || !src) {
+        return;
+    }
+
+    memcpy(dst, src, sizeof(*dst));
+
+    char effective_ssid[33];
+    if (copy_effective_scan_ssid(src, effective_ssid, sizeof(effective_ssid))) {
+        snprintf((char *)dst->ssid, sizeof(dst->ssid), "%s", effective_ssid);
+    }
+}
+
+static bool sniffer_learn_hidden_ssid(const uint8_t *bssid, const char *ssid, const char *source) {
+    if (!bssid || !ssid || ssid[0] == '\0' || is_broadcast_bssid(bssid)) {
+        return false;
+    }
+
+    const wifi_ap_record_t *scan_ap = find_scan_record_by_bssid(bssid);
+    bool from_hidden_scan_record = (scan_ap != NULL && scan_record_ssid_is_hidden(scan_ap));
+    bool from_unseen_bssid = (scan_ap == NULL);
+
+    if (!from_hidden_scan_record && !from_unseen_bssid) {
+        return false;
+    }
+
+    int idx = hidden_ssid_cache_find_index(bssid);
+    uint32_t now = esp_timer_get_time() / 1000;
+    bool changed = false;
+
+    if (idx >= 0) {
+        if (strcmp(g_hidden_ssid_cache[idx].ssid, ssid) != 0) {
+            snprintf(g_hidden_ssid_cache[idx].ssid, sizeof(g_hidden_ssid_cache[idx].ssid), "%s", ssid);
+            changed = true;
+        }
+        g_hidden_ssid_cache[idx].last_seen = now;
+        g_hidden_ssid_cache[idx].active = true;
+    } else {
+        if (g_hidden_ssid_cache_count >= MAX_SNIFFER_APS) {
+            return false;
+        }
+
+        idx = g_hidden_ssid_cache_count++;
+        memset(&g_hidden_ssid_cache[idx], 0, sizeof(g_hidden_ssid_cache[idx]));
+        memcpy(g_hidden_ssid_cache[idx].bssid, bssid, 6);
+        snprintf(g_hidden_ssid_cache[idx].ssid, sizeof(g_hidden_ssid_cache[idx].ssid), "%s", ssid);
+        g_hidden_ssid_cache[idx].last_seen = now;
+        g_hidden_ssid_cache[idx].active = true;
+        changed = true;
+    }
+
+    sniffer_sync_ap_ssid(bssid, ssid);
+
+    if (changed && from_hidden_scan_record) {
+        MY_LOG_INFO(TAG, "Learned hidden SSID '%s' for BSSID %02X:%02X:%02X:%02X:%02X:%02X via %s",
+                    ssid,
+                    bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+                    source ? source : "sniffer");
+    }
+
+    return true;
+}
+
+static bool parse_ssid_tag(const uint8_t *ies, int ies_len, char *ssid_out, size_t out_size) {
+    if (!ies || ies_len <= 0 || !ssid_out || out_size < 2) {
+        return false;
+    }
+
+    ssid_out[0] = '\0';
+
+    int offset = 0;
+    while (offset + 2 <= ies_len) {
+        uint8_t tag_number = ies[offset];
+        uint8_t tag_length = ies[offset + 1];
+
+        if (offset + 2 + tag_length > ies_len) {
+            break;
+        }
+
+        if (tag_number == 0) {
+            if (tag_length == 0 || tag_length > 32 || tag_length >= out_size) {
+                return false;
+            }
+
+            memcpy(ssid_out, &ies[offset + 2], tag_length);
+            ssid_out[tag_length] = '\0';
+            return true;
+        }
+
+        offset += 2 + tag_length;
+    }
+
+    return false;
+}
+
+static void sniffer_try_learn_hidden_ssid_from_mgmt(const uint8_t *frame, int len, uint8_t frame_type) {
+    if (!frame || len <= 24) {
+        return;
+    }
+
+    const uint8_t *bssid = NULL;
+    const uint8_t *ies = NULL;
+    int ies_len = 0;
+    const char *source = NULL;
+
+    switch (frame_type) {
+        case 0x00: // Association Request
+            if (len <= 28) return;
+            bssid = &frame[16];
+            ies = frame + 24 + 4;
+            ies_len = len - 24 - 4;
+            source = "association request";
+            break;
+        case 0x20: // Reassociation Request
+            if (len <= 34) return;
+            bssid = &frame[16];
+            ies = frame + 24 + 10;
+            ies_len = len - 24 - 10;
+            source = "reassociation request";
+            break;
+        case 0x50: // Probe Response
+            if (len <= 36) return;
+            bssid = &frame[16];
+            ies = frame + 24 + 12;
+            ies_len = len - 24 - 12;
+            source = "probe response";
+            break;
+        case 0x80: // Beacon
+            if (len <= 36) return;
+            bssid = &frame[16];
+            ies = frame + 24 + 12;
+            ies_len = len - 24 - 12;
+            source = "beacon";
+            break;
+        default:
+            return;
+    }
+
+    char ssid[33];
+    if (parse_ssid_tag(ies, ies_len, ssid, sizeof(ssid))) {
+        sniffer_learn_hidden_ssid(bssid, ssid, source);
+    }
 }
 
 const char* authmode_to_string(wifi_auth_mode_t mode) {
@@ -3957,6 +4272,28 @@ static void print_network_csv(int index, const wifi_ap_record_t* ap) {
     vTaskDelay(pdMS_TO_TICKS(50));
 }
 
+static void print_network_csv_hidden(int index, const wifi_ap_record_t* ap) {
+    char display_ssid[64];
+    build_scan_display_ssid(ap, display_ssid, sizeof(display_ssid));
+    char escaped_ssid[64];
+    escape_csv_field(display_ssid, escaped_ssid, sizeof(escaped_ssid));
+    char escaped_vendor[64];
+    const char *vendor_name = vendor_is_enabled() ? lookup_vendor_name(ap->bssid) : NULL;
+    escape_csv_field(vendor_name ? vendor_name : "", escaped_vendor, sizeof(escaped_vendor));
+    
+    MY_LOG_INFO(TAG, "\"%d\",\"%s\",\"%s\",\"%02X:%02X:%02X:%02X:%02X:%02X\",\"%d\",\"%s\",\"%d\",\"%s\"",
+                (index + 1),
+                escaped_ssid,
+                escaped_vendor,
+                ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                ap->bssid[3], ap->bssid[4], ap->bssid[5],
+                ap->primary,
+                authmode_to_string(ap->authmode),
+                ap->rssi,
+                ap->primary <= 14 ? "2.4GHz" : "5GHz");
+    vTaskDelay(pdMS_TO_TICKS(50));
+}
+
 
 
 static void print_scan_results(void) {
@@ -3983,6 +4320,14 @@ static void print_scan_results(void) {
     MY_LOG_INFO(TAG, "Scan results printed.");
 }
 
+static void print_scan_results_hidden(void) {
+    for (int i = 0; i < g_scan_count; ++i) {
+        wifi_ap_record_t *ap = &g_scan_results[i];
+        print_network_csv_hidden(i, ap);
+    }
+    MY_LOG_INFO(TAG, "Scan results printed.");
+}
+
 // --- OLED display helper functions ---
 
 /**
@@ -3998,11 +4343,17 @@ static void oled_build_target_summary(char *buf, size_t sz)
         snprintf(buf, sz, "  No target");
         return;
     }
-    const char *first = (const char *)g_scan_results[g_selected_indices[0]].ssid;
+    char first[33];
+    if (!copy_effective_scan_ssid(&g_scan_results[g_selected_indices[0]], first, sizeof(first))) {
+        snprintf(first, sizeof(first), "<hidden>");
+    }
     if (g_selected_count == 1) {
         snprintf(buf, sz, ">> %s", first);
     } else if (g_selected_count == 2) {
-        const char *second = (const char *)g_scan_results[g_selected_indices[1]].ssid;
+        char second[33];
+        if (!copy_effective_scan_ssid(&g_scan_results[g_selected_indices[1]], second, sizeof(second))) {
+            snprintf(second, sizeof(second), "<hidden>");
+        }
         snprintf(buf, sz, ">> %s, %s", first, second);
     } else {
         snprintf(buf, sz, ">> %s +%d more", first, g_selected_count - 1);
@@ -4037,6 +4388,7 @@ static void oled_build_channel_info(char *buf, size_t sz)
 // --- CLI: commands ---
 static int cmd_scan_networks(int argc, char **argv) {
     (void)argc; (void)argv;
+    g_scan_print_hidden_results_on_complete = false;
     oled_display_update_full("> Scanning WiFi", "  All channels", "", "  Working...");
     log_memory_info("scan_networks");
     
@@ -4082,6 +4434,53 @@ static int cmd_scan_networks(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_scan_networks_hidden(int argc, char **argv) {
+    (void)argc; (void)argv;
+    g_scan_print_hidden_results_on_complete = true;
+    oled_display_update_full("> Scan Hidden", "  All channels", "", "  Working...");
+    log_memory_info("scan_networks_hidden");
+    
+    if (!ensure_wifi_mode()) {
+        g_scan_print_hidden_results_on_complete = false;
+        return 1;
+    }
+    
+    if (wardrive_active || wardrive_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Wardrive is active. Use 'stop' to stop it first before scanning.");
+        g_scan_print_hidden_results_on_complete = false;
+        return 1;
+    }
+
+    operation_stop_requested = false;
+    
+    esp_err_t led_err = led_set_color(0, 255, 0);
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for scan: %s", esp_err_to_name(led_err));
+    }
+
+    esp_err_t err = start_background_scan(g_scan_min_channel_time, g_scan_max_channel_time);
+    
+    if (err != ESP_OK) {
+        g_scan_print_hidden_results_on_complete = false;
+        led_err = led_set_idle();
+        if (led_err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to restore idle LED after scan failure: %s", esp_err_to_name(led_err));
+        }
+        
+        if (err == ESP_ERR_INVALID_STATE) {
+            MY_LOG_INFO(TAG, "Scan already in progress. Use 'show_scan_results_hidden' to see current results or 'stop' to cancel.");
+        } else {
+            ESP_LOGE(TAG, "Failed to start scan: %s", esp_err_to_name(err));
+        }
+        return 1;
+    }
+    
+    g_scan_start_time_us = esp_timer_get_time();
+    MY_LOG_INFO(TAG, "Background hidden scan started (min: %u ms, max: %u ms per channel)", 
+                (unsigned int)g_scan_min_channel_time, (unsigned int)g_scan_max_channel_time);
+    return 0;
+}
+
 static int cmd_show_scan_results(int argc, char **argv) {
     (void)argc; (void)argv;
     
@@ -4102,6 +4501,29 @@ static int cmd_show_scan_results(int argc, char **argv) {
     
     MY_LOG_INFO(TAG, "Showing results from last scan (%u networks found):", g_scan_count);
     print_scan_results();
+    return 0;
+}
+
+static int cmd_show_scan_results_hidden(int argc, char **argv) {
+    (void)argc; (void)argv;
+    
+    if (g_scan_in_progress) {
+        MY_LOG_INFO(TAG, "Scan still in progress... Please wait.");
+        return 0;
+    }
+    
+    if (!g_scan_done) {
+        MY_LOG_INFO(TAG, "No scan has been performed yet. Use 'scan_networks_hidden' first.");
+        return 0;
+    }
+    
+    if (g_scan_count == 0) {
+        MY_LOG_INFO(TAG, "No networks found in last scan.");
+        return 0;
+    }
+    
+    MY_LOG_INFO(TAG, "Showing hidden-aware results from last scan (%u networks found):", g_scan_count);
+    print_scan_results_hidden();
     return 0;
 }
 
@@ -4149,13 +4571,17 @@ static int cmd_select_networks(int argc, char **argv) {
 
     for (int i = 0; i < g_selected_count; ++i) {
         const wifi_ap_record_t* ap = &g_scan_results[g_selected_indices[i]];
+        char selected_ssid[33];
+        if (!copy_effective_scan_ssid(ap, selected_ssid, sizeof(selected_ssid))) {
+            snprintf(selected_ssid, sizeof(selected_ssid), "<hidden>");
+        }
         
         // I assume auth is available as a string in your structure, if not - replace with appropriate field or string.
         const char* auth = authmode_to_string(ap->authmode);
 
         // Formatting: SSID, BSSID, Channel, Auth
         len += snprintf(buf + len, sizeof(buf) - len, "%s, %02x:%02x:%02x:%02x:%02x:%02x, Ch%d, %s%s\n",
-                        (char*)ap->ssid,
+                        selected_ssid,
                         ap->bssid[0], ap->bssid[1], ap->bssid[2],
                         ap->bssid[3], ap->bssid[4], ap->bssid[5],
                         ap->primary, auth,
@@ -6158,7 +6584,7 @@ static int cmd_start_handshake(int argc, char **argv) {
         // Copy selected networks to handshake targets
         for (int i = 0; i < g_selected_count; i++) {
             int idx = g_selected_indices[i];
-            memcpy(&handshake_targets[i], &g_scan_results[idx], sizeof(wifi_ap_record_t));
+            copy_scan_record_with_effective_ssid(&handshake_targets[i], &g_scan_results[idx]);
             MY_LOG_INFO(TAG, "  [%d] SSID='%s' Ch=%d", 
                        i + 1, (const char*)handshake_targets[i].ssid, handshake_targets[i].primary);
         }
@@ -7077,8 +7503,16 @@ static int cmd_wigle_upload(int argc, char **argv) {
 static int cmd_start_sae_overflow(int argc, char **argv) {
     //avoid compiler warnings:
     (void)argc; (void)argv;
+    char oled_target[33];
+    if (g_selected_count > 0 && g_scan_done) {
+        if (!copy_effective_scan_ssid(&g_scan_results[g_selected_indices[0]], oled_target, sizeof(oled_target))) {
+            snprintf(oled_target, sizeof(oled_target), "<hidden>");
+        }
+    } else {
+        snprintf(oled_target, sizeof(oled_target), "  No target");
+    }
     oled_display_update_full("> SAE Flood",
-        (g_selected_count > 0) ? (const char *)g_scan_results[g_selected_indices[0]].ssid : "  No target",
+        oled_target,
         "  WPA3 Overflow", "  Flooding...");
     
     // Ensure WiFi is initialized
@@ -7099,6 +7533,10 @@ static int cmd_start_sae_overflow(int argc, char **argv) {
         applicationState = SAE_OVERFLOW;
         int idx = g_selected_indices[0];
         const wifi_ap_record_t *ap = &g_scan_results[idx];
+        char target_ssid[33];
+        if (!copy_effective_scan_ssid(ap, target_ssid, sizeof(target_ssid))) {
+            snprintf(target_ssid, sizeof(target_ssid), "<hidden>");
+        }
         
         // Set LED
         esp_err_t led_err = led_set_color(255, 0, 0);
@@ -7107,7 +7545,7 @@ static int cmd_start_sae_overflow(int argc, char **argv) {
         }
         
         MY_LOG_INFO(TAG,"WPA3 SAE Overflow Attack");
-        MY_LOG_INFO(TAG,"Target: SSID='%s' Ch=%d Auth=%d", (const char*)ap->ssid, ap->primary, ap->authmode);
+        MY_LOG_INFO(TAG,"Target: SSID='%s' Ch=%d Auth=%d", target_ssid, ap->primary, ap->authmode);
         MY_LOG_INFO(TAG,"SAE attack started. Use 'stop' to stop.");
         
         // Allocate memory for ap_record to pass to task
@@ -7117,7 +7555,7 @@ static int cmd_start_sae_overflow(int argc, char **argv) {
             applicationState = IDLE;
             return 1;
         }
-        memcpy(ap_copy, ap, sizeof(wifi_ap_record_t));
+        copy_scan_record_with_effective_ssid(ap_copy, ap);
         
         // Start SAE attack in background task
         sae_attack_active = true;
@@ -7266,7 +7704,11 @@ static int cmd_start_evil_twin(int argc, char **argv) {
             last_password_wrong = false;
         }
 
-        const char *sourceSSID = (const char *)g_scan_results[g_selected_indices[0]].ssid;
+        char source_ssid[33];
+        if (!copy_effective_scan_ssid(&g_scan_results[g_selected_indices[0]], source_ssid, sizeof(source_ssid))) {
+            snprintf(source_ssid, sizeof(source_ssid), "%s", (const char *)g_scan_results[g_selected_indices[0]].ssid);
+        }
+        const char *sourceSSID = source_ssid;
         evilTwinSSID = malloc(strlen(sourceSSID) + 1); 
         if (evilTwinSSID != NULL) {
             strcpy(evilTwinSSID, sourceSSID);
@@ -7917,6 +8359,7 @@ static int cmd_stop(int argc, char **argv) {
         
         // Reset selected networks mode state
         sniffer_selected_mode = false;
+        sniffer_channel_list_active = false;
         sniffer_selected_channels_count = 0;
         memset(sniffer_selected_channels, 0, sizeof(sniffer_selected_channels));
         
@@ -10111,6 +10554,9 @@ static int cmd_start_sniffer_noscan(int argc, char **argv) {
     sniffer_active = true;
     sniffer_scan_phase = false;
     sniffer_selected_mode = false;
+    sniffer_channel_list_active = false;
+    sniffer_selected_channels_count = 0;
+    memset(sniffer_selected_channels, 0, sizeof(sniffer_selected_channels));
     
     // Process existing scan results while preserving sniffer data when possible
     if (had_sniffer_data) {
@@ -10146,6 +10592,100 @@ static int cmd_start_sniffer_noscan(int argc, char **argv) {
     
     MY_LOG_INFO(TAG, "Sniffer: Now monitoring %d networks (no scan performed)", sniffer_ap_count);
     MY_LOG_INFO(TAG, "Use 'show_sniffer_results' to see captured clients or 'stop' to stop.");
+    
+    return 0;
+}
+
+static int cmd_start_sniffer_noscan_hidden(int argc, char **argv) {
+    (void)argc; (void)argv;
+    {
+        char oled_l3[32];
+        snprintf(oled_l3, sizeof(oled_l3), "  %u networks", g_scan_count);
+        oled_display_update_full("> Sniff Hidden", "  Prior scan data", oled_l3, "  Capturing...");
+    }
+    log_memory_info("start_sniffer_noscan_hidden");
+    
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+    
+    operation_stop_requested = false;
+    
+    if (sniffer_active) {
+        MY_LOG_INFO(TAG, "Sniffer already active. Use 'stop' to stop it first.");
+        return 1;
+    }
+    
+    if (!g_scan_done || g_scan_count == 0) {
+        MY_LOG_INFO(TAG, "Please scan_networks_hidden first.");
+        return 1;
+    }
+    
+    bool had_sniffer_data = (sniffer_ap_count > 0 || probe_request_count > 0);
+    
+    if (g_selected_count > 0) {
+        MY_LOG_INFO(TAG, "Starting hidden sniffer in SELECTED NETWORKS mode...");
+        MY_LOG_INFO(TAG, "Will monitor %d selected network(s) only", g_selected_count);
+        
+        sniffer_active = true;
+        sniffer_scan_phase = false;
+        sniffer_selected_mode = true;
+        
+        sniffer_init_selected_networks();
+        
+        if (sniffer_ap_count == 0 || sniffer_selected_channels_count == 0) {
+            MY_LOG_INFO(TAG, "Failed to initialize selected networks for hidden sniffer");
+            sniffer_active = false;
+            sniffer_selected_mode = false;
+            sniffer_channel_list_active = false;
+            return 1;
+        }
+    } else {
+        MY_LOG_INFO(TAG, "Starting hidden sniffer using existing hidden scan results...");
+        
+        sniffer_active = true;
+        sniffer_scan_phase = false;
+        sniffer_selected_mode = false;
+        
+        sniffer_build_hidden_channel_list_from_scan_results();
+        if (!sniffer_channel_list_active || sniffer_selected_channels_count == 0) {
+            MY_LOG_INFO(TAG, "No hidden networks found in last scan. Run scan_networks_hidden first or select hidden targets.");
+            sniffer_active = false;
+            return 1;
+        }
+        
+        if (had_sniffer_data) {
+            sniffer_merge_scan_results();
+        } else {
+            sniffer_process_scan_results();
+        }
+    }
+    
+    esp_wifi_set_promiscuous_filter(&sniffer_filter);
+    esp_wifi_set_promiscuous_rx_cb(sniffer_promiscuous_callback);
+    esp_wifi_set_promiscuous(true);
+    
+    sniffer_channel_index = 0;
+    sniffer_current_channel = sniffer_selected_channels[0];
+    sniffer_last_channel_hop = esp_timer_get_time() / 1000;
+    esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE);
+    
+    if (sniffer_channel_task_handle == NULL) {
+        xTaskCreate(sniffer_channel_task, "sniffer_channel", 2048, NULL, 5, &sniffer_channel_task_handle);
+        MY_LOG_INFO(TAG, "Started sniffer channel hopping task");
+    }
+    
+    esp_err_t led_err = led_set_color(0, 255, 0);
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for sniffer: %s", esp_err_to_name(led_err));
+    }
+    
+    if (g_selected_count > 0) {
+        MY_LOG_INFO(TAG, "Hidden sniffer: monitoring selected network channels only");
+    } else {
+        MY_LOG_INFO(TAG, "Hidden sniffer: monitoring hidden-network channels only");
+    }
+    MY_LOG_INFO(TAG, "Use 'show_scan_results_hidden' to check learned SSIDs or 'stop' to stop.");
     
     return 0;
 }
@@ -10308,6 +10848,8 @@ static int cmd_clear_sniffer_results(int argc, char **argv) {
     memset(probe_requests, 0, MAX_PROBE_REQUESTS * sizeof(probe_request_t));
     sniffer_packet_counter = 0;
     sniffer_last_debug_packet = 0;
+    memset(g_hidden_ssid_cache, 0, sizeof(g_hidden_ssid_cache));
+    g_hidden_ssid_cache_count = 0;
     
     MY_LOG_INFO(TAG, "Sniffer results cleared.");
     return 0;
@@ -10608,7 +11150,11 @@ static int cmd_deauth_detector(int argc, char **argv) {
             
             if (!channel_exists && deauth_detector_selected_channels_count < MAX_AP_CNT) {
                 deauth_detector_selected_channels[deauth_detector_selected_channels_count++] = channel;
-                MY_LOG_INFO(TAG, "  Added: %s (ch %d)", ap->ssid, channel);
+                char effective_ssid[33];
+                if (!copy_effective_scan_ssid(ap, effective_ssid, sizeof(effective_ssid))) {
+                    snprintf(effective_ssid, sizeof(effective_ssid), "<hidden>");
+                }
+                MY_LOG_INFO(TAG, "  Added: %s (ch %d)", effective_ssid, channel);
             }
         }
         
@@ -14874,6 +15420,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&scan_cmd));
 
+    const esp_console_cmd_t scan_hidden_cmd = {
+        .command = "scan_networks_hidden",
+        .help = "Starts background network scan for hidden-SSID workflow",
+        .hint = NULL,
+        .func = &cmd_scan_networks_hidden,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&scan_hidden_cmd));
+
     const esp_console_cmd_t show_scan_cmd = {
         .command = "show_scan_results",
         .help = "Shows results from last network scan",
@@ -14882,6 +15437,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&show_scan_cmd));
+
+    const esp_console_cmd_t show_scan_hidden_cmd = {
+        .command = "show_scan_results_hidden",
+        .help = "Shows last scan with learned hidden SSIDs when available",
+        .hint = NULL,
+        .func = &cmd_show_scan_results_hidden,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&show_scan_hidden_cmd));
     
 
     const esp_console_cmd_t sniffer_cmd = {
@@ -14901,6 +15465,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_noscan_cmd));
+
+    const esp_console_cmd_t sniffer_noscan_hidden_cmd = {
+        .command = "start_sniffer_noscan_hidden",
+        .help = "Starts hidden-SSID sniffer using existing scan results; if networks are selected, focuses only them",
+        .hint = NULL,
+        .func = &cmd_start_sniffer_noscan_hidden,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_noscan_hidden_cmd));
 
     const esp_console_cmd_t packet_monitor_cmd = {
         .command = "packet_monitor",
@@ -15782,6 +16355,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  scan_airtag");
       MY_LOG_INFO(TAG,"  scan_bt");
       MY_LOG_INFO(TAG,"  scan_networks");
+      MY_LOG_INFO(TAG,"  scan_networks_hidden");
       MY_LOG_INFO(TAG,"  select_html <index>");
       MY_LOG_INFO(TAG,"  select_networks <index1> [index2] ...");
       MY_LOG_INFO(TAG,"  select_stations <MAC1> [MAC2] ...");
@@ -15792,6 +16366,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  show_probes");
       MY_LOG_INFO(TAG,"  show_probes_vendor");
       MY_LOG_INFO(TAG,"  show_scan_results");
+      MY_LOG_INFO(TAG,"  show_scan_results_hidden");
       MY_LOG_INFO(TAG,"  show_sniffer_results");
       MY_LOG_INFO(TAG,"  show_sniffer_results_vendor");
       MY_LOG_INFO(TAG,"  sniffer_debug <0|1>");
@@ -15808,6 +16383,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  start_sniffer");
       MY_LOG_INFO(TAG,"  start_sniffer_dog");
       MY_LOG_INFO(TAG,"  start_sniffer_noscan");
+      MY_LOG_INFO(TAG,"  start_sniffer_noscan_hidden");
       MY_LOG_INFO(TAG,"  start_wardrive");
       MY_LOG_INFO(TAG,"  start_wardrive_promisc");
       MY_LOG_INFO(TAG,"  stop");
@@ -16463,6 +17039,10 @@ static void sniffer_process_scan_results(void) {
             if (memcmp(sniffer_aps[j].bssid, scan_ap->bssid, 6) == 0) {
                 ap_exists = true;
                 // Update info but keep clients
+                char effective_ssid[33];
+                if (copy_effective_scan_ssid(scan_ap, effective_ssid, sizeof(effective_ssid))) {
+                    snprintf(sniffer_aps[j].ssid, sizeof(sniffer_aps[j].ssid), "%s", effective_ssid);
+                }
                 sniffer_aps[j].channel = scan_ap->primary;
                 sniffer_aps[j].rssi = scan_ap->rssi;
                 sniffer_aps[j].last_seen = esp_timer_get_time() / 1000;
@@ -16473,9 +17053,12 @@ static void sniffer_process_scan_results(void) {
         // Add new AP if not present
         if (!ap_exists) {
             sniffer_ap_t *new_ap = &sniffer_aps[sniffer_ap_count++];
+            char effective_ssid[33];
+            memset(new_ap, 0, sizeof(*new_ap));
             memcpy(new_ap->bssid, scan_ap->bssid, 6);
-            strncpy(new_ap->ssid, (char*)scan_ap->ssid, sizeof(new_ap->ssid) - 1);
-            new_ap->ssid[sizeof(new_ap->ssid) - 1] = '\0';
+            if (copy_effective_scan_ssid(scan_ap, effective_ssid, sizeof(effective_ssid))) {
+                snprintf(new_ap->ssid, sizeof(new_ap->ssid), "%s", effective_ssid);
+            }
             new_ap->channel = scan_ap->primary;
             new_ap->authmode = scan_ap->authmode;
             new_ap->rssi = scan_ap->rssi;
@@ -16486,6 +17069,52 @@ static void sniffer_process_scan_results(void) {
     }
     
     MY_LOG_INFO(TAG, "Sniffer: added %d new APs, total %d APs in database", added_count, sniffer_ap_count);
+}
+
+static void sniffer_build_hidden_channel_list_from_scan_results(void) {
+    sniffer_selected_channels_count = 0;
+    memset(sniffer_selected_channels, 0, sizeof(sniffer_selected_channels));
+    sniffer_channel_list_active = false;
+
+    if (!g_scan_done || g_scan_count == 0) {
+        return;
+    }
+
+    for (int i = 0; i < g_scan_count && sniffer_selected_channels_count < MAX_AP_CNT; i++) {
+        if (!scan_record_ssid_is_hidden(&g_scan_results[i])) {
+            continue;
+        }
+
+        int channel = g_scan_results[i].primary;
+        if (channel <= 0) {
+            continue;
+        }
+
+        bool exists = false;
+        for (int j = 0; j < sniffer_selected_channels_count; j++) {
+            if (sniffer_selected_channels[j] == channel) {
+                exists = true;
+                break;
+            }
+        }
+
+        if (!exists) {
+            sniffer_selected_channels[sniffer_selected_channels_count++] = channel;
+        }
+    }
+
+    sniffer_channel_list_active = (sniffer_selected_channels_count > 0);
+
+    if (sniffer_channel_list_active) {
+        char channel_list[128] = {0};
+        int offset = 0;
+        for (int i = 0; i < sniffer_selected_channels_count && offset < (int)sizeof(channel_list) - 4; i++) {
+            offset += snprintf(channel_list + offset, sizeof(channel_list) - offset,
+                               "%d%s", sniffer_selected_channels[i],
+                               (i < sniffer_selected_channels_count - 1) ? ", " : "");
+        }
+        MY_LOG_INFO(TAG, "Hidden sniffer: channel list from hidden scan results [%s]", channel_list);
+    }
 }
 
 static void sniffer_merge_scan_results(void) {
@@ -16508,8 +17137,10 @@ static void sniffer_merge_scan_results(void) {
 
         if (existing >= 0) {
             sniffer_ap_t *sniffer_ap = &sniffer_aps[existing];
-            strncpy(sniffer_ap->ssid, (char*)scan_ap->ssid, sizeof(sniffer_ap->ssid) - 1);
-            sniffer_ap->ssid[sizeof(sniffer_ap->ssid) - 1] = '\0';
+            char effective_ssid[33];
+            if (copy_effective_scan_ssid(scan_ap, effective_ssid, sizeof(effective_ssid))) {
+                snprintf(sniffer_ap->ssid, sizeof(sniffer_ap->ssid), "%s", effective_ssid);
+            }
             sniffer_ap->channel = scan_ap->primary;
             sniffer_ap->authmode = scan_ap->authmode;
             sniffer_ap->rssi = scan_ap->rssi;
@@ -16524,8 +17155,10 @@ static void sniffer_merge_scan_results(void) {
         sniffer_ap_t *sniffer_ap = &sniffer_aps[sniffer_ap_count++];
         memset(sniffer_ap, 0, sizeof(*sniffer_ap));
         memcpy(sniffer_ap->bssid, scan_ap->bssid, 6);
-        strncpy(sniffer_ap->ssid, (char*)scan_ap->ssid, sizeof(sniffer_ap->ssid) - 1);
-        sniffer_ap->ssid[sizeof(sniffer_ap->ssid) - 1] = '\0';
+        char effective_ssid[33];
+        if (copy_effective_scan_ssid(scan_ap, effective_ssid, sizeof(effective_ssid))) {
+            snprintf(sniffer_ap->ssid, sizeof(sniffer_ap->ssid), "%s", effective_ssid);
+        }
         sniffer_ap->channel = scan_ap->primary;
         sniffer_ap->authmode = scan_ap->authmode;
         sniffer_ap->rssi = scan_ap->rssi;
@@ -16547,6 +17180,7 @@ static void sniffer_init_selected_networks(void) {
     // Only clear channel list, NOT sniffer_aps data (preserve all captured clients)
     sniffer_selected_channels_count = 0;
     memset(sniffer_selected_channels, 0, sizeof(sniffer_selected_channels));
+    sniffer_channel_list_active = false;
     
     // Build channel list and ensure selected networks exist in sniffer_aps
     for (int i = 0; i < g_selected_count; i++) {
@@ -16576,6 +17210,10 @@ static void sniffer_init_selected_networks(void) {
             if (memcmp(sniffer_aps[j].bssid, scan_ap->bssid, 6) == 0) {
                 ap_exists = true;
                 // Update info but keep clients
+                char effective_ssid[33];
+                if (copy_effective_scan_ssid(scan_ap, effective_ssid, sizeof(effective_ssid))) {
+                    snprintf(sniffer_aps[j].ssid, sizeof(sniffer_aps[j].ssid), "%s", effective_ssid);
+                }
                 sniffer_aps[j].channel = scan_ap->primary;
                 sniffer_aps[j].rssi = scan_ap->rssi;
                 sniffer_aps[j].last_seen = esp_timer_get_time() / 1000;
@@ -16584,9 +17222,12 @@ static void sniffer_init_selected_networks(void) {
         }
         if (!ap_exists && sniffer_ap_count < MAX_SNIFFER_APS) {
             sniffer_ap_t *new_ap = &sniffer_aps[sniffer_ap_count++];
+            char effective_ssid[33];
+            memset(new_ap, 0, sizeof(*new_ap));
             memcpy(new_ap->bssid, scan_ap->bssid, 6);
-            strncpy(new_ap->ssid, (char*)scan_ap->ssid, sizeof(new_ap->ssid) - 1);
-            new_ap->ssid[sizeof(new_ap->ssid) - 1] = '\0';
+            if (copy_effective_scan_ssid(scan_ap, effective_ssid, sizeof(effective_ssid))) {
+                snprintf(new_ap->ssid, sizeof(new_ap->ssid), "%s", effective_ssid);
+            }
             new_ap->channel = scan_ap->primary;
             new_ap->authmode = scan_ap->authmode;
             new_ap->rssi = scan_ap->rssi;
@@ -16594,7 +17235,11 @@ static void sniffer_init_selected_networks(void) {
             new_ap->last_seen = esp_timer_get_time() / 1000;
         }
         
-        MY_LOG_INFO(TAG, "  [%d] SSID='%s' Ch=%d", i + 1, (char*)scan_ap->ssid, scan_ap->primary);
+        char effective_ssid[33];
+        if (!copy_effective_scan_ssid(scan_ap, effective_ssid, sizeof(effective_ssid))) {
+            snprintf(effective_ssid, sizeof(effective_ssid), "<hidden>");
+        }
+        MY_LOG_INFO(TAG, "  [%d] SSID='%s' Ch=%d", i + 1, effective_ssid, scan_ap->primary);
     }
     
     MY_LOG_INFO(TAG, "Sniffer: %d networks on %d channel(s), total %d APs in database", 
@@ -16602,6 +17247,7 @@ static void sniffer_init_selected_networks(void) {
     
     // Log channels
     if (sniffer_selected_channels_count > 0) {
+        sniffer_channel_list_active = true;
         char channel_list[128] = {0};
         int offset = 0;
         for (int i = 0; i < sniffer_selected_channels_count && offset < 120; i++) {
@@ -16618,9 +17264,8 @@ static void sniffer_channel_hop(void) {
         return;
     }
     
-    // Check if we're in selected networks mode
-    if (sniffer_selected_mode && sniffer_selected_channels_count > 0) {
-        // Use selected channels only
+    if (sniffer_channel_list_active && sniffer_selected_channels_count > 0) {
+        // Use selected channels or channels learned from the last scan
         sniffer_current_channel = sniffer_selected_channels[sniffer_channel_index];
         
         sniffer_channel_index++;
@@ -16953,6 +17598,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
     // Process MGMT packets for client detection (like Marauder)
     if (type == WIFI_PKT_MGMT) {
         if (should_debug) printf("DEBUG: Processing MGMT packet %lu\n", sniffer_packet_counter);
+        sniffer_try_learn_hidden_ssid_from_mgmt(frame, len, frame_type);
         
         uint8_t *client_mac = NULL;
         uint8_t *ap_mac = NULL;
@@ -17112,9 +17758,15 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                 // In selected mode, only monitor pre-selected networks
                 if (ap_index < 0 && !sniffer_selected_mode && sniffer_ap_count < MAX_SNIFFER_APS) {
                     ap_index = sniffer_ap_count++;
+                    char known_ssid[33];
+                    memset(&sniffer_aps[ap_index], 0, sizeof(sniffer_aps[ap_index]));
                     memcpy(sniffer_aps[ap_index].bssid, ap_mac, 6);
-                    snprintf(sniffer_aps[ap_index].ssid, sizeof(sniffer_aps[ap_index].ssid), 
-                            "MGMT_%02X%02X", ap_mac[4], ap_mac[5]);
+                    if (copy_effective_ssid_by_bssid(ap_mac, known_ssid, sizeof(known_ssid))) {
+                        snprintf(sniffer_aps[ap_index].ssid, sizeof(sniffer_aps[ap_index].ssid), "%s", known_ssid);
+                    } else {
+                        snprintf(sniffer_aps[ap_index].ssid, sizeof(sniffer_aps[ap_index].ssid),
+                                 "MGMT_%02X%02X", ap_mac[4], ap_mac[5]);
+                    }
                     sniffer_aps[ap_index].channel = sniffer_current_channel;
                     sniffer_aps[ap_index].authmode = WIFI_AUTH_OPEN;
                     sniffer_aps[ap_index].rssi = pkt->rx_ctrl.rssi;
@@ -17225,9 +17877,15 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
         // In selected mode, only monitor pre-selected networks
         if (ap_index < 0 && !sniffer_selected_mode && sniffer_ap_count < MAX_SNIFFER_APS) {
             ap_index = sniffer_ap_count++;
+            char known_ssid[33];
+            memset(&sniffer_aps[ap_index], 0, sizeof(sniffer_aps[ap_index]));
             memcpy(sniffer_aps[ap_index].bssid, ap_mac, 6);
-            snprintf(sniffer_aps[ap_index].ssid, sizeof(sniffer_aps[ap_index].ssid), 
-                    "Unknown_%02X%02X", ap_mac[4], ap_mac[5]); // Use last 2 bytes for unique name
+            if (copy_effective_ssid_by_bssid(ap_mac, known_ssid, sizeof(known_ssid))) {
+                snprintf(sniffer_aps[ap_index].ssid, sizeof(sniffer_aps[ap_index].ssid), "%s", known_ssid);
+            } else {
+                snprintf(sniffer_aps[ap_index].ssid, sizeof(sniffer_aps[ap_index].ssid),
+                         "Unknown_%02X%02X", ap_mac[4], ap_mac[5]); // Use last 2 bytes for unique name
+            }
             sniffer_aps[ap_index].channel = sniffer_current_channel;
             sniffer_aps[ap_index].authmode = WIFI_AUTH_OPEN; // Unknown
             sniffer_aps[ap_index].rssi = pkt->rx_ctrl.rssi;
@@ -17462,13 +18120,8 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
 // === DEAUTH DETECTOR FUNCTIONS ===
 
 // Helper function to find SSID by BSSID from scan results
-static const char* deauth_detector_find_ssid_by_bssid(const uint8_t *bssid) {
-    for (int i = 0; i < g_scan_count; i++) {
-        if (memcmp(g_scan_results[i].bssid, bssid, 6) == 0) {
-            return (const char*)g_scan_results[i].ssid;
-        }
-    }
-    return NULL; // Unknown AP
+static bool deauth_detector_find_ssid_by_bssid(const uint8_t *bssid, char *ssid_out, size_t ssid_out_size) {
+    return copy_effective_ssid_by_bssid(bssid, ssid_out, ssid_out_size);
 }
 
 static void deauth_detector_channel_hop(void) {
@@ -17583,8 +18236,8 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
     int rssi = pkt->rx_ctrl.rssi;
     
     // Lookup SSID by BSSID from scan results
-    const char *ssid = deauth_detector_find_ssid_by_bssid(bssid_mac);
-    const char *ap_name = (ssid && ssid[0] != '\0') ? ssid : "<Unknown>";
+    char ssid[33];
+    const char *ap_name = deauth_detector_find_ssid_by_bssid(bssid_mac, ssid, sizeof(ssid)) ? ssid : "<Unknown>";
     
     // Throttle LED flash - only flash red if 100ms passed since last flash
     // This prevents RMT channel conflicts when deauth frames come rapidly
@@ -17597,7 +18250,8 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
     }
     
     // Update shared OLED state for task to render
-    snprintf((char *)dd_oled_ssid, sizeof(dd_oled_ssid), "%s", ap_name);
+    snprintf((char *)dd_oled_ssid, sizeof(dd_oled_ssid), "%.*s",
+             (int)sizeof(dd_oled_ssid) - 1, ap_name);
     snprintf((char *)dd_oled_bssid, sizeof(dd_oled_bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
              bssid_mac[0], bssid_mac[1], bssid_mac[2], bssid_mac[3], bssid_mac[4], bssid_mac[5]);
     dd_oled_ch = deauth_detector_current_channel;
