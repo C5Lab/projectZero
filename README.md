@@ -29,6 +29,7 @@ The firmware focuses on a small set of repeatable operations: discover targets, 
 - Bluetooth toolkit: `scan_bt` runs a 10s BLE sweep or tracks a specific MAC for locator duty; `scan_airtag` keeps hunting AirTags/SmartTags with periodic rollups.
 - Defensive watch: `deauth_detector` (Deauth Guard) passively flags nearby deauth floods before they disrupt your targets.
 - SD and vendor helpers: `list_sd`, `list_dir`, `file_delete`, `select_html`, `list_ssid`, `show_pass`, plus OUI lookups via `vendor set/read`.
+- Cloud sync helpers: `wpasec_key` / `wpasec_upload`, `wigle_key` / `wigle_upload`, and `wdgwars_key` / `wdgwars_upload`.
 - Controls and safety: `boot_button`, `channel_time`, `led`, `stop`, `reboot`, `download`, `ping`, and `save_handshake` to map buttons, tune scan dwell, reboot to UART flash, or flush captured handshakes.
 
 ## Core Capabilities
@@ -104,6 +105,7 @@ Enrich CLI/Flipper listings with manufacturer names by feeding a compact OUI dat
 - `/lab/white.txt` - whitelist BSSIDs (colon or dash separated) respected by Blackout and Sniffer Dog.
 - `/lab/wardrives/wXXXX.log` - Wigle-compatible wardrive logs incremented automatically.
 - `/lab/wigle.txt` - WiGLE API credentials loaded on boot in format `api_name:api_token` (single line, no quotes), e.g. `your_wigle_user:your_wigle_api_token`.
+- `/lab/wdgwars.txt` - WDGWars API key loaded on boot (single line, 64-char key from wdgwars.pl profile).
 - `/lab/htmls/*.html` - captive portal templates discovered by `list_sd`.
 - `/lab/portals.txt` - persistent CSV-like log of every POST field the captive portal receives.
 - `/lab/oui_wifi.bin` - vendor lookup table streamed on demand.
