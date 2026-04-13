@@ -9746,12 +9746,8 @@ static bool nmap_check_port(uint32_t ip_net_order, uint16_t port)
     int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock < 0) return false;
 
-    struct timeval tv = {
-        .tv_sec  = NMAP_CONNECT_TIMEOUT_MS / 1000,
-        .tv_usec = (NMAP_CONNECT_TIMEOUT_MS % 1000) * 1000,
-    };
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
@@ -9759,7 +9755,32 @@ static bool nmap_check_port(uint32_t ip_net_order, uint16_t port)
         .sin_addr.s_addr = ip_net_order,
     };
 
-    bool open = (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    int ret = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret == 0) {
+        close(sock);
+        return true;
+    }
+    if (errno != EINPROGRESS) {
+        close(sock);
+        return false;
+    }
+
+    fd_set wset;
+    FD_ZERO(&wset);
+    FD_SET(sock, &wset);
+    struct timeval tv = {
+        .tv_sec  = NMAP_CONNECT_TIMEOUT_MS / 1000,
+        .tv_usec = (NMAP_CONNECT_TIMEOUT_MS % 1000) * 1000,
+    };
+
+    bool open = false;
+    if (select(sock + 1, NULL, &wset, NULL, &tv) > 0) {
+        int so_err = 0;
+        socklen_t len = sizeof(so_err);
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_err, &len);
+        open = (so_err == 0);
+    }
+
     close(sock);
     return open;
 }
@@ -9850,12 +9871,28 @@ static int cmd_start_nmap(int argc, char **argv)
 
         int open_on_host = 0;
         for (int p = 0; p < port_count; p++) {
+            if (operation_stop_requested) break;
+            if (p % 10 == 0) {
+                int end_p = p + 9;
+                if (end_p >= port_count) end_p = port_count - 1;
+                MY_LOG_INFO(TAG, "  Scanning %s ports %d-%d [%d/%d] ...",
+                            ip_str, nmap_ports[p].port, nmap_ports[end_p].port, p + 1, port_count);
+                char oled_prog[40];
+                snprintf(oled_prog, sizeof(oled_prog), "  Port %d/%d (%d-%d)",
+                         p + 1, port_count, nmap_ports[p].port, nmap_ports[end_p].port);
+                oled_display_update_full("> NMAP Scan", oled_line, oled_prog, "");
+            }
             if (nmap_check_port(host_ip, nmap_ports[p].port)) {
                 MY_LOG_INFO(TAG, "  %5d/tcp  open  %s",
                             nmap_ports[p].port, nmap_ports[p].name);
                 open_on_host++;
                 total_open++;
             }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (operation_stop_requested) {
+            MY_LOG_INFO(TAG, "  (scan stopped by user)");
+            break;
         }
         if (open_on_host == 0) {
             MY_LOG_INFO(TAG, "  (no open ports)");
