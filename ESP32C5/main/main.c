@@ -243,6 +243,7 @@ typedef struct {
     float longitude;
     float altitude;
     float accuracy;
+    int satellites;
     bool valid;
 } gps_data_t;
 
@@ -265,6 +266,8 @@ static gps_data_t external_cap_gps_position = {0};
 static bool gps_uart_initialized = false;
 static gps_module_t current_gps_module = GPS_MODULE_ATGM336H;
 static volatile bool gps_raw_active = false;
+static bool wardrive_promisc_trace_enabled = false;
+static char wardrive_promisc_trace_path[96] = "";
 
 // Global stop flag for all operations
 static volatile bool operation_stop_requested = false;
@@ -1411,6 +1414,8 @@ static int wdp_get_dwell_ms(wdp_channel_tier_t tier);
 static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
 static void wardrive_promisc_task(void *pvParameters);
 static int cmd_start_wardrive_promisc(int argc, char **argv);
+static int cmd_start_wardrive_promisc_trace(int argc, char **argv);
+static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_enabled);
 // DNS server task
 static void dns_server_task(void *pvParameters);
 // Portal HTTP handlers
@@ -1591,6 +1596,11 @@ static void bt_format_addr(const uint8_t *addr, char *str);
 static int bt_start_scan(void);
 static int bt_start_scan_coex(void);
 static void bt_stop_scan(void);
+static int wigle_wifi_channel_to_frequency_mhz(int channel);
+static double gps_distance_meters(double lat1, double lon1, double lat2, double lon2);
+static bool wardrive_trace_init_file(const char *path);
+static bool wardrive_trace_append_point(const char *path, double lat, double lon, double alt);
+static void wardrive_trace_finalize_file(const char *path);
 static void register_commands(void);
 
 // --- Wi-Fi event handler ---
@@ -4915,6 +4925,17 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     int file_number = find_next_wardrive_file_number();
     MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", file_number);
+    double wdp_total_distance_m = 0.0;
+    double wdp_last_trace_lat = 0.0;
+    double wdp_last_trace_lon = 0.0;
+    bool wdp_has_trace_point = false;
+
+    if (wardrive_promisc_trace_enabled) {
+        snprintf(wardrive_promisc_trace_path, sizeof(wardrive_promisc_trace_path),
+                 "/sdcard/lab/wardrives/w%d_track.kml", file_number);
+    } else {
+        wardrive_promisc_trace_path[0] = '\0';
+    }
 
     MY_LOG_INFO(TAG, "Waiting for GPS fix (no timeout - use 'stop' to cancel)...");
     oled_display_update_full("> Wardrive Pro", "  Waiting GPS...", "  No timeout", "  Use 'stop'");
@@ -4926,6 +4947,23 @@ static void wardrive_promisc_task(void *pvParameters) {
     MY_LOG_INFO(TAG, "GPS fix obtained: Lat=%.7f Lon=%.7f",
                 current_gps.latitude, current_gps.longitude);
     oled_display_update_full("> Wardrive Pro", "  GPS fix OK!", "  D-UCB scanning", "");
+
+    if (wardrive_promisc_trace_enabled) {
+        if (wardrive_trace_init_file(wardrive_promisc_trace_path)) {
+            wardrive_trace_append_point(wardrive_promisc_trace_path,
+                                        current_gps.latitude,
+                                        current_gps.longitude,
+                                        current_gps.altitude);
+            wdp_last_trace_lat = current_gps.latitude;
+            wdp_last_trace_lon = current_gps.longitude;
+            wdp_has_trace_point = true;
+            MY_LOG_INFO(TAG, "Wardrive trace enabled: %s", wardrive_promisc_trace_path);
+        } else {
+            MY_LOG_INFO(TAG, "Failed to create wardrive trace file: %s", wardrive_promisc_trace_path);
+            wardrive_promisc_trace_enabled = false;
+            wardrive_promisc_trace_path[0] = '\0';
+        }
+    }
 
     wdp_seen_count = 0;
     wdp_dwell_new_networks = 0;
@@ -5009,7 +5047,8 @@ static void wardrive_promisc_task(void *pvParameters) {
                 char wdp_l2[64], wdp_l3[64], wdp_l4[64];
                 snprintf(wdp_l2, sizeof(wdp_l2), "  Ch %d  D-UCB", channel);
                 snprintf(wdp_l3, sizeof(wdp_l3), "  %d networks", wdp_seen_count);
-                snprintf(wdp_l4, sizeof(wdp_l4), "  GPS: %s", current_gps.valid ? "OK" : "LOST");
+                snprintf(wdp_l4, sizeof(wdp_l4), "  GPS:%s SAT:%d",
+                         current_gps.valid ? "OK" : "LOST", current_gps.satellites);
                 oled_display_update_full("> Wardrive Pro", wdp_l2, wdp_l3, wdp_l4);
             }
         }
@@ -5051,6 +5090,31 @@ static void wardrive_promisc_task(void *pvParameters) {
             gps_fix_lost_count++;
         } else {
             gps_fix_lost_count = 0;
+            if (wardrive_promisc_trace_enabled) {
+                if (!wdp_has_trace_point) {
+                    if (wardrive_trace_append_point(wardrive_promisc_trace_path,
+                                                    current_gps.latitude,
+                                                    current_gps.longitude,
+                                                    current_gps.altitude)) {
+                        wdp_last_trace_lat = current_gps.latitude;
+                        wdp_last_trace_lon = current_gps.longitude;
+                        wdp_has_trace_point = true;
+                    }
+                } else {
+                    double step_m = gps_distance_meters(wdp_last_trace_lat, wdp_last_trace_lon,
+                                                        current_gps.latitude, current_gps.longitude);
+                    if (step_m >= 3.0) {
+                        if (wardrive_trace_append_point(wardrive_promisc_trace_path,
+                                                        current_gps.latitude,
+                                                        current_gps.longitude,
+                                                        current_gps.altitude)) {
+                            wdp_total_distance_m += step_m;
+                            wdp_last_trace_lat = current_gps.latitude;
+                            wdp_last_trace_lon = current_gps.longitude;
+                        }
+                    }
+                }
+            }
         }
 
         if (gps_fix_lost_count >= WDP_GPS_FIX_LOST_THRESHOLD) {
@@ -5137,17 +5201,18 @@ static void wardrive_promisc_task(void *pvParameters) {
                         escape_csv_field(wdp_seen_networks[i].ssid, escaped_ssid, sizeof(escaped_ssid));
 
                         const char *auth_str = get_auth_mode_wiggle(wdp_seen_networks[i].authmode);
+                        int wifi_freq_mhz = wigle_wifi_channel_to_frequency_mhz(wdp_seen_networks[i].channel);
 
                         if (current_gps.valid) {
-                            fprintf(file, "%s,%s,[%s],%s,%d,,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
+                            fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
                                     mac_str, escaped_ssid, auth_str, timestamp,
-                                    wdp_seen_networks[i].channel, (int)wdp_seen_networks[i].rssi,
+                                    wdp_seen_networks[i].channel, wifi_freq_mhz, (int)wdp_seen_networks[i].rssi,
                                     current_gps.latitude, current_gps.longitude,
                                     current_gps.altitude, current_gps.accuracy);
                         } else {
-                            fprintf(file, "%s,%s,[%s],%s,%d,,%d,0.0000000,0.0000000,0.00,0.00,,,WIFI\n",
+                            fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,0.0000000,0.0000000,0.00,0.00,,,WIFI\n",
                                     mac_str, escaped_ssid, auth_str, timestamp,
-                                    wdp_seen_networks[i].channel, (int)wdp_seen_networks[i].rssi);
+                                    wdp_seen_networks[i].channel, wifi_freq_mhz, (int)wdp_seen_networks[i].rssi);
                         }
                         wdp_seen_networks[i].written_to_file = true;
                     }
@@ -5215,9 +5280,10 @@ static void wardrive_promisc_task(void *pvParameters) {
                     top_ch = wdp_ducb_channels[i].channel;
                 }
             }
-            MY_LOG_INFO(TAG, "Wardrive promisc: %d unique networks, %d BT devices, D-UCB best ch: %d (%d visits), GPS: %s",
+            MY_LOG_INFO(TAG, "Wardrive promisc: %d unique networks, %d BT devices, D-UCB best ch: %d (%d visits), GPS: %s, sats: %d, dist: %.1fm",
                         wdp_seen_count, bt_device_count, top_ch, top_pulls,
-                        current_gps.valid ? "valid" : "no fix");
+                        current_gps.valid ? "valid" : "no fix",
+                        current_gps.satellites, wdp_total_distance_m);
             last_stats_time = now;
         }
     }
@@ -5231,20 +5297,26 @@ static void wardrive_promisc_task(void *pvParameters) {
     }
 
 cleanup:
+    if (wardrive_promisc_trace_path[0] != '\0') {
+        wardrive_trace_finalize_file(wardrive_promisc_trace_path);
+        MY_LOG_INFO(TAG, "Wardrive trace saved to %s (distance %.1fm)", wardrive_promisc_trace_path, wdp_total_distance_m);
+        wardrive_promisc_trace_path[0] = '\0';
+    }
     led_err = led_set_idle();
     if (led_err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to restore idle LED after wardrive promisc: %s", esp_err_to_name(led_err));
     }
 
-    MY_LOG_INFO(TAG, "Wardrive promisc stopped. Total unique networks: %d, BT devices: %d",
-                wdp_seen_count, bt_device_count);
+    MY_LOG_INFO(TAG, "Wardrive promisc stopped. Total unique networks: %d, BT devices: %d, distance: %.1fm",
+                wdp_seen_count, bt_device_count, wdp_total_distance_m);
     wardrive_promisc_active = false;
     wardrive_promisc_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
-static int cmd_start_wardrive_promisc(int argc, char **argv) {
+static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_enabled) {
     (void)argc; (void)argv;
+    wardrive_promisc_trace_enabled = trace_enabled;
     oled_display_update_full("> Wardrive Pro", "  Promiscuous", "  GPS + SD log", "  Active...");
     log_memory_info("start_wardrive_promisc");
 
@@ -5326,6 +5398,14 @@ static int cmd_start_wardrive_promisc(int argc, char **argv) {
 
     MY_LOG_INFO(TAG, "Wardrive promisc task started. Use 'stop' to stop.");
     return 0;
+}
+
+static int cmd_start_wardrive_promisc(int argc, char **argv) {
+    return cmd_start_wardrive_promisc_impl(argc, argv, false);
+}
+
+static int cmd_start_wardrive_promisc_trace(int argc, char **argv) {
+    return cmd_start_wardrive_promisc_impl(argc, argv, true);
 }
 
 // ============================================================================
@@ -12822,20 +12902,21 @@ static void wardrive_task(void *pvParameters) {
             
             // Get auth mode string
             const char* auth_mode = get_auth_mode_wiggle(ap->authmode);
+            int wifi_freq_mhz = wigle_wifi_channel_to_frequency_mhz(ap->primary);
             
             // Format line for Wiggle format
             char line[512];
             if (gps_valid_for_cycle) {
                 snprintf(line, sizeof(line), 
-                        "%s,%s,[%s],%s,%d,,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
+                        "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
                         mac_str, escaped_ssid, auth_mode, timestamp,
-                        ap->primary, ap->rssi,
+                        ap->primary, wifi_freq_mhz, ap->rssi,
                         gps_lat, gps_lon, gps_alt, gps_acc);
             } else {
                 snprintf(line, sizeof(line), 
-                        "%s,%s,[%s],%s,%d,,%d,0.0000000,0.0000000,0.00,0.00,,,WIFI\n",
+                        "%s,%s,[%s],%s,%d,%d,%d,0.0000000,0.0000000,0.00,0.00,,,WIFI\n",
                         mac_str, escaped_ssid, auth_mode, timestamp,
-                        ap->primary, ap->rssi);
+                        ap->primary, wifi_freq_mhz, ap->rssi);
             }
             
             // Write to file and print to UART
@@ -14818,6 +14899,85 @@ static void bt_format_addr(const uint8_t *addr, char *str)
             addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
 }
 
+static int wigle_wifi_channel_to_frequency_mhz(int channel)
+{
+    if (channel == 14) {
+        return 2484;
+    }
+    if (channel >= 1 && channel <= 13) {
+        return 2407 + (channel * 5);
+    }
+    if (channel >= 32 && channel <= 177) {
+        return 5000 + (channel * 5);
+    }
+    return 0;
+}
+
+static double gps_distance_meters(double lat1, double lon1, double lat2, double lon2)
+{
+    const double earth_radius_m = 6371000.0;
+    const double deg_to_rad = 0.017453292519943295;
+    double dlat = (lat2 - lat1) * deg_to_rad;
+    double dlon = (lon2 - lon1) * deg_to_rad;
+    double a_lat1 = lat1 * deg_to_rad;
+    double a_lat2 = lat2 * deg_to_rad;
+    double sin_dlat = sin(dlat / 2.0);
+    double sin_dlon = sin(dlon / 2.0);
+    double a = sin_dlat * sin_dlat +
+               cos(a_lat1) * cos(a_lat2) * sin_dlon * sin_dlon;
+    double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+    return earth_radius_m * c;
+}
+
+static bool wardrive_trace_init_file(const char *path)
+{
+    FILE *file = fopen(path, "w");
+    if (!file) {
+        return false;
+    }
+
+    fprintf(file, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    fprintf(file, "<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n");
+    fprintf(file, "<Document>\n");
+    fprintf(file, "  <name>Wardrive Promisc Trace</name>\n");
+    fprintf(file, "  <Style id=\"traceLine\">\n");
+    fprintf(file, "    <LineStyle><color>ff00ffff</color><width>4</width></LineStyle>\n");
+    fprintf(file, "  </Style>\n");
+    fprintf(file, "  <Placemark>\n");
+    fprintf(file, "    <name>Wardrive Trace</name>\n");
+    fprintf(file, "    <styleUrl>#traceLine</styleUrl>\n");
+    fprintf(file, "    <LineString>\n");
+    fprintf(file, "      <tessellate>1</tessellate>\n");
+    fprintf(file, "      <coordinates>\n");
+    fclose(file);
+    return true;
+}
+
+static bool wardrive_trace_append_point(const char *path, double lat, double lon, double alt)
+{
+    FILE *file = fopen(path, "a");
+    if (!file) {
+        return false;
+    }
+    fprintf(file, "        %.7f,%.7f,%.2f\n", lon, lat, alt);
+    fclose(file);
+    return true;
+}
+
+static void wardrive_trace_finalize_file(const char *path)
+{
+    FILE *file = fopen(path, "a");
+    if (!file) {
+        return;
+    }
+    fprintf(file, "      </coordinates>\n");
+    fprintf(file, "    </LineString>\n");
+    fprintf(file, "  </Placemark>\n");
+    fprintf(file, "</Document>\n");
+    fprintf(file, "</kml>\n");
+    fclose(file);
+}
+
 /**
  * Parse MAC address string to bytes (format: XX:XX:XX:XX:XX:XX)
  * Returns true if parsing successful
@@ -15880,6 +16040,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_promisc_cmd));
 
+    const esp_console_cmd_t wardrive_promisc_trace_cmd = {
+        .command = "start_wardrive_promisc_trace",
+        .help = "Promiscuous wardrive with D-UCB channel selection and KML trace logging",
+        .hint = NULL,
+        .func = &cmd_start_wardrive_promisc_trace,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_promisc_trace_cmd));
+
     const esp_console_cmd_t portal_cmd = {
         .command = "start_portal",
         .help = "Starts captive portal with password form: start_portal <SSID>",
@@ -16485,6 +16654,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  start_sniffer_noscan");
       MY_LOG_INFO(TAG,"  start_wardrive");
       MY_LOG_INFO(TAG,"  start_wardrive_promisc");
+      MY_LOG_INFO(TAG,"  start_wardrive_promisc_trace");
       MY_LOG_INFO(TAG,"  stop");
       MY_LOG_INFO(TAG,"  unselect_networks");
       MY_LOG_INFO(TAG,"  unselect_stations");
@@ -18684,6 +18854,9 @@ static bool parse_gps_nmea(const char* nmea_sentence) {
                 case 6: // GPS quality
                     quality = atoi(token);
                     break;
+                case 7: // Number of satellites
+                    current_gps.satellites = atoi(token);
+                    break;
                 case 8: // HDOP
                     hdop = atof(token);
                     break;
@@ -18709,6 +18882,7 @@ static bool parse_gps_nmea(const char* nmea_sentence) {
             
             return true;
         } else {
+            current_gps.satellites = 0;
             current_gps.valid = false;
             return false;
         }
