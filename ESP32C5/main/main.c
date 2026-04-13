@@ -672,9 +672,10 @@ static TaskHandle_t bt_scan_task_handle = NULL;
 static volatile bool nimble_initialized = false;
 
 // BLE device tracking for deduplication
-#define BT_MAX_DEVICES 128
-static uint8_t bt_found_devices[BT_MAX_DEVICES][6];
+#define BT_INITIAL_CAPACITY 128
+static uint8_t (*bt_found_devices)[6] = NULL;
 static int bt_found_device_count = 0;
+static int bt_found_device_capacity = 0;
 
 // AirTag/SmartTag counters
 static int bt_airtag_count = 0;
@@ -692,6 +693,7 @@ typedef struct {
 
 static bt_device_info_t *bt_devices = NULL;                 // ~5.5 KB in PSRAM
 static int bt_device_count = 0;
+static int bt_device_capacity = 0;
 
 // MAC tracking mode for scan_bt with argument
 static bool bt_tracking_mode = false;
@@ -1209,7 +1211,8 @@ static bool init_psram_buffers(void)
 {
     sniffer_aps = heap_caps_calloc(MAX_SNIFFER_APS, sizeof(sniffer_ap_t), MALLOC_CAP_SPIRAM);
     probe_requests = heap_caps_calloc(MAX_PROBE_REQUESTS, sizeof(probe_request_t), MALLOC_CAP_SPIRAM);
-    bt_devices = heap_caps_calloc(BT_MAX_DEVICES, sizeof(bt_device_info_t), MALLOC_CAP_SPIRAM);
+    bt_found_devices = heap_caps_calloc(BT_INITIAL_CAPACITY, sizeof(*bt_found_devices), MALLOC_CAP_SPIRAM);
+    bt_devices = heap_caps_calloc(BT_INITIAL_CAPACITY, sizeof(bt_device_info_t), MALLOC_CAP_SPIRAM);
     wardrive_scan_results = heap_caps_calloc(MAX_AP_CNT, sizeof(wifi_ap_record_t), MALLOC_CAP_SPIRAM);
     handshake_targets = heap_caps_calloc(MAX_AP_CNT, sizeof(wifi_ap_record_t), MALLOC_CAP_SPIRAM);
     sd_html_files = heap_caps_calloc(MAX_HTML_FILES, MAX_HTML_FILENAME, MALLOC_CAP_SPIRAM);
@@ -1222,12 +1225,14 @@ static bool init_psram_buffers(void)
     wdp_seen_networks = heap_caps_calloc(WDP_INITIAL_CAPACITY, sizeof(wdp_network_t), MALLOC_CAP_SPIRAM);
     wdp_seen_capacity = WDP_INITIAL_CAPACITY;
     
-    if (!sniffer_aps || !probe_requests || !bt_devices || !wardrive_scan_results ||
+    if (!sniffer_aps || !probe_requests || !bt_found_devices || !bt_devices || !wardrive_scan_results ||
         !handshake_targets || !sd_html_files || !target_bssids || !whiteListedBssids || !selected_stations ||
         !hs_ap_targets || !hs_clients || !ducb_channels || !wdp_seen_networks) {
         MY_LOG_INFO(TAG, "PSRAM allocation failed!");
         return false;
     }
+    bt_found_device_capacity = BT_INITIAL_CAPACITY;
+    bt_device_capacity = BT_INITIAL_CAPACITY;
     return true;
 }
 
@@ -4943,12 +4948,17 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     // Start BLE scanning in background (coexistence handled by ESP-IDF)
     bt_reset_counters();
-    bool wdp_bt_enabled = (nimble_initialized && bt_start_scan_coex() == 0);
-    int wdp_bt_flush_count = 0;
+    bool wdp_bt_enabled = nimble_initialized;
+    bool wdp_bt_running = false;
     if (wdp_bt_enabled) {
+        wdp_bt_running = (bt_start_scan_coex() == 0);
+    }
+    int wdp_bt_flush_count = 0;
+    if (wdp_bt_running) {
         MY_LOG_INFO(TAG, "BLE scan started alongside WiFi promiscuous capture.");
     } else {
         MY_LOG_INFO(TAG, "BLE scan unavailable, logging WiFi only.");
+        wdp_bt_enabled = false;
     }
 
     int64_t last_stats_time = esp_timer_get_time();
@@ -4964,6 +4974,10 @@ static void wardrive_promisc_task(void *pvParameters) {
             MY_LOG_INFO(TAG, "GPS fix lost! Pausing wardrive...");
             oled_display_update_full("> Wardrive Pro", "  GPS fix lost!", "  Pausing...", "");
             esp_wifi_set_promiscuous(false);
+            if (wdp_bt_running) {
+                bt_stop_scan();
+                wdp_bt_running = false;
+            }
             while (!current_gps.valid && wardrive_promisc_active && !operation_stop_requested) {
                 gps_sync_from_selected_external_source();
                 vTaskDelay(pdMS_TO_TICKS(200));
@@ -4973,6 +4987,12 @@ static void wardrive_promisc_task(void *pvParameters) {
                         current_gps.latitude, current_gps.longitude);
             oled_display_update_full("> Wardrive Pro", "  GPS recovered!", "  Resuming...", "");
             esp_wifi_set_promiscuous(true);
+            if (wdp_bt_enabled) {
+                wdp_bt_running = (bt_start_scan_coex() == 0);
+                if (!wdp_bt_running) {
+                    MY_LOG_INFO(TAG, "Failed to resume BLE scan after GPS recovery.");
+                }
+            }
         }
 
         int ch_idx = wdp_ducb_select_channel();
@@ -5036,6 +5056,10 @@ static void wardrive_promisc_task(void *pvParameters) {
         if (gps_fix_lost_count >= WDP_GPS_FIX_LOST_THRESHOLD) {
             MY_LOG_INFO(TAG, "GPS fix lost for %d cycles! Pausing wardrive...", gps_fix_lost_count);
             esp_wifi_set_promiscuous(false);
+            if (wdp_bt_running) {
+                bt_stop_scan();
+                wdp_bt_running = false;
+            }
 
             while (!current_gps.valid && wardrive_promisc_active && !operation_stop_requested) {
                 if (external_feed) {
@@ -5060,6 +5084,12 @@ static void wardrive_promisc_task(void *pvParameters) {
             MY_LOG_INFO(TAG, "GPS fix recovered: Lat=%.7f Lon=%.7f. Resuming wardrive.",
                         current_gps.latitude, current_gps.longitude);
             esp_wifi_set_promiscuous(true);
+            if (wdp_bt_enabled) {
+                wdp_bt_running = (bt_start_scan_coex() == 0);
+                if (!wdp_bt_running) {
+                    MY_LOG_INFO(TAG, "Failed to resume BLE scan after GPS recovery.");
+                }
+            }
             gps_fix_lost_count = 0;
         }
 
@@ -5187,7 +5217,7 @@ static void wardrive_promisc_task(void *pvParameters) {
     esp_wifi_set_promiscuous(false);
 
     // Stop BLE scan if it was started
-    if (wdp_bt_enabled) {
+    if (wdp_bt_running) {
         bt_stop_scan();
         MY_LOG_INFO(TAG, "BLE scan stopped. Total BT devices seen: %d", bt_device_count);
     }
@@ -14695,15 +14725,63 @@ static int bt_find_device_index(const uint8_t *addr)
     return -1;
 }
 
+static bool bt_grow_storage_if_needed(int required_count)
+{
+    if (required_count <= bt_device_capacity && required_count <= bt_found_device_capacity) {
+        return true;
+    }
+
+    int new_capacity = bt_device_capacity > bt_found_device_capacity ? bt_device_capacity : bt_found_device_capacity;
+    if (new_capacity <= 0) {
+        new_capacity = BT_INITIAL_CAPACITY;
+    }
+    while (new_capacity < required_count) {
+        new_capacity *= 2;
+    }
+
+    uint8_t (*new_found_devices)[6] = heap_caps_calloc(new_capacity, sizeof(*bt_found_devices), MALLOC_CAP_SPIRAM);
+    if (!new_found_devices) {
+        MY_LOG_INFO(TAG, "Failed to grow BLE dedup buffer to %d entries", new_capacity);
+        return false;
+    }
+
+    bt_device_info_t *new_bt_devices = heap_caps_calloc(new_capacity, sizeof(bt_device_info_t), MALLOC_CAP_SPIRAM);
+    if (!new_bt_devices) {
+        free(new_found_devices);
+        MY_LOG_INFO(TAG, "Failed to grow BLE device buffer to %d entries", new_capacity);
+        return false;
+    }
+
+    if (bt_found_devices && bt_found_device_count > 0) {
+        memcpy(new_found_devices, bt_found_devices,
+               (size_t)bt_found_device_count * sizeof(*bt_found_devices));
+    }
+    if (bt_devices && bt_device_count > 0) {
+        memcpy(new_bt_devices, bt_devices,
+               (size_t)bt_device_count * sizeof(bt_device_info_t));
+    }
+
+    free(bt_found_devices);
+    free(bt_devices);
+    bt_found_devices = new_found_devices;
+    bt_devices = new_bt_devices;
+    bt_found_device_capacity = new_capacity;
+    bt_device_capacity = new_capacity;
+    MY_LOG_INFO(TAG, "BLE device buffers grown to %d entries", new_capacity);
+    return true;
+}
+
 /**
  * Add BLE device to found list
  */
-static void bt_add_found_device(const uint8_t *addr)
+static bool bt_add_found_device(const uint8_t *addr)
 {
-    if (bt_found_device_count < BT_MAX_DEVICES) {
-        memcpy(bt_found_devices[bt_found_device_count], addr, 6);
-        bt_found_device_count++;
+    if (!bt_grow_storage_if_needed(bt_found_device_count + 1)) {
+        return false;
     }
+    memcpy(bt_found_devices[bt_found_device_count], addr, 6);
+    bt_found_device_count++;
+    return true;
 }
 
 /**
@@ -14715,8 +14793,12 @@ static void bt_reset_counters(void)
     bt_smarttag_count = 0;
     bt_found_device_count = 0;
     bt_device_count = 0;
-    memset(bt_found_devices, 0, sizeof(bt_found_devices));
-    memset(bt_devices, 0, BT_MAX_DEVICES * sizeof(bt_device_info_t));
+    if (bt_found_devices && bt_found_device_capacity > 0) {
+        memset(bt_found_devices, 0, (size_t)bt_found_device_capacity * sizeof(*bt_found_devices));
+    }
+    if (bt_devices && bt_device_capacity > 0) {
+        memset(bt_devices, 0, (size_t)bt_device_capacity * sizeof(bt_device_info_t));
+    }
 }
 
 /**
@@ -14865,44 +14947,47 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     }
     
     // Add to found devices list
-    bt_add_found_device(desc->addr.val);
+    if (!bt_add_found_device(desc->addr.val)) {
+        return 0;
+    }
     
     // Store device info
-    if (bt_device_count < BT_MAX_DEVICES) {
-        bt_device_info_t *dev = &bt_devices[bt_device_count];
-        memcpy(dev->addr, desc->addr.val, 6);
-        dev->rssi = desc->rssi;
-        dev->name[0] = '\0';
-        dev->company_id = 0;
-        dev->is_airtag = false;
-        dev->is_smarttag = false;
-        
-        // Extract device name if available (standard AD field)
-        bool has_name = (fields.name != NULL && fields.name_len > 0);
-        if (has_name) {
-            int name_len = fields.name_len < 31 ? fields.name_len : 31;
-            memcpy(dev->name, fields.name, name_len);
-            dev->name[name_len] = '\0';
-        }
-        
-        // Check for AirTag using raw payload (Marauder method)
-        if (bt_is_airtag_payload(desc->data, desc->length_data)) {
-            dev->is_airtag = true;
-            bt_airtag_count++;
-        }
-        
-        // Check manufacturer data for SmartTag and company ID
-        if (fields.mfg_data != NULL && fields.mfg_data_len >= 2) {
-            dev->company_id = fields.mfg_data[0] | (fields.mfg_data[1] << 8);
-            
-            if (!dev->is_airtag && bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
-                dev->is_smarttag = true;
-                bt_smarttag_count++;
-            }
-        }
-        
-        bt_device_count++;
+    if (!bt_grow_storage_if_needed(bt_device_count + 1)) {
+        return 0;
     }
+    bt_device_info_t *dev = &bt_devices[bt_device_count];
+    memcpy(dev->addr, desc->addr.val, 6);
+    dev->rssi = desc->rssi;
+    dev->name[0] = '\0';
+    dev->company_id = 0;
+    dev->is_airtag = false;
+    dev->is_smarttag = false;
+    
+    // Extract device name if available (standard AD field)
+    bool has_name = (fields.name != NULL && fields.name_len > 0);
+    if (has_name) {
+        int name_len = fields.name_len < 31 ? fields.name_len : 31;
+        memcpy(dev->name, fields.name, name_len);
+        dev->name[name_len] = '\0';
+    }
+    
+    // Check for AirTag using raw payload (Marauder method)
+    if (bt_is_airtag_payload(desc->data, desc->length_data)) {
+        dev->is_airtag = true;
+        bt_airtag_count++;
+    }
+    
+    // Check manufacturer data for SmartTag and company ID
+    if (fields.mfg_data != NULL && fields.mfg_data_len >= 2) {
+        dev->company_id = fields.mfg_data[0] | (fields.mfg_data[1] << 8);
+        
+        if (!dev->is_airtag && bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
+            dev->is_smarttag = true;
+            bt_smarttag_count++;
+        }
+    }
+    
+    bt_device_count++;
     
     return 0;
 }
