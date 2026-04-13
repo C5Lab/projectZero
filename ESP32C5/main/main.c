@@ -5117,8 +5117,8 @@ static void wardrive_promisc_task(void *pvParameters) {
                 if (file) {
                     fseek(file, 0, SEEK_END);
                     if (ftell(file) == 0) {
-                        fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=MonsterC5,release=v1.0,device=MonsterC5,display=SPI TFT,board=ESP32C5,brand=Laboratorium\n");
-                        fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
+                        fprintf(file, "WigleWifi-1.6,appRelease=v1.1,model=MonsterC5,release=v1.0,device=MonsterC5,display=SPI TFT,board=ESP32C5,brand=LAB5\n");
+                        fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n");
                     }
 
                     char timestamp[32];
@@ -5139,13 +5139,13 @@ static void wardrive_promisc_task(void *pvParameters) {
                         const char *auth_str = get_auth_mode_wiggle(wdp_seen_networks[i].authmode);
 
                         if (current_gps.valid) {
-                            fprintf(file, "%s,%s,[%s],%s,%d,%d,%.7f,%.7f,%.2f,%.2f,WIFI\n",
+                            fprintf(file, "%s,%s,[%s],%s,%d,,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
                                     mac_str, escaped_ssid, auth_str, timestamp,
                                     wdp_seen_networks[i].channel, (int)wdp_seen_networks[i].rssi,
                                     current_gps.latitude, current_gps.longitude,
                                     current_gps.altitude, current_gps.accuracy);
                         } else {
-                            fprintf(file, "%s,%s,[%s],%s,%d,%d,0.0000000,0.0000000,0.00,0.00,WIFI\n",
+                            fprintf(file, "%s,%s,[%s],%s,%d,,%d,0.0000000,0.0000000,0.00,0.00,,,WIFI\n",
                                     mac_str, escaped_ssid, auth_str, timestamp,
                                     wdp_seen_networks[i].channel, (int)wdp_seen_networks[i].rssi);
                         }
@@ -5157,27 +5157,35 @@ static void wardrive_promisc_task(void *pvParameters) {
                         int bt_total = bt_device_count;
                         for (int i = wdp_bt_flush_count; i < bt_total; i++) {
                             char bt_mac[18];
+                            char escaped_bt_name[64];
+                            char bt_mfgr_id[8];
                             bt_format_addr(bt_devices[i].addr, bt_mac);
+                            escape_csv_field(bt_devices[i].name, escaped_bt_name, sizeof(escaped_bt_name));
+                            if (bt_devices[i].company_id != 0) {
+                                snprintf(bt_mfgr_id, sizeof(bt_mfgr_id), "%u", bt_devices[i].company_id);
+                            } else {
+                                bt_mfgr_id[0] = '\0';
+                            }
                             const char *bt_cap = bt_devices[i].is_airtag  ? "AirTag [LE]"  :
                                                  bt_devices[i].is_smarttag ? "SmartTag [LE]" : "Misc [LE]";
                             if (current_gps.valid) {
-                                fprintf(file, "%s,%s,%s,%s,0,%d,%.7f,%.7f,%.2f,%.2f,BLE\n",
-                                        bt_mac, bt_devices[i].name, bt_cap, timestamp,
+                                fprintf(file, "%s,%s,%s,%s,0,,%d,%.7f,%.7f,%.2f,%.2f,,%s,BLE\n",
+                                        bt_mac, escaped_bt_name, bt_cap, timestamp,
                                         (int)bt_devices[i].rssi,
                                         current_gps.latitude, current_gps.longitude,
-                                        current_gps.altitude, current_gps.accuracy);
-                                printf("%s,%s,%s,%s,0,%d,%.7f,%.7f,%.2f,%.2f,BLE\n",
-                                       bt_mac, bt_devices[i].name, bt_cap, timestamp,
+                                        current_gps.altitude, current_gps.accuracy, bt_mfgr_id);
+                                printf("%s,%s,%s,%s,0,,%d,%.7f,%.7f,%.2f,%.2f,,%s,BLE\n",
+                                       bt_mac, escaped_bt_name, bt_cap, timestamp,
                                        (int)bt_devices[i].rssi,
                                        current_gps.latitude, current_gps.longitude,
-                                       current_gps.altitude, current_gps.accuracy);
+                                       current_gps.altitude, current_gps.accuracy, bt_mfgr_id);
                             } else {
-                                fprintf(file, "%s,%s,%s,%s,0,%d,0.0000000,0.0000000,0.00,0.00,BLE\n",
-                                        bt_mac, bt_devices[i].name, bt_cap, timestamp,
-                                        (int)bt_devices[i].rssi);
-                                printf("%s,%s,%s,%s,0,%d,0.0000000,0.0000000,0.00,0.00,BLE\n",
-                                       bt_mac, bt_devices[i].name, bt_cap, timestamp,
-                                       (int)bt_devices[i].rssi);
+                                fprintf(file, "%s,%s,%s,%s,0,,%d,0.0000000,0.0000000,0.00,0.00,,%s,BLE\n",
+                                        bt_mac, escaped_bt_name, bt_cap, timestamp,
+                                        (int)bt_devices[i].rssi, bt_mfgr_id);
+                                printf("%s,%s,%s,%s,0,,%d,0.0000000,0.0000000,0.00,0.00,,%s,BLE\n",
+                                       bt_mac, escaped_bt_name, bt_cap, timestamp,
+                                       (int)bt_devices[i].rssi, bt_mfgr_id);
                             }
                         }
                         wdp_bt_flush_count = bt_total;
@@ -12790,8 +12798,8 @@ static void wardrive_task(void *pvParameters) {
         // Write header if file is new
         fseek(file, 0, SEEK_END);
         if (ftell(file) == 0) {
-            fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board,display=SPI TFT,board=ESP32C5,brand=Laboratorium\n");
-            fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
+            fprintf(file, "WigleWifi-1.6,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board,display=SPI TFT,board=ESP32C5,brand=Laboratorium\n");
+            fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n");
         }
         
         // Get timestamp
@@ -12819,13 +12827,13 @@ static void wardrive_task(void *pvParameters) {
             char line[512];
             if (gps_valid_for_cycle) {
                 snprintf(line, sizeof(line), 
-                        "%s,%s,[%s],%s,%d,%d,%.7f,%.7f,%.2f,%.2f,WIFI\n",
+                        "%s,%s,[%s],%s,%d,,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
                         mac_str, escaped_ssid, auth_mode, timestamp,
                         ap->primary, ap->rssi,
                         gps_lat, gps_lon, gps_alt, gps_acc);
             } else {
                 snprintf(line, sizeof(line), 
-                        "%s,%s,[%s],%s,%d,%d,0.0000000,0.0000000,0.00,0.00,WIFI\n",
+                        "%s,%s,[%s],%s,%d,,%d,0.0000000,0.0000000,0.00,0.00,,,WIFI\n",
                         mac_str, escaped_ssid, auth_mode, timestamp,
                         ap->primary, ap->rssi);
             }
