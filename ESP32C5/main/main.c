@@ -1581,6 +1581,11 @@ static void ota_led_stop(void);
 static esp_err_t wifi_init_ap_sta(void);
 static esp_err_t bt_nimble_init(void);
 static void bt_nimble_deinit(void);
+static void bt_reset_counters(void);
+static void bt_format_addr(const uint8_t *addr, char *str);
+static int bt_start_scan(void);
+static int bt_start_scan_coex(void);
+static void bt_stop_scan(void);
 static void register_commands(void);
 
 // --- Wi-Fi event handler ---
@@ -4936,6 +4941,16 @@ static void wardrive_promisc_task(void *pvParameters) {
                 (int)WDP_CH_5_NON_DFS_COUNT, (int)WDP_CH_5_DFS_COUNT);
     MY_LOG_INFO(TAG, "Use 'stop' command to stop.");
 
+    // Start BLE scanning in background (coexistence handled by ESP-IDF)
+    bt_reset_counters();
+    bool wdp_bt_enabled = (nimble_initialized && bt_start_scan_coex() == 0);
+    int wdp_bt_flush_count = 0;
+    if (wdp_bt_enabled) {
+        MY_LOG_INFO(TAG, "BLE scan started alongside WiFi promiscuous capture.");
+    } else {
+        MY_LOG_INFO(TAG, "BLE scan unavailable, logging WiFi only.");
+    }
+
     int64_t last_stats_time = esp_timer_get_time();
     int last_flush_count = 0;
     int gps_fix_lost_count = 0;
@@ -5053,8 +5068,12 @@ static void wardrive_promisc_task(void *pvParameters) {
 
         // Flush new entries to SD file periodically
         int current_count = wdp_seen_count;
+        int bt_pending = wdp_bt_enabled ? (bt_device_count - wdp_bt_flush_count) : 0;
+        bool bt_flush_due = wdp_bt_enabled && bt_pending > 0 &&
+                            ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US);
         if ((current_count - last_flush_count) >= WDP_FILE_FLUSH_INTERVAL ||
-            ((current_count > last_flush_count) && ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US))) {
+            ((current_count > last_flush_count) && ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US)) ||
+            bt_flush_due) {
 
             char filename[64];
             snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", file_number);
@@ -5103,13 +5122,45 @@ static void wardrive_promisc_task(void *pvParameters) {
                         wdp_seen_networks[i].written_to_file = true;
                     }
 
+                    // Flush BT devices collected since last flush
+                    if (wdp_bt_enabled) {
+                        int bt_total = bt_device_count;
+                        for (int i = wdp_bt_flush_count; i < bt_total; i++) {
+                            char bt_mac[18];
+                            bt_format_addr(bt_devices[i].addr, bt_mac);
+                            const char *bt_cap = bt_devices[i].is_airtag  ? "AirTag [LE]"  :
+                                                 bt_devices[i].is_smarttag ? "SmartTag [LE]" : "Misc [LE]";
+                            if (current_gps.valid) {
+                                fprintf(file, "%s,%s,%s,%s,0,%d,%.7f,%.7f,%.2f,%.2f,BLE\n",
+                                        bt_mac, bt_devices[i].name, bt_cap, timestamp,
+                                        (int)bt_devices[i].rssi,
+                                        current_gps.latitude, current_gps.longitude,
+                                        current_gps.altitude, current_gps.accuracy);
+                                printf("%s,%s,%s,%s,0,%d,%.7f,%.7f,%.2f,%.2f,BLE\n",
+                                       bt_mac, bt_devices[i].name, bt_cap, timestamp,
+                                       (int)bt_devices[i].rssi,
+                                       current_gps.latitude, current_gps.longitude,
+                                       current_gps.altitude, current_gps.accuracy);
+                            } else {
+                                fprintf(file, "%s,%s,%s,%s,0,%d,0.0000000,0.0000000,0.00,0.00,BLE\n",
+                                        bt_mac, bt_devices[i].name, bt_cap, timestamp,
+                                        (int)bt_devices[i].rssi);
+                                printf("%s,%s,%s,%s,0,%d,0.0000000,0.0000000,0.00,0.00,BLE\n",
+                                       bt_mac, bt_devices[i].name, bt_cap, timestamp,
+                                       (int)bt_devices[i].rssi);
+                            }
+                        }
+                        wdp_bt_flush_count = bt_total;
+                    }
+
                     fclose(file);
                     sd_sync();
                     last_flush_count = current_count;
-                    MY_LOG_INFO(TAG, "Flushed %d networks to %s", current_count, filename);
+                    MY_LOG_INFO(TAG, "Flushed %d networks + %d BT devices to %s",
+                                current_count, wdp_bt_flush_count, filename);
                     {
                         char wdp_fl3[64];
-                        snprintf(wdp_fl3, sizeof(wdp_fl3), "  %d networks", current_count);
+                        snprintf(wdp_fl3, sizeof(wdp_fl3), "  %d nets %d BT", current_count, wdp_bt_flush_count);
                         oled_display_update_full("> Wardrive Pro", "  Flushed to SD", wdp_fl3, "  D-UCB active");
                     }
                 }
@@ -5126,8 +5177,8 @@ static void wardrive_promisc_task(void *pvParameters) {
                     top_ch = wdp_ducb_channels[i].channel;
                 }
             }
-            MY_LOG_INFO(TAG, "Wardrive promisc: %d unique networks, D-UCB best ch: %d (%d visits), GPS: %s",
-                        wdp_seen_count, top_ch, top_pulls,
+            MY_LOG_INFO(TAG, "Wardrive promisc: %d unique networks, %d BT devices, D-UCB best ch: %d (%d visits), GPS: %s",
+                        wdp_seen_count, bt_device_count, top_ch, top_pulls,
                         current_gps.valid ? "valid" : "no fix");
             last_stats_time = now;
         }
@@ -5135,13 +5186,20 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     esp_wifi_set_promiscuous(false);
 
+    // Stop BLE scan if it was started
+    if (wdp_bt_enabled) {
+        bt_stop_scan();
+        MY_LOG_INFO(TAG, "BLE scan stopped. Total BT devices seen: %d", bt_device_count);
+    }
+
 cleanup:
     led_err = led_set_idle();
     if (led_err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to restore idle LED after wardrive promisc: %s", esp_err_to_name(led_err));
     }
 
-    MY_LOG_INFO(TAG, "Wardrive promisc stopped. Total unique networks: %d", wdp_seen_count);
+    MY_LOG_INFO(TAG, "Wardrive promisc stopped. Total unique networks: %d, BT devices: %d",
+                wdp_seen_count, bt_device_count);
     wardrive_promisc_active = false;
     wardrive_promisc_task_handle = NULL;
     vTaskDelete(NULL);
@@ -5172,10 +5230,20 @@ static int cmd_start_wardrive_promisc(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Cannot start wardrive promisc while GPS raw reader is running. Use 'stop' first.");
         return 1;
     }
+    if (bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start wardrive promisc while BT scan is running. Use 'stop' first.");
+        return 1;
+    }
 
     operation_stop_requested = false;
 
     MY_LOG_INFO(TAG, "Starting promiscuous wardrive mode...");
+
+    // Initialize NimBLE for BT scanning (idempotent if already initialized)
+    esp_err_t bt_ret = bt_nimble_init();
+    if (bt_ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Warning: BLE init failed (%s) - wardrive will run without BT logging", esp_err_to_name(bt_ret));
+    }
 
     const bool external_feed = gps_module_uses_external_feed(current_gps_module);
 
@@ -14840,7 +14908,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
 }
 
 /**
- * Start BLE scanning
+ * Start BLE scanning - full duty cycle (for dedicated BT scan commands)
  */
 static int bt_start_scan(void)
 {
@@ -14852,7 +14920,28 @@ static int bt_start_scan(void)
         .passive = 0,             // ACTIVE scan - critical for Scan Response names
         .filter_duplicates = 0,   // We handle duplicates ourselves
     };
-    
+
+    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &scan_params,
+                          bt_gap_event_callback, NULL);
+    return rc;
+}
+
+/**
+ * Start BLE scanning with reduced duty cycle for WiFi coexistence.
+ * Uses ~25% duty cycle (40ms window / 160ms interval) so the shared
+ * ESP32-C5 radio spends most of its time on WiFi promiscuous capture.
+ */
+static int bt_start_scan_coex(void)
+{
+    struct ble_gap_disc_params scan_params = {
+        .itvl = 0x100,            // 160ms interval (0x100 * 0.625ms)
+        .window = 0x40,           // 40ms window  -> ~25% duty cycle
+        .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+        .limited = 0,
+        .passive = 0,
+        .filter_duplicates = 0,
+    };
+
     int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &scan_params,
                           bt_gap_event_callback, NULL);
     return rc;
