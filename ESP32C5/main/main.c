@@ -7933,7 +7933,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "boot_button", " read|list|set <short|long> <command> | status <short|long> <on|off>" },
     { "led", " set <on|off> | level <1-100> | read" },
     { "channel_time", " set <min|max> <ms> | read <min|max>" },
-    { "wifi_connect", " <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
+    { "wifi_connect", " <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
     { "ota_channel", " [main|dev]" },
     { "ota_boot", " <ota_0|ota_1>" },
     { "arp_ban", " <MAC> [IP]" },
@@ -7963,8 +7963,8 @@ static const char *lookup_cli_hint(const char *command) {
 }
 
 static const char *wifi_connect_dynamic_hint(const char *buf, int *color, int *bold) {
-    static const char *hint_ssid = " <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
-    static const char *hint_pass = " <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_ssid = " <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_pass = " [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
     static const char *hint_optional = " [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
     static const char *hint_ip_optional = " [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
     static const char *hint_mask = " <Netmask> <GW> [DNS1] [DNS2]";
@@ -8140,13 +8140,13 @@ static int cmd_wifi_connect(int argc, char **argv) {
     oled_display_update_full("> WiFi Connect",
         argc >= 2 ? argv[1] : "  No SSID",
         "  STA Mode", "  Connecting...");
-    if (argc < 3 || argc > 9) {
-        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+    if (argc < 2 || argc > 9) {
+        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
         return 0;
     }
     
     const char *ssid = argv[1];
-    const char *password = argv[2];
+    const char *password = (argc >= 3) ? argv[2] : "";
     bool ota_after_connect = false;
     bool use_static_ip = false;
     esp_ip4_addr_t static_ip = { 0 };
@@ -8157,7 +8157,7 @@ static int cmd_wifi_connect(int argc, char **argv) {
     esp_ip4_addr_t static_dns1 = { 0 };
     esp_ip4_addr_t static_dns2 = { 0 };
 
-    int argi = 3;
+    int argi = (argc >= 3) ? 3 : 2;
     if (argc > argi && strcasecmp(argv[argi], "ota") == 0) {
         ota_after_connect = true;
         argi++;
@@ -8165,7 +8165,7 @@ static int cmd_wifi_connect(int argc, char **argv) {
 
     int remaining = argc - argi;
     if (remaining != 0 && remaining != 3 && remaining != 4 && remaining != 5) {
-        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
         return 0;
     }
     if (remaining >= 3) {
@@ -8257,7 +8257,12 @@ static int cmd_wifi_connect(int argc, char **argv) {
     // Configure STA and connect
     wifi_config_t sta_config = { 0 };
     strncpy((char *)sta_config.sta.ssid, ssid, sizeof(sta_config.sta.ssid) - 1);
-    strncpy((char *)sta_config.sta.password, password, sizeof(sta_config.sta.password) - 1);
+    if (password[0] != '\0') {
+        strncpy((char *)sta_config.sta.password, password, sizeof(sta_config.sta.password) - 1);
+        sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    } else {
+        sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    }
     
     esp_wifi_set_config(WIFI_IF_STA, &sta_config);
     
@@ -8276,7 +8281,9 @@ static int cmd_wifi_connect(int argc, char **argv) {
         esp_netif_ip_info_t ip_info = { 0 };
         bool has_ip = wait_for_sta_ip_info(&ip_info, 5000);
         MY_LOG_INFO(TAG, "SUCCESS: Connected to '%s'", ssid);
-        save_evil_twin_password(ssid, password);
+        if (password[0] != '\0') {
+            save_evil_twin_password(ssid, password);
+        }
         if (has_ip) {
             if (use_static_ip) {
                 MY_LOG_INFO(TAG, "Static IP: " IPSTR ", Netmask: " IPSTR ", GW: " IPSTR,
@@ -14843,8 +14850,8 @@ static void register_commands(void)
 
     const esp_console_cmd_t wifi_connect_cmd = {
         .command = "wifi_connect",
-        .help = "Connect to AP as STA: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
-        .hint = "<SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
+        .help = "Connect to AP as STA: wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
+        .hint = "<SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
         .func = &cmd_wifi_connect,
         .argtable = NULL
     };
@@ -15342,7 +15349,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  unselect_networks");
       MY_LOG_INFO(TAG,"  unselect_stations");
       MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
-      MY_LOG_INFO(TAG,"  wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+      MY_LOG_INFO(TAG,"  wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
       MY_LOG_INFO(TAG,"  wifi_disconnect");
       MY_LOG_INFO(TAG,"  wigle_key set <api_name> <api_token> | wigle_key read");
       MY_LOG_INFO(TAG,"  wigle_upload");
