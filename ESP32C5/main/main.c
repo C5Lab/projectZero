@@ -244,6 +244,7 @@ typedef struct {
     float longitude;
     float altitude;
     float accuracy;
+    int satellites;
     bool valid;
 } gps_data_t;
 
@@ -266,6 +267,8 @@ static gps_data_t external_cap_gps_position = {0};
 static bool gps_uart_initialized = false;
 static gps_module_t current_gps_module = GPS_MODULE_ATGM336H;
 static volatile bool gps_raw_active = false;
+static bool wardrive_promisc_trace_enabled = false;
+static char wardrive_promisc_trace_path[96] = "";
 
 // Global stop flag for all operations
 static volatile bool operation_stop_requested = false;
@@ -673,9 +676,10 @@ static TaskHandle_t bt_scan_task_handle = NULL;
 static volatile bool nimble_initialized = false;
 
 // BLE device tracking for deduplication
-#define BT_MAX_DEVICES 128
-static uint8_t bt_found_devices[BT_MAX_DEVICES][6];
+#define BT_INITIAL_CAPACITY 128
+static uint8_t (*bt_found_devices)[6] = NULL;
 static int bt_found_device_count = 0;
+static int bt_found_device_capacity = 0;
 
 // AirTag/SmartTag counters
 static int bt_airtag_count = 0;
@@ -693,6 +697,7 @@ typedef struct {
 
 static bt_device_info_t *bt_devices = NULL;                 // ~5.5 KB in PSRAM
 static int bt_device_count = 0;
+static int bt_device_capacity = 0;
 
 // MAC tracking mode for scan_bt with argument
 static bool bt_tracking_mode = false;
@@ -1210,7 +1215,8 @@ static bool init_psram_buffers(void)
 {
     sniffer_aps = heap_caps_calloc(MAX_SNIFFER_APS, sizeof(sniffer_ap_t), MALLOC_CAP_SPIRAM);
     probe_requests = heap_caps_calloc(MAX_PROBE_REQUESTS, sizeof(probe_request_t), MALLOC_CAP_SPIRAM);
-    bt_devices = heap_caps_calloc(BT_MAX_DEVICES, sizeof(bt_device_info_t), MALLOC_CAP_SPIRAM);
+    bt_found_devices = heap_caps_calloc(BT_INITIAL_CAPACITY, sizeof(*bt_found_devices), MALLOC_CAP_SPIRAM);
+    bt_devices = heap_caps_calloc(BT_INITIAL_CAPACITY, sizeof(bt_device_info_t), MALLOC_CAP_SPIRAM);
     wardrive_scan_results = heap_caps_calloc(MAX_AP_CNT, sizeof(wifi_ap_record_t), MALLOC_CAP_SPIRAM);
     handshake_targets = heap_caps_calloc(MAX_AP_CNT, sizeof(wifi_ap_record_t), MALLOC_CAP_SPIRAM);
     sd_html_files = heap_caps_calloc(MAX_HTML_FILES, MAX_HTML_FILENAME, MALLOC_CAP_SPIRAM);
@@ -1223,12 +1229,14 @@ static bool init_psram_buffers(void)
     wdp_seen_networks = heap_caps_calloc(WDP_INITIAL_CAPACITY, sizeof(wdp_network_t), MALLOC_CAP_SPIRAM);
     wdp_seen_capacity = WDP_INITIAL_CAPACITY;
     
-    if (!sniffer_aps || !probe_requests || !bt_devices || !wardrive_scan_results ||
+    if (!sniffer_aps || !probe_requests || !bt_found_devices || !bt_devices || !wardrive_scan_results ||
         !handshake_targets || !sd_html_files || !target_bssids || !whiteListedBssids || !selected_stations ||
         !hs_ap_targets || !hs_clients || !ducb_channels || !wdp_seen_networks) {
         MY_LOG_INFO(TAG, "PSRAM allocation failed!");
         return false;
     }
+    bt_found_device_capacity = BT_INITIAL_CAPACITY;
+    bt_device_capacity = BT_INITIAL_CAPACITY;
     return true;
 }
 
@@ -1408,6 +1416,8 @@ static int wdp_get_dwell_ms(wdp_channel_tier_t tier);
 static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
 static void wardrive_promisc_task(void *pvParameters);
 static int cmd_start_wardrive_promisc(int argc, char **argv);
+static int cmd_start_wardrive_promisc_trace(int argc, char **argv);
+static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_enabled);
 // DNS server task
 static void dns_server_task(void *pvParameters);
 // Portal HTTP handlers
@@ -1583,6 +1593,16 @@ static void ota_led_stop(void);
 static esp_err_t wifi_init_ap_sta(void);
 static esp_err_t bt_nimble_init(void);
 static void bt_nimble_deinit(void);
+static void bt_reset_counters(void);
+static void bt_format_addr(const uint8_t *addr, char *str);
+static int bt_start_scan(void);
+static int bt_start_scan_coex(void);
+static void bt_stop_scan(void);
+static int wigle_wifi_channel_to_frequency_mhz(int channel);
+static double gps_distance_meters(double lat1, double lon1, double lat2, double lon2);
+static bool wardrive_trace_init_file(const char *path);
+static bool wardrive_trace_append_point(const char *path, double lat, double lon, double alt);
+static void wardrive_trace_finalize_file(const char *path);
 static void register_commands(void);
 
 // --- Wi-Fi event handler ---
@@ -4907,6 +4927,17 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     int file_number = find_next_wardrive_file_number();
     MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", file_number);
+    double wdp_total_distance_m = 0.0;
+    double wdp_last_trace_lat = 0.0;
+    double wdp_last_trace_lon = 0.0;
+    bool wdp_has_trace_point = false;
+
+    if (wardrive_promisc_trace_enabled) {
+        snprintf(wardrive_promisc_trace_path, sizeof(wardrive_promisc_trace_path),
+                 "/sdcard/lab/wardrives/w%d_track.kml", file_number);
+    } else {
+        wardrive_promisc_trace_path[0] = '\0';
+    }
 
     MY_LOG_INFO(TAG, "Waiting for GPS fix (no timeout - use 'stop' to cancel)...");
     oled_display_update_full("> Wardrive Pro", "  Waiting GPS...", "  No timeout", "  Use 'stop'");
@@ -4918,6 +4949,23 @@ static void wardrive_promisc_task(void *pvParameters) {
     MY_LOG_INFO(TAG, "GPS fix obtained: Lat=%.7f Lon=%.7f",
                 current_gps.latitude, current_gps.longitude);
     oled_display_update_full("> Wardrive Pro", "  GPS fix OK!", "  D-UCB scanning", "");
+
+    if (wardrive_promisc_trace_enabled) {
+        if (wardrive_trace_init_file(wardrive_promisc_trace_path)) {
+            wardrive_trace_append_point(wardrive_promisc_trace_path,
+                                        current_gps.latitude,
+                                        current_gps.longitude,
+                                        current_gps.altitude);
+            wdp_last_trace_lat = current_gps.latitude;
+            wdp_last_trace_lon = current_gps.longitude;
+            wdp_has_trace_point = true;
+            MY_LOG_INFO(TAG, "Wardrive trace enabled: %s", wardrive_promisc_trace_path);
+        } else {
+            MY_LOG_INFO(TAG, "Failed to create wardrive trace file: %s", wardrive_promisc_trace_path);
+            wardrive_promisc_trace_enabled = false;
+            wardrive_promisc_trace_path[0] = '\0';
+        }
+    }
 
     wdp_seen_count = 0;
     wdp_dwell_new_networks = 0;
@@ -4938,6 +4986,21 @@ static void wardrive_promisc_task(void *pvParameters) {
                 (int)WDP_CH_5_NON_DFS_COUNT, (int)WDP_CH_5_DFS_COUNT);
     MY_LOG_INFO(TAG, "Use 'stop' command to stop.");
 
+    // Start BLE scanning in background (coexistence handled by ESP-IDF)
+    bt_reset_counters();
+    bool wdp_bt_enabled = nimble_initialized;
+    bool wdp_bt_running = false;
+    if (wdp_bt_enabled) {
+        wdp_bt_running = (bt_start_scan_coex() == 0);
+    }
+    int wdp_bt_flush_count = 0;
+    if (wdp_bt_running) {
+        MY_LOG_INFO(TAG, "BLE scan started alongside WiFi promiscuous capture.");
+    } else {
+        MY_LOG_INFO(TAG, "BLE scan unavailable, logging WiFi only.");
+        wdp_bt_enabled = false;
+    }
+
     int64_t last_stats_time = esp_timer_get_time();
     int last_flush_count = 0;
     int gps_fix_lost_count = 0;
@@ -4951,6 +5014,10 @@ static void wardrive_promisc_task(void *pvParameters) {
             MY_LOG_INFO(TAG, "GPS fix lost! Pausing wardrive...");
             oled_display_update_full("> Wardrive Pro", "  GPS fix lost!", "  Pausing...", "");
             esp_wifi_set_promiscuous(false);
+            if (wdp_bt_running) {
+                bt_stop_scan();
+                wdp_bt_running = false;
+            }
             while (!current_gps.valid && wardrive_promisc_active && !operation_stop_requested) {
                 gps_sync_from_selected_external_source();
                 vTaskDelay(pdMS_TO_TICKS(200));
@@ -4960,6 +5027,12 @@ static void wardrive_promisc_task(void *pvParameters) {
                         current_gps.latitude, current_gps.longitude);
             oled_display_update_full("> Wardrive Pro", "  GPS recovered!", "  Resuming...", "");
             esp_wifi_set_promiscuous(true);
+            if (wdp_bt_enabled) {
+                wdp_bt_running = (bt_start_scan_coex() == 0);
+                if (!wdp_bt_running) {
+                    MY_LOG_INFO(TAG, "Failed to resume BLE scan after GPS recovery.");
+                }
+            }
         }
 
         int ch_idx = wdp_ducb_select_channel();
@@ -4976,7 +5049,8 @@ static void wardrive_promisc_task(void *pvParameters) {
                 char wdp_l2[64], wdp_l3[64], wdp_l4[64];
                 snprintf(wdp_l2, sizeof(wdp_l2), "  Ch %d  D-UCB", channel);
                 snprintf(wdp_l3, sizeof(wdp_l3), "  %d networks", wdp_seen_count);
-                snprintf(wdp_l4, sizeof(wdp_l4), "  GPS: %s", current_gps.valid ? "OK" : "LOST");
+                snprintf(wdp_l4, sizeof(wdp_l4), "  GPS:%s SAT:%d",
+                         current_gps.valid ? "OK" : "LOST", current_gps.satellites);
                 oled_display_update_full("> Wardrive Pro", wdp_l2, wdp_l3, wdp_l4);
             }
         }
@@ -5018,11 +5092,40 @@ static void wardrive_promisc_task(void *pvParameters) {
             gps_fix_lost_count++;
         } else {
             gps_fix_lost_count = 0;
+            if (wardrive_promisc_trace_enabled) {
+                if (!wdp_has_trace_point) {
+                    if (wardrive_trace_append_point(wardrive_promisc_trace_path,
+                                                    current_gps.latitude,
+                                                    current_gps.longitude,
+                                                    current_gps.altitude)) {
+                        wdp_last_trace_lat = current_gps.latitude;
+                        wdp_last_trace_lon = current_gps.longitude;
+                        wdp_has_trace_point = true;
+                    }
+                } else {
+                    double step_m = gps_distance_meters(wdp_last_trace_lat, wdp_last_trace_lon,
+                                                        current_gps.latitude, current_gps.longitude);
+                    if (step_m >= 3.0) {
+                        if (wardrive_trace_append_point(wardrive_promisc_trace_path,
+                                                        current_gps.latitude,
+                                                        current_gps.longitude,
+                                                        current_gps.altitude)) {
+                            wdp_total_distance_m += step_m;
+                            wdp_last_trace_lat = current_gps.latitude;
+                            wdp_last_trace_lon = current_gps.longitude;
+                        }
+                    }
+                }
+            }
         }
 
         if (gps_fix_lost_count >= WDP_GPS_FIX_LOST_THRESHOLD) {
             MY_LOG_INFO(TAG, "GPS fix lost for %d cycles! Pausing wardrive...", gps_fix_lost_count);
             esp_wifi_set_promiscuous(false);
+            if (wdp_bt_running) {
+                bt_stop_scan();
+                wdp_bt_running = false;
+            }
 
             while (!current_gps.valid && wardrive_promisc_active && !operation_stop_requested) {
                 if (external_feed) {
@@ -5047,6 +5150,12 @@ static void wardrive_promisc_task(void *pvParameters) {
             MY_LOG_INFO(TAG, "GPS fix recovered: Lat=%.7f Lon=%.7f. Resuming wardrive.",
                         current_gps.latitude, current_gps.longitude);
             esp_wifi_set_promiscuous(true);
+            if (wdp_bt_enabled) {
+                wdp_bt_running = (bt_start_scan_coex() == 0);
+                if (!wdp_bt_running) {
+                    MY_LOG_INFO(TAG, "Failed to resume BLE scan after GPS recovery.");
+                }
+            }
             gps_fix_lost_count = 0;
         }
 
@@ -5055,8 +5164,12 @@ static void wardrive_promisc_task(void *pvParameters) {
 
         // Flush new entries to SD file periodically
         int current_count = wdp_seen_count;
+        int bt_pending = wdp_bt_enabled ? (bt_device_count - wdp_bt_flush_count) : 0;
+        bool bt_flush_due = wdp_bt_enabled && bt_pending > 0 &&
+                            ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US);
         if ((current_count - last_flush_count) >= WDP_FILE_FLUSH_INTERVAL ||
-            ((current_count > last_flush_count) && ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US))) {
+            ((current_count > last_flush_count) && ((esp_timer_get_time() - last_stats_time) >= WDP_STATS_INTERVAL_US)) ||
+            bt_flush_due) {
 
             char filename[64];
             snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", file_number);
@@ -5070,8 +5183,8 @@ static void wardrive_promisc_task(void *pvParameters) {
                 if (file) {
                     fseek(file, 0, SEEK_END);
                     if (ftell(file) == 0) {
-                        fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=MonsterC5,release=v1.0,device=MonsterC5,display=SPI TFT,board=ESP32C5,brand=Laboratorium\n");
-                        fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
+                        fprintf(file, "WigleWifi-1.6,appRelease=v1.1,model=MonsterC5,release=v1.0,device=MonsterC5,display=SPI TFT,board=ESP32C5,brand=LAB5\n");
+                        fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n");
                     }
 
                     char timestamp[32];
@@ -5090,28 +5203,69 @@ static void wardrive_promisc_task(void *pvParameters) {
                         escape_csv_field(wdp_seen_networks[i].ssid, escaped_ssid, sizeof(escaped_ssid));
 
                         const char *auth_str = get_auth_mode_wiggle(wdp_seen_networks[i].authmode);
+                        int wifi_freq_mhz = wigle_wifi_channel_to_frequency_mhz(wdp_seen_networks[i].channel);
 
                         if (current_gps.valid) {
-                            fprintf(file, "%s,%s,[%s],%s,%d,%d,%.7f,%.7f,%.2f,%.2f,WIFI\n",
+                            fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
                                     mac_str, escaped_ssid, auth_str, timestamp,
-                                    wdp_seen_networks[i].channel, (int)wdp_seen_networks[i].rssi,
+                                    wdp_seen_networks[i].channel, wifi_freq_mhz, (int)wdp_seen_networks[i].rssi,
                                     current_gps.latitude, current_gps.longitude,
                                     current_gps.altitude, current_gps.accuracy);
                         } else {
-                            fprintf(file, "%s,%s,[%s],%s,%d,%d,0.0000000,0.0000000,0.00,0.00,WIFI\n",
+                            fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,0.0000000,0.0000000,0.00,0.00,,,WIFI\n",
                                     mac_str, escaped_ssid, auth_str, timestamp,
-                                    wdp_seen_networks[i].channel, (int)wdp_seen_networks[i].rssi);
+                                    wdp_seen_networks[i].channel, wifi_freq_mhz, (int)wdp_seen_networks[i].rssi);
                         }
                         wdp_seen_networks[i].written_to_file = true;
+                    }
+
+                    // Flush BT devices collected since last flush
+                    if (wdp_bt_enabled) {
+                        int bt_total = bt_device_count;
+                        for (int i = wdp_bt_flush_count; i < bt_total; i++) {
+                            char bt_mac[18];
+                            char escaped_bt_name[64];
+                            char bt_mfgr_id[8];
+                            bt_format_addr(bt_devices[i].addr, bt_mac);
+                            escape_csv_field(bt_devices[i].name, escaped_bt_name, sizeof(escaped_bt_name));
+                            if (bt_devices[i].company_id != 0) {
+                                snprintf(bt_mfgr_id, sizeof(bt_mfgr_id), "%u", bt_devices[i].company_id);
+                            } else {
+                                bt_mfgr_id[0] = '\0';
+                            }
+                            const char *bt_cap = bt_devices[i].is_airtag  ? "AirTag [LE]"  :
+                                                 bt_devices[i].is_smarttag ? "SmartTag [LE]" : "Misc [LE]";
+                            if (current_gps.valid) {
+                                fprintf(file, "%s,%s,%s,%s,0,,%d,%.7f,%.7f,%.2f,%.2f,,%s,BLE\n",
+                                        bt_mac, escaped_bt_name, bt_cap, timestamp,
+                                        (int)bt_devices[i].rssi,
+                                        current_gps.latitude, current_gps.longitude,
+                                        current_gps.altitude, current_gps.accuracy, bt_mfgr_id);
+                                printf("%s,%s,%s,%s,0,,%d,%.7f,%.7f,%.2f,%.2f,,%s,BLE\n",
+                                       bt_mac, escaped_bt_name, bt_cap, timestamp,
+                                       (int)bt_devices[i].rssi,
+                                       current_gps.latitude, current_gps.longitude,
+                                       current_gps.altitude, current_gps.accuracy, bt_mfgr_id);
+                            } else {
+                                fprintf(file, "%s,%s,%s,%s,0,,%d,0.0000000,0.0000000,0.00,0.00,,%s,BLE\n",
+                                        bt_mac, escaped_bt_name, bt_cap, timestamp,
+                                        (int)bt_devices[i].rssi, bt_mfgr_id);
+                                printf("%s,%s,%s,%s,0,,%d,0.0000000,0.0000000,0.00,0.00,,%s,BLE\n",
+                                       bt_mac, escaped_bt_name, bt_cap, timestamp,
+                                       (int)bt_devices[i].rssi, bt_mfgr_id);
+                            }
+                        }
+                        wdp_bt_flush_count = bt_total;
                     }
 
                     fclose(file);
                     sd_sync();
                     last_flush_count = current_count;
-                    MY_LOG_INFO(TAG, "Flushed %d networks to %s", current_count, filename);
+                    MY_LOG_INFO(TAG, "Flushed %d networks + %d BT devices to %s",
+                                current_count, wdp_bt_flush_count, filename);
                     {
                         char wdp_fl3[64];
-                        snprintf(wdp_fl3, sizeof(wdp_fl3), "  %d networks", current_count);
+                        snprintf(wdp_fl3, sizeof(wdp_fl3), "  %d nets %d BT", current_count, wdp_bt_flush_count);
                         oled_display_update_full("> Wardrive Pro", "  Flushed to SD", wdp_fl3, "  D-UCB active");
                     }
                 }
@@ -5128,29 +5282,43 @@ static void wardrive_promisc_task(void *pvParameters) {
                     top_ch = wdp_ducb_channels[i].channel;
                 }
             }
-            MY_LOG_INFO(TAG, "Wardrive promisc: %d unique networks, D-UCB best ch: %d (%d visits), GPS: %s",
-                        wdp_seen_count, top_ch, top_pulls,
-                        current_gps.valid ? "valid" : "no fix");
+            MY_LOG_INFO(TAG, "Wardrive promisc: %d unique networks, %d BT devices, D-UCB best ch: %d (%d visits), GPS: %s, sats: %d, dist: %.1fm",
+                        wdp_seen_count, bt_device_count, top_ch, top_pulls,
+                        current_gps.valid ? "valid" : "no fix",
+                        current_gps.satellites, wdp_total_distance_m);
             last_stats_time = now;
         }
     }
 
     esp_wifi_set_promiscuous(false);
 
+    // Stop BLE scan if it was started
+    if (wdp_bt_running) {
+        bt_stop_scan();
+        MY_LOG_INFO(TAG, "BLE scan stopped. Total BT devices seen: %d", bt_device_count);
+    }
+
 cleanup:
+    if (wardrive_promisc_trace_path[0] != '\0') {
+        wardrive_trace_finalize_file(wardrive_promisc_trace_path);
+        MY_LOG_INFO(TAG, "Wardrive trace saved to %s (distance %.1fm)", wardrive_promisc_trace_path, wdp_total_distance_m);
+        wardrive_promisc_trace_path[0] = '\0';
+    }
     led_err = led_set_idle();
     if (led_err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to restore idle LED after wardrive promisc: %s", esp_err_to_name(led_err));
     }
 
-    MY_LOG_INFO(TAG, "Wardrive promisc stopped. Total unique networks: %d", wdp_seen_count);
+    MY_LOG_INFO(TAG, "Wardrive promisc stopped. Total unique networks: %d, BT devices: %d, distance: %.1fm",
+                wdp_seen_count, bt_device_count, wdp_total_distance_m);
     wardrive_promisc_active = false;
     wardrive_promisc_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
-static int cmd_start_wardrive_promisc(int argc, char **argv) {
+static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_enabled) {
     (void)argc; (void)argv;
+    wardrive_promisc_trace_enabled = trace_enabled;
     oled_display_update_full("> Wardrive Pro", "  Promiscuous", "  GPS + SD log", "  Active...");
     log_memory_info("start_wardrive_promisc");
 
@@ -5174,10 +5342,20 @@ static int cmd_start_wardrive_promisc(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Cannot start wardrive promisc while GPS raw reader is running. Use 'stop' first.");
         return 1;
     }
+    if (bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start wardrive promisc while BT scan is running. Use 'stop' first.");
+        return 1;
+    }
 
     operation_stop_requested = false;
 
     MY_LOG_INFO(TAG, "Starting promiscuous wardrive mode...");
+
+    // Initialize NimBLE for BT scanning (idempotent if already initialized)
+    esp_err_t bt_ret = bt_nimble_init();
+    if (bt_ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Warning: BLE init failed (%s) - wardrive will run without BT logging", esp_err_to_name(bt_ret));
+    }
 
     const bool external_feed = gps_module_uses_external_feed(current_gps_module);
 
@@ -5222,6 +5400,14 @@ static int cmd_start_wardrive_promisc(int argc, char **argv) {
 
     MY_LOG_INFO(TAG, "Wardrive promisc task started. Use 'stop' to stop.");
     return 0;
+}
+
+static int cmd_start_wardrive_promisc(int argc, char **argv) {
+    return cmd_start_wardrive_promisc_impl(argc, argv, false);
+}
+
+static int cmd_start_wardrive_promisc_trace(int argc, char **argv) {
+    return cmd_start_wardrive_promisc_impl(argc, argv, true);
 }
 
 // ============================================================================
@@ -13092,8 +13278,8 @@ static void wardrive_task(void *pvParameters) {
         // Write header if file is new
         fseek(file, 0, SEEK_END);
         if (ftell(file) == 0) {
-            fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board,display=SPI TFT,board=ESP32C5,brand=Laboratorium\n");
-            fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
+            fprintf(file, "WigleWifi-1.6,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board,display=SPI TFT,board=ESP32C5,brand=Laboratorium\n");
+            fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n");
         }
         
         // Get timestamp
@@ -13116,20 +13302,21 @@ static void wardrive_task(void *pvParameters) {
             
             // Get auth mode string
             const char* auth_mode = get_auth_mode_wiggle(ap->authmode);
+            int wifi_freq_mhz = wigle_wifi_channel_to_frequency_mhz(ap->primary);
             
             // Format line for Wiggle format
             char line[512];
             if (gps_valid_for_cycle) {
                 snprintf(line, sizeof(line), 
-                        "%s,%s,[%s],%s,%d,%d,%.7f,%.7f,%.2f,%.2f,WIFI\n",
+                        "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
                         mac_str, escaped_ssid, auth_mode, timestamp,
-                        ap->primary, ap->rssi,
+                        ap->primary, wifi_freq_mhz, ap->rssi,
                         gps_lat, gps_lon, gps_alt, gps_acc);
             } else {
                 snprintf(line, sizeof(line), 
-                        "%s,%s,[%s],%s,%d,%d,0.0000000,0.0000000,0.00,0.00,WIFI\n",
+                        "%s,%s,[%s],%s,%d,%d,%d,0.0000000,0.0000000,0.00,0.00,,,WIFI\n",
                         mac_str, escaped_ssid, auth_mode, timestamp,
-                        ap->primary, ap->rssi);
+                        ap->primary, wifi_freq_mhz, ap->rssi);
             }
             
             // Write to file and print to UART
@@ -15027,15 +15214,63 @@ static int bt_find_device_index(const uint8_t *addr)
     return -1;
 }
 
+static bool bt_grow_storage_if_needed(int required_count)
+{
+    if (required_count <= bt_device_capacity && required_count <= bt_found_device_capacity) {
+        return true;
+    }
+
+    int new_capacity = bt_device_capacity > bt_found_device_capacity ? bt_device_capacity : bt_found_device_capacity;
+    if (new_capacity <= 0) {
+        new_capacity = BT_INITIAL_CAPACITY;
+    }
+    while (new_capacity < required_count) {
+        new_capacity *= 2;
+    }
+
+    uint8_t (*new_found_devices)[6] = heap_caps_calloc(new_capacity, sizeof(*bt_found_devices), MALLOC_CAP_SPIRAM);
+    if (!new_found_devices) {
+        MY_LOG_INFO(TAG, "Failed to grow BLE dedup buffer to %d entries", new_capacity);
+        return false;
+    }
+
+    bt_device_info_t *new_bt_devices = heap_caps_calloc(new_capacity, sizeof(bt_device_info_t), MALLOC_CAP_SPIRAM);
+    if (!new_bt_devices) {
+        free(new_found_devices);
+        MY_LOG_INFO(TAG, "Failed to grow BLE device buffer to %d entries", new_capacity);
+        return false;
+    }
+
+    if (bt_found_devices && bt_found_device_count > 0) {
+        memcpy(new_found_devices, bt_found_devices,
+               (size_t)bt_found_device_count * sizeof(*bt_found_devices));
+    }
+    if (bt_devices && bt_device_count > 0) {
+        memcpy(new_bt_devices, bt_devices,
+               (size_t)bt_device_count * sizeof(bt_device_info_t));
+    }
+
+    free(bt_found_devices);
+    free(bt_devices);
+    bt_found_devices = new_found_devices;
+    bt_devices = new_bt_devices;
+    bt_found_device_capacity = new_capacity;
+    bt_device_capacity = new_capacity;
+    MY_LOG_INFO(TAG, "BLE device buffers grown to %d entries", new_capacity);
+    return true;
+}
+
 /**
  * Add BLE device to found list
  */
-static void bt_add_found_device(const uint8_t *addr)
+static bool bt_add_found_device(const uint8_t *addr)
 {
-    if (bt_found_device_count < BT_MAX_DEVICES) {
-        memcpy(bt_found_devices[bt_found_device_count], addr, 6);
-        bt_found_device_count++;
+    if (!bt_grow_storage_if_needed(bt_found_device_count + 1)) {
+        return false;
     }
+    memcpy(bt_found_devices[bt_found_device_count], addr, 6);
+    bt_found_device_count++;
+    return true;
 }
 
 /**
@@ -15047,8 +15282,12 @@ static void bt_reset_counters(void)
     bt_smarttag_count = 0;
     bt_found_device_count = 0;
     bt_device_count = 0;
-    memset(bt_found_devices, 0, sizeof(bt_found_devices));
-    memset(bt_devices, 0, BT_MAX_DEVICES * sizeof(bt_device_info_t));
+    if (bt_found_devices && bt_found_device_capacity > 0) {
+        memset(bt_found_devices, 0, (size_t)bt_found_device_capacity * sizeof(*bt_found_devices));
+    }
+    if (bt_devices && bt_device_capacity > 0) {
+        memset(bt_devices, 0, (size_t)bt_device_capacity * sizeof(bt_device_info_t));
+    }
 }
 
 /**
@@ -15058,6 +15297,85 @@ static void bt_format_addr(const uint8_t *addr, char *str)
 {
     sprintf(str, "%02X:%02X:%02X:%02X:%02X:%02X",
             addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+}
+
+static int wigle_wifi_channel_to_frequency_mhz(int channel)
+{
+    if (channel == 14) {
+        return 2484;
+    }
+    if (channel >= 1 && channel <= 13) {
+        return 2407 + (channel * 5);
+    }
+    if (channel >= 32 && channel <= 177) {
+        return 5000 + (channel * 5);
+    }
+    return 0;
+}
+
+static double gps_distance_meters(double lat1, double lon1, double lat2, double lon2)
+{
+    const double earth_radius_m = 6371000.0;
+    const double deg_to_rad = 0.017453292519943295;
+    double dlat = (lat2 - lat1) * deg_to_rad;
+    double dlon = (lon2 - lon1) * deg_to_rad;
+    double a_lat1 = lat1 * deg_to_rad;
+    double a_lat2 = lat2 * deg_to_rad;
+    double sin_dlat = sin(dlat / 2.0);
+    double sin_dlon = sin(dlon / 2.0);
+    double a = sin_dlat * sin_dlat +
+               cos(a_lat1) * cos(a_lat2) * sin_dlon * sin_dlon;
+    double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+    return earth_radius_m * c;
+}
+
+static bool wardrive_trace_init_file(const char *path)
+{
+    FILE *file = fopen(path, "w");
+    if (!file) {
+        return false;
+    }
+
+    fprintf(file, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    fprintf(file, "<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n");
+    fprintf(file, "<Document>\n");
+    fprintf(file, "  <name>Wardrive Promisc Trace</name>\n");
+    fprintf(file, "  <Style id=\"traceLine\">\n");
+    fprintf(file, "    <LineStyle><color>ff00ffff</color><width>4</width></LineStyle>\n");
+    fprintf(file, "  </Style>\n");
+    fprintf(file, "  <Placemark>\n");
+    fprintf(file, "    <name>Wardrive Trace</name>\n");
+    fprintf(file, "    <styleUrl>#traceLine</styleUrl>\n");
+    fprintf(file, "    <LineString>\n");
+    fprintf(file, "      <tessellate>1</tessellate>\n");
+    fprintf(file, "      <coordinates>\n");
+    fclose(file);
+    return true;
+}
+
+static bool wardrive_trace_append_point(const char *path, double lat, double lon, double alt)
+{
+    FILE *file = fopen(path, "a");
+    if (!file) {
+        return false;
+    }
+    fprintf(file, "        %.7f,%.7f,%.2f\n", lon, lat, alt);
+    fclose(file);
+    return true;
+}
+
+static void wardrive_trace_finalize_file(const char *path)
+{
+    FILE *file = fopen(path, "a");
+    if (!file) {
+        return;
+    }
+    fprintf(file, "      </coordinates>\n");
+    fprintf(file, "    </LineString>\n");
+    fprintf(file, "  </Placemark>\n");
+    fprintf(file, "</Document>\n");
+    fprintf(file, "</kml>\n");
+    fclose(file);
 }
 
 /**
@@ -15197,50 +15515,53 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     }
     
     // Add to found devices list
-    bt_add_found_device(desc->addr.val);
+    if (!bt_add_found_device(desc->addr.val)) {
+        return 0;
+    }
     
     // Store device info
-    if (bt_device_count < BT_MAX_DEVICES) {
-        bt_device_info_t *dev = &bt_devices[bt_device_count];
-        memcpy(dev->addr, desc->addr.val, 6);
-        dev->rssi = desc->rssi;
-        dev->name[0] = '\0';
-        dev->company_id = 0;
-        dev->is_airtag = false;
-        dev->is_smarttag = false;
-        
-        // Extract device name if available (standard AD field)
-        bool has_name = (fields.name != NULL && fields.name_len > 0);
-        if (has_name) {
-            int name_len = fields.name_len < 31 ? fields.name_len : 31;
-            memcpy(dev->name, fields.name, name_len);
-            dev->name[name_len] = '\0';
-        }
-        
-        // Check for AirTag using raw payload (Marauder method)
-        if (bt_is_airtag_payload(desc->data, desc->length_data)) {
-            dev->is_airtag = true;
-            bt_airtag_count++;
-        }
-        
-        // Check manufacturer data for SmartTag and company ID
-        if (fields.mfg_data != NULL && fields.mfg_data_len >= 2) {
-            dev->company_id = fields.mfg_data[0] | (fields.mfg_data[1] << 8);
-            
-            if (!dev->is_airtag && bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
-                dev->is_smarttag = true;
-                bt_smarttag_count++;
-            }
-        }
-        
-        bt_device_count++;
+    if (!bt_grow_storage_if_needed(bt_device_count + 1)) {
+        return 0;
     }
+    bt_device_info_t *dev = &bt_devices[bt_device_count];
+    memcpy(dev->addr, desc->addr.val, 6);
+    dev->rssi = desc->rssi;
+    dev->name[0] = '\0';
+    dev->company_id = 0;
+    dev->is_airtag = false;
+    dev->is_smarttag = false;
+    
+    // Extract device name if available (standard AD field)
+    bool has_name = (fields.name != NULL && fields.name_len > 0);
+    if (has_name) {
+        int name_len = fields.name_len < 31 ? fields.name_len : 31;
+        memcpy(dev->name, fields.name, name_len);
+        dev->name[name_len] = '\0';
+    }
+    
+    // Check for AirTag using raw payload (Marauder method)
+    if (bt_is_airtag_payload(desc->data, desc->length_data)) {
+        dev->is_airtag = true;
+        bt_airtag_count++;
+    }
+    
+    // Check manufacturer data for SmartTag and company ID
+    if (fields.mfg_data != NULL && fields.mfg_data_len >= 2) {
+        dev->company_id = fields.mfg_data[0] | (fields.mfg_data[1] << 8);
+        
+        if (!dev->is_airtag && bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
+            dev->is_smarttag = true;
+            bt_smarttag_count++;
+        }
+    }
+    
+    bt_device_count++;
     
     return 0;
 }
 
 /**
- * Start BLE scanning
+ * Start BLE scanning - full duty cycle (for dedicated BT scan commands)
  */
 static int bt_start_scan(void)
 {
@@ -15252,7 +15573,28 @@ static int bt_start_scan(void)
         .passive = 0,             // ACTIVE scan - critical for Scan Response names
         .filter_duplicates = 0,   // We handle duplicates ourselves
     };
-    
+
+    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &scan_params,
+                          bt_gap_event_callback, NULL);
+    return rc;
+}
+
+/**
+ * Start BLE scanning with reduced duty cycle for WiFi coexistence.
+ * Uses ~25% duty cycle (40ms window / 160ms interval) so the shared
+ * ESP32-C5 radio spends most of its time on WiFi promiscuous capture.
+ */
+static int bt_start_scan_coex(void)
+{
+    struct ble_gap_disc_params scan_params = {
+        .itvl = 0x100,            // 160ms interval (0x100 * 0.625ms)
+        .window = 0x40,           // 40ms window  -> ~25% duty cycle
+        .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+        .limited = 0,
+        .passive = 0,
+        .filter_duplicates = 0,
+    };
+
     int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &scan_params,
                           bt_gap_event_callback, NULL);
     return rc;
@@ -16098,6 +16440,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_promisc_cmd));
 
+    const esp_console_cmd_t wardrive_promisc_trace_cmd = {
+        .command = "start_wardrive_promisc_trace",
+        .help = "Promiscuous wardrive with D-UCB channel selection and KML trace logging",
+        .hint = NULL,
+        .func = &cmd_start_wardrive_promisc_trace,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_promisc_trace_cmd));
+
     const esp_console_cmd_t portal_cmd = {
         .command = "start_portal",
         .help = "Starts captive portal with password form: start_portal <SSID>",
@@ -16713,6 +17064,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  start_sniffer_noscan");
       MY_LOG_INFO(TAG,"  start_wardrive");
       MY_LOG_INFO(TAG,"  start_wardrive_promisc");
+      MY_LOG_INFO(TAG,"  start_wardrive_promisc_trace");
       MY_LOG_INFO(TAG,"  stop");
       MY_LOG_INFO(TAG,"  unselect_networks");
       MY_LOG_INFO(TAG,"  unselect_stations");
@@ -18912,6 +19264,9 @@ static bool parse_gps_nmea(const char* nmea_sentence) {
                 case 6: // GPS quality
                     quality = atoi(token);
                     break;
+                case 7: // Number of satellites
+                    current_gps.satellites = atoi(token);
+                    break;
                 case 8: // HDOP
                     hdop = atof(token);
                     break;
@@ -18937,6 +19292,7 @@ static bool parse_gps_nmea(const char* nmea_sentence) {
             
             return true;
         } else {
+            current_gps.satellites = 0;
             current_gps.valid = false;
             return false;
         }
