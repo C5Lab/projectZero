@@ -47,8 +47,7 @@
 #include "esp_random.h"
 #include "mbedtls/ecp.h"
 #include "mbedtls/bignum.h"
-#include "mbedtls/ctr_drbg.h"
-#include "mbedtls/entropy.h"
+#include "mbedtls/private/ctr_drbg.h"
 #include "mbedtls/base64.h"
 #include "esp_timer.h"
 #include "esp_app_format.h"
@@ -112,7 +111,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.6.0"
+#define JANOS_VERSION "1.6.1"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -1525,8 +1524,7 @@ static int64_t start_time = 0;
 static mbedtls_ecp_group ecc_group;      // grupa ECC (secp256r1)
 static mbedtls_ecp_point ecc_element;      // bieżący element (punkt ECC)
 static mbedtls_mpi ecc_scalar;             // bieżący skalar
-static mbedtls_ctr_drbg_context ctr_drbg; 
-static mbedtls_entropy_context entropy;
+static mbedtls_ctr_drbg_context ctr_drbg;
 
 /* Router BSSID */
 static uint8_t bssid[6] = { 0x30, 0xAA, 0xE4, 0x3C, 0x3F, 0x68};
@@ -8900,6 +8898,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "set_gps_position_cap", " <lat> <lon> [alt] [acc]" },
     { "start_portal", " <SSID>" },
     { "start_karma", " <index>" },
+    { "start_nmap", " [quick|medium|heavy] [IP]" },
     { "vendor", " set <on|off> | read" },
     { "boot_button", " read|list|set <short|long> <command[, command...]> | status <short|long> <on|off>" },
     { "led", " set <on|off> | level <1-100> | read" },
@@ -17330,7 +17329,6 @@ static int crypto_init(void) {
     int ret;
     const char *pers = "dragon_drain";
 
-    mbedtls_entropy_init(&entropy);
     mbedtls_ctr_drbg_init(&ctr_drbg);
 
     // TRNG as entropy source
