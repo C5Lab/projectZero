@@ -72,6 +72,7 @@
 #include "lwip/ip4_addr.h"
 #include "lwip/prot/ethernet.h"
 #include "lwip/pbuf.h"
+#include "lwip/sockets.h"
 #include "linenoise/linenoise.h"
 #include "esp_netif_net_stack.h"
 
@@ -111,7 +112,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.5.9"
+#define JANOS_VERSION "1.6.0"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -1355,6 +1356,7 @@ static int cmd_stop(int argc, char **argv);
 static int cmd_wifi_connect(int argc, char **argv);
 static int cmd_list_hosts(int argc, char **argv);
 static int cmd_list_hosts_vendor(int argc, char **argv);
+static int cmd_start_nmap(int argc, char **argv);
 static int cmd_arp_ban(int argc, char **argv);
 static void arp_ban_task(void *pvParameters);
 static int cmd_reboot(int argc, char **argv);
@@ -6002,8 +6004,8 @@ static void handshake_attack_task_selected(void) {
             if (check_handshake_file_exists((const char*)ap->ssid)) {
                 handshake_captured[i] = true;
                 captured_count++;
-                continue;
             }
+                continue;
             
             attacked_count++;
             MY_LOG_INFO(TAG, ">>> [%d/%d] Attacking '%s' (Ch %d, RSSI: %d dBm) <<<",
@@ -8902,7 +8904,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "boot_button", " read|list|set <short|long> <command[, command...]> | status <short|long> <on|off>" },
     { "led", " set <on|off> | level <1-100> | read" },
     { "channel_time", " set <min|max> <ms> | read <min|max>" },
-    { "wifi_connect", " <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
+    { "wifi_connect", " <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
     { "ota_channel", " [main|dev]" },
     { "ota_boot", " <ota_0|ota_1>" },
     { "arp_ban", " <MAC> [IP]" },
@@ -8934,8 +8936,8 @@ static const char *lookup_cli_hint(const char *command) {
 }
 
 static const char *wifi_connect_dynamic_hint(const char *buf, int *color, int *bold) {
-    static const char *hint_ssid = " <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
-    static const char *hint_pass = " <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_ssid = " <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
+    static const char *hint_pass = " [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
     static const char *hint_optional = " [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
     static const char *hint_ip_optional = " [<IP> <Netmask> <GW> [DNS1] [DNS2]]";
     static const char *hint_mask = " <Netmask> <GW> [DNS1] [DNS2]";
@@ -9111,13 +9113,13 @@ static int cmd_wifi_connect(int argc, char **argv) {
     oled_display_update_full("> WiFi Connect",
         argc >= 2 ? argv[1] : "  No SSID",
         "  STA Mode", "  Connecting...");
-    if (argc < 3 || argc > 9) {
-        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+    if (argc < 2 || argc > 9) {
+        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
         return 0;
     }
     
     const char *ssid = argv[1];
-    const char *password = argv[2];
+    const char *password = (argc >= 3) ? argv[2] : "";
     bool ota_after_connect = false;
     bool use_static_ip = false;
     esp_ip4_addr_t static_ip = { 0 };
@@ -9128,7 +9130,7 @@ static int cmd_wifi_connect(int argc, char **argv) {
     esp_ip4_addr_t static_dns1 = { 0 };
     esp_ip4_addr_t static_dns2 = { 0 };
 
-    int argi = 3;
+    int argi = (argc >= 3) ? 3 : 2;
     if (argc > argi && strcasecmp(argv[argi], "ota") == 0) {
         ota_after_connect = true;
         argi++;
@@ -9136,7 +9138,7 @@ static int cmd_wifi_connect(int argc, char **argv) {
 
     int remaining = argc - argi;
     if (remaining != 0 && remaining != 3 && remaining != 4 && remaining != 5) {
-        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+        MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
         return 0;
     }
     if (remaining >= 3) {
@@ -9228,7 +9230,12 @@ static int cmd_wifi_connect(int argc, char **argv) {
     // Configure STA and connect
     wifi_config_t sta_config = { 0 };
     strncpy((char *)sta_config.sta.ssid, ssid, sizeof(sta_config.sta.ssid) - 1);
-    strncpy((char *)sta_config.sta.password, password, sizeof(sta_config.sta.password) - 1);
+    if (password[0] != '\0') {
+        strncpy((char *)sta_config.sta.password, password, sizeof(sta_config.sta.password) - 1);
+        sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    } else {
+        sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    }
     
     esp_wifi_set_config(WIFI_IF_STA, &sta_config);
     
@@ -9247,7 +9254,9 @@ static int cmd_wifi_connect(int argc, char **argv) {
         esp_netif_ip_info_t ip_info = { 0 };
         bool has_ip = wait_for_sta_ip_info(&ip_info, 5000);
         MY_LOG_INFO(TAG, "SUCCESS: Connected to '%s'", ssid);
-        save_evil_twin_password(ssid, password);
+        if (password[0] != '\0') {
+            save_evil_twin_password(ssid, password);
+        }
         if (has_ip) {
             if (use_static_ip) {
                 MY_LOG_INFO(TAG, "Static IP: " IPSTR ", Netmask: " IPSTR ", GW: " IPSTR,
@@ -9521,178 +9530,569 @@ static int cmd_ota_boot(int argc, char **argv) {
     return 0;
 }
 
-static int cmd_list_hosts(int argc, char **argv) {
-    (void)argc; (void)argv;
-    oled_display_update_full("> ARP Scan", "  Scanning LAN", "", "  Working...");
-    
-    // Check if connected to AP
+// --- Shared host discovery (ARP batches + ICMP ping sweep) ---
+
+#define DISCOVER_MAX_HOSTS 254
+#define DISCOVER_ARP_POLL_INTERVAL_MS 200
+#define DISCOVER_ARP_POLL_ROUNDS 20
+#define DISCOVER_ICMP_WAIT_MS 2000
+#define DISCOVER_ICMP_ID 0x4A4E
+
+typedef struct {
+    uint32_t ip_addr;
+    uint8_t  mac[6];
+    bool     mac_known;
+} discovered_host_t;
+
+static uint16_t icmp_checksum(const void *data, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t sum = 0;
+    for (size_t i = 0; i < len - 1; i += 2)
+        sum += (uint16_t)(p[i] << 8 | p[i + 1]);
+    if (len & 1)
+        sum += (uint16_t)(p[len - 1] << 8);
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return htons((uint16_t)~sum);
+}
+
+static bool discover_host_already_found(const discovered_host_t *hosts, int count, uint32_t ip_addr)
+{
+    for (int i = 0; i < count; i++) {
+        if (hosts[i].ip_addr == ip_addr)
+            return true;
+    }
+    return false;
+}
+
+static int discover_lan_hosts(discovered_host_t *hosts, int max_hosts)
+{
     wifi_ap_record_t ap_info;
     if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
         MY_LOG_INFO(TAG, "Not connected to any AP. Use 'wifi_connect' first.");
-        return 1;
+        return -1;
     }
-    
-    // Get STA netif
+
     esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (!sta_netif) {
         MY_LOG_INFO(TAG, "STA interface not found");
-        return 1;
+        return -1;
     }
-    
-    // Get IP info
+
     esp_netif_ip_info_t ip_info;
     if (esp_netif_get_ip_info(sta_netif, &ip_info) != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to get IP info. DHCP may not have completed.");
-        return 1;
+        return -1;
     }
-    
     if (ip_info.ip.addr == 0) {
         MY_LOG_INFO(TAG, "No IP address assigned yet. Wait for DHCP.");
-        return 1;
+        return -1;
     }
-    
-    // Calculate host range from subnet
-    uint32_t ip = ntohl(ip_info.ip.addr);
-    uint32_t mask = ntohl(ip_info.netmask.addr);
-    uint32_t network = ip & mask;
-    uint32_t broadcast = network | ~mask;
-    uint32_t host_count_to_scan = broadcast - network - 1;
-    
-    MY_LOG_INFO(TAG, "Our IP: " IPSTR ", Netmask: " IPSTR, IP2STR(&ip_info.ip), IP2STR(&ip_info.netmask));
-    MY_LOG_INFO(TAG, "Scanning %lu hosts on network...", (unsigned long)host_count_to_scan);
-    
-    // Get LwIP netif from esp_netif
+
+    uint32_t ip_h  = ntohl(ip_info.ip.addr);
+    uint32_t mask_h = ntohl(ip_info.netmask.addr);
+    uint32_t network   = ip_h & mask_h;
+    uint32_t broadcast = network | ~mask_h;
+    uint32_t subnet_size = broadcast - network - 1;
+    if (subnet_size > (uint32_t)max_hosts)
+        subnet_size = (uint32_t)max_hosts;
+
+    MY_LOG_INFO(TAG, "Our IP: " IPSTR ", Netmask: " IPSTR,
+                IP2STR(&ip_info.ip), IP2STR(&ip_info.netmask));
+
     struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
     if (!lwip_netif) {
         MY_LOG_INFO(TAG, "Failed to get LwIP netif");
-        return 1;
+        return -1;
     }
-    
-    // Send ARP requests to all IPs in subnet
-    int requests_sent = 0;
-    for (uint32_t target = network + 1; target < broadcast && requests_sent < 254; target++) {
-        ip4_addr_t target_ip;
-        target_ip.addr = htonl(target);
-        etharp_request(lwip_netif, &target_ip);
-        requests_sent++;
-        
-        // Small delay between requests to avoid flooding
-        if (requests_sent % 10 == 0) {
+
+    int host_count = 0;
+    int arp_found = 0;
+
+    // --- Phase 1: ARP flood + repeated table polling ---
+    MY_LOG_INFO(TAG, "Phase 1: ARP scan (%lu hosts)...", (unsigned long)subnet_size);
+
+    int sent = 0;
+    for (uint32_t target = network + 1; target < broadcast && sent < max_hosts; target++, sent++) {
+        ip4_addr_t tip;
+        tip.addr = htonl(target);
+        etharp_request(lwip_netif, &tip);
+        if (sent % 10 == 0)
             vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    MY_LOG_INFO(TAG, "Sent %d ARP requests, polling table for %d seconds...",
+                sent, (DISCOVER_ARP_POLL_INTERVAL_MS * DISCOVER_ARP_POLL_ROUNDS) / 1000);
+
+    for (int round = 0; round < DISCOVER_ARP_POLL_ROUNDS; round++) {
+        vTaskDelay(pdMS_TO_TICKS(DISCOVER_ARP_POLL_INTERVAL_MS));
+        for (int i = 0; i < ARP_TABLE_SIZE && host_count < max_hosts; i++) {
+            ip4_addr_t *ip_ret;
+            struct netif *netif_ret;
+            struct eth_addr *eth_ret;
+            if (etharp_get_entry(i, &ip_ret, &netif_ret, &eth_ret) == 1) {
+                if (!discover_host_already_found(hosts, host_count, ip_ret->addr)) {
+                    hosts[host_count].ip_addr = ip_ret->addr;
+                    memcpy(hosts[host_count].mac, eth_ret->addr, 6);
+                    hosts[host_count].mac_known = true;
+                    host_count++;
+                    arp_found++;
+                }
+            }
         }
     }
-    
-    MY_LOG_INFO(TAG, "Sent %d ARP requests, waiting for responses...", requests_sent);
-    
-    // Wait for ARP responses
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    
-    // Read and display ARP table
+
+    MY_LOG_INFO(TAG, "ARP: found %d hosts", arp_found);
+
+    // --- Phase 2: ICMP ping sweep for unfound IPs ---
+    int ping_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (ping_sock < 0) {
+        MY_LOG_INFO(TAG, "ICMP socket failed, skipping ping sweep");
+        return host_count;
+    }
+
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
+    setsockopt(ping_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    typedef struct __attribute__((packed)) {
+        uint8_t  type;
+        uint8_t  code;
+        uint16_t checksum;
+        uint16_t id;
+        uint16_t seqno;
+    } icmp_echo_t;
+
+    int pings_sent = 0;
+    uint16_t seq = 0;
+    for (uint32_t target = network + 1; target < broadcast && (int)seq < max_hosts; target++) {
+        uint32_t target_net = htonl(target);
+        if (discover_host_already_found(hosts, host_count, target_net))
+            continue;
+
+        icmp_echo_t echo = {0};
+        echo.type = 8;
+        echo.code = 0;
+        echo.id   = htons(DISCOVER_ICMP_ID);
+        echo.seqno = htons(seq++);
+        echo.checksum = 0;
+        echo.checksum = icmp_checksum(&echo, sizeof(echo));
+
+        struct sockaddr_in dest = {
+            .sin_family = AF_INET,
+            .sin_addr.s_addr = target_net,
+        };
+        sendto(ping_sock, &echo, sizeof(echo), 0,
+               (struct sockaddr *)&dest, sizeof(dest));
+        pings_sent++;
+
+        if (pings_sent % 10 == 0)
+            vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    MY_LOG_INFO(TAG, "Phase 2: sent %d ICMP pings, waiting for replies...", pings_sent);
+    vTaskDelay(pdMS_TO_TICKS(DISCOVER_ICMP_WAIT_MS));
+
+    int icmp_found = 0;
+    char recv_buf[64];
+    struct sockaddr_in from;
+    socklen_t fromlen;
+    for (;;) {
+        fromlen = sizeof(from);
+        int n = recvfrom(ping_sock, recv_buf, sizeof(recv_buf), 0,
+                         (struct sockaddr *)&from, &fromlen);
+        if (n <= 0) break;
+
+        if (n < 20 + (int)sizeof(icmp_echo_t)) continue;
+        int ihl = (recv_buf[0] & 0x0F) * 4;
+        if (n < ihl + (int)sizeof(icmp_echo_t)) continue;
+        icmp_echo_t *reply = (icmp_echo_t *)(recv_buf + ihl);
+        if (reply->type != 0 || reply->code != 0) continue;
+        if (ntohs(reply->id) != DISCOVER_ICMP_ID) continue;
+
+        uint32_t src_ip = from.sin_addr.s_addr;
+        if (host_count < max_hosts &&
+            !discover_host_already_found(hosts, host_count, src_ip)) {
+            hosts[host_count].ip_addr = src_ip;
+            memset(hosts[host_count].mac, 0, 6);
+            hosts[host_count].mac_known = false;
+            host_count++;
+            icmp_found++;
+        }
+    }
+    close(ping_sock);
+
+    MY_LOG_INFO(TAG, "ICMP: found %d additional hosts", icmp_found);
+    MY_LOG_INFO(TAG, "Total: %d hosts discovered (%d ARP + %d ICMP)",
+                host_count, arp_found, icmp_found);
+
+    return host_count;
+}
+
+// --- Host listing commands ---
+
+static int cmd_list_hosts(int argc, char **argv) {
+    (void)argc; (void)argv;
+    oled_display_update_full("> Host Scan", "  Scanning LAN", "", "  Working...");
+
+    discovered_host_t *hosts = calloc(DISCOVER_MAX_HOSTS, sizeof(discovered_host_t));
+    if (!hosts) {
+        MY_LOG_INFO(TAG, "Out of memory for host list");
+        return 1;
+    }
+
+    int host_count = discover_lan_hosts(hosts, DISCOVER_MAX_HOSTS);
+    if (host_count < 0) {
+        free(hosts);
+        return 1;
+    }
+
     MY_LOG_INFO(TAG, "=== Discovered Hosts ===");
-    int found_count = 0;
-    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-        ip4_addr_t *ip_ret;
-        struct netif *netif_ret;
-        struct eth_addr *eth_ret;
-        if (etharp_get_entry(i, &ip_ret, &netif_ret, &eth_ret) == 1) {
-            MY_LOG_INFO(TAG, "  %d.%d.%d.%d  ->  %02X:%02X:%02X:%02X:%02X:%02X",
-                ip4_addr1(ip_ret), ip4_addr2(ip_ret), ip4_addr3(ip_ret), ip4_addr4(ip_ret),
-                eth_ret->addr[0], eth_ret->addr[1], eth_ret->addr[2],
-                eth_ret->addr[3], eth_ret->addr[4], eth_ret->addr[5]);
-            found_count++;
+    int arp_cnt = 0, icmp_cnt = 0;
+    for (int i = 0; i < host_count; i++) {
+        ip4_addr_t tmp;
+        tmp.addr = hosts[i].ip_addr;
+        uint8_t *m = hosts[i].mac;
+        if (hosts[i].mac_known) {
+            MY_LOG_INFO(TAG, "  " IPSTR "  ->  %02X:%02X:%02X:%02X:%02X:%02X  [ARP]",
+                IP2STR(&tmp), m[0], m[1], m[2], m[3], m[4], m[5]);
+            arp_cnt++;
+        } else {
+            MY_LOG_INFO(TAG, "  " IPSTR "  ->  (MAC unknown)  [ICMP]", IP2STR(&tmp));
+            icmp_cnt++;
         }
     }
     MY_LOG_INFO(TAG, "========================");
-    MY_LOG_INFO(TAG, "Found %d hosts", found_count);
-    
+    MY_LOG_INFO(TAG, "Found %d hosts (%d via ARP, %d via ICMP)", host_count, arp_cnt, icmp_cnt);
+
+    free(hosts);
     return 0;
 }
 
 static int cmd_list_hosts_vendor(int argc, char **argv) {
     (void)argc; (void)argv;
-    
-    // Check if connected to AP
-    wifi_ap_record_t ap_info;
-    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
-        MY_LOG_INFO(TAG, "Not connected to any AP. Use 'wifi_connect' first.");
+    oled_display_update_full("> Host Scan", "  Scanning LAN", "  + vendor lookup", "  Working...");
+
+    discovered_host_t *hosts = calloc(DISCOVER_MAX_HOSTS, sizeof(discovered_host_t));
+    if (!hosts) {
+        MY_LOG_INFO(TAG, "Out of memory for host list");
         return 1;
     }
-    
-    // Get STA netif
-    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (!sta_netif) {
-        MY_LOG_INFO(TAG, "STA interface not found");
+
+    int host_count = discover_lan_hosts(hosts, DISCOVER_MAX_HOSTS);
+    if (host_count < 0) {
+        free(hosts);
         return 1;
     }
-    
-    // Get IP info
-    esp_netif_ip_info_t ip_info;
-    if (esp_netif_get_ip_info(sta_netif, &ip_info) != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to get IP info. DHCP may not have completed.");
-        return 1;
-    }
-    
-    if (ip_info.ip.addr == 0) {
-        MY_LOG_INFO(TAG, "No IP address assigned yet. Wait for DHCP.");
-        return 1;
-    }
-    
-    // Calculate host range from subnet
-    uint32_t ip = ntohl(ip_info.ip.addr);
-    uint32_t mask = ntohl(ip_info.netmask.addr);
-    uint32_t network = ip & mask;
-    uint32_t broadcast = network | ~mask;
-    uint32_t host_count_to_scan = broadcast - network - 1;
-    
-    MY_LOG_INFO(TAG, "Our IP: " IPSTR ", Netmask: " IPSTR, IP2STR(&ip_info.ip), IP2STR(&ip_info.netmask));
-    MY_LOG_INFO(TAG, "Scanning %lu hosts on network...", (unsigned long)host_count_to_scan);
-    
-    // Get LwIP netif from esp_netif
-    struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
-    if (!lwip_netif) {
-        MY_LOG_INFO(TAG, "Failed to get LwIP netif");
-        return 1;
-    }
-    
-    // Send ARP requests to all IPs in subnet
-    int requests_sent = 0;
-    for (uint32_t target = network + 1; target < broadcast && requests_sent < 254; target++) {
-        ip4_addr_t target_ip;
-        target_ip.addr = htonl(target);
-        etharp_request(lwip_netif, &target_ip);
-        requests_sent++;
-        
-        // Small delay between requests to avoid flooding
-        if (requests_sent % 10 == 0) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
-    
-    MY_LOG_INFO(TAG, "Sent %d ARP requests, waiting for responses...", requests_sent);
-    
-    // Wait for ARP responses
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    
-    // Read and display ARP table with vendor info
+
     MY_LOG_INFO(TAG, "=== Discovered Hosts ===");
-    int found_count = 0;
-    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-        ip4_addr_t *ip_ret;
-        struct netif *netif_ret;
-        struct eth_addr *eth_ret;
-        if (etharp_get_entry(i, &ip_ret, &netif_ret, &eth_ret) == 1) {
-            const char *vendor = lookup_vendor_name(eth_ret->addr);
-            MY_LOG_INFO(TAG, "  %d.%d.%d.%d  ->  %02X:%02X:%02X:%02X:%02X:%02X [%s]",
-                ip4_addr1(ip_ret), ip4_addr2(ip_ret), ip4_addr3(ip_ret), ip4_addr4(ip_ret),
-                eth_ret->addr[0], eth_ret->addr[1], eth_ret->addr[2],
-                eth_ret->addr[3], eth_ret->addr[4], eth_ret->addr[5],
+    int arp_cnt = 0, icmp_cnt = 0;
+    for (int i = 0; i < host_count; i++) {
+        ip4_addr_t tmp;
+        tmp.addr = hosts[i].ip_addr;
+        uint8_t *m = hosts[i].mac;
+        if (hosts[i].mac_known) {
+            const char *vendor = lookup_vendor_name(m);
+            MY_LOG_INFO(TAG, "  " IPSTR "  ->  %02X:%02X:%02X:%02X:%02X:%02X  [%s]  [ARP]",
+                IP2STR(&tmp), m[0], m[1], m[2], m[3], m[4], m[5],
                 vendor ? vendor : "Unknown");
-            found_count++;
+            arp_cnt++;
+        } else {
+            MY_LOG_INFO(TAG, "  " IPSTR "  ->  (MAC unknown)  [ICMP]", IP2STR(&tmp));
+            icmp_cnt++;
         }
     }
     MY_LOG_INFO(TAG, "========================");
-    MY_LOG_INFO(TAG, "Found %d hosts", found_count);
-    
+    MY_LOG_INFO(TAG, "Found %d hosts (%d via ARP, %d via ICMP)", host_count, arp_cnt, icmp_cnt);
+
+    free(hosts);
+    return 0;
+}
+
+// --- Port scanner (nmap-like) ---
+
+typedef struct {
+    uint16_t port;
+    const char *name;
+} nmap_port_entry_t;
+
+static const nmap_port_entry_t nmap_ports[] = {
+    // --- quick (first 20) ---
+    {   21, "FTP"        },
+    {   22, "SSH"        },
+    {   23, "Telnet"     },
+    {   25, "SMTP"       },
+    {   53, "DNS"        },
+    {   80, "HTTP"       },
+    {  110, "POP3"       },
+    {  135, "MSRPC"      },
+    {  139, "NetBIOS"    },
+    {  143, "IMAP"       },
+    {  443, "HTTPS"      },
+    {  445, "SMB"        },
+    {  993, "IMAPS"      },
+    { 1433, "MSSQL"      },
+    { 3306, "MySQL"      },
+    { 3389, "RDP"        },
+    { 5432, "PostgreSQL" },
+    { 5900, "VNC"        },
+    { 8080, "HTTP-alt"   },
+    { 8443, "HTTPS-alt"  },
+    // --- medium (next 30) ---
+    {  111, "RPCbind"    },
+    {  161, "SNMP"       },
+    {  162, "SNMP-trap"  },
+    {  389, "LDAP"       },
+    {  465, "SMTPS"      },
+    {  514, "Syslog"     },
+    {  515, "LPD"        },
+    {  554, "RTSP"       },
+    {  587, "Submission" },
+    {  636, "LDAPS"      },
+    {  873, "Rsync"      },
+    {  995, "POP3S"      },
+    { 1080, "SOCKS"      },
+    { 1443, "IES-LM"     },
+    { 1521, "Oracle"     },
+    { 1883, "MQTT"       },
+    { 2049, "NFS"        },
+    { 2181, "ZooKeeper"  },
+    { 2375, "Docker"     },
+    { 3000, "Grafana"    },
+    { 3128, "Squid"      },
+    { 4443, "Pharos"     },
+    { 5000, "UPnP"       },
+    { 5060, "SIP"        },
+    { 5222, "XMPP"       },
+    { 5601, "Kibana"     },
+    { 6379, "Redis"      },
+    { 8000, "HTTP-alt2"  },
+    { 8888, "HTTP-alt3"  },
+    { 9090, "Prometheus" },
+    // --- heavy (next 50) ---
+    {   69, "TFTP"       },
+    {  179, "BGP"        },
+    {  502, "Modbus"     },
+    {  548, "AFP"        },
+    {  623, "IPMI"       },
+    {  631, "IPP"        },
+    {  902, "VMware"     },
+    { 1194, "OpenVPN"    },
+    { 1234, "VLC"        },
+    { 1723, "PPTP"       },
+    { 1900, "SSDP"       },
+    { 2082, "cPanel"     },
+    { 2083, "cPanel-SSL" },
+    { 2222, "SSH-alt"    },
+    { 2484, "Oracle-SSL" },
+    { 3268, "LDAP-GC"    },
+    { 3269, "LDAPS-GC"   },
+    { 3690, "SVN"        },
+    { 4000, "ICQ"        },
+    { 4444, "Metasploit" },
+    { 4567, "Sinatra"    },
+    { 4848, "GlassFish"  },
+    { 5353, "mDNS"       },
+    { 5433, "PostgreAlt" },
+    { 5672, "AMQP"       },
+    { 5984, "CouchDB"    },
+    { 6000, "X11"        },
+    { 6443, "K8s-API"    },
+    { 6660, "IRC"        },
+    { 6667, "IRC"        },
+    { 7001, "WebLogic"   },
+    { 7077, "Spark"      },
+    { 7474, "Neo4j"      },
+    { 8008, "HTTP-alt4"  },
+    { 8081, "HTTP-alt5"  },
+    { 8181, "HTTP-alt6"  },
+    { 8444, "HTTP-alt7"  },
+    { 8834, "Nessus"     },
+    { 8883, "MQTT-SSL"   },
+    { 9000, "SonarQube"  },
+    { 9092, "Kafka"      },
+    { 9100, "JetDirect"  },
+    { 9200, "Elastic"    },
+    { 9443, "WSO2"       },
+    {10000, "Webmin"     },
+    {11211, "Memcached"  },
+    {15672, "RabbitMQ"   },
+    {25565, "Minecraft"  },
+    {27017, "MongoDB"    },
+    {28017, "MongoHTTP"  },
+    {50000, "SAP"        },
+};
+#define NMAP_PORTS_QUICK   20
+#define NMAP_PORTS_MEDIUM  50
+#define NMAP_PORTS_HEAVY  100
+#define NMAP_CONNECT_TIMEOUT_MS 500
+
+static bool nmap_check_port(uint32_t ip_net_order, uint16_t port)
+{
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) return false;
+
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(port),
+        .sin_addr.s_addr = ip_net_order,
+    };
+
+    int ret = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret == 0) {
+        close(sock);
+        return true;
+    }
+    if (errno != EINPROGRESS) {
+        close(sock);
+        return false;
+    }
+
+    fd_set wset;
+    FD_ZERO(&wset);
+    FD_SET(sock, &wset);
+    struct timeval tv = {
+        .tv_sec  = NMAP_CONNECT_TIMEOUT_MS / 1000,
+        .tv_usec = (NMAP_CONNECT_TIMEOUT_MS % 1000) * 1000,
+    };
+
+    bool open = false;
+    if (select(sock + 1, NULL, &wset, NULL, &tv) > 0) {
+        int so_err = 0;
+        socklen_t len = sizeof(so_err);
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_err, &len);
+        open = (so_err == 0);
+    }
+
+    close(sock);
+    return open;
+}
+
+static int cmd_start_nmap(int argc, char **argv)
+{
+    int port_count = NMAP_PORTS_QUICK;
+    const char *level_name = "quick";
+    uint32_t single_ip = 0;
+    bool single_host_mode = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcasecmp(argv[i], "quick") == 0) {
+            port_count = NMAP_PORTS_QUICK;
+            level_name = "quick";
+        } else if (strcasecmp(argv[i], "medium") == 0) {
+            port_count = NMAP_PORTS_MEDIUM;
+            level_name = "medium";
+        } else if (strcasecmp(argv[i], "heavy") == 0) {
+            port_count = NMAP_PORTS_HEAVY;
+            level_name = "heavy";
+        } else {
+            struct in_addr parsed;
+            if (inet_aton(argv[i], &parsed)) {
+                single_ip = parsed.s_addr;
+                single_host_mode = true;
+            } else {
+                MY_LOG_INFO(TAG, "Usage: start_nmap [quick|medium|heavy] [IP]");
+                return 1;
+            }
+        }
+    }
+
+    oled_display_update_full("> NMAP Scan",
+        single_host_mode ? "  Single host" : "  Discovering hosts",
+        "", "  Working...");
+    log_memory_info("start_nmap");
+
+    MY_LOG_INFO(TAG, "Scan level: %s (%d ports)", level_name, port_count);
+
+    discovered_host_t *hosts = calloc(DISCOVER_MAX_HOSTS, sizeof(discovered_host_t));
+    if (!hosts) {
+        MY_LOG_INFO(TAG, "Out of memory for host list");
+        return 1;
+    }
+
+    int host_count = 0;
+
+    if (single_host_mode) {
+        hosts[0].ip_addr = single_ip;
+        memset(hosts[0].mac, 0, 6);
+        hosts[0].mac_known = false;
+        host_count = 1;
+        MY_LOG_INFO(TAG, "Single-host mode, skipping host discovery.");
+    } else {
+        host_count = discover_lan_hosts(hosts, DISCOVER_MAX_HOSTS);
+        if (host_count < 0) {
+            free(hosts);
+            return 1;
+        }
+    }
+
+    MY_LOG_INFO(TAG, "Scanning %d host(s), %d ports each (%s)...",
+                host_count, port_count, level_name);
+
+    int total_open = 0;
+
+    MY_LOG_INFO(TAG, "=== NMAP Scan Results ===");
+    for (int h = 0; h < host_count; h++) {
+        uint32_t host_ip = hosts[h].ip_addr;
+        uint8_t *m = hosts[h].mac;
+
+        char ip_str[16];
+        ip4_addr_t tmp;
+        tmp.addr = host_ip;
+        snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&tmp));
+
+        char oled_line[40];
+        snprintf(oled_line, sizeof(oled_line), "  %d/%d %s", h + 1, host_count, ip_str);
+        oled_display_update_full("> NMAP Scan", oled_line, "  Scanning ports...", "");
+
+        if (hosts[h].mac_known) {
+            MY_LOG_INFO(TAG, "Host: %s  (%02X:%02X:%02X:%02X:%02X:%02X)",
+                        ip_str, m[0], m[1], m[2], m[3], m[4], m[5]);
+        } else {
+            MY_LOG_INFO(TAG, "Host: %s  (MAC unknown)", ip_str);
+        }
+
+        int open_on_host = 0;
+        for (int p = 0; p < port_count; p++) {
+            if (operation_stop_requested) break;
+            if (p % 10 == 0) {
+                int end_p = p + 9;
+                if (end_p >= port_count) end_p = port_count - 1;
+                MY_LOG_INFO(TAG, "  Scanning %s ports %d-%d [%d/%d] ...",
+                            ip_str, nmap_ports[p].port, nmap_ports[end_p].port, p + 1, port_count);
+                char oled_prog[40];
+                snprintf(oled_prog, sizeof(oled_prog), "  Port %d/%d (%d-%d)",
+                         p + 1, port_count, nmap_ports[p].port, nmap_ports[end_p].port);
+                oled_display_update_full("> NMAP Scan", oled_line, oled_prog, "");
+            }
+            if (nmap_check_port(host_ip, nmap_ports[p].port)) {
+                MY_LOG_INFO(TAG, "  %5d/tcp  open  %s",
+                            nmap_ports[p].port, nmap_ports[p].name);
+                open_on_host++;
+                total_open++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (operation_stop_requested) {
+            MY_LOG_INFO(TAG, "  (scan stopped by user)");
+            break;
+        }
+        if (open_on_host == 0) {
+            MY_LOG_INFO(TAG, "  (no open ports)");
+        }
+    }
+    MY_LOG_INFO(TAG, "=========================");
+    MY_LOG_INFO(TAG, "Scanned %d hosts, found %d open ports", host_count, total_open);
+
+    free(hosts);
+
+    oled_display_update_full("> NMAP Done",
+        host_count > 0 ? "  Scan complete" : "  No hosts found",
+        "", "");
+
     return 0;
 }
 
@@ -16159,8 +16559,8 @@ static void register_commands(void)
 
     const esp_console_cmd_t wifi_connect_cmd = {
         .command = "wifi_connect",
-        .help = "Connect to AP as STA: wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
-        .hint = "<SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
+        .help = "Connect to AP as STA: wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
+        .hint = "<SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]",
         .func = &cmd_wifi_connect,
         .argtable = NULL
     };
@@ -16237,6 +16637,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&list_hosts_vendor_cmd));
+
+    const esp_console_cmd_t nmap_cmd = {
+        .command = "start_nmap",
+        .help = "Port scan: start_nmap [quick|medium|heavy] [IP]",
+        .hint = NULL,
+        .func = &cmd_start_nmap,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&nmap_cmd));
 
     const esp_console_cmd_t arp_ban_cmd = {
         .command = "arp_ban",
@@ -16647,6 +17056,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  start_gps_raw");
       MY_LOG_INFO(TAG,"  start_handshake [index1] [index2] ...");
       MY_LOG_INFO(TAG,"  start_karma <index>");
+      MY_LOG_INFO(TAG,"  start_nmap [quick|medium|heavy] [IP]");
       MY_LOG_INFO(TAG,"  start_portal <SSID>");
       MY_LOG_INFO(TAG,"  start_rogueap <SSID> <password>");
       MY_LOG_INFO(TAG,"  start_sniffer");
@@ -16660,7 +17070,7 @@ void app_main(void) {
       MY_LOG_INFO(TAG,"  unselect_stations");
       MY_LOG_INFO(TAG,"  vendor set <on|off> | vendor read");
       MY_LOG_INFO(TAG,"  version");
-      MY_LOG_INFO(TAG,"  wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
+      MY_LOG_INFO(TAG,"  wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
       MY_LOG_INFO(TAG,"  wifi_disconnect");
       MY_LOG_INFO(TAG,"  wdgwars_key set <key> | wdgwars_key read");
       MY_LOG_INFO(TAG,"  wdgwars_upload");

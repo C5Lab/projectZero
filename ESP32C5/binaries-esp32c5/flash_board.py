@@ -1,8 +1,96 @@
+#!/usr/bin/env python3
 import time
 import sys
 import subprocess
 import os
 import argparse
+try:
+    from importlib import metadata as importlib_metadata
+except ImportError:
+    importlib_metadata = None
+
+# Colors
+RED = "\033[91m"; GREEN = "\033[92m"; YELLOW = "\033[93m"; CYAN = "\033[96m"; RESET = "\033[0m"
+
+VERSION = "v04"
+MIN_ESPTOOL_VERSION = "5.2.0"
+DEFAULT_BAUD = 460800  # Original default; can be overridden via CLI
+REQUIRED_FILES = ["bootloader.bin", "partition-table.bin", "projectZero.bin"]
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+VENV_DIR = os.environ.get("FLASH_BOARD_VENV", os.path.join(SCRIPT_DIR, ".venv"))
+
+def parse_version(version):
+    parts = []
+    prerelease = False
+    for part in version.split("."):
+        digits = []
+        for ch in part:
+            if ch.isdigit():
+                digits.append(ch)
+            else:
+                prerelease = True
+                break
+        parts.append(int("".join(digits) or 0))
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3]), prerelease
+
+def is_version_at_least(installed, required):
+    installed_tuple, installed_prerelease = parse_version(installed)
+    required_tuple, _ = parse_version(required)
+    if installed_tuple != required_tuple:
+        return installed_tuple > required_tuple
+    return not installed_prerelease
+
+def get_esptool_version(esptool_module):
+    if importlib_metadata is not None:
+        try:
+            return importlib_metadata.version("esptool")
+        except importlib_metadata.PackageNotFoundError:
+            pass
+    return getattr(esptool_module, "__version__", None)
+
+def in_virtualenv():
+    return (
+        getattr(sys, "base_prefix", sys.prefix) != sys.prefix
+        or getattr(sys, "real_prefix", None) is not None
+    )
+
+def get_venv_python(venv_dir=VENV_DIR):
+    if os.name == "nt":
+        return os.path.join(venv_dir, "Scripts", "python.exe")
+    return os.path.join(venv_dir, "bin", "python")
+
+def create_local_venv(venv_dir=VENV_DIR):
+    venv_python = get_venv_python(venv_dir)
+    if os.path.exists(venv_python):
+        return venv_python
+    print(f"{YELLOW}Creating local virtual environment: {venv_dir}{RESET}")
+    try:
+        subprocess.check_call([sys.executable, "-m", "venv", venv_dir])
+    except subprocess.CalledProcessError:
+        print(f"{RED}Failed to create virtual environment at {venv_dir}.{RESET}")
+        print(f"{YELLOW}Install Python venv support (for Debian/Ubuntu: apt install python3-venv) and retry.{RESET}")
+        sys.exit(1)
+    return venv_python
+
+def ensure_pip(python_executable):
+    probe = subprocess.run(
+        [python_executable, "-m", "pip", "--version"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if probe.returncode == 0:
+        return
+    subprocess.check_call([python_executable, "-m", "ensurepip", "--upgrade"])
+
+def install_with_python(python_executable, packages):
+    ensure_pip(python_executable)
+    print(f"{YELLOW}Installing/upgrading packages: {', '.join(packages)}{RESET}")
+    subprocess.check_call([python_executable, "-m", "pip", "install", "--upgrade"] + packages)
+
+def reexec_with_python(python_executable):
+    os.execv(python_executable, [python_executable] + sys.argv)
 
 def ensure_packages():
     missing = []
@@ -11,24 +99,21 @@ def ensure_packages():
     except ImportError:
         missing.append("pyserial")
     try:
-        import esptool  # noqa
+        import esptool
     except ImportError:
-        missing.append("esptool")
+        missing.append(f"esptool>={MIN_ESPTOOL_VERSION}")
+    else:
+        installed_version = get_esptool_version(esptool)
+        if not installed_version or not is_version_at_least(installed_version, MIN_ESPTOOL_VERSION):
+            missing.append(f"esptool>={MIN_ESPTOOL_VERSION}")
     if missing:
-        print("\033[93mInstalling missing packages: " + ", ".join(missing) + "\033[0m")
-        subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        target_python = sys.executable if in_virtualenv() else create_local_venv()
+        install_with_python(target_python, missing)
+        reexec_with_python(target_python)
 
 ensure_packages()
 import serial
 import serial.tools.list_ports
-
-# Colors
-RED = "\033[91m"; GREEN = "\033[92m"; YELLOW = "\033[93m"; CYAN = "\033[96m"; RESET = "\033[0m"
-
-VERSION = "v04"
-DEFAULT_BAUD = 460800  # Original default; can be overridden via CLI
-REQUIRED_FILES = ["bootloader.bin", "partition-table.bin", "projectZero.bin"]
 
 # Keep these offsets in sync with partitions.csv.
 OFFSETS = {
