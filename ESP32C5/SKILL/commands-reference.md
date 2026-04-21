@@ -306,9 +306,13 @@ Connect to 'MojaSiec' WiFi network to access the portal
 ## WiFi Connection (STA Mode)
 
 ### `wifi_connect`
-- **Syntax**: `wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]`
-- **Description**: Connects to an AP as STA. Optional static IP config.
-- **Example**: `wifi_connect AX4 ruletka2022`
+- **Syntax**: `wifi_connect <SSID> [Password] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]`
+- **Description**: Connects to an AP as STA. Password is optional -- omit it for open (no-password) networks. Optional static IP config.
+- **Examples**:
+  - WPA2 network: `wifi_connect AX4 ruletka2022`
+  - Open network: `wifi_connect BRW`
+  - With OTA: `wifi_connect AX4 ruletka2022 ota`
+  - Static IP: `wifi_connect AX4 ruletka2022 192.168.1.50 255.255.255.0 192.168.1.1`
 - **Output**:
 ```
 Connecting to AP 'AX4'...
@@ -318,10 +322,11 @@ WiFi initialized OK
 Waiting for connection result...
 Wi-Fi: connected to SSID='AX4'
 SUCCESS: Connected to 'AX4'
+DHCP IP: 192.168.0.5, Netmask: 255.255.255.0, GW: 192.168.0.1
 ```
 - **Success marker**: `strstr("SUCCESS")`
-- **Failure markers**: `strstr("FAILED")` or `strstr("Error")`
-- **Notes**: `ota` flag enables OTA-related behavior.
+- **Failure markers**: `strstr("FAILED")` or `strstr("TIMEOUT")`
+- **Notes**: When password is omitted, firmware sets `authmode = WIFI_AUTH_OPEN`. When password is provided, `authmode = WIFI_AUTH_WPA2_PSK`. The `ota` flag triggers OTA check after successful connection.
 
 ### `wifi_disconnect`
 - **Syntax**: `wifi_disconnect`
@@ -358,6 +363,85 @@ Sent 254 ARP requests, waiting for responses...
 - **Example**: `arp_ban C4:2B:44:12:29:15 192.168.3.61`
 - **Prerequisite**: `wifi_connect`.
 - **Stop**: Send `stop`.
+
+---
+
+## Network Scanning (NMAP)
+
+### `start_nmap`
+- **Syntax**: `start_nmap [quick|medium|heavy] [IP]`
+- **Description**: TCP port scanner. Discovers live hosts on the LAN (ARP + ICMP) then probes each host's ports with non-blocking TCP connect (500ms timeout per port). Can scan a single IP or the full subnet.
+- **Scan levels**:
+  - `quick` (default): 20 most common ports (FTP, SSH, HTTP, SMB, RDP, etc.)
+  - `medium`: 50 ports (adds LDAP, MQTT, Docker, Redis, etc.)
+  - `heavy`: 100 ports (adds TFTP, BGP, Modbus, MongoDB, Minecraft, etc.)
+- **Examples**:
+  - `start_nmap` -- quick scan of entire subnet
+  - `start_nmap heavy` -- 100-port scan of entire subnet
+  - `start_nmap medium 192.168.0.4` -- 50-port scan of single host
+- **Prerequisite**: `wifi_connect` (must be connected to a network).
+- **Stop**: Send `stop` (checked between each port probe).
+- **Output phases** (in order):
+
+**Phase 1 -- Host Discovery (only when not in single-host mode)**:
+```
+[MEM] start_nmap: Internal=125/251KB, DMA=109/235KB, PSRAM=7944/8192KB
+Scan level: heavy (100 ports)
+Our IP: 192.168.0.5, Netmask: 255.255.255.0
+Phase 1: ARP scan (254 hosts)...
+Sent 254 ARP requests, polling table for 4 seconds...
+ARP: found 3 hosts
+Phase 2: sent 251 ICMP pings, waiting for replies...
+ICMP: found 1 additional hosts
+Total: 4 hosts discovered (3 ARP + 1 ICMP)
+```
+
+**Phase 2 -- Port Scanning** (repeated per host):
+```
+Scanning 4 host(s), 100 ports each (heavy)...
+=== NMAP Scan Results ===
+Host: 192.168.0.1  (00:0B:00:00:AD:D0)
+  Scanning 192.168.0.1 ports 21-143 [1/100] ...
+     80/tcp  open  HTTP
+  Scanning 192.168.0.1 ports 443-8443 [11/100] ...
+  Scanning 192.168.0.1 ports 111-636 [21/100] ...
+  ...
+Host: 192.168.0.4  (00:C0:CA:B4:E6:3F)
+  Scanning 192.168.0.4 ports 21-143 [1/100] ...
+    135/tcp  open  MSRPC
+    139/tcp  open  NetBIOS
+  Scanning 192.168.0.4 ports 443-8443 [11/100] ...
+    445/tcp  open  SMB
+  ...
+Host: 192.168.0.128  (5C:D8:9E:8C:0C:B2)
+  Scanning 192.168.0.128 ports 21-143 [1/100] ...
+  ...
+  (no open ports)
+=========================
+Scanned 4 hosts, found 4 open ports
+```
+
+- **Key line formats for parsing**:
+
+| Line pattern | Meaning | Regex |
+|---|---|---|
+| `Scan level: <level> (<N> ports)` | Scan started, extract level and total port count | `Scan level: (\w+) \((\d+) ports\)` |
+| `Our IP: <IP>, Netmask: <mask>` | Local IP info | `Our IP: ([\d.]+), Netmask: ([\d.]+)` |
+| `Total: <N> hosts discovered` | Host discovery complete, extract host count | `Total: (\d+) hosts discovered` |
+| `Scanning <N> host(s), <M> ports each (<level>)...` | Port scan phase starting | `Scanning (\d+) host.*?(\d+) ports` |
+| `=== NMAP Scan Results ===` | Results header (marks start of per-host output) | literal match |
+| `Host: <IP>  (<MAC>)` | New host block starts | `Host: ([\d.]+)\s+\(([0-9A-Fa-f:]+)\)` |
+| `Host: <IP>  (MAC unknown)` | New host block, no MAC | `Host: ([\d.]+)\s+\(MAC unknown\)` |
+| `  Scanning <IP> ports <from>-<to> [<current>/<total>] ...` | Progress: current port batch | `Scanning ([\d.]+) ports (\d+)-(\d+) \[(\d+)/(\d+)\]` |
+| `  <port>/tcp  open  <service>` | Open port found | `(\d+)/tcp\s+open\s+(\S+)` |
+| `  (no open ports)` | Host has no open ports | literal match |
+| `  (scan stopped by user)` | User sent `stop` during scan | literal match |
+| `=========================` | Results footer | literal match |
+| `Scanned <N> hosts, found <M> open ports` | Final summary | `Scanned (\d+) hosts, found (\d+) open ports` |
+
+- **Completion marker**: `strstr("Scanned") && strstr("open ports")` -- this is the last line of output.
+- **Progress tracking**: The `Scanning <IP> ports <from>-<to> [<current>/<total>]` lines are emitted every 10 ports. Use `current` and `total` to calculate percentage. Combine with the host index from counting `Host:` lines vs total from the `Scanning N host(s)` line for overall progress.
+- **Single-host mode**: When an IP argument is given, host discovery is skipped entirely. Output starts with `Single-host mode, skipping host discovery.` followed directly by the port scan.
 
 ---
 
@@ -630,9 +714,9 @@ SSID removed. 2 SSIDs remaining.
 - **Description**: Sets or reads display mode for attached OLED/LCD.
 
 ### `boot_button`
-- **Syntax**: `boot_button read` | `boot_button list` | `boot_button set <short|long> <command>` | `boot_button status <short|long> <on|off>`
-- **Description**: Configures boot button press actions.
-- **Allowed commands**: `start_blackout`, `start_sniffer_dog`, `channel_view`, `packet_monitor`, `start_sniffer`, `scan_networks`, `start_gps_raw`, `start_wardrive`, `deauth_detector`
+- **Syntax**: `boot_button read` | `boot_button list` | `boot_button set <short|long> <command[, command...]>` | `boot_button status <short|long> <on|off>`
+- **Description**: Configures boot button press actions. Multiple commands can be chained with commas, for example `list_sd, select_html 1, start_portal FreeWifi`.
+- **Allowed commands**: `start_blackout`, `start_sniffer_dog`, `channel_view`, `packet_monitor`, `start_sniffer`, `scan_networks`, `start_gps_raw`, `start_wardrive`, `deauth_detector`, `list_sd`, `select_html`, `start_portal`
 
 ### `led`
 - **Syntax**: `led set <on|off>` | `led level <1-100>` | `led read`
@@ -688,6 +772,12 @@ SSID removed. 2 SSIDs remaining.
 ### `download`
 - **Syntax**: `download`
 - **Description**: Reboots into ROM download (UART flashing) mode.
+
+### `version`
+- **Syntax**: `version`
+- **Description**: Prints the current JanOS firmware version.
+- **Output**: `"JanOS version: X.Y.Z"`
+- **Notes**: Use to check which firmware version is running on the device.
 
 ### `help`
 - **Syntax**: `help` or `help <command>`
