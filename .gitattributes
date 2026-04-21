@@ -1,1 +1,2 @@
 ESP32C5/sdkconfig* text eol=lf
+*.sh text eol=lf

