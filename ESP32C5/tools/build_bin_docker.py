@@ -5,7 +5,7 @@ brudzenia drzewa roboczego. Tworzy tymczasową kopię repo, buduje w kontenerze,
 po czym kopiuje artefakty do ESP32C5/tools/docker_bin_output.
 
 Usage:
-    python ESP32C5/tools/build_bin_docker.py [--image espressif/idf:v6.0-beta1]
+    python ESP32C5/tools/build_bin_docker.py [--image espressif/idf:release-v6.0]
 """
 
 import argparse
@@ -21,8 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--image",
-        default="espressif/idf:v6.0-beta1",
-        help="Docker image to use (default: espressif/idf:v6.0-beta1)",
+        default="espressif/idf:release-v6.0",
+        help="Docker image to use (default: espressif/idf:release-v6.0)",
     )
     return parser.parse_args()
 
@@ -57,6 +57,18 @@ def main() -> int:
         print(f"Failed to prepare workspace: {exc}", file=sys.stderr)
         shutil.rmtree(tmpdir, ignore_errors=True)
         return 1
+
+    # Windows checkouts can carry CRLF into shell scripts; normalize to LF
+    # so bash inside Docker parses options like `set -euo pipefail` correctly.
+    shell_script = workspace / ".github" / "scripts" / "container_build.sh"
+    if shell_script.is_file():
+        try:
+            content = shell_script.read_bytes()
+            shell_script.write_bytes(content.replace(b"\r\n", b"\n"))
+        except OSError as exc:
+            print(f"Failed to normalize script line endings: {exc}", file=sys.stderr)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return 1
 
     cmd = [
         "docker",
