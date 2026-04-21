@@ -1,4 +1,4 @@
-name: ESP32C5 Build (IDF 6.0-beta1)
+name: ESP32C5 Build (IDF 6.0)
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ jobs:
       contents: write
     runs-on: ubuntu-24.04
     container:
-      image: espressif/idf:release-v6.0
+      image: espressif/idf:v6.0
     outputs:
       fw_version: ${{ steps.version.outputs.version }}
     steps:
@@ -34,12 +34,12 @@ jobs:
         uses: actions/cache@v5
         with:
           path: /root/.espressif
-          key: espidf-6.0-${{ runner.os }}-${{ hashFiles('ESP32C5/sdkconfig', 'ESP32C5/dependencies.lock') }}
+          key: espidf-v6.0-stable-${{ runner.os }}-${{ hashFiles('ESP32C5/sdkconfig', 'ESP32C5/dependencies.lock') }}
           restore-keys: |
-            espidf-6.0-${{ runner.os }}-
-            espidf-6.0-
+            espidf-v6.0-stable-${{ runner.os }}-
+            espidf-v6.0-stable-
 
-      - name: Build JanOS (IDF 6.0)
+      - name: Build JanOS (IDF 6.0 stable)
         run: IDF_PY_FLAGS="--preview" bash .github/scripts/container_build.sh --no-docker
 
       - name: Stamp JanOS with JANOS_VERSION

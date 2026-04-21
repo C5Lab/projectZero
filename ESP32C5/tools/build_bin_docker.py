@@ -5,7 +5,7 @@ brudzenia drzewa roboczego. Tworzy tymczasową kopię repo, buduje w kontenerze,
 po czym kopiuje artefakty do ESP32C5/tools/docker_bin_output.
 
 Usage:
-    python ESP32C5/tools/build_bin_docker.py [--image espressif/idf:release-v6.0]
+    python ESP32C5/tools/build_bin_docker.py [--image espressif/idf:v6.0]
 """
 
 import argparse
@@ -21,8 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--image",
-        default="espressif/idf:release-v6.0",
-        help="Docker image to use (default: espressif/idf:release-v6.0)",
+        default="espressif/idf:v6.0",
+        help="Docker image to use (default: espressif/idf:v6.0)",
     )
     return parser.parse_args()
 
