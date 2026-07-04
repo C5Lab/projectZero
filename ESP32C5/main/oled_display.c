@@ -30,6 +30,9 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "driver/i2c_master.h"
+#include "driver/spi_master.h"
+#include "driver/gpio.h"
+#include "board_spi.h"
 
 #include "lvgl.h"
 
@@ -111,6 +114,63 @@ static const char *TAG = "display";
 #ifndef OLED_UNIT_LCD_I2C_FREQ_HZ
 #define OLED_UNIT_LCD_I2C_FREQ_HZ 400000
 #endif
+
+/* --- LILYGO T-Dongle-C5 ST7735 SPI LCD (0.96" 80x160 panel, used landscape) --- */
+/* Bus pins come from board_spi.h (shared SPI2). Only the panel-private lines here. */
+#ifndef ST7735_CS_GPIO
+#define ST7735_CS_GPIO          10
+#endif
+#ifndef ST7735_DC_GPIO
+#define ST7735_DC_GPIO          3   /* RS / data-command */
+#endif
+#ifndef ST7735_RST_GPIO
+#define ST7735_RST_GPIO         1
+#endif
+#ifndef ST7735_BL_GPIO
+#define ST7735_BL_GPIO          0   /* backlight */
+#endif
+/* T-Dongle-C5 backlight is ACTIVE-LOW (confirmed on hardware: GPIO0=0 -> lit). */
+#ifndef ST7735_BL_ON
+#define ST7735_BL_ON            0
+#endif
+#ifndef ST7735_BL_OFF
+#define ST7735_BL_OFF           1
+#endif
+#ifndef ST7735_PCLK_HZ
+#define ST7735_PCLK_HZ          (20 * 1000 * 1000)
+#endif
+/* Landscape geometry: 160 wide x 80 tall. */
+#ifndef ST7735_W
+#define ST7735_W                160
+#endif
+#ifndef ST7735_H
+#define ST7735_H                80
+#endif
+/* Panel RAM offsets for the common 0.96" 80x160 module in landscape orientation.
+ * If the image is shifted, tune these two (portrait module is 26/1 -> swapped here). */
+#ifndef ST7735_COL_OFFSET
+#define ST7735_COL_OFFSET       1
+#endif
+#ifndef ST7735_ROW_OFFSET
+#define ST7735_ROW_OFFSET       26
+#endif
+/* MADCTL for landscape; flip MY/MX/MV bits here if mirrored/upside-down. */
+#ifndef ST7735_MADCTL
+#define ST7735_MADCTL           0x60   /* MV|MX -> landscape, RGB order */
+#endif
+/* Text layout: 5x7 font scaled x2 -> 6 lines worth of room; we use 4 lines. */
+#ifndef ST7735_TEXT_SCALE
+#define ST7735_TEXT_SCALE       2
+#endif
+#ifndef ST7735_COLOR_STATUS
+#define ST7735_COLOR_STATUS     1   /* color-code lines by keyword like the Unit LCD */
+#endif
+/* Flush in horizontal bands so each SPI DMA transfer stays small (shared bus).
+ * ST7735_W * ST7735_FLUSH_ROWS * 2 must be <= BOARD_SPI_MAX_TRANSFER. */
+#ifndef ST7735_FLUSH_ROWS
+#define ST7735_FLUSH_ROWS       8   /* 160*8*2 = 2560 bytes per band */
+#endif
+#define ST7735_BAND_BYTES       (ST7735_W * ST7735_FLUSH_ROWS * 2)
 
 #define BUS_A_SDA               OLED_BUS_A_SDA_GPIO
 #define BUS_A_SCL               OLED_BUS_A_SCL_GPIO
@@ -1383,6 +1443,296 @@ fail:
     return false;
 }
 
+/* ====================================================================== */
+/*        ST7735  DRIVER  (LILYGO T-Dongle-C5, raw SPI framebuffer)       */
+/* ====================================================================== */
+
+static esp_lcd_panel_io_handle_t s_st7735_io = NULL;
+static uint8_t *s_st7735_fb = NULL;       /* PSRAM: ST7735_W * ST7735_H * 2 (RGB565 BE) */
+static uint8_t *s_st7735_bounce = NULL;   /* internal DMA: one band (ST7735_BAND_BYTES) */
+/* Runtime-tunable for bring-up via the `lcd` CLI command. */
+static uint8_t s_st7735_col_off = ST7735_COL_OFFSET;
+static uint8_t s_st7735_row_off = ST7735_ROW_OFFSET;
+
+static inline esp_err_t st7735_cmd(uint8_t cmd, const uint8_t *data, size_t len)
+{
+    return esp_lcd_panel_io_tx_param(s_st7735_io, cmd, data, len);
+}
+
+static void st7735_reset_hw(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << ST7735_RST_GPIO) | (1ULL << ST7735_BL_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&io);
+    gpio_set_level(ST7735_BL_GPIO, ST7735_BL_OFF);   /* backlight off during init */
+    gpio_set_level(ST7735_RST_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(ST7735_RST_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level(ST7735_RST_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(120));
+}
+
+static esp_err_t st7735_send_init_seq(void)
+{
+    typedef struct { uint8_t cmd; uint8_t len; uint8_t delay_ms; uint8_t data[16]; } st_cmd_t;
+    static const st_cmd_t seq[] = {
+        {0x01, 0, 150, {0}},                                   /* SWRESET */
+        {0x11, 0, 255, {0}},                                   /* SLPOUT  */
+        {0xB1, 3, 0,   {0x01,0x2C,0x2D}},                      /* FRMCTR1 */
+        {0xB2, 3, 0,   {0x01,0x2C,0x2D}},                      /* FRMCTR2 */
+        {0xB3, 6, 0,   {0x01,0x2C,0x2D,0x01,0x2C,0x2D}},       /* FRMCTR3 */
+        {0xB4, 1, 0,   {0x07}},                                /* INVCTR  */
+        {0xC0, 3, 0,   {0xA2,0x02,0x84}},                      /* PWCTR1  */
+        {0xC1, 1, 0,   {0xC5}},                                /* PWCTR2  */
+        {0xC2, 2, 0,   {0x0A,0x00}},                           /* PWCTR3  */
+        {0xC3, 2, 0,   {0x8A,0x2A}},                           /* PWCTR4  */
+        {0xC4, 2, 0,   {0x8A,0xEE}},                           /* PWCTR5  */
+        {0xC5, 1, 0,   {0x0E}},                                /* VMCTR1  */
+        {0x21, 0, 0,   {0}},                                   /* INVON (80x160 panels) */
+        {0x36, 1, 0,   {ST7735_MADCTL}},                       /* MADCTL  */
+        {0x3A, 1, 0,   {0x05}},                                /* COLMOD 16-bit */
+        {0xE0, 16, 0,  {0x02,0x1C,0x07,0x12,0x37,0x32,0x29,0x2D,
+                        0x29,0x25,0x2B,0x39,0x00,0x01,0x03,0x10}}, /* GMCTRP1 */
+        {0xE1, 16, 0,  {0x03,0x1D,0x07,0x06,0x2E,0x2C,0x29,0x2D,
+                        0x2E,0x2E,0x37,0x3F,0x00,0x00,0x02,0x10}}, /* GMCTRN1 */
+        {0x13, 0, 10,  {0}},                                   /* NORON   */
+        {0x29, 0, 100, {0}},                                   /* DISPON  */
+    };
+    for (size_t i = 0; i < sizeof(seq)/sizeof(seq[0]); i++) {
+        esp_err_t e = st7735_cmd(seq[i].cmd, seq[i].len ? seq[i].data : NULL, seq[i].len);
+        if (e != ESP_OK) return e;
+        if (seq[i].delay_ms) vTaskDelay(pdMS_TO_TICKS(seq[i].delay_ms));
+    }
+    return ESP_OK;
+}
+
+static inline void st7735_put_pixel(int x, int y, uint16_t c)
+{
+    if (!s_st7735_fb) return;
+    if (x < 0 || y < 0 || x >= ST7735_W || y >= ST7735_H) return;
+    uint8_t *p = &s_st7735_fb[(y * ST7735_W + x) * 2];
+    p[0] = (uint8_t)(c >> 8);   /* ST7735 expects high byte first */
+    p[1] = (uint8_t)(c & 0xFF);
+}
+
+static void st7735_fb_fill(uint16_t c)
+{
+    if (!s_st7735_fb) return;
+    uint8_t hi = (uint8_t)(c >> 8), lo = (uint8_t)(c & 0xFF);
+    for (int i = 0; i < ST7735_W * ST7735_H; i++) {
+        s_st7735_fb[i * 2]     = hi;
+        s_st7735_fb[i * 2 + 1] = lo;
+    }
+}
+
+static void st7735_draw_char(char ch, int cx, int cy, int scale, uint16_t fg)
+{
+    const uint8_t *g = font_get_glyph(ch);
+    for (int col = 0; col < 5; col++) {
+        uint8_t bits = g[col];
+        for (int row = 0; row < 7; row++) {
+            if (!(bits & (1 << row))) continue;
+            for (int sx = 0; sx < scale; sx++)
+                for (int sy = 0; sy < scale; sy++)
+                    st7735_put_pixel(cx + col * scale + sx, cy + row * scale + sy, fg);
+        }
+    }
+}
+
+static void st7735_draw_text(const char *text, int x, int y, int scale, int max_chars, uint16_t fg)
+{
+    if (!text || !text[0]) return;
+    char buf[64];
+    int len = truncate_text(text, buf, sizeof(buf), max_chars);
+    int pitch = 5 * scale + scale;  /* glyph + 1-col gap */
+    for (int i = 0; i < len; i++)
+        st7735_draw_char(buf[i], x + i * pitch, y, scale, fg);
+}
+
+static esp_err_t st7735_flush(void)
+{
+    if (!s_st7735_io || !s_st7735_fb || !s_st7735_bounce) return ESP_FAIL;
+    const uint8_t xs = s_st7735_col_off;
+    const uint8_t xe = s_st7735_col_off + ST7735_W - 1;
+    uint8_t caset[4] = {0x00, xs, 0x00, xe};
+
+    /* Push the PSRAM framebuffer in horizontal bands through a small internal
+     * DMA bounce buffer, so each SPI transfer is tiny and shares the bus nicely
+     * with the SD card. Address window is set per band via RASET. */
+    for (int y = 0; y < ST7735_H; y += ST7735_FLUSH_ROWS) {
+        int rows = ST7735_H - y;
+        if (rows > ST7735_FLUSH_ROWS) rows = ST7735_FLUSH_ROWS;
+        size_t bytes = (size_t)rows * ST7735_W * 2;
+
+        uint8_t ys = (uint8_t)(s_st7735_row_off + y);
+        uint8_t ye = (uint8_t)(s_st7735_row_off + y + rows - 1);
+        uint8_t raset[4] = {0x00, ys, 0x00, ye};
+
+        esp_err_t e;
+        if ((e = st7735_cmd(0x2A, caset, 4)) != ESP_OK) return e;   /* CASET */
+        if ((e = st7735_cmd(0x2B, raset, 4)) != ESP_OK) return e;   /* RASET */
+
+        memcpy(s_st7735_bounce, &s_st7735_fb[(size_t)y * ST7735_W * 2], bytes);
+        if ((e = esp_lcd_panel_io_tx_color(s_st7735_io, 0x2C,       /* RAMWR */
+                                           s_st7735_bounce, bytes)) != ESP_OK) {
+            return e;
+        }
+    }
+    return ESP_OK;
+}
+
+static int st7735_max_chars(void)
+{
+    int pitch = 5 * ST7735_TEXT_SCALE + ST7735_TEXT_SCALE;
+    return ST7735_W / pitch;
+}
+
+static uint16_t st7735_line_color(const char *line, int idx)
+{
+#if ST7735_COLOR_STATUS
+    return ulcd_status_color_for_line(line, idx);
+#else
+    (void)line; (void)idx; return 0xFFFF;
+#endif
+}
+
+static void st7735_update(const char *lines[4])
+{
+    st7735_fb_fill(0x0000);
+    const int scale = ST7735_TEXT_SCALE;
+    const int line_h = 7 * scale;
+    const int gap = (ST7735_H - 4 * line_h) / 5;  /* even vertical spacing */
+    const int mc = st7735_max_chars();
+    int y = gap;
+    for (int i = 0; i < 4; i++) {
+        if (lines[i] && lines[i][0]) {
+            uint16_t fg = st7735_line_color(lines[i], i);
+            st7735_draw_text(lines[i], 2, y, scale, mc, fg);
+        }
+        y += line_h + gap;
+    }
+    st7735_flush();
+}
+
+static void st7735_draw_monster(void)
+{
+    st7735_fb_fill(0x0000);
+    const int scale = ST7735_TEXT_SCALE;
+    const char *text = "Monster !";
+    int pitch = 5 * scale + scale;
+    int tw = (int)strlen(text) * pitch - scale;
+    int sx = (ST7735_W - tw) / 2;
+    int sy = (ST7735_H - 7 * scale) / 2;
+    if (sx < 0) sx = 0;
+    if (sy < 0) sy = 0;
+    st7735_draw_text(text, sx, sy, scale, st7735_max_chars(), 0x07FF);
+    st7735_flush();
+}
+
+static bool st7735_init(void)
+{
+    ESP_LOGI(TAG, "Probing ST7735 SPI LCD (CS=%d DC=%d RST=%d BL=%d) on shared SPI bus",
+             ST7735_CS_GPIO, ST7735_DC_GPIO, ST7735_RST_GPIO, ST7735_BL_GPIO);
+
+    if (board_shared_spi_bus_init() != ESP_OK) {
+        return false;
+    }
+
+    if (!s_st7735_fb) {
+        /* Full framebuffer in PSRAM (keeps the scarce internal DMA pool free). */
+        s_st7735_fb = heap_caps_malloc(ST7735_W * ST7735_H * 2,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_st7735_fb) {
+            ESP_LOGE(TAG, "ST7735 framebuffer alloc failed (%d bytes)", ST7735_W * ST7735_H * 2);
+            return false;
+        }
+    }
+    if (!s_st7735_bounce) {
+        /* One band, internal DMA-capable memory for the actual SPI transfers. */
+        s_st7735_bounce = heap_caps_malloc(ST7735_BAND_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        if (!s_st7735_bounce) {
+            ESP_LOGE(TAG, "ST7735 bounce buffer alloc failed (%d bytes)", ST7735_BAND_BYTES);
+            return false;
+        }
+    }
+
+    st7735_reset_hw();
+
+    esp_lcd_panel_io_spi_config_t io_cfg = {
+        .cs_gpio_num = ST7735_CS_GPIO,
+        .dc_gpio_num = ST7735_DC_GPIO,
+        .spi_mode = 0,
+        .pclk_hz = ST7735_PCLK_HZ,
+        .trans_queue_depth = 10,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+    };
+    if (esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)BOARD_SPI_HOST,
+                                 &io_cfg, &s_st7735_io) != ESP_OK) {
+        ESP_LOGE(TAG, "ST7735 panel IO create failed");
+        return false;
+    }
+
+    if (st7735_send_init_seq() != ESP_OK) {
+        ESP_LOGE(TAG, "ST7735 init sequence failed");
+        esp_lcd_panel_io_del(s_st7735_io);
+        s_st7735_io = NULL;
+        return false;
+    }
+
+    st7735_fb_fill(0x0000);
+    if (st7735_flush() != ESP_OK) {
+        ESP_LOGE(TAG, "ST7735 first flush failed");
+        esp_lcd_panel_io_del(s_st7735_io);
+        s_st7735_io = NULL;
+        return false;
+    }
+
+    gpio_set_level(ST7735_BL_GPIO, ST7735_BL_ON);  /* backlight on (active-low) */
+    ESP_LOGI(TAG, "ST7735 ready (%dx%d landscape) on shared SPI bus", ST7735_W, ST7735_H);
+    return true;
+}
+
+/* ---- Bring-up debug hooks, driven by the `lcd` CLI command ---- */
+void oled_st7735_dbg_backlight(int on)
+{
+    gpio_set_level(ST7735_BL_GPIO, on ? ST7735_BL_ON : ST7735_BL_OFF);
+    ESP_LOGI(TAG, "ST7735 backlight (GPIO%d) %s", ST7735_BL_GPIO, on ? "ON" : "OFF");
+}
+
+void oled_st7735_dbg_fill(uint16_t color)
+{
+    if (s_display_type != DISPLAY_ST7735) return;
+    _lock_acquire(&s_api_lock);
+    st7735_fb_fill(color);
+    st7735_flush();
+    _lock_release(&s_api_lock);
+    ESP_LOGI(TAG, "ST7735 fill 0x%04X", color);
+}
+
+void oled_st7735_dbg_madctl(int madctl, int invert)
+{
+    if (s_display_type != DISPLAY_ST7735 || !s_st7735_io) return;
+    _lock_acquire(&s_api_lock);
+    uint8_t m = (uint8_t)madctl;
+    st7735_cmd(0x36, &m, 1);                 /* MADCTL */
+    st7735_cmd(invert ? 0x21 : 0x20, NULL, 0); /* INVON / INVOFF */
+    st7735_flush();
+    _lock_release(&s_api_lock);
+    ESP_LOGI(TAG, "ST7735 MADCTL=0x%02X invert=%d", (unsigned)(uint8_t)madctl, invert);
+}
+
+void oled_st7735_dbg_offset(int col, int row)
+{
+    s_st7735_col_off = (uint8_t)col;
+    s_st7735_row_off = (uint8_t)row;
+    oled_st7735_dbg_fill(0xF800);  /* red, so the visible window is obvious */
+    ESP_LOGI(TAG, "ST7735 offsets col=%d row=%d", col, row);
+}
+
 static void release_bus_b(void)
 {
     if (s_i2c_bus_b) {
@@ -1477,9 +1827,27 @@ static bool select_bus_b_non_ssd_displays(void)
     return false;
 }
 
+static bool select_st7735(void)
+{
+    if (!st7735_init()) {
+        return false;
+    }
+    s_display_type = DISPLAY_ST7735;
+    s_detected_addr_7bit = 0;   /* SPI display, no I2C address */
+    s_detected_addr_raw = 0;
+    ESP_LOGI(TAG, "Display: ST7735 SPI LCD %dx%d (LILYGO T-Dongle-C5)", ST7735_W, ST7735_H);
+    st7735_draw_monster();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    return true;
+}
+
 static bool select_forced_display(void)
 {
     switch (s_forced_type) {
+    case DISPLAY_ST7735:
+        ESP_LOGI(TAG, "Display force mode: ST7735");
+        return select_st7735();
+
     case DISPLAY_SSD1306:
         ESP_LOGI(TAG, "Display force mode: SSD1306");
         return select_ssd1306(SSD1306_BUS_A_BIT | SSD1306_BUS_B_BIT);
@@ -1647,6 +2015,8 @@ static void oled_render_cached_locked(bool cursor_visible)
         sh1106_update(render_lines);
     else if (s_display_type == DISPLAY_UNIT_LCD)
         ulcd_update(render_lines);
+    else if (s_display_type == DISPLAY_ST7735)
+        st7735_update(render_lines);
 }
 
 static void oled_cursor_blink_task(void *arg)
@@ -1659,7 +2029,12 @@ static void oled_cursor_blink_task(void *arg)
     while (1) {
         vTaskDelay(tick);
         _lock_acquire(&s_api_lock);
-        if ((s_cursor_blink_enabled || s_dots_anim_enabled) && s_display_type != DISPLAY_NONE) {
+        /* ST7735 shares its SPI bus with the SD card. Flushing the panel from
+         * this background task concurrently with SD I/O can deadlock the bus, so
+         * the cursor/dots animation is driven only by explicit (main-task)
+         * updates for ST7735 - never from here. */
+        if ((s_cursor_blink_enabled || s_dots_anim_enabled) &&
+            s_display_type != DISPLAY_NONE && s_display_type != DISPLAY_ST7735) {
             bool changed = false;
 
             if (s_cursor_blink_enabled) {
@@ -1723,6 +2098,7 @@ void oled_display_set_forced_type(display_type_t type)
     case DISPLAY_SH1107:
     case DISPLAY_SH1106:
     case DISPLAY_UNIT_LCD:
+    case DISPLAY_ST7735:
         s_forced_type = type;
         break;
     default:
@@ -1781,6 +2157,11 @@ void oled_display_init(void)
         release_bus_b();
         ESP_LOGW(TAG, "Forced display init failed (type=%d). Check wiring/address and reset force mode to auto.",
                  (int)s_forced_type);
+        return;
+    }
+
+    /* LILYGO T-Dongle-C5: onboard ST7735 SPI LCD is the primary display. */
+    if (select_st7735()) {
         return;
     }
 

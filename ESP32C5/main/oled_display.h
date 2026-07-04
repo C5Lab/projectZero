@@ -14,6 +14,7 @@ typedef enum {
     DISPLAY_SH1107,         /**< SH1107 1.3"  OLED 128x64 (GPIO 8/9)    */
     DISPLAY_SH1106,         /**< SH1106 1.3"  OLED 128x64 (GPIO 8/9)    */
     DISPLAY_UNIT_LCD,       /**< M5 Unit LCD 1.14" ST7789 (GPIO 8/9)     */
+    DISPLAY_ST7735,         /**< LILYGO T-Dongle-C5 ST7735 SPI LCD 160x80 */
 } display_type_t;
 
 /**
@@ -82,6 +83,12 @@ void oled_display_update_full(const char *line1, const char *line2,
  * Clear all four lines of the display.
  */
 void oled_display_clear(void);
+
+/* ---- ST7735 bring-up debug hooks (used by the `lcd` CLI command) ---- */
+void oled_st7735_dbg_backlight(int on);
+void oled_st7735_dbg_fill(uint16_t color);
+void oled_st7735_dbg_madctl(int madctl, int invert);
+void oled_st7735_dbg_offset(int col, int row);
 
 #ifdef __cplusplus
 }

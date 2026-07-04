@@ -1,13 +1,12 @@
 # Main task stack - increased from 3584 to avoid overflow during startup help printing
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 
-# Console: keep stdio only on UART0. Disabling the USB-Serial-JTAG secondary
-# console prevents the vfs_console fan-out which otherwise sends every byte
-# (logs and linenoise queries) to BOTH UART0 and USB-JTAG, causing duplicated
-# output and "ghost" characters bouncing back into stdin.
+# Console on USB-Serial-JTAG (LILYGO T-Dongle-C5 is a USB stick: flash + log +
+# CLI all over the one USB cable). USB-JTAG is the PRIMARY console (not the
+# secondary fan-out), so there is no duplicated output / "ghost" char issue.
+# Secondary kept NONE to avoid mirroring to UART0.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
-# CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG is not set
-# CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_ENABLED is not set
 
 # Partition table - custom 8 MB OTA layout for BLE+WiFi app
 CONFIG_PARTITION_TABLE_CUSTOM=y
@@ -23,19 +22,16 @@ CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
-# Default log level - ERROR only
-CONFIG_LOG_DEFAULT_LEVEL_ERROR=y
-CONFIG_LOG_DEFAULT_LEVEL=1
+# Default log level - INFO (temporarily verbose for T-Dongle-C5 bring-up).
+# Revert to ERROR (LEVEL=1) once display/SD are confirmed working.
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_DEFAULT_LEVEL=3
 
-# Bootloader log level - ERROR only
-CONFIG_LOG_BOOTLOADER_LEVEL_ERROR=y
-CONFIG_LOG_BOOTLOADER_LEVEL=1
+# Bootloader log level - INFO (show boot/partition/PSRAM init on UART0 GPIO11/12)
+CONFIG_LOG_BOOTLOADER_LEVEL_INFO=y
+CONFIG_LOG_BOOTLOADER_LEVEL=3
 
-# UART-only console
-CONFIG_ESP_CONSOLE_UART_DEFAULT=y
-CONFIG_ESP_CONSOLE_UART=y
-CONFIG_ESP_CONSOLE_UART_NUM=0
-CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+# (console selected above: USB-Serial-JTAG)
 
 # Enable Bluetooth with NimBLE stack
 CONFIG_BT_ENABLED=y

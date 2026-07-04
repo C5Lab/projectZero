@@ -42,7 +42,6 @@
 
 #include "driver/gpio.h"
 
-#include "led_strip.h"
 
 #include "esp_random.h"
 #include "mbedtls/ecp.h"
@@ -94,6 +93,7 @@
 #include "frame_analyzer_types.h"
 #include "sniffer.h"
 #include "oled_display.h"
+#include "board_spi.h"
 #include "nrf24_jammer.h"
 #include <math.h>
 
@@ -163,10 +163,6 @@
 
 
 
-#define NEOPIXEL_GPIO      27
-#define LED_COUNT          1
-#define RMT_RES_HZ         (10 * 1000 * 1000)  // 10 MHz
-
 // Boot/flash button (GPIO28) starts sniffer dog on tap, blackout on long-press
 #define BOOT_BUTTON_GPIO               28
 #define BOOT_BUTTON_TASK_STACK_SIZE    2048
@@ -175,19 +171,42 @@
 #define BOOT_BUTTON_POLL_DELAY_MS      20
 #define BOOT_BUTTON_LONG_PRESS_MS      1000
 
-// GPS UART pins (Marauder compatible)
+// GPS UART pins.
+// NOTE: On the LILYGO T-Dongle-C5 there is no GPS header, and the original
+// Marauder pins (GPIO13/GPIO14) are the native USB D-/D+ lines on this board.
+// Driving UART1 there would tear down USB, so GPS is moved to free, unused pins.
+// GPS is effectively unused here; this only keeps the subsystem harmless.
 #define GPS_UART_NUM       UART_NUM_1
-#define GPS_TX_PIN         13
-#define GPS_RX_PIN         14
+#define GPS_TX_PIN         15
+#define GPS_RX_PIN         16
 #define GPS_BUF_SIZE       1024
 #define GPS_BAUD_ATGM336H  9600
 #define GPS_BAUD_M5STACK   115200
 
-// SD Card SPI pins (Marauder compatible)
-#define SD_MISO_PIN        2
-#define SD_MOSI_PIN        7  
+// SD Card SPI pins (LILYGO T-Dongle-C5: SDMMC routed over SDSPI, shared SPI bus)
+//   D0/MISO=IO07, CMD/MOSI=IO02, CLK=IO06, CS=IO23
+#define SD_MISO_PIN        7
+#define SD_MOSI_PIN        2
 #define SD_CLK_PIN         6
-#define SD_CS_PIN          10
+#define SD_CS_PIN          23
+
+// LILYGO T-Dongle-C5 ST7735 LCD (80x160) on the SHARED SPI bus (SPI2_HOST)
+//   SCK=IO06, MOSI=IO02, MISO=IO07 are shared with the SD card -> bus mutex required.
+#define TFT_SCK_PIN        6
+#define TFT_MOSI_PIN       2
+#define TFT_MISO_PIN       7
+#define TFT_CS_PIN         10
+#define TFT_DC_PIN         3    // RS / data-command
+#define TFT_RST_PIN        1
+#define TFT_BL_PIN         0    // backlight
+#define TFT_H_RES          160
+#define TFT_V_RES          80
+
+// LILYGO T-Dongle-C5 addressable LED is an APA102 (2-wire, clocked), NOT WS2812.
+//   Dedicated pins per official pinout: DI=IO05 (data), CI=IO04 (clock).
+//   Not shared with the SPI bus, so it is bit-banged independently.
+#define LED_APA102_DI_PIN  5
+#define LED_APA102_CI_PIN  4
 
 #define MY_LOG_INFO(tag, fmt, ...) printf("" fmt "\n", ##__VA_ARGS__)
 
@@ -1043,7 +1062,6 @@ char * evilTwinSSID = NULL;
 char * evilTwinPassword = NULL;
 char * portalSSID = NULL;  // SSID for standalone portal mode
 int connectAttemptCount = 0;
-led_strip_handle_t strip;
 static bool last_password_wrong = false;
 
 typedef struct {
@@ -1079,22 +1097,43 @@ static uint8_t led_scale_component(uint8_t value) {
     return (uint8_t)scaled;
 }
 
+// --- APA102 (DotStar) bit-bang driver for the single onboard LED ---
+// T-Dongle-C5 uses an APA102, not a WS2812. Dedicated pins DI=IO05, CI=IO04,
+// so a simple bit-bang is enough (no SPI bus contention).
+static inline void apa102_write_byte(uint8_t value) {
+    for (int i = 0; i < 8; i++) {
+        gpio_set_level(LED_APA102_DI_PIN, (value & 0x80) ? 1 : 0);
+        gpio_set_level(LED_APA102_CI_PIN, 1);
+        gpio_set_level(LED_APA102_CI_PIN, 0);
+        value <<= 1;
+    }
+}
+
+// Push one BGR pixel. Global 5-bit brightness kept at max; per-channel scaling
+// is already applied by the caller via led_scale_component().
+static void apa102_show(uint8_t r, uint8_t g, uint8_t b) {
+    // Start frame: 4 zero bytes
+    for (int i = 0; i < 4; i++) apa102_write_byte(0x00);
+    // LED frame: 0xE0 | brightness(0x1F), then B, G, R
+    apa102_write_byte(0xE0 | 0x1F);
+    apa102_write_byte(b);
+    apa102_write_byte(g);
+    apa102_write_byte(r);
+    // End frame: clock out >= n/2 bits; one byte covers a single LED
+    apa102_write_byte(0xFF);
+}
+
 static esp_err_t led_commit_color(uint8_t r, uint8_t g, uint8_t b) {
-    if (!led_initialized || strip == NULL) {
+    if (!led_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_err_t err;
     if (!led_user_enabled || (r == 0 && g == 0 && b == 0)) {
-        err = led_strip_clear(strip);
+        apa102_show(0, 0, 0);
     } else {
-        err = led_strip_set_pixel(strip, 0, led_scale_component(r), led_scale_component(g), led_scale_component(b));
+        apa102_show(led_scale_component(r), led_scale_component(g), led_scale_component(b));
     }
-
-    if (err == ESP_OK) {
-        err = led_strip_refresh(strip);
-    }
-    return err;
+    return ESP_OK;
 }
 
 static esp_err_t led_apply_current(void) {
@@ -3373,6 +3412,7 @@ static const char *display_mode_to_str(display_type_t mode)
     case DISPLAY_SH1107:  return "sh1107";
     case DISPLAY_SH1106:  return "sh1106";
     case DISPLAY_UNIT_LCD:return "unit_lcd";
+    case DISPLAY_ST7735:  return "st7735";
     case DISPLAY_NONE:
     default:
         return "auto";
@@ -3400,6 +3440,10 @@ static bool display_mode_from_str(const char *s, display_type_t *out_mode)
     }
     if (strcasecmp(s, "unit_lcd") == 0 || strcasecmp(s, "lcd") == 0) {
         *out_mode = DISPLAY_UNIT_LCD;
+        return true;
+    }
+    if (strcasecmp(s, "st7735") == 0 || strcasecmp(s, "tft") == 0) {
+        *out_mode = DISPLAY_ST7735;
         return true;
     }
     return false;
@@ -3456,6 +3500,7 @@ static void display_mode_load_from_nvs(void)
     case DISPLAY_SH1107:
     case DISPLAY_SH1106:
     case DISPLAY_UNIT_LCD:
+    case DISPLAY_ST7735:
         display_forced_mode = (display_type_t)raw;
         break;
     default:
@@ -12816,10 +12861,37 @@ static int cmd_vendor(int argc, char **argv) {
     return 1;
 }
 
+// ST7735 bring-up helper: tweak backlight / fill / MADCTL / offsets live from CLI.
+static int cmd_lcd(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: lcd bl <0|1> | fill <hex565> | rgb <r> <g> <b> | madctl <hex> [inv0|1] | off <col> <row>");
+        return 0;
+    }
+    if (strcasecmp(argv[1], "bl") == 0 && argc >= 3) {
+        oled_st7735_dbg_backlight(atoi(argv[2]));
+    } else if (strcasecmp(argv[1], "fill") == 0 && argc >= 3) {
+        oled_st7735_dbg_fill((uint16_t)strtol(argv[2], NULL, 16));
+    } else if (strcasecmp(argv[1], "rgb") == 0 && argc >= 5) {
+        int r = atoi(argv[2]) & 0xFF, g = atoi(argv[3]) & 0xFF, b = atoi(argv[4]) & 0xFF;
+        uint16_t c = (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+        oled_st7735_dbg_fill(c);
+    } else if (strcasecmp(argv[1], "madctl") == 0 && argc >= 3) {
+        int m = (int)strtol(argv[2], NULL, 16);
+        int inv = (argc >= 4) ? atoi(argv[3]) : 1;
+        oled_st7735_dbg_madctl(m, inv);
+    } else if (strcasecmp(argv[1], "off") == 0 && argc >= 4) {
+        oled_st7735_dbg_offset(atoi(argv[2]), atoi(argv[3]));
+    } else {
+        MY_LOG_INFO(TAG, "lcd: unknown subcommand");
+    }
+    return 0;
+}
+
 static int cmd_display(int argc, char **argv)
 {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: display set <auto|ssd1306|sh1107|sh1106|unit_lcd> | display read");
+        MY_LOG_INFO(TAG, "Usage: display set <auto|ssd1306|sh1107|sh1106|unit_lcd|st7735> | display read");
         return 1;
     }
 
@@ -12831,6 +12903,7 @@ static int cmd_display(int argc, char **argv)
             case DISPLAY_SH1107: detected_name = "sh1107"; break;
             case DISPLAY_SH1106: detected_name = "sh1106"; break;
             case DISPLAY_UNIT_LCD: detected_name = "unit_lcd"; break;
+            case DISPLAY_ST7735: detected_name = "st7735"; break;
             case DISPLAY_NONE:
             default: detected_name = "none"; break;
         }
@@ -17217,6 +17290,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&display_cmd));
 
+    const esp_console_cmd_t lcd_cmd = {
+        .command = "lcd",
+        .help = "ST7735 bring-up: lcd bl <0|1> | fill <hex565> | rgb <r> <g> <b> | madctl <hex> [inv0|1] | off <col> <row>",
+        .hint = NULL,
+        .func = &cmd_lcd,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&lcd_cmd));
+
     const esp_console_cmd_t boot_button_cmd = {
         .command = "boot_button",
         .help = "Configure boot button actions: boot_button read|list|set <short|long> <command[, command...]>|status <short|long> <on|off>",
@@ -17536,7 +17618,6 @@ static void register_commands(void)
 
 void app_main(void) {
 
-
     // printf("Heap regions:\n");
     // printf("  DRAM total: %u KB\n", (unsigned)(heap_caps_get_total_size(MALLOC_CAP_8BIT) / 1024));
     // printf("  IRAM total: %u KB\n", (unsigned)(heap_caps_get_total_size(MALLOC_CAP_EXEC) / 1024));
@@ -17617,6 +17698,10 @@ void app_main(void) {
                 display_name = "UNIT_LCD";
                 snprintf(display_desc, sizeof(display_desc), "addr 0x%02X", disp_addr7);
                 break;
+            case DISPLAY_ST7735:
+                display_name = "ST7735";
+                snprintf(display_desc, sizeof(display_desc), "SPI LCD 160x80 (shared bus)");
+                break;
             case DISPLAY_NONE:
             default:
                 display_name = "NONE";
@@ -17644,34 +17729,25 @@ void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(60));
     MY_LOG_INFO(TAG, "GPS: %s", gps_get_module_name(current_gps_module));
 
-    //printf("Step 4: Init LED strip\n");
-    // 1. LED strip configuration
-    led_strip_config_t strip_cfg = {
-        .strip_gpio_num            = NEOPIXEL_GPIO,
-        .max_leds                  = LED_COUNT,
-        .led_model                 = LED_MODEL_WS2812,
-        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
-        .flags.invert_out          = false,
+    //printf("Step 4: Init APA102 LED\n");
+    // T-Dongle-C5 has a single APA102 LED on dedicated pins DI=IO05, CI=IO04.
+    gpio_config_t led_io = {
+        .pin_bit_mask = (1ULL << LED_APA102_DI_PIN) | (1ULL << LED_APA102_CI_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
     };
-
-    // 2. LED Strip RMT configuration
-    led_strip_rmt_config_t rmt_cfg = {
-        .clk_src        = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz  = RMT_RES_HZ,
-        .flags.with_dma = false,
-    };
-
-    // 3. strip instance (non-fatal on failure)
-    esp_err_t led_init_err = led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &strip);
+    esp_err_t led_init_err = gpio_config(&led_io);
     if (led_init_err != ESP_OK) {
-        ESP_LOGE(TAG, "LED strip init failed on GPIO %d (model %s): %s",
-                 strip_cfg.strip_gpio_num,
-                 "WS2812",
-                 esp_err_to_name(led_init_err));
-        strip = NULL;
+        ESP_LOGE(TAG, "APA102 LED GPIO init failed (DI=%d CI=%d): %s",
+                 LED_APA102_DI_PIN, LED_APA102_CI_PIN, esp_err_to_name(led_init_err));
         led_initialized = false;
     } else {
+        gpio_set_level(LED_APA102_CI_PIN, 0);
+        gpio_set_level(LED_APA102_DI_PIN, 0);
         led_initialized = true;
+        apa102_show(0, 0, 0);   // ensure LED is off before boot animation
         led_boot_sequence();
     }
     //printf("Step 6: Vendor load state\n");
@@ -17709,8 +17785,10 @@ void app_main(void) {
     esp_console_register_help_command();
     register_commands();
 
-    esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
+    // LILYGO T-Dongle-C5: console runs over USB-Serial-JTAG (the dongle's USB),
+    // so flashing, logs and the CLI all share the single USB connection.
+    esp_console_dev_usb_serial_jtag_config_t hw_config = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&hw_config, &repl_config, &repl));
 
     linenoiseSetHintsCallback((linenoiseHintsCallback *)&janos_console_hint);
 
@@ -17837,7 +17915,7 @@ void app_main(void) {
         oled_display_update_full(NULL, "  SD: MISSING!", "  No file save", "");
     }
     vTaskDelay(pdMS_TO_TICKS(400));
-    
+
     // Load BSSID whitelist from SD card
     load_whitelist_from_sd();
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -17847,7 +17925,7 @@ void app_main(void) {
                             "",
                             "  > Ready _");
     vTaskDelay(pdMS_TO_TICKS(100));
-    
+
 }
 
 void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count) {   
@@ -19694,9 +19772,33 @@ static void safe_restart(void) {
     esp_restart();
 }
 
+// Shared SPI2 bus for SD card + ST7735 LCD + APA102 LED (LILYGO T-Dongle-C5).
+// Idempotent: the first caller initialises the bus, later callers no-op.
+esp_err_t board_shared_spi_bus_init(void) {
+    static bool bus_inited = false;
+    if (bus_inited) {
+        return ESP_OK;
+    }
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num   = BOARD_SPI_MOSI_PIN,  // IO02 (shared: SD CMD / TFT MOSI / LED DI)
+        .miso_io_num   = BOARD_SPI_MISO_PIN,  // IO07 (shared: SD D0  / TFT MISO)
+        .sclk_io_num   = BOARD_SPI_SCK_PIN,   // IO06 (shared: SD CLK / TFT SCK)
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = BOARD_SPI_MAX_TRANSFER,
+    };
+    esp_err_t ret = spi_bus_initialize(BOARD_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (ret == ESP_OK || ret == ESP_ERR_INVALID_STATE) {
+        bus_inited = true;
+        return ESP_OK;
+    }
+    MY_LOG_INFO(TAG, "Shared SPI bus init failed: %s", esp_err_to_name(ret));
+    return ret;
+}
+
 static esp_err_t init_sd_card(void) {
     esp_err_t ret;
-    
+
     // Check if SD card is already mounted
     if (sd_card_mounted) {
         return ESP_OK;
@@ -19711,27 +19813,19 @@ static esp_err_t init_sd_card(void) {
     };
     
     const char mount_point[] = "/sdcard";
-    
-    // Configure SPI bus (balanced for SD card requirements and memory)
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = SD_MOSI_PIN,
-        .miso_io_num = SD_MISO_PIN,
-        .sclk_io_num = SD_CLK_PIN,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4096,  // SD card needs at least 4KB for sector operations
-    };
-    
-    ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);  // DMA required for SD card
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+
+    // SD shares SPI2 with the ST7735 LCD and APA102 LED on the T-Dongle-C5.
+    // Initialise the shared bus once; the SPI driver arbitrates between devices.
+    ret = board_shared_spi_bus_init();
+    if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
         return ret;
     }
-    
+
     // Initialize the SD card host
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = SPI2_HOST;
-    
+    host.slot = BOARD_SPI_HOST;
+
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot_config.gpio_cs = SD_CS_PIN;
     slot_config.host_id = host.slot;
