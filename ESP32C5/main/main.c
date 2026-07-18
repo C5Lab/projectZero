@@ -125,7 +125,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.6.9"
+#define JANOS_VERSION "1.7.0"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -9492,7 +9492,9 @@ static int cmd_wigle_upload(int argc, char **argv) {
         return 1;
     }
     create_sd_directories();
-    wigle_load_key_from_sd();
+    if (wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') {
+        wigle_load_key_from_sd();
+    }
 
     if (wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') {
         MY_LOG_INFO(TAG, "NO WIGLE CREDENTIALS");
@@ -10344,7 +10346,9 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
         return 1;
     }
     create_sd_directories();
-    wdgwars_load_key_from_sd();
+    if (wdgwars_api_key[0] == '\0') {
+        wdgwars_load_key_from_sd();
+    }
 
     if (wdgwars_api_key[0] == '\0') {
         MY_LOG_INFO(TAG, "NO WDGWARS CREDENTIALS");
@@ -21128,6 +21132,26 @@ void app_main(void) {
                     }
                 }
                 fclose(wf);
+            }
+        }
+        // Restore WiGLE credentials from SD only when NVS did not provide a
+        // complete pair. Existing NVS credentials remain authoritative.
+        if ((wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') &&
+            wigle_load_key_from_sd()) {
+            if (wigle_save_key_to_nvs(wigle_api_name, wigle_api_token)) {
+                MY_LOG_INFO(TAG, "WiGLE credentials restored from SD card into NVS.");
+            } else {
+                MY_LOG_INFO(TAG, "Failed to save WiGLE credentials from SD card to NVS.");
+            }
+        }
+        // Restore the WDGWars key from SD only when no NVS key was loaded.
+        // This keeps an explicitly configured NVS key authoritative, while
+        // allowing /sdcard/lab/wdgwars.txt to recover a cleared/missing key.
+        if (wdgwars_api_key[0] == '\0' && wdgwars_load_key_from_sd()) {
+            if (wdgwars_save_key_to_nvs(wdgwars_api_key)) {
+                MY_LOG_INFO(TAG, "WDGWars key restored from SD card into NVS.");
+            } else {
+                MY_LOG_INFO(TAG, "Failed to save WDGWars key from SD card to NVS.");
             }
         }
         oled_display_update_full(NULL, "  SD: mounted", "  All systems OK", "");

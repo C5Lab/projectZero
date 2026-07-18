@@ -797,7 +797,7 @@ SSID removed. 2 SSIDs remaining.
 
 ### `wigle_key`
 - **Syntax**: `wigle_key set <api_name> <api_token>` or `wigle_key set <api_name:api_token>` or `wigle_key read` or `wigle_key clear`
-- **Description**: Set, read, or clear WiGLE API credentials from NVS. `/sdcard/lab/wigle.txt` is read only during upload and is not persisted to NVS.
+- **Description**: Set, read, or clear WiGLE API credentials from NVS. If either credential is missing at boot, `/sdcard/lab/wigle.txt` is loaded and persisted to NVS; a complete NVS credential pair takes precedence.
 
 ### `wigle_upload`
 - **Syntax**: `wigle_upload` or `wigle_upload [file1 file2 ...]` or `wigle_upload all`
@@ -807,7 +807,7 @@ SSID removed. 2 SSIDs remaining.
 
 ### `wdgwars_key`
 - **Syntax**: `wdgwars_key set <key>` or `wdgwars_key read` or `wdgwars_key clear`
-- **Description**: Set, read, or clear WDGWars API key from NVS. `/sdcard/lab/wdgwars.txt` is read only during upload and is not persisted to NVS.
+- **Description**: Set, read, or clear WDGWars API key from NVS. If NVS has no key at boot, `/sdcard/lab/wdgwars.txt` is loaded and persisted to NVS; an existing NVS key takes precedence.
 
 ### `wdgwars_upload`
 - **Syntax**: `wdgwars_upload` or `wdgwars_upload [file1 file2 ...]` or `wdgwars_upload all`
