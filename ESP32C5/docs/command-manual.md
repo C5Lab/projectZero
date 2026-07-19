@@ -23,7 +23,7 @@ Configuration commands persist their settings in **NVS** (survive reboot). The w
 
 # Part 1 — Wardrive 2.0 (new)
 
-The promiscuous wardrive (`start_wardrive_promisc`) is a Kismet‑style scanner that hops Wi‑Fi channels with a **D‑UCB** (discounted upper‑confidence‑bound) algorithm, logs Wi‑Fi APs **and** BLE devices to a WigleWifi‑1.6 CSV on the SD card, and records a KML track. The behaviour below is controlled by a configuration block stored in NVS and shown by `get_wardrive_config`.
+The promiscuous wardrive (`start_wardrive_promisc`) is a Kismet‑style scanner that hops Wi‑Fi channels with a **D‑UCB** (discounted upper‑confidence‑bound) algorithm and logs Wi‑Fi APs **and** BLE devices to a WigleWifi‑1.6 CSV on the SD card. The `start_wardrive_promisc_trace` variant additionally records a KML track plus Wi‑Fi and BLE POIs (see its entry). The behaviour below is controlled by a configuration block stored in NVS and shown by `get_wardrive_config`.
 
 ## How the engine works
 
@@ -34,13 +34,13 @@ The promiscuous wardrive (`start_wardrive_promisc`) is a Kismet‑style scanner 
 - **Startup cooldown** — drop everything seen during the first N seconds so your starting location (e.g. home) is not logged.
 - **Blacklist** — exclude your own devices by MAC from results and exports.
 
-Output file: `/sdcard/lab/wardrives/wN.log` (N auto‑increments). Console shows first sightings live; re‑logs go to the file.
+Output file: `/sdcard/lab/wardrives/<base>.log`. The `<base>` is decided **after** the GPS fix: real UTC time `YYYYMMDD_HHMMSS` (from `$GxRMC`, same clock as the CSV `FirstSeen`, so files sort chronologically). If the module never sends time, it falls back to the legacy `wN` counter. A numeric suffix (`_2`, `_3`, …) is added if that base is already taken, so nothing is overwritten. Console shows first sightings live; re‑logs go to the file.
 
 ---
 
 ### `start_wardrive_promisc`
 - **Syntax**: `start_wardrive_promisc`
-- **Description**: Starts the promiscuous wardrive using the current config. Waits for a GPS fix, then logs Wi‑Fi + BLE to SD with a KML track.
+- **Description**: Starts the promiscuous wardrive using the current config. Waits for a GPS fix, then logs Wi‑Fi + BLE to a WigleWifi‑1.6 CSV on SD. No KML is produced — use `start_wardrive_promisc_trace` for that.
 - **Startup log** (shows the active config):
 ```
 Wardrive config: bands=wifi24,wifi5,ble channels=popular wifi_delta=5 ble_delta=15 cooldown=0s memcap=40000
@@ -55,7 +55,14 @@ Wardrive promisc: 58 unique networks, 48 BT devices, 12 relogs, D-UCB best ch: 1
 
 ### `start_wardrive_promisc_trace`
 - **Syntax**: `start_wardrive_promisc_trace`
-- **Description**: Same as `start_wardrive_promisc` but also writes a per‑session KML track at `/sdcard/lab/wardrives/wN_track.kml`.
+- **Description**: Same as `start_wardrive_promisc` (still writes the WigleWifi CSV) **and** builds a single per‑session KML that contains the drive track, one Wi‑Fi POI per unique BSSID, and one BLE POI per unique advertiser address.
+  - **Track**: written as successive complete `<Placemark><LineString>` segments (buffered ~16 points / 15 s, new vertex every ≥3 m). Consecutive segments share a point so the line is continuous; a GPS jump above 100 m starts a new segment without a misleading straight connector.
+  - **POI**: one `<Point>` placemark per first‑seen BSSID, captured with the GPS snapshot from the moment the beacon was seen (name = SSID or `<hidden>`; description = BSSID, RSSI, channel, auth, timestamp, altitude, accuracy). No POI is written without a valid GPS fix, and re‑logs of the same BSSID never add another POI. Markers are coloured by security: Open green, WPA/WPA2 mixed purple, WPA2 blue, WPA3/mixed WPA2-WPA3 red, WEP orange, unknown grey.
+  - **BLE POI**: one `<Point>` per first‑seen advertiser, using its detected name or `BLE <address>` when unnamed. The description contains address, type, RSSI, optional manufacturer ID, timestamp and GPS snapshot. BLE is cyan; AirTag purple and SmartTag amber.
+  - **File naming**: the KML shares the CSV base (see `start_wardrive_promisc`): `<base>_track.kml`, e.g. `20260719_100647_track.kml`.
+  - **Crash tolerance**: during the run the file is `/sdcard/lab/wardrives/<base>_track.inprogress.kml`. On a normal `stop` it is closed and atomically renamed to the final `/sdcard/lab/wardrives/<base>_track.kml` — the single artifact you keep. Because every track segment and POI is a **complete, closed `<Placemark>`** inside one open `<Folder>`, an `.inprogress.kml` left behind by a power loss can be repaired by Tab5/ADV: find the last `</Placemark>`, cut the truncated tail, and append `</Folder></Document></kml>`.
+- **Stop log**: reports the number of track segments, POIs written, POIs dropped (queue full), and the final KML path.
+- **Note**: only `start_wardrive_promisc_trace` produces KML/POI; plain `start_wardrive_promisc` does not. `wardrive_cleanup` moves the finalized `<base>_track.kml` together with `<base>.log`; it never moves `.inprogress.kml`.
 
 ### `start_wardrive`
 - **Syntax**: `start_wardrive`

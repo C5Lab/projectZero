@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <limits.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
@@ -284,6 +286,9 @@ typedef enum {
 static bool wardrive_active = false;
 static int wardrive_file_counter = 1;
 static gps_data_t current_gps = {0};
+// Set true once a valid $GxRMC seeded the system clock (settimeofday) with real UTC.
+// Until then, observation timestamps fall back to time(NULL) at flush.
+static volatile bool g_gps_clock_synced = false;
 static gps_data_t external_gps_position = {0};
 static gps_data_t external_cap_gps_position = {0};
 static bool gps_uart_initialized = false;
@@ -650,7 +655,83 @@ typedef struct {
     bool     last_logged_valid;    // last_logged_lat/lon hold a real position
     double   last_logged_lat;
     double   last_logged_lon;
+    // Observation snapshot: position + wall-clock captured at the moment needs_log
+    // was set (first sighting or re-log), so the CSV row carries where/when the AP
+    // was actually seen — not where/when the batch was flushed to SD.
+    bool     obs_gps_valid;
+    double   obs_lat;
+    double   obs_lon;
+    float    obs_alt;
+    float    obs_acc;
+    time_t   obs_time;             // 0 = clock not yet seeded from GPS at capture time
 } wdp_network_t;
+
+// Snapshot the current GPS position + wall-clock into a pending network/BT row.
+// Called from the WiFi/BLE observation callbacks the instant needs_log is set, so
+// the row is stamped where/when it was seen instead of at flush time.
+#define WDP_DECLARE_OBS_SNAPSHOT(TYPE, NAME)                       \
+    static inline void NAME(TYPE *o) {                            \
+        o->obs_gps_valid = current_gps.valid;                     \
+        if (current_gps.valid) {                                  \
+            o->obs_lat = current_gps.latitude;                    \
+            o->obs_lon = current_gps.longitude;                   \
+            o->obs_alt = current_gps.altitude;                    \
+            o->obs_acc = current_gps.accuracy;                    \
+        }                                                         \
+        o->obs_time = g_gps_clock_synced ? time(NULL) : (time_t)0;\
+    }
+WDP_DECLARE_OBS_SNAPSHOT(wdp_network_t, wdp_snapshot_obs)
+
+// ============================================================================
+// Wardrive Trace (KML) — active ONLY during start_wardrive_promisc_trace.
+// Produces a single crash-tolerant KML with the track (successive complete
+// <Placemark><LineString> segments), Wi-Fi POIs, and BLE-device POIs.
+// ============================================================================
+
+// Snapshot of a first-seen Wi-Fi AP or BLE device handed from its radio callback to
+// the wardrive task over a bounded queue. The callbacks never touch the SD card.
+typedef struct {
+    uint8_t          bssid[6];       // Wi-Fi BSSID or BLE advertiser address
+    char             ssid[33];       // Wi-Fi SSID or BLE device name
+    int8_t           rssi;
+    uint8_t          channel;
+    wifi_auth_mode_t authmode;
+    bool             is_ble;
+    bool             is_airtag;
+    bool             is_smarttag;
+    uint16_t         company_id;
+    double           lat;
+    double           lon;
+    float            alt;
+    float            acc;
+    time_t           ts;          // detection time (UTC); 0 = clock not seeded yet
+} wdp_poi_msg_t;
+
+#define WDP_POI_QUEUE_LEN      64       // Wi-Fi/BLE POI snapshots buffered callback -> task
+#define WDP_TRACE_SEG_POINTS   16       // flush a track segment after this many points
+#define WDP_TRACE_SEG_MS       15000    // ...or this long since the last segment write
+#define WDP_TRACE_MIN_STEP_M   3.0      // minimum movement before a new trace vertex
+#define WDP_TRACE_MAX_STEP_M   100.0    // larger jump starts a new line, never a false connector
+
+// Track-segment builder, touched exclusively by wardrive_promisc_task.
+typedef struct {
+    bool    active;
+    double  seg_lat[WDP_TRACE_SEG_POINTS];
+    double  seg_lon[WDP_TRACE_SEG_POINTS];
+    double  seg_alt[WDP_TRACE_SEG_POINTS];
+    int     seg_n;                       // buffered points not yet written
+    bool    have_prev;                   // prev_* holds the last written vertex (stitch)
+    double  prev_lat, prev_lon, prev_alt;
+    bool    have_cur;                    // cur_* holds the last accepted vertex (3 m gate)
+    double  cur_lat, cur_lon;
+    int64_t last_seg_us;                 // esp_timer time of the last segment write
+    int     seg_written;
+    int     poi_written;
+} wdp_trace_ctx_t;
+
+static wdp_trace_ctx_t   wdp_trace;            // reset at task start; task-owned
+static QueueHandle_t     wdp_poi_queue = NULL; // non-NULL only during a trace session
+static volatile uint32_t wdp_poi_dropped = 0;  // POIs dropped because the queue was full
 
 static bool wardrive_promisc_active = false;
 static TaskHandle_t wardrive_promisc_task_handle = NULL;
@@ -762,6 +843,13 @@ typedef struct {
     bool   last_logged_valid;
     double last_logged_lat;
     double last_logged_lon;
+    // Observation snapshot captured when needs_log was set (see wdp_network_t).
+    bool    obs_gps_valid;
+    double  obs_lat;
+    double  obs_lon;
+    float   obs_alt;
+    float   obs_acc;
+    time_t  obs_time;
     // Anti-surveillance tracking (used only while antisurv_active)
     int64_t as_first_us;        // first time this device was seen
     int64_t as_last_us;         // most recent sighting
@@ -771,6 +859,8 @@ typedef struct {
     double  as_max_dist_m;      // furthest we travelled from origin while it stayed visible
     bool    as_alerted;         // already raised as a follower
 } bt_device_info_t;
+
+WDP_DECLARE_OBS_SNAPSHOT(bt_device_info_t, bt_snapshot_obs)
 
 static bt_device_info_t *bt_devices = NULL;                 // ~5.5 KB in PSRAM
 static int bt_device_count = 0;
@@ -2050,9 +2140,11 @@ static void sd_sync(void);
 static void safe_restart(void);
 static bool parse_gps_nmea(const char* nmea_sentence);
 static void get_timestamp_string(char* buffer, size_t size);
+static void format_epoch_utc(time_t t, char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
 static bool wait_for_gps_fix(int timeout_seconds);
 static int find_next_wardrive_file_number(void);
+static void wardrive_make_session_base(char *out, size_t out_sz);
 // PCAP capture functions
 static int find_next_pcap_file_number(void);
 static void pcap_radio_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
@@ -2172,8 +2264,11 @@ static void bt_stop_scan(void);
 static int wigle_wifi_channel_to_frequency_mhz(int channel);
 static double gps_distance_meters(double lat1, double lon1, double lat2, double lon2);
 static bool wardrive_trace_init_file(const char *path);
-static bool wardrive_trace_append_point(const char *path, double lat, double lon, double alt);
 static void wardrive_trace_finalize_file(const char *path);
+static bool wdp_trace_flush_segment(const char *path, wdp_trace_ctx_t *c);
+static void wdp_trace_add_point(const char *path, wdp_trace_ctx_t *c,
+                                double lat, double lon, double alt, double *dist_accum);
+static bool wdp_trace_write_poi(const char *path, wdp_trace_ctx_t *c, const wdp_poi_msg_t *p);
 static void register_commands(void);
 
 // --- Wi-Fi event handler ---
@@ -5879,8 +5974,9 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         wdp_seen_networks[existing].rssi = cur_rssi;   // keep the latest reading for re-log
 
         // Re-log this AP if its signal or our position moved enough since the last row.
-        // wifi_rssi_delta == 0 keeps the legacy "log once" behavior.
-        if (g_wd_cfg.wifi_rssi_delta > 0 && !wdp_seen_networks[existing].needs_log) {
+        // wifi_rssi_delta == 0 keeps the legacy "log once" behavior. Only re-log with a
+        // valid fix so a row never carries 0,0 — without GPS the observation is useless.
+        if (g_wd_cfg.wifi_rssi_delta > 0 && !wdp_seen_networks[existing].needs_log && current_gps.valid) {
             bool trig = false;
             int rd = cur_rssi - wdp_seen_networks[existing].last_logged_rssi;
             if (rd < 0) rd = -rd;
@@ -5897,11 +5993,17 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
             }
             if (trig) {
                 wdp_seen_networks[existing].needs_log = true;
+                wdp_snapshot_obs(&wdp_seen_networks[existing]);  // stamp this re-observation
                 wdp_relog_pending = true;
             }
         }
         return;
     }
+
+    // First sighting: don't register/log an AP we can't place. Without a GPS fix the
+    // row would be 0,0 (and no POI is created); it will register on the next beacon
+    // once we have a fix, which for a beaconing AP is within a second or two.
+    if (!current_gps.valid) return;
 
     if (wdp_seen_count >= wdp_seen_capacity) {
         wdp_needs_grow = true;
@@ -5917,9 +6019,32 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     wdp_seen_networks[idx].authmode = authmode;
     wdp_seen_networks[idx].needs_log = true;        // pending first write
     wdp_seen_networks[idx].last_logged_valid = false;
+    wdp_snapshot_obs(&wdp_seen_networks[idx]);      // stamp the first sighting (WiGLE FirstSeen)
     wdp_seen_count++;
 
     wdp_dwell_new_networks++;
+
+    // Wardrive Trace: emit one POI per unique BSSID (first sighting only). Runs only
+    // when the trace session is active and we have a GPS fix. The callback must not
+    // touch the SD card, so it just hands a self-contained snapshot to the wardrive
+    // task over a bounded queue; a full queue is counted, never blocked on.
+    if (wardrive_promisc_trace_enabled && wdp_poi_queue && current_gps.valid) {
+        wdp_poi_msg_t poi;
+        memcpy(poi.bssid, ap_bssid, 6);
+        strncpy(poi.ssid, ssid, sizeof(poi.ssid) - 1);
+        poi.ssid[sizeof(poi.ssid) - 1] = '\0';
+        poi.rssi     = (int8_t)pkt->rx_ctrl.rssi;
+        poi.channel  = beacon_channel;
+        poi.authmode = authmode;
+        poi.lat      = current_gps.latitude;
+        poi.lon      = current_gps.longitude;
+        poi.alt      = current_gps.altitude;
+        poi.acc      = current_gps.accuracy;
+        poi.ts       = g_gps_clock_synced ? time(NULL) : (time_t)0;
+        if (xQueueSend(wdp_poi_queue, &poi, 0) != pdTRUE) {
+            wdp_poi_dropped++;
+        }
+    }
 
     char mac_str[18];
     snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -6011,19 +6136,18 @@ static void wardrive_promisc_task(void *pvParameters) {
         ESP_LOGW(TAG, "Failed to set LED for wardrive promisc: %s", esp_err_to_name(led_err));
     }
 
-    int file_number = find_next_wardrive_file_number();
-    MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", file_number);
     double wdp_total_distance_m = 0.0;
-    double wdp_last_trace_lat = 0.0;
-    double wdp_last_trace_lon = 0.0;
-    bool wdp_has_trace_point = false;
+    // Session file base + paths are decided AFTER the GPS fix (below) so the names can use
+    // real UTC time. Declared here (before any `goto cleanup`) and left empty until then.
+    char wardrive_base[32] = "";
+    char wardrive_csv_path[80] = "";
 
-    if (wardrive_promisc_trace_enabled) {
-        snprintf(wardrive_promisc_trace_path, sizeof(wardrive_promisc_trace_path),
-                 "/sdcard/lab/wardrives/w%d_track.kml", file_number);
-    } else {
-        wardrive_promisc_trace_path[0] = '\0';
-    }
+    // Trace state (only used when wardrive_promisc_trace_enabled). We write to a
+    // ".inprogress.kml" during the session and atomically rename it to the final
+    // ".kml" on a clean stop, so a power loss leaves a repairable partial file.
+    memset(&wdp_trace, 0, sizeof(wdp_trace));
+    wdp_poi_dropped = 0;
+    wardrive_promisc_trace_path[0] = '\0';
 
     MY_LOG_INFO(TAG, "Waiting for GPS fix (no timeout - use 'stop' to cancel)...");
     oled_display_update_full("> Wardrive Pro", "  Waiting GPS...", "  No timeout", "  Use 'stop'");
@@ -6036,18 +6160,46 @@ static void wardrive_promisc_task(void *pvParameters) {
                 current_gps.latitude, current_gps.longitude);
     oled_display_update_full("> Wardrive Pro", "  GPS fix OK!", "  D-UCB scanning", "");
 
+    // Name the session files from real UTC once the clock is seeded from $GxRMC. That
+    // usually already happened inside wait_for_gps_fix; give RMC a short bounded window
+    // in case it trailed the GGA fix. Falls back to the "wN" counter if no time arrives.
+    if (!external_feed) {
+        int64_t clk_t0 = esp_timer_get_time();
+        while (!g_gps_clock_synced && (esp_timer_get_time() - clk_t0) < 3000000LL &&
+               wardrive_promisc_active && !operation_stop_requested) {
+            int glen = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer,
+                                       GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
+            if (glen > 0) {
+                wardrive_gps_buffer[glen] = '\0';
+                char *gline = strtok(wardrive_gps_buffer, "\r\n");
+                while (gline) { parse_gps_nmea(gline); gline = strtok(NULL, "\r\n"); }
+            }
+        }
+    }
+    wardrive_make_session_base(wardrive_base, sizeof(wardrive_base));
+    snprintf(wardrive_csv_path, sizeof(wardrive_csv_path),
+             "/sdcard/lab/wardrives/%s.log", wardrive_base);
     if (wardrive_promisc_trace_enabled) {
-        if (wardrive_trace_init_file(wardrive_promisc_trace_path)) {
-            wardrive_trace_append_point(wardrive_promisc_trace_path,
-                                        current_gps.latitude,
-                                        current_gps.longitude,
-                                        current_gps.altitude);
-            wdp_last_trace_lat = current_gps.latitude;
-            wdp_last_trace_lon = current_gps.longitude;
-            wdp_has_trace_point = true;
+        snprintf(wardrive_promisc_trace_path, sizeof(wardrive_promisc_trace_path),
+                 "/sdcard/lab/wardrives/%s_track.inprogress.kml", wardrive_base);
+    }
+    MY_LOG_INFO(TAG, "Wardrive session files: %s.log%s (%s)",
+                wardrive_base, wardrive_promisc_trace_enabled ? " + _track.kml" : "",
+                g_gps_clock_synced ? "GPS UTC time" : "counter fallback");
+
+    if (wardrive_promisc_trace_enabled) {
+        wdp_poi_queue = xQueueCreate(WDP_POI_QUEUE_LEN, sizeof(wdp_poi_msg_t));
+        if (wdp_poi_queue && wardrive_trace_init_file(wardrive_promisc_trace_path)) {
+            wdp_trace.active = true;
+            // Seed the first trace vertex from the initial fix.
+            wdp_trace_add_point(wardrive_promisc_trace_path, &wdp_trace,
+                                current_gps.latitude, current_gps.longitude,
+                                current_gps.altitude, &wdp_total_distance_m);
+            wdp_trace.last_seg_us = esp_timer_get_time();
             MY_LOG_INFO(TAG, "Wardrive trace enabled: %s", wardrive_promisc_trace_path);
         } else {
-            MY_LOG_INFO(TAG, "Failed to create wardrive trace file: %s", wardrive_promisc_trace_path);
+            MY_LOG_INFO(TAG, "Failed to start wardrive trace (file/queue): %s", wardrive_promisc_trace_path);
+            if (wdp_poi_queue) { vQueueDelete(wdp_poi_queue); wdp_poi_queue = NULL; }
             wardrive_promisc_trace_enabled = false;
             wardrive_promisc_trace_path[0] = '\0';
         }
@@ -6227,30 +6379,30 @@ static void wardrive_promisc_task(void *pvParameters) {
             gps_fix_lost_count++;
         } else {
             gps_fix_lost_count = 0;
-            if (wardrive_promisc_trace_enabled) {
-                if (!wdp_has_trace_point) {
-                    if (wardrive_trace_append_point(wardrive_promisc_trace_path,
-                                                    current_gps.latitude,
-                                                    current_gps.longitude,
-                                                    current_gps.altitude)) {
-                        wdp_last_trace_lat = current_gps.latitude;
-                        wdp_last_trace_lon = current_gps.longitude;
-                        wdp_has_trace_point = true;
-                    }
-                } else {
-                    double step_m = gps_distance_meters(wdp_last_trace_lat, wdp_last_trace_lon,
-                                                        current_gps.latitude, current_gps.longitude);
-                    if (step_m >= 3.0) {
-                        if (wardrive_trace_append_point(wardrive_promisc_trace_path,
-                                                        current_gps.latitude,
-                                                        current_gps.longitude,
-                                                        current_gps.altitude)) {
-                            wdp_total_distance_m += step_m;
-                            wdp_last_trace_lat = current_gps.latitude;
-                            wdp_last_trace_lon = current_gps.longitude;
-                        }
-                    }
-                }
+            // Trace: buffer a new vertex once we've moved >= 3 m; the buffer is flushed
+            // as a complete <Placemark><LineString> segment inside wdp_trace_add_point
+            // when it fills (16 points), or by the time-based flush below.
+            if (wdp_trace.active) {
+                wdp_trace_add_point(wardrive_promisc_trace_path, &wdp_trace,
+                                    current_gps.latitude, current_gps.longitude,
+                                    current_gps.altitude, &wdp_total_distance_m);
+            }
+        }
+
+        // Trace: drain queued Wi-Fi/BLE POIs (callback -> task) and write them as complete
+        // Placemarks, then flush a partial track segment if 15 s elapsed. All KML file
+        // writes happen here, on the task, never in the callback.
+        if (wdp_trace.active) {
+            wdp_poi_msg_t poi;
+            int drained = 0;
+            while (drained < WDP_POI_QUEUE_LEN && xQueueReceive(wdp_poi_queue, &poi, 0) == pdTRUE) {
+                wdp_trace_write_poi(wardrive_promisc_trace_path, &wdp_trace, &poi);
+                drained++;
+            }
+            if (drained > 0) sd_sync();
+            if (wdp_trace.seg_n > 0 &&
+                (esp_timer_get_time() - wdp_trace.last_seg_us) >= (int64_t)WDP_TRACE_SEG_MS * 1000) {
+                wdp_trace_flush_segment(wardrive_promisc_trace_path, &wdp_trace);
             }
         }
 
@@ -6313,8 +6465,8 @@ static void wardrive_promisc_task(void *pvParameters) {
             // Clear before the write loop; any re-log marked during the loop re-arms it.
             wdp_relog_pending = false;
 
-            char filename[64];
-            snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", file_number);
+            char filename[80];
+            snprintf(filename, sizeof(filename), "%s", wardrive_csv_path);
 
             struct stat st;
             if (stat("/sdcard/lab/wardrives", &st) != 0) {
@@ -6328,9 +6480,6 @@ static void wardrive_promisc_task(void *pvParameters) {
                         fprintf(file, "WigleWifi-1.6,appRelease=v1.1,model=MonsterC5,release=v1.0,device=MonsterC5,display=SPI TFT,board=ESP32C5,brand=LAB5\n");
                         fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n");
                     }
-
-                    char timestamp[32];
-                    get_timestamp_string(timestamp, sizeof(timestamp));
 
                     for (int i = 0; i < current_count; i++) {
                         if (!wdp_seen_networks[i].needs_log) continue;
@@ -6347,24 +6496,31 @@ static void wardrive_promisc_task(void *pvParameters) {
                         const char *auth_str = get_auth_mode_wiggle(wdp_seen_networks[i].authmode);
                         int wifi_freq_mhz = wigle_wifi_channel_to_frequency_mhz(wdp_seen_networks[i].channel);
 
-                        if (current_gps.valid) {
+                        // Stamp the row with the position + time captured when this AP was
+                        // actually observed, not with the flush-time position. If the clock
+                        // was seeded after capture (obs_time==0), fall back to "now".
+                        char timestamp[32];
+                        time_t obs_t = wdp_seen_networks[i].obs_time ? wdp_seen_networks[i].obs_time : time(NULL);
+                        format_epoch_utc(obs_t, timestamp, sizeof(timestamp));
+
+                        if (wdp_seen_networks[i].obs_gps_valid) {
                             fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
                                     mac_str, escaped_ssid, auth_str, timestamp,
                                     wdp_seen_networks[i].channel, wifi_freq_mhz, (int)wdp_seen_networks[i].rssi,
-                                    current_gps.latitude, current_gps.longitude,
-                                    current_gps.altitude, current_gps.accuracy);
+                                    wdp_seen_networks[i].obs_lat, wdp_seen_networks[i].obs_lon,
+                                    wdp_seen_networks[i].obs_alt, wdp_seen_networks[i].obs_acc);
                         } else {
                             fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,0.0000000,0.0000000,0.00,0.00,,,WIFI\n",
                                     mac_str, escaped_ssid, auth_str, timestamp,
                                     wdp_seen_networks[i].channel, wifi_freq_mhz, (int)wdp_seen_networks[i].rssi);
                         }
-                        // Record the baseline for the next re-log decision.
+                        // Record the baseline for the next re-log decision (from where we logged).
                         if (wdp_seen_networks[i].last_logged_valid) wdp_relog_writes++;  // re-observation row
                         wdp_seen_networks[i].needs_log = false;
                         wdp_seen_networks[i].last_logged_rssi = wdp_seen_networks[i].rssi;
-                        if (current_gps.valid) {
-                            wdp_seen_networks[i].last_logged_lat = current_gps.latitude;
-                            wdp_seen_networks[i].last_logged_lon = current_gps.longitude;
+                        if (wdp_seen_networks[i].obs_gps_valid) {
+                            wdp_seen_networks[i].last_logged_lat = wdp_seen_networks[i].obs_lat;
+                            wdp_seen_networks[i].last_logged_lon = wdp_seen_networks[i].obs_lon;
                             wdp_seen_networks[i].last_logged_valid = true;
                         }
                     }
@@ -6386,32 +6542,36 @@ static void wardrive_promisc_task(void *pvParameters) {
                             }
                             const char *bt_cap = bt_devices[i].is_airtag  ? "AirTag [LE]"  :
                                                  bt_devices[i].is_smarttag ? "SmartTag [LE]" : "Misc [LE]";
-                            if (current_gps.valid) {
+                            // Stamp with the observation snapshot (see WiFi rows above).
+                            char bt_ts[32];
+                            time_t bt_obs_t = bt_devices[i].obs_time ? bt_devices[i].obs_time : time(NULL);
+                            format_epoch_utc(bt_obs_t, bt_ts, sizeof(bt_ts));
+                            if (bt_devices[i].obs_gps_valid) {
                                 fprintf(file, "%s,%s,%s,%s,0,,%d,%.7f,%.7f,%.2f,%.2f,,%s,BLE\n",
-                                        bt_mac, escaped_bt_name, bt_cap, timestamp,
+                                        bt_mac, escaped_bt_name, bt_cap, bt_ts,
                                         (int)bt_devices[i].rssi,
-                                        current_gps.latitude, current_gps.longitude,
-                                        current_gps.altitude, current_gps.accuracy, bt_mfgr_id);
+                                        bt_devices[i].obs_lat, bt_devices[i].obs_lon,
+                                        bt_devices[i].obs_alt, bt_devices[i].obs_acc, bt_mfgr_id);
                                 printf("%s,%s,%s,%s,0,,%d,%.7f,%.7f,%.2f,%.2f,,%s,BLE\n",
-                                       bt_mac, escaped_bt_name, bt_cap, timestamp,
+                                       bt_mac, escaped_bt_name, bt_cap, bt_ts,
                                        (int)bt_devices[i].rssi,
-                                       current_gps.latitude, current_gps.longitude,
-                                       current_gps.altitude, current_gps.accuracy, bt_mfgr_id);
+                                       bt_devices[i].obs_lat, bt_devices[i].obs_lon,
+                                       bt_devices[i].obs_alt, bt_devices[i].obs_acc, bt_mfgr_id);
                             } else {
                                 fprintf(file, "%s,%s,%s,%s,0,,%d,0.0000000,0.0000000,0.00,0.00,,%s,BLE\n",
-                                        bt_mac, escaped_bt_name, bt_cap, timestamp,
+                                        bt_mac, escaped_bt_name, bt_cap, bt_ts,
                                         (int)bt_devices[i].rssi, bt_mfgr_id);
                                 printf("%s,%s,%s,%s,0,,%d,0.0000000,0.0000000,0.00,0.00,,%s,BLE\n",
-                                       bt_mac, escaped_bt_name, bt_cap, timestamp,
+                                       bt_mac, escaped_bt_name, bt_cap, bt_ts,
                                        (int)bt_devices[i].rssi, bt_mfgr_id);
                             }
-                            // Baseline for the next re-log decision.
+                            // Baseline for the next re-log decision (from where we logged).
                             if (bt_devices[i].last_logged_valid) wdp_relog_writes++;
                             bt_devices[i].needs_log = false;
                             bt_devices[i].last_logged_rssi = bt_devices[i].rssi;
-                            if (current_gps.valid) {
-                                bt_devices[i].last_logged_lat = current_gps.latitude;
-                                bt_devices[i].last_logged_lon = current_gps.longitude;
+                            if (bt_devices[i].obs_gps_valid) {
+                                bt_devices[i].last_logged_lat = bt_devices[i].obs_lat;
+                                bt_devices[i].last_logged_lon = bt_devices[i].obs_lon;
                                 bt_devices[i].last_logged_valid = true;
                             }
                         }
@@ -6463,11 +6623,46 @@ static void wardrive_promisc_task(void *pvParameters) {
     }
 
 cleanup:
-    if (wardrive_promisc_trace_path[0] != '\0') {
+    if (wdp_trace.active) {
+        // Stop the RX callback from enqueuing more POIs, then drain what's left.
+        esp_wifi_set_promiscuous(false);
+        if (wdp_poi_queue) {
+            wdp_poi_msg_t poi;
+            while (xQueueReceive(wdp_poi_queue, &poi, 0) == pdTRUE) {
+                wdp_trace_write_poi(wardrive_promisc_trace_path, &wdp_trace, &poi);
+            }
+        }
+        // Write the last partial track segment, then close the KML document.
+        wdp_trace_flush_segment(wardrive_promisc_trace_path, &wdp_trace);
         wardrive_trace_finalize_file(wardrive_promisc_trace_path);
-        MY_LOG_INFO(TAG, "Wardrive trace saved to %s (distance %.1fm)", wardrive_promisc_trace_path, wdp_total_distance_m);
-        wardrive_promisc_trace_path[0] = '\0';
+        sd_sync();
+
+        // Publish atomically: rename ".inprogress.kml" -> final ".kml".
+        char final_path[100];
+        snprintf(final_path, sizeof(final_path),
+                 "/sdcard/lab/wardrives/%s_track.kml", wardrive_base);
+        unlink(final_path);
+        if (rename(wardrive_promisc_trace_path, final_path) == 0) {
+            sd_sync();
+            MY_LOG_INFO(TAG,
+                "Wardrive trace saved: %s (segments=%d, POIs=%d, dropped=%u, distance=%.1fm)",
+                final_path, wdp_trace.seg_written, wdp_trace.poi_written,
+                (unsigned)wdp_poi_dropped, wdp_total_distance_m);
+        } else {
+            MY_LOG_INFO(TAG,
+                "Wardrive trace rename failed (errno=%d); kept in-progress: %s "
+                "(segments=%d, POIs=%d, dropped=%u)",
+                errno, wardrive_promisc_trace_path, wdp_trace.seg_written,
+                wdp_trace.poi_written, (unsigned)wdp_poi_dropped);
+        }
+        wdp_trace.active = false;
     }
+    if (wdp_poi_queue) {
+        QueueHandle_t q = wdp_poi_queue;
+        wdp_poi_queue = NULL;
+        vQueueDelete(q);
+    }
+    wardrive_promisc_trace_path[0] = '\0';
     led_err = led_set_idle();
     if (led_err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to restore idle LED after wardrive promisc: %s", esp_err_to_name(led_err));
@@ -19122,52 +19317,252 @@ static double gps_distance_meters(double lat1, double lon1, double lat2, double 
     return earth_radius_m * c;
 }
 
+// Escape a UTF-8 string for XML text/attribute content. Multi-byte UTF-8 sequences
+// pass through unchanged (valid in a UTF-8 document); C0 control chars are dropped.
+static void xml_escape(const char *in, char *out, size_t outsz)
+{
+    size_t o = 0;
+    if (outsz == 0) return;
+    for (size_t i = 0; in && in[i] && o + 7 < outsz; i++) {
+        unsigned char c = (unsigned char)in[i];
+        const char *rep = NULL;
+        size_t rlen = 0;
+        switch (c) {
+            case '&':  rep = "&amp;";  rlen = 5; break;
+            case '<':  rep = "&lt;";   rlen = 4; break;
+            case '>':  rep = "&gt;";   rlen = 4; break;
+            case '"':  rep = "&quot;"; rlen = 6; break;
+            case '\'': rep = "&#39;";  rlen = 5; break;
+            default: break;
+        }
+        if (rep) {
+            memcpy(out + o, rep, rlen);
+            o += rlen;
+        } else if (c < 0x20 && c != '\n' && c != '\t') {
+            // drop other control characters
+        } else {
+            out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+}
+
+// Open the KML: header + styles (track segments, Wi-Fi security, BLE device types) + one open
+// <Folder>. The Document/Folder stay open for the whole session; every track
+// segment and POI is written as a complete, self-closed <Placemark> inside it, so a
+// power-loss leaves a file that a repair tool can close by finding the last
+// </Placemark>, trimming the tail and appending </Folder></Document></kml>.
 static bool wardrive_trace_init_file(const char *path)
 {
     FILE *file = fopen(path, "w");
     if (!file) {
         return false;
     }
-
-    fprintf(file, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    fprintf(file, "<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n");
-    fprintf(file, "<Document>\n");
-    fprintf(file, "  <name>Wardrive Promisc Trace</name>\n");
-    fprintf(file, "  <Style id=\"traceLine\">\n");
-    fprintf(file, "    <LineStyle><color>ff00ffff</color><width>4</width></LineStyle>\n");
-    fprintf(file, "  </Style>\n");
-    fprintf(file, "  <Placemark>\n");
-    fprintf(file, "    <name>Wardrive Trace</name>\n");
-    fprintf(file, "    <styleUrl>#traceLine</styleUrl>\n");
-    fprintf(file, "    <LineString>\n");
-    fprintf(file, "      <tessellate>1</tessellate>\n");
-    fprintf(file, "      <coordinates>\n");
+    fprintf(file,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n"
+        "<Document>\n"
+        "  <name>Wardrive Promisc Trace</name>\n"
+        "  <Style id=\"traceSeg\">\n"
+        "    <LineStyle><color>ff00ffff</color><width>4</width></LineStyle>\n"
+        "  </Style>\n"
+        // Small dot + visible SSID label. No external <Icon> href: renderers like
+        // GPSVisualizer can't fetch maps.google.com icons (they show as broken
+        // frames), so we let the viewer draw its own small marker in this colour.
+        // KML colours are aabbggrr: open=green, WPA2=blue, WPA3=red.
+        "  <Style id=\"wifiOpen\"><IconStyle><color>ff00cc00</color><scale>0.5</scale></IconStyle><LabelStyle><color>ff00cc00</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiWep\"><IconStyle><color>ff00a5ff</color><scale>0.5</scale></IconStyle><LabelStyle><color>ff00a5ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiWpa\"><IconStyle><color>ffff00ff</color><scale>0.5</scale></IconStyle><LabelStyle><color>ffff00ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiWpa2\"><IconStyle><color>ffff0000</color><scale>0.5</scale></IconStyle><LabelStyle><color>ffff0000</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiWpa3\"><IconStyle><color>ff0000ff</color><scale>0.5</scale></IconStyle><LabelStyle><color>ff0000ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiUnknown\"><IconStyle><color>ffb0b0b0</color><scale>0.5</scale></IconStyle><LabelStyle><color>ffb0b0b0</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"blePoi\"><IconStyle><color>ffffff00</color><scale>0.5</scale></IconStyle><LabelStyle><color>ffffff00</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"airTagPoi\"><IconStyle><color>ffff00ff</color><scale>0.6</scale></IconStyle><LabelStyle><color>ffff00ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"smartTagPoi\"><IconStyle><color>ff00d7ff</color><scale>0.6</scale></IconStyle><LabelStyle><color>ff00d7ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Folder>\n"
+        "    <name>Wardrive</name>\n");
     fclose(file);
     return true;
 }
 
-static bool wardrive_trace_append_point(const char *path, double lat, double lon, double alt)
+// Write the buffered points as one complete <Placemark><LineString> segment.
+// Segments touch: the first coordinate repeats the last vertex of the previous
+// segment (c->prev_*) so the drawn line is continuous. A segment is only written
+// once it has >= 2 coordinates, so we never emit a degenerate single-point line.
+static bool wdp_trace_flush_segment(const char *path, wdp_trace_ctx_t *c)
 {
+    if (!c || c->seg_n <= 0) return false;
+    int total = c->seg_n + (c->have_prev ? 1 : 0);
+    if (total < 2) return false;   // keep buffering until the line has 2+ points
+
     FILE *file = fopen(path, "a");
-    if (!file) {
-        return false;
+    if (!file) return false;
+    fprintf(file,
+        "    <Placemark>\n"
+        "      <name>seg %d</name>\n"
+        "      <styleUrl>#traceSeg</styleUrl>\n"
+        "      <LineString>\n"
+        "        <tessellate>1</tessellate>\n"
+        "        <coordinates>\n",
+        c->seg_written + 1);
+    if (c->have_prev) {
+        fprintf(file, "          %.7f,%.7f,%.2f\n", c->prev_lon, c->prev_lat, c->prev_alt);
     }
-    fprintf(file, "        %.7f,%.7f,%.2f\n", lon, lat, alt);
+    for (int i = 0; i < c->seg_n; i++) {
+        fprintf(file, "          %.7f,%.7f,%.2f\n", c->seg_lon[i], c->seg_lat[i], c->seg_alt[i]);
+    }
+    fprintf(file,
+        "        </coordinates>\n"
+        "      </LineString>\n"
+        "    </Placemark>\n");
     fclose(file);
+    sd_sync();
+
+    // Remember the last written vertex to stitch the next segment onto, clear buffer.
+    c->prev_lat = c->seg_lat[c->seg_n - 1];
+    c->prev_lon = c->seg_lon[c->seg_n - 1];
+    c->prev_alt = c->seg_alt[c->seg_n - 1];
+    c->have_prev = true;
+    c->seg_written++;
+    c->seg_n = 0;
+    c->last_seg_us = esp_timer_get_time();
     return true;
 }
 
+// Consider a new GPS vertex for the track: keep the existing 3 m sampling, buffer it,
+// accumulate distance, and flush a full segment (16 points) as soon as it fills. A
+// large GPS jump is a discontinuity: close the current segment and start the next one
+// without a connector, rather than drawing a false straight line across a GPS outage.
+static void wdp_trace_add_point(const char *path, wdp_trace_ctx_t *c,
+                                double lat, double lon, double alt, double *dist_accum)
+{
+    if (!c) return;
+    if (c->have_cur) {
+        double step = gps_distance_meters(c->cur_lat, c->cur_lon, lat, lon);
+        if (step < WDP_TRACE_MIN_STEP_M) return;
+        if (step > WDP_TRACE_MAX_STEP_M) {
+            MY_LOG_INFO(TAG,
+                "Wardrive trace discontinuity: GPS jump %.1fm; starting a new segment",
+                step);
+            wdp_trace_flush_segment(path, c);
+            c->have_prev = false;
+            c->seg_n = 0;
+            c->last_seg_us = esp_timer_get_time();
+        } else if (dist_accum) {
+            *dist_accum += step;
+        }
+    }
+    if (c->seg_n < WDP_TRACE_SEG_POINTS) {
+        c->seg_lat[c->seg_n] = lat;
+        c->seg_lon[c->seg_n] = lon;
+        c->seg_alt[c->seg_n] = alt;
+        c->seg_n++;
+    }
+    c->cur_lat = lat;
+    c->cur_lon = lon;
+    c->have_cur = true;
+    if (c->seg_n >= WDP_TRACE_SEG_POINTS) {
+        wdp_trace_flush_segment(path, c);
+    }
+}
+
+static const char *wdp_trace_poi_style(wifi_auth_mode_t authmode)
+{
+    switch (authmode) {
+        case WIFI_AUTH_OPEN:
+            return "#wifiOpen";
+        case WIFI_AUTH_WEP:
+            return "#wifiWep";
+        case WIFI_AUTH_WPA_PSK:
+        case WIFI_AUTH_WPA_WPA2_PSK:
+            return "#wifiWpa";
+        case WIFI_AUTH_WPA2_PSK:
+        case WIFI_AUTH_WPA2_ENTERPRISE:
+            return "#wifiWpa2";
+        case WIFI_AUTH_WPA3_PSK:
+        case WIFI_AUTH_WPA2_WPA3_PSK:
+            return "#wifiWpa3";
+        default:
+            return "#wifiUnknown";
+    }
+}
+
+static const char *wdp_trace_ble_style(const wdp_poi_msg_t *p)
+{
+    if (p->is_airtag) return "#airTagPoi";
+    if (p->is_smarttag) return "#smartTagPoi";
+    return "#blePoi";
+}
+
+// Write one Wi-Fi or BLE POI as a complete <Placemark><Point>. Called only from the
+// task while draining the callback queue. Label and description text are XML-escaped.
+static bool wdp_trace_write_poi(const char *path, wdp_trace_ctx_t *c, const wdp_poi_msg_t *p)
+{
+    if (!c || !p) return false;
+    FILE *file = fopen(path, "a");
+    if (!file) return false;
+
+    char mac[18];
+    snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             p->bssid[0], p->bssid[1], p->bssid[2], p->bssid[3], p->bssid[4], p->bssid[5]);
+
+    char ts[32];
+    if (p->ts) format_epoch_utc(p->ts, ts, sizeof(ts));
+    else       snprintf(ts, sizeof(ts), "unknown");
+
+    char name_raw[64];
+    if (p->is_ble && !p->ssid[0]) snprintf(name_raw, sizeof(name_raw), "BLE %s", mac);
+    else                           snprintf(name_raw, sizeof(name_raw), "%s", p->ssid[0] ? p->ssid : "<hidden>");
+    char name_esc[384];
+    xml_escape(name_raw, name_esc, sizeof(name_esc));
+
+    char desc_raw[256];
+    const char *style = p->is_ble ? wdp_trace_ble_style(p) : wdp_trace_poi_style(p->authmode);
+    if (p->is_ble) {
+        const char *kind = p->is_airtag ? "AirTag [LE]" : p->is_smarttag ? "SmartTag [LE]" : "BLE";
+        if (p->company_id) {
+            snprintf(desc_raw, sizeof(desc_raw),
+                "Address: %s\nType: %s\nRSSI: %d dBm\nManufacturer ID: %u\nTime: %s\nAlt: %.1f m\nAcc: %.1f m",
+                mac, kind, (int)p->rssi, (unsigned)p->company_id, ts, p->alt, p->acc);
+        } else {
+            snprintf(desc_raw, sizeof(desc_raw),
+                "Address: %s\nType: %s\nRSSI: %d dBm\nTime: %s\nAlt: %.1f m\nAcc: %.1f m",
+                mac, kind, (int)p->rssi, ts, p->alt, p->acc);
+        }
+    } else {
+        snprintf(desc_raw, sizeof(desc_raw),
+            "BSSID: %s\nRSSI: %d dBm\nChannel: %d\nAuth: %s\nTime: %s\nAlt: %.1f m\nAcc: %.1f m",
+            mac, (int)p->rssi, (int)p->channel, get_auth_mode_wiggle(p->authmode),
+            ts, p->alt, p->acc);
+    }
+    char desc_esc[384];
+    xml_escape(desc_raw, desc_esc, sizeof(desc_esc));
+
+    fprintf(file,
+        "    <Placemark>\n"
+        "      <name>%s</name>\n"
+        "      <styleUrl>%s</styleUrl>\n"
+        "      <description>%s</description>\n"
+        "      <Point><coordinates>%.7f,%.7f,%.2f</coordinates></Point>\n"
+        "    </Placemark>\n",
+        name_esc, style, desc_esc, p->lon, p->lat, p->alt);
+    fclose(file);
+    c->poi_written++;
+    return true;
+}
+
+// Close the open <Folder>, <Document> and <kml>. On a clean stop this makes the
+// in-progress file a fully valid KML before it is renamed to its final name.
 static void wardrive_trace_finalize_file(const char *path)
 {
     FILE *file = fopen(path, "a");
     if (!file) {
         return;
     }
-    fprintf(file, "      </coordinates>\n");
-    fprintf(file, "    </LineString>\n");
-    fprintf(file, "  </Placemark>\n");
-    fprintf(file, "</Document>\n");
-    fprintf(file, "</kml>\n");
+    fprintf(file,
+        "  </Folder>\n"
+        "</Document>\n"
+        "</kml>\n");
     fclose(file);
 }
 
@@ -19319,7 +19714,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         if (dev_idx >= 0 && wardrive_promisc_active) {
             int8_t cur = desc->rssi;
             bt_devices[dev_idx].rssi = cur;
-            if (g_wd_cfg.ble_rssi_delta > 0 && !bt_devices[dev_idx].needs_log) {
+            if (g_wd_cfg.ble_rssi_delta > 0 && !bt_devices[dev_idx].needs_log && current_gps.valid) {
                 bool trig = false;
                 int rd = cur - bt_devices[dev_idx].last_logged_rssi;
                 if (rd < 0) rd = -rd;
@@ -19335,6 +19730,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
                 }
                 if (trig) {
                     bt_devices[dev_idx].needs_log = true;
+                    bt_snapshot_obs(&bt_devices[dev_idx]);   // stamp this re-observation
                     wdp_relog_pending = true;
                 }
             }
@@ -19360,6 +19756,13 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         return 0;
     }
 
+    // First sighting during a wardrive: don't register a device we can't place, or its
+    // CSV row (and the re-log baseline) would be 0,0. It re-registers on the next advert
+    // once a fix returns. Scoped to wardrive so scan_bt / anti-surveillance are unaffected.
+    if (wardrive_promisc_active && !current_gps.valid) {
+        return 0;
+    }
+
     // Add to found devices list
     if (!bt_add_found_device(desc->addr.val)) {
         return 0;
@@ -19378,6 +19781,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     dev->is_smarttag = false;
     dev->needs_log = true;          // pending first write to SD
     dev->last_logged_valid = false;
+    bt_snapshot_obs(dev);           // stamp the first sighting (WiGLE FirstSeen)
     dev->as_first_us = esp_timer_get_time();
     dev->as_last_us = dev->as_first_us;
     dev->as_has_origin = false;
@@ -19410,6 +19814,29 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         if (!dev->is_airtag && bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
             dev->is_smarttag = true;
             bt_smarttag_count++;
+        }
+    }
+
+    // Wardrive Trace: one KML POI per first-seen BLE advertiser. As with Wi-Fi,
+    // only a compact snapshot crosses the callback/task boundary; the task owns all
+    // KML/SD writes. The observation snapshot keeps its position/time consistent with
+    // the matching BLE CSV row.
+    if (wardrive_promisc_trace_enabled && wdp_poi_queue && dev->obs_gps_valid) {
+        wdp_poi_msg_t poi = {0};
+        memcpy(poi.bssid, dev->addr, sizeof(poi.bssid));
+        strncpy(poi.ssid, dev->name, sizeof(poi.ssid) - 1);
+        poi.rssi        = dev->rssi;
+        poi.is_ble      = true;
+        poi.is_airtag   = dev->is_airtag;
+        poi.is_smarttag = dev->is_smarttag;
+        poi.company_id  = dev->company_id;
+        poi.lat         = dev->obs_lat;
+        poi.lon         = dev->obs_lon;
+        poi.alt         = dev->obs_alt;
+        poi.acc         = dev->obs_acc;
+        poi.ts          = dev->obs_time;
+        if (xQueueSend(wdp_poi_queue, &poi, 0) != pdTRUE) {
+            wdp_poi_dropped++;
         }
     }
     
@@ -23185,11 +23612,81 @@ static esp_err_t create_sd_directories(void) {
     return ESP_OK;
 }
 
+// Copy the idx-th comma-separated field of an NMEA sentence into out.
+// Unlike strtok, empty fields are preserved (",," advances the index), which is
+// required for RMC where optional fields (speed/course) may be blank yet later
+// fields (the date) must still land at their fixed positions. Returns false if
+// the field index does not exist.
+static bool nmea_get_field(const char *s, int idx, char *out, size_t outsz) {
+    int f = 0;
+    const char *start = s;
+    for (;; s++) {
+        char c = *s;
+        if (c == ',' || c == '*' || c == '\0') {
+            if (f == idx) {
+                size_t n = (size_t)(s - start);
+                if (n >= outsz) n = outsz - 1;
+                memcpy(out, start, n);
+                out[n] = '\0';
+                return true;
+            }
+            if (c == '\0' || c == '*') break;   // end of sentence / checksum marker
+            f++;
+            start = s + 1;
+        }
+    }
+    return false;
+}
+
+// Seed the ESP32 system clock from a GPS UTC date+time (from $GxRMC). Runs once,
+// then only re-corrects on drift > 2 s so we don't call settimeofday every second.
+static void gps_seed_clock_from_utc(int yy, int mo, int dd, int hh, int mi, int ss) {
+    if (mo < 1 || mo > 12 || dd < 1 || dd > 31 || hh > 23 || mi > 59 || ss > 61) return;
+    static bool tz_set = false;
+    if (!tz_set) { setenv("TZ", "UTC0", 1); tzset(); tz_set = true; }  // mktime() == UTC epoch
+    struct tm t = {0};
+    t.tm_year = (2000 + yy) - 1900;
+    t.tm_mon  = mo - 1;
+    t.tm_mday = dd;
+    t.tm_hour = hh;
+    t.tm_min  = mi;
+    t.tm_sec  = ss;
+    t.tm_isdst = 0;
+    time_t epoch = mktime(&t);
+    if (epoch <= 0) return;
+    time_t now = time(NULL);
+    long drift = (long)(now > epoch ? now - epoch : epoch - now);
+    if (!g_gps_clock_synced || drift > 2) {
+        struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        g_gps_clock_synced = true;
+    }
+}
+
 static bool parse_gps_nmea(const char* nmea_sentence) {
     if (!nmea_sentence || strlen(nmea_sentence) < 10) {
         return false;
     }
-    
+
+    // Parse GPRMC/GNRMC for real UTC date+time and seed the system clock. GGA carries
+    // only time-of-day (no date), so RMC is what makes WiGLE FirstSeen a real timestamp.
+    if (strncmp(nmea_sentence, "$GPRMC", 6) == 0 || strncmp(nmea_sentence, "$GNRMC", 6) == 0) {
+        char utc[16] = "", status[4] = "", date[12] = "";
+        nmea_get_field(nmea_sentence, 1, utc, sizeof(utc));      // HHMMSS(.sss)
+        nmea_get_field(nmea_sentence, 2, status, sizeof(status)); // A=valid, V=void
+        nmea_get_field(nmea_sentence, 9, date, sizeof(date));     // DDMMYY
+        if (status[0] == 'A' && strlen(utc) >= 6 && strlen(date) == 6) {
+            int hh = (utc[0]-'0')*10 + (utc[1]-'0');
+            int mi = (utc[2]-'0')*10 + (utc[3]-'0');
+            int ss = (utc[4]-'0')*10 + (utc[5]-'0');
+            int dd = (date[0]-'0')*10 + (date[1]-'0');
+            int mo = (date[2]-'0')*10 + (date[3]-'0');
+            int yy = (date[4]-'0')*10 + (date[5]-'0');
+            gps_seed_clock_from_utc(yy, mo, dd, hh, mi, ss);
+        }
+        return true;  // RMC handled; lat/lon come from GGA
+    }
+
     // Parse GPGGA sentence for basic GPS data
     if (strncmp(nmea_sentence, "$GPGGA", 6) == 0 || strncmp(nmea_sentence, "$GNGGA", 6) == 0) {
         char sentence[256];
@@ -23265,17 +23762,18 @@ static bool parse_gps_nmea(const char* nmea_sentence) {
     return false;
 }
 
+// Format an absolute UTC epoch as WiGLE-style "YYYY-MM-DD HH:MM:SS".
+static void format_epoch_utc(time_t t, char* buffer, size_t size) {
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    strftime(buffer, size, "%Y-%m-%d %H:%M:%S", &tmv);
+}
+
+// Real wall-clock timestamp (UTC). Requires the clock to have been seeded from GPS
+// $GxRMC (see gps_seed_clock_from_utc). If not yet seeded the epoch is near 1970,
+// which is deliberately obvious rather than a plausible-but-fake value.
 static void get_timestamp_string(char* buffer, size_t size) {
-    // For now, use a simple counter-based timestamp
-    // In a real implementation, you'd use RTC or NTP time
-    static uint32_t timestamp_counter = 0;
-    timestamp_counter++;
-    
-    // Format as a simple date-time string
-    snprintf(buffer, size, "2025-09-26 %02d:%02d:%02d", 
-             (int)((timestamp_counter / 3600) % 24),
-             (int)((timestamp_counter / 60) % 60), 
-             (int)(timestamp_counter % 60));
+    format_epoch_utc(time(NULL), buffer, size);
 }
 
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode) {
@@ -23376,27 +23874,77 @@ static bool wait_for_gps_fix(int timeout_seconds) {
 
 static int find_next_wardrive_file_number(void) {
     int max_number = 0;
-    char filename[64];
-    MY_LOG_INFO(TAG, "Scanning for existing wardrive log files...");
-    // Scan through possible file numbers to find the highest existing one
+    char filename[80];
+    MY_LOG_INFO(TAG, "Scanning for existing wardrive session files...");
+    // A session "occupies" a number if ANY of its artifacts exist: the CSV log, the
+    // finalized track KML, or a not-yet-committed ".inprogress.kml" from a run that
+    // lost power. Considering all three means we never overwrite a partial trace.
     for (int i = 1; i <= 9999; i++) {
+        struct stat st;
+        bool exists = false;
+
         snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", i);
-        
-        struct stat file_stat;
-        if (stat(filename, &file_stat) == 0) {
-            // File exists, update max_number
+        if (stat(filename, &st) == 0) exists = true;
+        if (!exists) {
+            snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d_track.kml", i);
+            if (stat(filename, &st) == 0) exists = true;
+        }
+        if (!exists) {
+            snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d_track.inprogress.kml", i);
+            if (stat(filename, &st) == 0) exists = true;
+        }
+
+        if (exists) {
             max_number = i;
-            MY_LOG_INFO(TAG, "Found existing file: w%d.log", i);
         } else {
-            // First non-existing file number, we can break here for efficiency
+            // First fully-free number; contiguous scan is enough for our sequential naming.
             break;
         }
     }
-    
+
     int next_number = max_number + 1;
-    MY_LOG_INFO(TAG, "Highest existing file number: %d, next will be: %d", max_number, next_number);
-    
+    MY_LOG_INFO(TAG, "Highest existing session number: %d, next will be: %d", max_number, next_number);
+
     return next_number;
+}
+
+// Build the base name for a wardrive session; files are "{base}.log", "{base}_track.kml"
+// and "{base}_track.inprogress.kml". Once the clock is seeded from GPS ($GxRMC), the base
+// is real UTC time "YYYYMMDD_HHMMSS" (same clock as the CSV FirstSeen, chronologically
+// sortable). Without a synced clock it falls back to the legacy "wN" counter. A short
+// numeric suffix is appended if that base is already taken, so nothing is ever overwritten
+// and archived files never collide.
+static void wardrive_make_session_base(char *out, size_t out_sz) {
+    char raw[24];
+    if (g_gps_clock_synced) {
+        time_t now = time(NULL);
+        struct tm tmv;
+        gmtime_r(&now, &tmv);
+        strftime(raw, sizeof(raw), "%Y%m%d_%H%M%S", &tmv);   // UTC
+    } else {
+        snprintf(raw, sizeof(raw), "w%d", find_next_wardrive_file_number());
+    }
+
+    for (int suffix = 0; suffix < 100; suffix++) {
+        if (suffix == 0) snprintf(out, out_sz, "%s", raw);
+        else             snprintf(out, out_sz, "%s_%d", raw, suffix);
+
+        struct stat st;
+        char probe[96];
+        bool taken = false;
+        snprintf(probe, sizeof(probe), "/sdcard/lab/wardrives/%s.log", out);
+        if (stat(probe, &st) == 0) taken = true;
+        if (!taken) {
+            snprintf(probe, sizeof(probe), "/sdcard/lab/wardrives/%s_track.kml", out);
+            if (stat(probe, &st) == 0) taken = true;
+        }
+        if (!taken) {
+            snprintf(probe, sizeof(probe), "/sdcard/lab/wardrives/%s_track.inprogress.kml", out);
+            if (stat(probe, &st) == 0) taken = true;
+        }
+        if (!taken) return;
+    }
+    // 100 collisions in the same second is not realistic; keep the last candidate.
 }
 
 static int find_next_pcap_file_number(void) {
