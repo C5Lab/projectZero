@@ -1838,6 +1838,8 @@ static sdmmc_card_t *sd_card_handle = NULL;
 #define MAX_SSID_NAME_LEN 32
 #define SSID_PRESET_PATH "/sdcard/lab/ssid.txt"
 #define SSIDS_FILE_PATH  "/sdcard/lab/ssids.txt"
+#define HOME_FILE_PATH   "/sdcard/lab/home.txt"
+#define MAX_HOME_NETWORKS 16
 
 // Whitelist for BSSID protection (allocated in PSRAM)
 #define MAX_WHITELISTED_BSSIDS 150
@@ -1989,6 +1991,9 @@ static int cmd_list_ssid(int argc, char **argv);
 static int cmd_list_ssids(int argc, char **argv);
 static int cmd_add_ssid(int argc, char **argv);
 static int cmd_remove_ssid(int argc, char **argv);
+static int cmd_home_list(int argc, char **argv);
+static int cmd_home_add(int argc, char **argv);
+static int cmd_home_remove(int argc, char **argv);
 static int cmd_start_beacon_spam_ssids(int argc, char **argv);
 static int start_beacon_spam_internal(void);
 static int cmd_select_html(int argc, char **argv);
@@ -2265,6 +2270,9 @@ static int wigle_wifi_channel_to_frequency_mhz(int channel);
 static double gps_distance_meters(double lat1, double lon1, double lat2, double lon2);
 static bool wardrive_trace_init_file(const char *path);
 static void wardrive_trace_finalize_file(const char *path);
+static bool wardrive_kml_finalize_orphan(const char *inprogress_path);
+static void wardrive_kml_repair_orphans(void);
+static int  cmd_wardrive_fix_kml(int argc, char **argv);
 static bool wdp_trace_flush_segment(const char *path, wdp_trace_ctx_t *c);
 static void wdp_trace_add_point(const char *path, wdp_trace_ctx_t *c,
                                 double lat, double lon, double alt, double *dist_accum);
@@ -6136,6 +6144,10 @@ static void wardrive_promisc_task(void *pvParameters) {
         ESP_LOGW(TAG, "Failed to set LED for wardrive promisc: %s", esp_err_to_name(led_err));
     }
 
+    // Finalize any trace KML left unclosed by a previous power-loss (e.g. dead battery)
+    // before this session starts writing a new one, so old traces open in Google Earth.
+    wardrive_kml_repair_orphans();
+
     double wdp_total_distance_m = 0.0;
     // Session file base + paths are decided AFTER the GPS fix (below) so the names can use
     // real UTC time. Declared here (before any `goto cleanup`) and left empty until then.
@@ -8435,6 +8447,132 @@ static bool wardrive_fix_file_soft(const char *filepath, const char *filename,
     // intentionally not automatic yet because guessing broken records can corrupt
     // coordinates or device identity; the soft mode only drops unsafe rows.
     return true;
+}
+
+// Finalize a truncated wardrive trace KML: copy everything up to and including the last
+// complete </Placemark>, then append the closing tags and publish as the final
+// "_track.kml". Fixes files left by a hard power-off (dead battery) that Google Earth
+// refuses to open because the document is not closed.
+static bool wardrive_kml_finalize_orphan(const char *inprogress_path) {
+    if (!inprogress_path) return false;
+
+    FILE *in = fopen(inprogress_path, "r");
+    if (!in) return false;
+
+    // Pass 1: byte offset just past the last complete "</Placemark>" line. Anything
+    // after it is a half-written record from the power-loss and gets dropped.
+    long cut = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), in)) {
+        if (strstr(line, "</Placemark>") != NULL) {
+            cut = ftell(in);
+        }
+    }
+    if (cut <= 0) {
+        fclose(in);
+        MY_LOG_INFO(TAG, "wardrive_fix_kml: no complete placemark in %s", inprogress_path);
+        return false;
+    }
+
+    // Derive the final path: "..._track.inprogress.kml" -> "..._track.kml".
+    char final_path[128];
+    snprintf(final_path, sizeof(final_path), "%s", inprogress_path);
+    char *ip = strstr(final_path, ".inprogress.kml");
+    if (ip) {
+        snprintf(ip, sizeof(final_path) - (size_t)(ip - final_path), ".kml");
+    } else {
+        snprintf(final_path, sizeof(final_path), "%s.fixed.kml", inprogress_path);
+    }
+
+    FILE *out = fopen(final_path, "w");
+    if (!out) {
+        fclose(in);
+        return false;
+    }
+
+    // Pass 2: copy the valid prefix, then close the KML document.
+    rewind(in);
+    long remaining = cut;
+    char buf[512];
+    while (remaining > 0) {
+        size_t want = remaining < (long)sizeof(buf) ? (size_t)remaining : sizeof(buf);
+        size_t got = fread(buf, 1, want, in);
+        if (got == 0) break;
+        fwrite(buf, 1, got, out);
+        remaining -= (long)got;
+    }
+    fprintf(out, "  </Folder>\n</Document>\n</kml>\n");
+    fclose(in);
+    fclose(out);
+    sd_sync();
+
+    // Drop the broken in-progress file now that a valid copy exists.
+    unlink(inprogress_path);
+    sd_sync();
+    return true;
+}
+
+// Scan the wardrives folder and finalize any orphaned "*_track.inprogress.kml" left by a
+// session that didn't stop cleanly. Names are collected before repairing so the directory
+// is not modified mid-iteration. Called at wardrive start (SD is mounted then).
+static void wardrive_kml_repair_orphans(void) {
+    DIR *dir = opendir("/sdcard/lab/wardrives");
+    if (!dir) return;
+
+    char names[8][96];
+    int n = 0;
+    const char *suffix = "_track.inprogress.kml";
+    size_t slen = strlen(suffix);
+    struct dirent *entry;
+    while (n < 8 && (entry = readdir(dir)) != NULL) {
+        const char *nm = entry->d_name;
+        size_t len = strlen(nm);
+        if (len > slen && strcmp(nm + len - slen, suffix) == 0) {
+            snprintf(names[n], sizeof(names[n]), "%.95s", nm);
+            n++;
+        }
+    }
+    closedir(dir);
+
+    int fixed = 0;
+    for (int i = 0; i < n; i++) {
+        char path[128];
+        snprintf(path, sizeof(path), "/sdcard/lab/wardrives/%s", names[i]);
+        if (wardrive_kml_finalize_orphan(path)) {
+            fixed++;
+            MY_LOG_INFO(TAG, "Repaired orphaned trace KML: %s", names[i]);
+        }
+    }
+    if (fixed > 0) {
+        MY_LOG_INFO(TAG, "Wardrive: finalized %d orphaned trace KML file(s).", fixed);
+    }
+}
+
+// Command: repair one truncated trace KML on demand (mirrors wardrive_fix for .log).
+static int cmd_wardrive_fix_kml(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: wardrive_fix_kml <file>");
+        return 1;
+    }
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    char path[128];
+    if (argv[1][0] == '/') snprintf(path, sizeof(path), "%s", argv[1]);
+    else snprintf(path, sizeof(path), "/sdcard/lab/wardrives/%s", argv[1]);
+
+    printf("[WARD_FIX_KML] BEGIN\n");
+    if (wardrive_kml_finalize_orphan(path)) {
+        printf("[WARD_FIX_KML] file=%s status=ok\n", argv[1]);
+        printf("[WARD_FIX_KML] END\n");
+        return 0;
+    }
+    printf("[WARD_FIX_KML] file=%s status=failed\n", argv[1]);
+    printf("[WARD_FIX_KML] END\n");
+    return 1;
 }
 
 static bool wardrive_collect_file_id(const char *filepath, long *out_size, uint32_t *out_hash) {
@@ -12693,6 +12831,28 @@ static bool wifi_lookup_portal_password(const char *ssid, char *out, size_t out_
     return found;
 }
 
+static bool wifi_lookup_home_password(const char *ssid, char *out, size_t out_sz) {
+    FILE *file = fopen(HOME_FILE_PATH, "r");
+    if (!file) {
+        return false;
+    }
+
+    bool found = false;
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        char saved_ssid[64];
+        char saved_pass[96];
+        if (csv_get_quoted_field(line, 0, saved_ssid, sizeof(saved_ssid)) &&
+            csv_get_quoted_field(line, 1, saved_pass, sizeof(saved_pass)) &&
+            strcmp(saved_ssid, ssid) == 0 && saved_pass[0] != '\0') {
+            snprintf(out, out_sz, "%s", saved_pass);
+            found = true;
+        }
+    }
+    fclose(file);
+    return found;
+}
+
 static bool wifi_lookup_known_password(const char *ssid, char *out, size_t out_sz) {
     if (!ssid || !out || out_sz == 0) {
         return false;
@@ -12710,6 +12870,10 @@ static bool wifi_lookup_known_password(const char *ssid, char *out, size_t out_s
     }
     if (wifi_lookup_portal_password(ssid, out, out_sz)) {
         MY_LOG_INFO(TAG, "wifi_connect: using saved password from portals.txt for '%s'", ssid);
+        return true;
+    }
+    if (wifi_lookup_home_password(ssid, out, out_sz)) {
+        MY_LOG_INFO(TAG, "wifi_connect: using saved password from home.txt for '%s'", ssid);
         return true;
     }
     return false;
@@ -16503,6 +16667,196 @@ static int cmd_remove_ssid(int argc, char **argv)
     sd_sync();
 
     MY_LOG_INFO(TAG, "SSID removed. %d SSIDs remaining.", count - 1);
+    return 0;
+}
+
+// ---- Home networks (home.txt) for wardrive auto-upload ----
+// File format: "SSID", "password", "BSSID" (one per line, quoted; BSSID optional/empty).
+// BSSID lets us match hidden networks (empty SSID in the wardrive stream) by MAC.
+
+// Load home networks from home.txt. Returns entry count, or -1 if file missing.
+static int load_home_networks(char ssids[][33], char passes[][65], char bssids[][18], int max_entries) {
+    FILE *f = fopen(HOME_FILE_PATH, "r");
+    if (f == NULL) {
+        return -1;
+    }
+    int count = 0;
+    char line[256];
+    while (count < max_entries && fgets(line, sizeof(line), f)) {
+        char ssid[64];
+        char pass[96];
+        char bssid[32];
+        if (!csv_get_quoted_field(line, 0, ssid, sizeof(ssid)) || ssid[0] == '\0') {
+            continue;
+        }
+        if (!csv_get_quoted_field(line, 1, pass, sizeof(pass))) {
+            pass[0] = '\0';
+        }
+        if (!csv_get_quoted_field(line, 2, bssid, sizeof(bssid))) {
+            bssid[0] = '\0';
+        }
+        strncpy(ssids[count], ssid, 32); ssids[count][32] = '\0';
+        strncpy(passes[count], pass, 64); passes[count][64] = '\0';
+        strncpy(bssids[count], bssid, 17); bssids[count][17] = '\0';
+        count++;
+    }
+    fclose(f);
+    return count;
+}
+
+// Rewrite the whole home.txt from the in-memory arrays. Returns true on success.
+static bool home_write_all(char ssids[][33], char passes[][65], char bssids[][18], int count) {
+    FILE *f = fopen(HOME_FILE_PATH, "w");
+    if (f == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open home.txt for writing");
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        fprintf(f, "\"%s\", \"%s\", \"%s\"\n", ssids[i], passes[i], bssids[i]);
+    }
+    fflush(f);
+    fclose(f);
+    sd_sync();
+    return true;
+}
+
+static int cmd_home_list(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    char ssids[MAX_HOME_NETWORKS][33];
+    char passes[MAX_HOME_NETWORKS][65];
+    char bssids[MAX_HOME_NETWORKS][18];
+    int count = load_home_networks(ssids, passes, bssids, MAX_HOME_NETWORKS);
+    if (count < 0) {
+        count = 0;  // no file yet == empty list
+    }
+
+    MY_LOG_INFO(TAG, "Home networks:");
+    for (int i = 0; i < count; i++) {
+        printf("%d \"%s\" \"%s\"\n", i + 1, ssids[i], bssids[i]);
+    }
+    MY_LOG_INFO(TAG, "Home networks printed");
+    return 0;
+}
+
+static int cmd_home_add(int argc, char **argv) {
+    if (argc < 3) {
+        MY_LOG_INFO(TAG, "Usage: home_add \"<SSID>\" \"<password>\" [BSSID]");
+        return 1;
+    }
+
+    const char *ssid = argv[1];
+    const char *pass = argv[2];
+    const char *bssid = (argc >= 4) ? argv[3] : "";
+    size_t ssid_len = strlen(ssid);
+    if (ssid_len == 0 || ssid_len > 32) {
+        MY_LOG_INFO(TAG, "SSID length must be 1-32 characters");
+        return 1;
+    }
+    if (strlen(pass) > 64) {
+        MY_LOG_INFO(TAG, "Password too long (max 64 characters)");
+        return 1;
+    }
+    if (strlen(bssid) > 17) {
+        MY_LOG_INFO(TAG, "BSSID too long (expected AA:BB:CC:DD:EE:FF)");
+        return 1;
+    }
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    char ssids[MAX_HOME_NETWORKS][33];
+    char passes[MAX_HOME_NETWORKS][65];
+    char bssids[MAX_HOME_NETWORKS][18];
+    int count = load_home_networks(ssids, passes, bssids, MAX_HOME_NETWORKS);
+    if (count < 0) {
+        count = 0;  // file not present yet, start fresh
+    }
+
+    // Update in place if the SSID is already known.
+    for (int i = 0; i < count; i++) {
+        if (strcmp(ssids[i], ssid) == 0) {
+            strncpy(passes[i], pass, 64); passes[i][64] = '\0';
+            strncpy(bssids[i], bssid, 17); bssids[i][17] = '\0';
+            if (!home_write_all(ssids, passes, bssids, count)) {
+                return 1;
+            }
+            MY_LOG_INFO(TAG, "Updated home network: %s", ssid);
+            return 0;
+        }
+    }
+
+    if (count >= MAX_HOME_NETWORKS) {
+        MY_LOG_INFO(TAG, "Home network list full (max %d)", MAX_HOME_NETWORKS);
+        return 1;
+    }
+
+    strncpy(ssids[count], ssid, 32); ssids[count][32] = '\0';
+    strncpy(passes[count], pass, 64); passes[count][64] = '\0';
+    strncpy(bssids[count], bssid, 17); bssids[count][17] = '\0';
+    count++;
+    if (!home_write_all(ssids, passes, bssids, count)) {
+        return 1;
+    }
+    MY_LOG_INFO(TAG, "Added home network: %s", ssid);
+    return 0;
+}
+
+static int cmd_home_remove(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: home_remove \"<SSID>\"");
+        return 1;
+    }
+    const char *ssid = argv[1];
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    char ssids[MAX_HOME_NETWORKS][33];
+    char passes[MAX_HOME_NETWORKS][65];
+    char bssids[MAX_HOME_NETWORKS][18];
+    int count = load_home_networks(ssids, passes, bssids, MAX_HOME_NETWORKS);
+    if (count < 0) {
+        MY_LOG_INFO(TAG, "home.txt not found on SD card.");
+        return 1;
+    }
+
+    int out = 0;
+    bool removed = false;
+    for (int i = 0; i < count; i++) {
+        if (!removed && strcmp(ssids[i], ssid) == 0) {
+            removed = true;
+            continue;
+        }
+        if (out != i) {
+            strncpy(ssids[out], ssids[i], 32); ssids[out][32] = '\0';
+            strncpy(passes[out], passes[i], 64); passes[out][64] = '\0';
+            strncpy(bssids[out], bssids[i], 17); bssids[out][17] = '\0';
+        }
+        out++;
+    }
+
+    if (!removed) {
+        MY_LOG_INFO(TAG, "Home network not found: %s", ssid);
+        return 1;
+    }
+
+    if (!home_write_all(ssids, passes, bssids, out)) {
+        return 1;
+    }
+    MY_LOG_INFO(TAG, "Removed home network: %s. %d remaining.", ssid, out);
     return 0;
 }
 
@@ -20714,6 +21068,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_cleanup_cmd));
 
+    const esp_console_cmd_t wardrive_fix_kml_cmd = {
+        .command = "wardrive_fix_kml",
+        .help = "Close a truncated trace KML and publish _track.kml: wardrive_fix_kml <file>",
+        .hint = NULL,
+        .func = &cmd_wardrive_fix_kml,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_fix_kml_cmd));
+
     const esp_console_cmd_t wardrive_fix_cmd = {
         .command = "wardrive_fix",
         .help = "Create a soft-fixed WigleWifi copy: wardrive_fix <file>",
@@ -21263,6 +21626,33 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&remove_ssid_cmd));
 
+    const esp_console_cmd_t home_list_cmd = {
+        .command = "home_list",
+        .help = "List home networks from /sdcard/lab/home.txt",
+        .hint = NULL,
+        .func = &cmd_home_list,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&home_list_cmd));
+
+    const esp_console_cmd_t home_add_cmd = {
+        .command = "home_add",
+        .help = "Add/update home network: home_add \"<SSID>\" \"<password>\"",
+        .hint = NULL,
+        .func = &cmd_home_add,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&home_add_cmd));
+
+    const esp_console_cmd_t home_remove_cmd = {
+        .command = "home_remove",
+        .help = "Remove home network: home_remove \"<SSID>\"",
+        .hint = NULL,
+        .func = &cmd_home_remove,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&home_remove_cmd));
+
     const esp_console_cmd_t file_delete_cmd = {
         .command = "file_delete",
         .help = "Delete a file on SD card: file_delete <path>",
@@ -21491,7 +21881,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"Type 'help' to list all commands.");
 
     repl_config.prompt = ">";
-    repl_config.max_cmdline_length = 100;
+    repl_config.max_cmdline_length = 256;
 
     esp_console_register_help_command();
     register_commands();
