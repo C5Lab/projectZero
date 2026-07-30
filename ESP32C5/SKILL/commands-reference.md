@@ -295,6 +295,15 @@ Connect to 'duap' WiFi network to access the captive portal
 - **Description**: Open captive portal (no password required to join).
 - **Args**: SSID (1-32 chars).
 - **Prerequisite**: Optionally `select_html` for custom HTML.
+
+### `start_admin_portal`
+- **Syntax**: `start_admin_portal <password>`
+- **Description**: Brings up a WPA2 access point named `JanOS-Admin` (reusing the captive portal AP/HTTP/DNS technique) and serves a web-based file manager scoped to `/sdcard/lab`. Features: browse the directory tree, upload/download any file, rename/delete files and folders, and edit text files in-browser.
+- **Args**: WPA2 password (8-63 chars).
+- **Prerequisite**: SD card inserted.
+- **Access**: Join `JanOS-Admin` with the password, then open `http://172.0.0.1`.
+- **HTTP endpoints**: `GET /api/list|download|read`, `POST /api/upload|write|rename|delete` (all paths are relative to `/sdcard/lab`; `..` is rejected).
+- **Stop**: Send `stop`.
 - **Output**:
 ```
 Captive portal started successfully!

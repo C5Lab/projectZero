@@ -127,7 +127,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.0"
+#define JANOS_VERSION "1.7.1"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -1982,6 +1982,7 @@ static int cmd_start_blackout(int argc, char **argv);
 static int cmd_ping(int argc, char **argv);
 static int cmd_boot_button(int argc, char **argv);
 static int cmd_start_portal(int argc, char **argv);
+static int cmd_start_admin_portal(int argc, char **argv);
 static int cmd_start_rogueap(int argc, char **argv);
 static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
@@ -2088,6 +2089,15 @@ static esp_err_t save_handler(httpd_req_t *req);
 static esp_err_t android_captive_handler(httpd_req_t *req);
 static esp_err_t ios_captive_handler(httpd_req_t *req);
 static esp_err_t captive_detection_handler(httpd_req_t *req);
+// Admin portal HTTP handlers
+static esp_err_t admin_root_handler(httpd_req_t *req);
+static esp_err_t admin_list_handler(httpd_req_t *req);
+static esp_err_t admin_download_handler(httpd_req_t *req);
+static esp_err_t admin_read_handler(httpd_req_t *req);
+static esp_err_t admin_upload_handler(httpd_req_t *req);
+static esp_err_t admin_write_handler(httpd_req_t *req);
+static esp_err_t admin_rename_handler(httpd_req_t *req);
+static esp_err_t admin_delete_handler(httpd_req_t *req);
 // Sniffer functions
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_process_scan_results(void);
@@ -12506,6 +12516,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "set_gps_position", " <lat> <lon> [alt] [acc]" },
     { "set_gps_position_cap", " <lat> <lon> [alt] [acc]" },
     { "start_portal", " <SSID>" },
+    { "start_admin_portal", " <password>" },
     { "start_karma", " <index>" },
     { "start_nmap", " [quick|medium|heavy] [IP]" },
     { "start_zig_recon", " [all|11,15,20] [dwell_ms]" },
@@ -19184,6 +19195,608 @@ static int cmd_start_portal(int argc, char **argv) {
     return 0;
 }
 
+// ===========================================================================
+// Admin portal (start_admin_portal): WPA2 AP "JanOS-Admin" that reuses the
+// captive portal AP/HTTP/DNS technique but serves a web-based file manager
+// restricted to /sdcard/lab (directory tree, upload/download, rename/delete,
+// text editing).
+// ===========================================================================
+
+#define ADMIN_ROOT_DIR "/sdcard/lab"
+#define ADMIN_EDIT_MAX (256 * 1024)   // max bytes served to the text editor
+#define ADMIN_IO_CHUNK 2048
+
+// Single-page admin UI (no external assets, works offline behind captive portal)
+static const char* admin_portal_html =
+"<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+"<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+"<title>JanOS Admin</title><style>"
+"body{font-family:Arial,sans-serif;background:#1e1e1e;color:#eee;margin:0;padding:0;}"
+"header{background:#007bff;color:#fff;padding:12px 16px;font-size:18px;font-weight:bold;}"
+"#bar{padding:8px 16px;background:#2a2a2a;display:flex;gap:8px;align-items:center;flex-wrap:wrap;}"
+"#path{font-family:monospace;color:#8fd8b0;}"
+"table{width:100%;border-collapse:collapse;}"
+"td,th{padding:8px 12px;border-bottom:1px solid #333;text-align:left;font-size:14px;}"
+"tr:hover{background:#333;}"
+"a.name{color:#7ab8ff;cursor:pointer;text-decoration:none;}"
+"button{background:#007bff;color:#fff;border:none;border-radius:4px;padding:6px 10px;cursor:pointer;font-size:13px;}"
+"button:hover{background:#0056b3;}"
+"button.danger{background:#d32f2f;}button.danger:hover{background:#a71d1d;}"
+".act{display:flex;gap:6px;flex-wrap:wrap;}"
+"#editor{position:fixed;inset:0;background:#1e1e1e;display:none;flex-direction:column;z-index:10;}"
+"#editor textarea{flex:1;width:100%;box-sizing:border-box;background:#111;color:#eee;border:none;font-family:monospace;font-size:14px;padding:12px;}"
+"#editbar{padding:10px 16px;background:#2a2a2a;display:flex;gap:8px;align-items:center;}"
+"#msg{padding:6px 16px;color:#ffe08a;font-size:13px;min-height:18px;}"
+"</style><script>"
+"if(location.hostname!=='172.0.0.1'){location.href='http://172.0.0.1/';}"
+"var cwd='';var editFile='';"
+"function j(p){return encodeURIComponent(p);}"
+"function child(n){return cwd?cwd+'/'+n:n;}"
+"function msg(t){document.getElementById('msg').textContent=t;}"
+"function row(){var tr=document.createElement('tr');var td1=document.createElement('td');"
+"var a=document.createElement('a');td1.appendChild(a);var td2=document.createElement('td');"
+"var td3=document.createElement('td');td3.className='act';tr.appendChild(td1);tr.appendChild(td2);"
+"tr.appendChild(td3);document.getElementById('tbody').appendChild(tr);return {name:a,size:td2,act:td3};}"
+"function btn(label,fn,cls){var b=document.createElement('button');b.textContent=label;"
+"if(cls)b.className=cls;b.onclick=fn;return b;}"
+"function load(){fetch('/api/list?path='+j(cwd)).then(r=>r.json()).then(items=>{"
+"document.getElementById('path').textContent='/lab/'+cwd;"
+"items.sort((a,b)=>a.dir!==b.dir?(a.dir?-1:1):a.name.localeCompare(b.name));"
+"var tb=document.getElementById('tbody');tb.innerHTML='';"
+"if(cwd){var u=row();u.name.textContent='.. (up)';u.name.className='name';u.name.onclick=up;}"
+"items.forEach(it=>{var r=row();"
+"if(it.dir){r.name.textContent='[DIR] '+it.name;r.name.className='name';r.name.onclick=()=>enter(it.name);"
+"r.size.textContent='';r.act.appendChild(btn('Rename',()=>ren(it.name)));"
+"r.act.appendChild(btn('Delete',()=>del(it.name),'danger'));}"
+"else{r.name.textContent=it.name;r.size.textContent=it.size;"
+"r.act.appendChild(btn('Download',()=>dl(it.name)));r.act.appendChild(btn('Edit',()=>edit(it.name)));"
+"r.act.appendChild(btn('Rename',()=>ren(it.name)));r.act.appendChild(btn('Delete',()=>del(it.name),'danger'));}"
+"});msg('');}).catch(e=>msg('List error: '+e));}"
+"function up(){cwd=cwd.split('/').slice(0,-1).join('/');load();}"
+"function enter(n){cwd=child(n);load();}"
+"function dl(n){location.href='/api/download?path='+j(child(n));}"
+"function del(n){if(!confirm('Delete '+n+'?'))return;"
+"fetch('/api/delete?path='+j(child(n)),{method:'POST'}).then(r=>{msg(r.ok?'Deleted '+n:'Delete failed');load();});}"
+"function ren(n){var nn=prompt('New name for '+n,n);if(!nn||nn===n)return;"
+"var body='from='+j(child(n))+'&to='+j(child(nn));"
+"fetch('/api/rename',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})"
+".then(r=>{msg(r.ok?'Renamed':'Rename failed');load();});}"
+"function edit(n){editFile=child(n);fetch('/api/read?path='+j(editFile)).then(r=>r.text()).then(t=>{"
+"document.getElementById('ta').value=t;document.getElementById('efn').textContent=editFile;"
+"document.getElementById('editor').style.display='flex';});}"
+"function saveEdit(){fetch('/api/write?path='+j(editFile),{method:'POST',body:document.getElementById('ta').value})"
+".then(r=>{msg(r.ok?'Saved '+editFile:'Save failed');closeEdit();load();});}"
+"function closeEdit(){document.getElementById('editor').style.display='none';}"
+"function doUpload(){var f=document.getElementById('file').files[0];if(!f){msg('Choose a file first');return;}"
+"msg('Uploading '+f.name+'...');fetch('/api/upload?path='+j(child(f.name)),{method:'POST',body:f})"
+".then(r=>{msg(r.ok?'Uploaded '+f.name:'Upload failed');load();});}"
+"</script></head><body>"
+"<header>JanOS Admin - File Manager (/sdcard/lab)</header>"
+"<div id='bar'><button onclick='up()'>Up</button><span id='path'>/lab/</span>"
+"<span style='flex:1'></span><input type='file' id='file'><button onclick='doUpload()'>Upload</button></div>"
+"<div id='msg'></div>"
+"<table><thead><tr><th>Name</th><th>Size</th><th>Actions</th></tr></thead><tbody id='tbody'></tbody></table>"
+"<div id='editor'><div id='editbar'><span id='efn' style='font-family:monospace;flex:1'></span>"
+"<button onclick='saveEdit()'>Save</button><button class='danger' onclick='closeEdit()'>Close</button></div>"
+"<textarea id='ta' spellcheck='false'></textarea></div>"
+"<script>load();</script></body></html>";
+
+// Build an absolute SD path under ADMIN_ROOT_DIR from a caller-supplied
+// relative path. Rejects any path containing ".." to prevent escaping the
+// sandbox. Leading and trailing slashes are trimmed.
+static bool build_admin_path(char *dest, size_t dest_size, const char *rel) {
+    if (!dest || dest_size == 0) {
+        return false;
+    }
+    if (!rel) {
+        rel = "";
+    }
+    while (*rel == '/') {
+        rel++;
+    }
+    if (strstr(rel, "..") != NULL) {
+        return false;
+    }
+    int written;
+    if (rel[0] == '\0') {
+        written = snprintf(dest, dest_size, "%s", ADMIN_ROOT_DIR);
+    } else {
+        written = snprintf(dest, dest_size, "%s/%s", ADMIN_ROOT_DIR, rel);
+    }
+    if (written < 0 || (size_t)written >= dest_size) {
+        return false;
+    }
+    size_t len = strlen(dest);
+    size_t root_len = strlen(ADMIN_ROOT_DIR);
+    while (len > root_len && dest[len - 1] == '/') {
+        dest[--len] = '\0';
+    }
+    return true;
+}
+
+// Decode an application/x-www-form-urlencoded value (%XX and '+').
+static void admin_url_decode(char *dst, const char *src, size_t dst_size) {
+    size_t di = 0;
+    for (const char *p = src; *p && di + 1 < dst_size; p++) {
+        if (*p == '%' && p[1] && p[2]) {
+            char hex[3] = { p[1], p[2], '\0' };
+            dst[di++] = (char)strtol(hex, NULL, 16);
+            p += 2;
+        } else if (*p == '+') {
+            dst[di++] = ' ';
+        } else {
+            dst[di++] = *p;
+        }
+    }
+    dst[di] = '\0';
+}
+
+// Minimal JSON string escaping for file names.
+static void admin_json_escape(char *dst, const char *src, size_t dst_size) {
+    size_t di = 0;
+    for (const char *p = src; *p && di + 7 < dst_size; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\') {
+            dst[di++] = '\\';
+            dst[di++] = c;
+        } else if (c < 0x20) {
+            di += snprintf(dst + di, dst_size - di, "\\u%04x", c);
+        } else {
+            dst[di++] = c;
+        }
+    }
+    dst[di] = '\0';
+}
+
+// Resolve the "path" query parameter of a request into an absolute SD path
+// inside the sandbox. Returns false on missing/invalid path.
+static bool admin_resolve_query_path(httpd_req_t *req, char *full, size_t full_size) {
+    char rel_enc[SD_PATH_MAX];
+    char rel[SD_PATH_MAX];
+    rel_enc[0] = '\0';
+
+    size_t qlen = httpd_req_get_url_query_len(req);
+    if (qlen > 0) {
+        char *query = malloc(qlen + 1);
+        if (query) {
+            if (httpd_req_get_url_query_str(req, query, qlen + 1) == ESP_OK) {
+                if (httpd_query_key_value(query, "path", rel_enc, sizeof(rel_enc)) != ESP_OK) {
+                    rel_enc[0] = '\0';
+                }
+            }
+            free(query);
+        }
+    }
+    admin_url_decode(rel, rel_enc, sizeof(rel));
+    return build_admin_path(full, full_size, rel);
+}
+
+// Stream the request body into an already-open file, in chunks.
+static esp_err_t admin_recv_body_to_file(httpd_req_t *req, const char *full) {
+    FILE *f = fopen(full, "wb");
+    if (!f) {
+        return ESP_FAIL;
+    }
+    char *buf = malloc(ADMIN_IO_CHUNK);
+    if (!buf) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+    esp_err_t res = ESP_OK;
+    int remaining = req->content_len;
+    while (remaining > 0) {
+        int to_read = remaining < ADMIN_IO_CHUNK ? remaining : ADMIN_IO_CHUNK;
+        int received = httpd_req_recv(req, buf, to_read);
+        if (received <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            res = ESP_FAIL;
+            break;
+        }
+        if (fwrite(buf, 1, received, f) != (size_t)received) {
+            res = ESP_FAIL;
+            break;
+        }
+        remaining -= received;
+    }
+    free(buf);
+    fclose(f);
+    return res;
+}
+
+// GET / and catch-all: serve the admin UI.
+static esp_err_t admin_root_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, admin_portal_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// GET /api/list?path=<rel> -> JSON array of {name,dir,size}
+static esp_err_t admin_list_handler(httpd_req_t *req) {
+    char full[SD_PATH_MAX];
+    if (!admin_resolve_query_path(req, full, sizeof(full))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
+        return ESP_FAIL;
+    }
+    if (init_sd_card() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card error");
+        return ESP_FAIL;
+    }
+    DIR *dir = opendir(full);
+    if (!dir) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Directory not found");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr_chunk(req, "[");
+    struct dirent *entry;
+    bool first = true;
+    char item[SD_PATH_MAX + 320];
+    char esc[256];
+    char child[SD_PATH_MAX];
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.' &&
+            (entry->d_name[1] == '\0' ||
+             (entry->d_name[1] == '.' && entry->d_name[2] == '\0'))) {
+            continue;
+        }
+        long size = 0;
+        bool isdir = (entry->d_type == DT_DIR);
+        if (snprintf(child, sizeof(child), "%s/%s", full, entry->d_name) < (int)sizeof(child)) {
+            struct stat st;
+            if (stat(child, &st) == 0) {
+                size = (long)st.st_size;
+                isdir = S_ISDIR(st.st_mode);
+            }
+        }
+        admin_json_escape(esc, entry->d_name, sizeof(esc));
+        snprintf(item, sizeof(item), "%s{\"name\":\"%s\",\"dir\":%s,\"size\":%ld}",
+                 first ? "" : ",", esc, isdir ? "true" : "false", size);
+        httpd_resp_sendstr_chunk(req, item);
+        first = false;
+    }
+    closedir(dir);
+    httpd_resp_sendstr_chunk(req, "]");
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
+
+// GET /api/download?path=<rel> -> raw file (chunked)
+static esp_err_t admin_download_handler(httpd_req_t *req) {
+    char full[SD_PATH_MAX];
+    if (!admin_resolve_query_path(req, full, sizeof(full))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
+        return ESP_FAIL;
+    }
+    if (init_sd_card() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card error");
+        return ESP_FAIL;
+    }
+    FILE *f = fopen(full, "rb");
+    if (!f) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
+        return ESP_FAIL;
+    }
+    const char *base = strrchr(full, '/');
+    base = base ? base + 1 : full;
+    char cd[SD_PATH_MAX + 32];
+    snprintf(cd, sizeof(cd), "attachment; filename=\"%s\"", base);
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Content-Disposition", cd);
+    char *buf = malloc(ADMIN_IO_CHUNK);
+    if (!buf) {
+        fclose(f);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    size_t r;
+    while ((r = fread(buf, 1, ADMIN_IO_CHUNK, f)) > 0) {
+        if (httpd_resp_send_chunk(req, buf, r) != ESP_OK) {
+            break;
+        }
+    }
+    free(buf);
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+// GET /api/read?path=<rel> -> file content as text (capped at ADMIN_EDIT_MAX)
+static esp_err_t admin_read_handler(httpd_req_t *req) {
+    char full[SD_PATH_MAX];
+    if (!admin_resolve_query_path(req, full, sizeof(full))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
+        return ESP_FAIL;
+    }
+    if (init_sd_card() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card error");
+        return ESP_FAIL;
+    }
+    FILE *f = fopen(full, "rb");
+    if (!f) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    char *buf = malloc(ADMIN_IO_CHUNK);
+    if (!buf) {
+        fclose(f);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    size_t total = 0;
+    size_t r;
+    while ((r = fread(buf, 1, ADMIN_IO_CHUNK, f)) > 0) {
+        if (total + r > ADMIN_EDIT_MAX) {
+            size_t allowed = ADMIN_EDIT_MAX - total;
+            if (allowed > 0) {
+                httpd_resp_send_chunk(req, buf, allowed);
+            }
+            break;
+        }
+        if (httpd_resp_send_chunk(req, buf, r) != ESP_OK) {
+            break;
+        }
+        total += r;
+    }
+    free(buf);
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+// POST /api/upload?path=<rel> -> store raw request body as file
+static esp_err_t admin_upload_handler(httpd_req_t *req) {
+    char full[SD_PATH_MAX];
+    if (!admin_resolve_query_path(req, full, sizeof(full))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
+        return ESP_FAIL;
+    }
+    if (init_sd_card() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card error");
+        return ESP_FAIL;
+    }
+    if (admin_recv_body_to_file(req, full) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Write failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+// POST /api/write?path=<rel> -> overwrite file with request body (text editor)
+static esp_err_t admin_write_handler(httpd_req_t *req) {
+    return admin_upload_handler(req);
+}
+
+// POST /api/rename  body: from=<rel>&to=<rel>
+static esp_err_t admin_rename_handler(httpd_req_t *req) {
+    char body[2 * SD_PATH_MAX];
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+        return ESP_FAIL;
+    }
+    body[len] = '\0';
+
+    char from_enc[SD_PATH_MAX];
+    char to_enc[SD_PATH_MAX];
+    if (httpd_query_key_value(body, "from", from_enc, sizeof(from_enc)) != ESP_OK ||
+        httpd_query_key_value(body, "to", to_enc, sizeof(to_enc)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing from/to");
+        return ESP_FAIL;
+    }
+
+    char from_rel[SD_PATH_MAX];
+    char to_rel[SD_PATH_MAX];
+    admin_url_decode(from_rel, from_enc, sizeof(from_rel));
+    admin_url_decode(to_rel, to_enc, sizeof(to_rel));
+
+    char from_full[SD_PATH_MAX];
+    char to_full[SD_PATH_MAX];
+    if (!build_admin_path(from_full, sizeof(from_full), from_rel) ||
+        !build_admin_path(to_full, sizeof(to_full), to_rel)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
+        return ESP_FAIL;
+    }
+    if (init_sd_card() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card error");
+        return ESP_FAIL;
+    }
+    if (rename(from_full, to_full) != 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Rename failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+// POST /api/delete?path=<rel> -> remove file or empty directory
+static esp_err_t admin_delete_handler(httpd_req_t *req) {
+    char full[SD_PATH_MAX];
+    if (!admin_resolve_query_path(req, full, sizeof(full))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
+        return ESP_FAIL;
+    }
+    if (init_sd_card() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card error");
+        return ESP_FAIL;
+    }
+    struct stat st;
+    if (stat(full, &st) != 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
+        return ESP_FAIL;
+    }
+    int rc = S_ISDIR(st.st_mode) ? rmdir(full) : remove(full);
+    if (rc != 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Delete failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+// CLI command: start_admin_portal <password>
+// Brings up a WPA2 AP named "JanOS-Admin" and serves the file-manager UI.
+static int cmd_start_admin_portal(int argc, char **argv) {
+    oled_display_update_full("> Admin Portal",
+        "  JanOS-Admin",
+        "  File manager", "  Active...");
+    log_memory_info("start_admin_portal");
+
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: start_admin_portal <password>");
+        MY_LOG_INFO(TAG, "Example: start_admin_portal MySecret123");
+        return 1;
+    }
+
+    const char *password = argv[1];
+    size_t password_len = strlen(password);
+    if (password_len < 8 || password_len > 63) {
+        MY_LOG_INFO(TAG, "Password length must be between 8 and 63 characters for WPA2");
+        return 1;
+    }
+
+    if (portal_active) {
+        MY_LOG_INFO(TAG, "Portal already running. Use 'stop' to stop it first.");
+        return 0;
+    }
+
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+
+    // SD card is required for the file manager
+    if (init_sd_card() != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card. Make sure it is inserted.");
+        return 1;
+    }
+
+    const char *ssid = "JanOS-Admin";
+    size_t ssid_len = strlen(ssid);
+
+    // Store portal SSID for logging/OLED/stop consistency
+    if (portalSSID != NULL) {
+        free(portalSSID);
+    }
+    portalSSID = malloc(ssid_len + 1);
+    if (portalSSID != NULL) {
+        strcpy(portalSSID, ssid);
+    }
+
+    MY_LOG_INFO(TAG, "Starting admin portal AP: %s", ssid);
+
+    esp_netif_t *ap_netif = ensure_ap_mode();
+    if (!ap_netif) {
+        MY_LOG_INFO(TAG, "Failed to enable AP mode");
+        return 1;
+    }
+
+    esp_netif_dhcps_stop(ap_netif);
+
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+    if (esp_netif_set_ip_info(ap_netif, &ip_info) != ESP_OK) {
+        return 1;
+    }
+
+    wifi_config_t ap_config = {0};
+    memcpy(ap_config.ap.ssid, ssid, ssid_len);
+    ap_config.ap.ssid_len = ssid_len;
+    ap_config.ap.channel = 1;
+    strncpy((char*)ap_config.ap.password, password, sizeof(ap_config.ap.password) - 1);
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+
+    esp_err_t ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    ret = esp_netif_dhcps_start(ap_netif);
+    if (ret != ESP_OK) {
+        esp_wifi_stop();
+        return 1;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.max_open_sockets = 7;
+    config.max_uri_handlers = 16;
+    config.uri_match_fn = httpd_uri_match_wildcard;
+
+    esp_err_t http_ret = httpd_start(&portal_server, &config);
+    if (http_ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to start HTTP server: %s", esp_err_to_name(http_ret));
+        esp_wifi_stop();
+        return 1;
+    }
+
+    // API endpoints must be registered before the "/*" catch-all so they win
+    // the (registration-order) match under wildcard matching.
+    httpd_uri_t list_uri = { .uri = "/api/list", .method = HTTP_GET, .handler = admin_list_handler };
+    httpd_register_uri_handler(portal_server, &list_uri);
+
+    httpd_uri_t download_uri = { .uri = "/api/download", .method = HTTP_GET, .handler = admin_download_handler };
+    httpd_register_uri_handler(portal_server, &download_uri);
+
+    httpd_uri_t read_uri = { .uri = "/api/read", .method = HTTP_GET, .handler = admin_read_handler };
+    httpd_register_uri_handler(portal_server, &read_uri);
+
+    httpd_uri_t upload_uri = { .uri = "/api/upload", .method = HTTP_POST, .handler = admin_upload_handler };
+    httpd_register_uri_handler(portal_server, &upload_uri);
+
+    httpd_uri_t write_uri = { .uri = "/api/write", .method = HTTP_POST, .handler = admin_write_handler };
+    httpd_register_uri_handler(portal_server, &write_uri);
+
+    httpd_uri_t rename_uri = { .uri = "/api/rename", .method = HTTP_POST, .handler = admin_rename_handler };
+    httpd_register_uri_handler(portal_server, &rename_uri);
+
+    httpd_uri_t delete_uri = { .uri = "/api/delete", .method = HTTP_POST, .handler = admin_delete_handler };
+    httpd_register_uri_handler(portal_server, &delete_uri);
+
+    httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = admin_root_handler };
+    httpd_register_uri_handler(portal_server, &root_uri);
+
+    // Catch-all so OS captive-portal detection URLs also load the admin UI.
+    httpd_uri_t catchall_uri = { .uri = "/*", .method = HTTP_GET, .handler = admin_root_handler };
+    httpd_register_uri_handler(portal_server, &catchall_uri);
+
+    portal_active = true;
+
+    BaseType_t task_ret = xTaskCreate(
+        dns_server_task,
+        "dns_server",
+        4096,
+        NULL,
+        5,
+        &dns_server_task_handle
+    );
+    if (task_ret != pdPASS) {
+        portal_active = false;
+        httpd_stop(portal_server);
+        portal_server = NULL;
+        esp_wifi_stop();
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "Admin portal started. Connect to '%s' (WPA2) and open http://172.0.0.1", ssid);
+
+    esp_err_t led_err = led_set_color(0, 255, 255); // Cyan for admin portal mode
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for admin portal mode: %s", esp_err_to_name(led_err));
+    }
+
+    return 0;
+}
+
 // Start password-protected rogue AP with captive portal and optional deauth
 static int cmd_start_rogueap(int argc, char **argv) {
     oled_display_update_full("> Rogue AP",
@@ -21274,6 +21887,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&portal_cmd));
+
+    const esp_console_cmd_t admin_portal_cmd = {
+        .command = "start_admin_portal",
+        .help = "WPA2 AP JanOS-Admin with a web file manager for /sdcard/lab (tree, upload/download, rename/delete, text edit): start_admin_portal <password>",
+        .hint = "<password>",
+        .func = &cmd_start_admin_portal,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&admin_portal_cmd));
 
     const esp_console_cmd_t darksword_cmd = {
         .command = "start_darksword",

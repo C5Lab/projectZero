@@ -245,6 +245,7 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 - `start_beacon_spam "SSID1" "SSID2" ...` — broadcast fake beacons (max 32 SSIDs, 1‑32 chars each).
 - `start_beacon_spam_ssids` — same, loading SSIDs from `/sdcard/lab/ssids.txt`.
 - `start_portal <SSID>` — open captive portal (no password to join). Optional `select_html`.
+- `start_admin_portal <password>` — WPA2 AP `JanOS-Admin` serving a web file manager for `/sdcard/lab` (directory tree, upload/download, rename/delete, text editing). Stop with `stop`.
 - `start_rogueap <SSID> <password>` — WPA2 rogue AP with captive portal (password 8‑63 chars).
 - `start_karma <index>` — Karma attack using a probe‑list SSID (`list_probes` for indices). Needs `select_html`.
 - `start_darksword` — advanced attack/exfil module. Run `help start_darksword` for current options. Stop with `stop`.
