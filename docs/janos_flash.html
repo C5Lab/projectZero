@@ -292,7 +292,7 @@
     <header>
       <div class="eyebrow">projectZero  ESP32-C5</div>
       <h1>Flash projectZero straight from your browser</h1>
-      <p>WebSerial flasher powered by esptool-js. Use Connect + Flash for firmware, or run Serial Monitor as a separate mode to read/write UART data in browser.</p>
+      <p>WebSerial flasher powered by esptool-js. On a running JanOS Monster, Connect automatically switches the device to download mode and starts flashing. Other devices still use Connect + Flash.</p>
     </header>
 
     <div class="split">
@@ -366,7 +366,8 @@
           <h2>Release info</h2>
           <p id="releaseInfo">Loading manifest</p>
           <div class="steps">
-            <li><strong>ROM mode:</strong> Hold BOOT on the LAB C5, plug the board in, then release.</li>
+            <li><strong>JanOS Monster:</strong> with JanOS running, click Connect and allow serial access. The flasher sends <code>ping</code>, then automatically enters download mode and flashes.</li>
+            <li><strong>ROM mode:</strong> For a blank or unresponsive board, hold BOOT on the LAB C5, plug the board in, then release.</li>
             <li><strong>Close serial hogs:</strong> quit qFlipper/monitors or anything holding the COM port.</li>
             <li><strong>Stuck-</strong> Unplug, re-run Connect, plug again with BOOT held, then Flash.</li>
             <li><strong>Reset:</strong> after flashing, press RESET on the board if it does not auto-reboot.</li>
@@ -389,7 +390,7 @@
   </div>
   <footer>
     Product of <a href="https://github.com/C5Lab/projectZero/">C5Lab/projectZero</a> -
-    <span id="pageVersion" class="mono">Web flasher v1.0.6</span>.
+    <span id="pageVersion" class="mono">Web flasher v1.0.8</span>.
   </footer>
 
   <script type="module">
@@ -439,8 +440,9 @@
       monitorConnected: false,
     };
 
-    const PAGE_VERSION = "1.0.6";
+    const PAGE_VERSION = "1.0.8";
     const monitorEncoder = new TextEncoder();
+    const commandEncoder = new TextEncoder();
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -448,6 +450,10 @@
     // This is the window where you typically press BOOT+RESET / enter ROM mode.
     const CONNECT_TIMEOUT_MS = 20000;
     const CONNECT_RETRY_DELAY_MS = 500;
+    const JANOS_PING_TIMEOUT_MS = 1500;
+    const JANOS_DOWNLOAD_TIMEOUT_MS = 8000;
+    const JANOS_ROM_SETTLE_MS = 1500;
+    const JANOS_ROM_FALLBACK_SETTLE_MS = 2500;
 
     const setFooterVersion = (manifest) => {
       if (!ui.pageVersion) return;
@@ -663,6 +669,106 @@
       }
     };
 
+    // JanOS runs its CLI at 115200 baud. Probe it before handing the port to
+    // esptool-js; a ROM bootloader will simply not answer this command.
+    const readUntil = async (reader, matcher, timeoutMs, onLine) => {
+      let received = "";
+      let bufferedLine = "";
+      let timedOut = false;
+      const decoder = new TextDecoder();
+      const emitCompleteLines = (text) => {
+        bufferedLine += text.replace(/\r/g, "");
+        const lines = bufferedLine.split("\n");
+        bufferedLine = lines.pop() || "";
+        for (const line of lines) {
+          if (line.trim()) onLine?.(line);
+        }
+      };
+      const timer = setTimeout(() => {
+        timedOut = true;
+        reader.cancel().catch(() => {});
+      }, timeoutMs);
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!value) continue;
+          const text = decoder.decode(value, { stream: true });
+          received += text;
+          emitCompleteLines(text);
+          matcher.lastIndex = 0;
+          if (matcher.test(received)) return { matched: true, received };
+        }
+        return { matched: false, received, timedOut };
+      } catch (err) {
+        if (timedOut) return { matched: false, received, timedOut: true };
+        throw err;
+      } finally {
+        clearTimeout(timer);
+        const tail = decoder.decode();
+        if (tail) emitCompleteLines(tail);
+        if (bufferedLine.trim()) onLine?.(bufferedLine);
+      }
+    };
+
+    const runJanosCommand = async (command, matcher, timeoutMs) => {
+      const port = state.port;
+      if (!port) throw new Error("No serial port selected");
+      await port.open({ baudRate: 115200 });
+      let reader = null;
+      let writer = null;
+      try {
+        reader = port.readable.getReader();
+        writer = port.writable.getWriter();
+        await writer.write(commandEncoder.encode(`${command}\r\n`));
+        return await readUntil(reader, matcher, timeoutMs, (line) => log(`JanOS: ${line}`));
+      } finally {
+        try { if (reader) await reader.cancel(); } catch {}
+        try { if (reader) reader.releaseLock(); } catch {}
+        try { if (writer) writer.releaseLock(); } catch {}
+        try { await port.close(); } catch {}
+      }
+    };
+
+    const prepareJanosForFlash = async () => {
+      try {
+        setStatus("Checking for a running JanOS Monster...");
+        log("Sending JanOS ping probe @ 115200 baud.");
+        const ping = await runJanosCommand("ping", /(?:^|\s)pong(?:\s|$)/i, JANOS_PING_TIMEOUT_MS);
+        if (!ping.matched) {
+          log("No JanOS pong received; using normal ROM connection.");
+          return false;
+        }
+
+        log("JanOS Monster detected. Sending download command.");
+        setStatus("JanOS detected. Switching to download mode...");
+        const download = await runJanosCommand(
+          "download",
+          /waiting for download/i,
+          JANOS_DOWNLOAD_TIMEOUT_MS
+        );
+        if (download.matched) {
+          log("ROM download mode confirmed.");
+          setStatus("ROM download mode confirmed. Waiting for the serial bridge...");
+          await sleep(JANOS_ROM_SETTLE_MS);
+        } else {
+          // Some USB serial implementations reset before their whole boot
+          // banner reaches the browser. Continue to the esptool sync, which
+          // is the definitive verification that ROM mode is ready.
+          log("No complete ROM banner received; waiting before ROM sync anyway.");
+          setStatus("Waiting for the serial bridge to enter ROM mode...");
+          await sleep(JANOS_ROM_FALLBACK_SETTLE_MS);
+        }
+        return true;
+      } catch (err) {
+        // The probe is optional. A blank board or a non-JanOS serial device
+        // must still be flashable with the standard BOOT + RESET flow.
+        log(`JanOS auto-detect unavailable: ${err?.message || err}`);
+        try { if (state.port?.readable || state.port?.writable) await state.port.close(); } catch {}
+        return false;
+      }
+    };
+
     const connect = async () => {
       ensureSupport();
       if (state.connected) {
@@ -675,6 +781,7 @@
       }
       ui.connectBtn.disabled = true;
       ui.flashBtn.disabled = true;
+      state.autoFlashTriggered = false;
       setStatus("Requesting serial port");
       log("Requesting port access");
       try {
@@ -687,6 +794,7 @@
         try {
           state.port.addEventListener("disconnect", state.onDisconnect);
         } catch {}
+        const janosDetected = await prepareJanosForFlash();
         const baud = parseInt(ui.baud.value, 10);
         state.transport = new Transport(state.port, true);
         const loaderOptions = {
@@ -699,7 +807,9 @@
           },
           debugLogging: false,
         };
-        setStatus(`Syncing with chip (hold BOOT + RESET). Timeout ${Math.round(CONNECT_TIMEOUT_MS/1000)}s`);
+        setStatus(janosDetected
+          ? "JanOS is in download mode. Syncing with chip..."
+          : `Syncing with chip (hold BOOT + RESET). Timeout ${Math.round(CONNECT_TIMEOUT_MS/1000)}s`);
         log("Syncing with chip");
 
         const start = Date.now();
@@ -717,7 +827,9 @@
             lastErr = err;
             const remainingMs = Math.max(0, CONNECT_TIMEOUT_MS - (Date.now() - start));
             const remainingS = Math.ceil(remainingMs / 1000);
-            setStatus(`Failed to connect. Hold BOOT + tap RESET, retrying... (${remainingS}s)`);
+            setStatus(janosDetected
+              ? `ROM sync failed, retrying... (${remainingS}s)`
+              : `Failed to connect. Hold BOOT + tap RESET, retrying... (${remainingS}s)`);
             log(`Error: ${err?.message || err}`);
             await sleep(CONNECT_RETRY_DELAY_MS);
           }
@@ -731,9 +843,9 @@
         log(`Connected: ${state.chip}`);
         ui.flashBtn.disabled = false;
 
-        if(state.autoFlash && !state.autoFlashTriggered && !state.isFlashing) {
+        if((janosDetected || state.autoFlash) && !state.autoFlashTriggered && !state.isFlashing) {
           state.autoFlashTriggered = true;
-          flash().catch((err) => log(`Auto flash failed: ${err.message || err}`));
+          await flash();
         }
       } catch (err) {
         console.error(err);
