@@ -295,6 +295,15 @@ Connect to 'duap' WiFi network to access the captive portal
 - **Description**: Open captive portal (no password required to join).
 - **Args**: SSID (1-32 chars).
 - **Prerequisite**: Optionally `select_html` for custom HTML.
+
+### `start_admin_portal`
+- **Syntax**: `start_admin_portal <password>`
+- **Description**: Brings up a WPA2 access point named `JanOS-Admin` (reusing the captive portal AP/HTTP/DNS technique) and serves a web-based file manager scoped to `/sdcard/lab`. Features: browse the directory tree, upload/download any file, rename/delete files and folders, and edit text files in-browser.
+- **Args**: WPA2 password (8-63 chars).
+- **Prerequisite**: SD card inserted.
+- **Access**: Join `JanOS-Admin` with the password, then open `http://172.0.0.1`.
+- **HTTP endpoints**: `GET /api/list|download|read`, `POST /api/upload|write|rename|delete` (all paths are relative to `/sdcard/lab`; `..` is rejected).
+- **Stop**: Send `stop`.
 - **Output**:
 ```
 Captive portal started successfully!
@@ -551,7 +560,7 @@ F1:2E:71:9F:C8:68  RSSI: -90 dBm  Name: Forerunner 935
 
 ### `start_wardrive_promisc`
 - **Syntax**: `start_wardrive_promisc`
-- **Description**: Promiscuous wardrive with D-UCB channel selection. Logs Wi-Fi APs **and** BLE devices to a WigleWifi-1.6 CSV at `/sdcard/lab/wardrives/wN.log`. Behaviour is controlled by the wardrive config block (see `get_wardrive_config` and the `set_wardrive_*` commands). Reads the config at start.
+- **Description**: Promiscuous wardrive with D-UCB channel selection. Logs Wi-Fi APs **and** BLE devices to a WigleWifi-1.6 CSV at `/sdcard/lab/wardrives/<base>.log`. `<base>` is chosen after the GPS fix: UTC `YYYYMMDD_HHMMSS` (from `$GxRMC`, same clock as `FirstSeen`; chronologically sortable), or the legacy `wN` counter if no GPS time; a `_2/_3…` suffix avoids overwriting. Behaviour is controlled by the wardrive config block (see `get_wardrive_config` and the `set_wardrive_*` commands). Reads the config at start.
 - **Startup line** (after GPS fix): echoes the active config, e.g.
 ```
 Wardrive config: bands=wifi24,wifi5,ble channels=popular wifi_delta=5 ble_delta=15 cooldown=0s memcap=40000
@@ -567,7 +576,13 @@ Wardrive promisc: 58 unique networks, 48 BT devices, 12 relogs, D-UCB best ch: 1
 
 ### `start_wardrive_promisc_trace`
 - **Syntax**: `start_wardrive_promisc_trace`
-- **Description**: Same as `start_wardrive_promisc` plus a per-session KML track at `/sdcard/lab/wardrives/wN_track.kml`.
+- **Description**: Same as `start_wardrive_promisc` (still writes `<base>.log`) **and** builds one per-session KML with the drive track, one Wi-Fi POI per unique BSSID, and one BLE POI per unique advertiser address.
+  - **Track**: successive complete `<Placemark><LineString>` segments (buffered ~16 points / 15 s, new vertex every ≥3 m); segments share a point so the line stays continuous. A GPS jump above 100 m starts a new segment without a misleading straight connector.
+  - **POI**: one `<Point>` per first-seen BSSID, with the GPS snapshot from detection time (name = SSID or `<hidden>`; description = BSSID, RSSI, channel, auth, timestamp, altitude, accuracy). Skipped when there is no GPS fix; re-logs never add a second POI. SSID/description are XML-escaped. Marker colours: Open green, WPA/WPA2 mixed purple, WPA2 blue, WPA3/mixed WPA2-WPA3 red, WEP orange, unknown grey.
+  - **BLE POI**: one `<Point>` per first-seen BLE advertiser, with name or `BLE <address>` when unnamed; description includes address, type, RSSI, optional manufacturer ID, timestamp and GPS snapshot. BLE is cyan, AirTag purple, SmartTag amber.
+  - **Crash-safe**: writes to `<base>_track.inprogress.kml` during the run (`<base>` = same UTC datetime as the CSV); a normal `stop` closes the XML and atomically renames it to the final `<base>_track.kml`. Every segment/POI is a complete `<Placemark>` inside one open `<Folder>`, so a power-loss `.inprogress.kml` is repairable by **Tab5/ADV**: locate the last `</Placemark>`, drop the truncated tail, append `</Folder></Document></kml>`.
+  - Plain `start_wardrive_promisc` produces **no** KML/POI. `wardrive_cleanup` moves the final `<base>_track.kml` with `<base>.log` and never moves `.inprogress.kml`.
+- **Stop line**: number of track segments, POIs written, POIs dropped (queue full), and the final KML path.
 - **Stop**: Send `stop`.
 
 ### `get_wardrive_config`
@@ -797,7 +812,7 @@ SSID removed. 2 SSIDs remaining.
 
 ### `wigle_key`
 - **Syntax**: `wigle_key set <api_name> <api_token>` or `wigle_key set <api_name:api_token>` or `wigle_key read` or `wigle_key clear`
-- **Description**: Set, read, or clear WiGLE API credentials from NVS. `/sdcard/lab/wigle.txt` is read only during upload and is not persisted to NVS.
+- **Description**: Set, read, or clear WiGLE API credentials from NVS. If either credential is missing at boot, `/sdcard/lab/wigle.txt` is loaded and persisted to NVS; a complete NVS credential pair takes precedence.
 
 ### `wigle_upload`
 - **Syntax**: `wigle_upload` or `wigle_upload [file1 file2 ...]` or `wigle_upload all`
@@ -807,7 +822,7 @@ SSID removed. 2 SSIDs remaining.
 
 ### `wdgwars_key`
 - **Syntax**: `wdgwars_key set <key>` or `wdgwars_key read` or `wdgwars_key clear`
-- **Description**: Set, read, or clear WDGWars API key from NVS. `/sdcard/lab/wdgwars.txt` is read only during upload and is not persisted to NVS.
+- **Description**: Set, read, or clear WDGWars API key from NVS. If NVS has no key at boot, `/sdcard/lab/wdgwars.txt` is loaded and persisted to NVS; an existing NVS key takes precedence.
 
 ### `wdgwars_upload`
 - **Syntax**: `wdgwars_upload` or `wdgwars_upload [file1 file2 ...]` or `wdgwars_upload all`

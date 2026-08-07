@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <limits.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
@@ -125,7 +127,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.6.9"
+#define JANOS_VERSION "1.7.1"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -284,6 +286,9 @@ typedef enum {
 static bool wardrive_active = false;
 static int wardrive_file_counter = 1;
 static gps_data_t current_gps = {0};
+// Set true once a valid $GxRMC seeded the system clock (settimeofday) with real UTC.
+// Until then, observation timestamps fall back to time(NULL) at flush.
+static volatile bool g_gps_clock_synced = false;
 static gps_data_t external_gps_position = {0};
 static gps_data_t external_cap_gps_position = {0};
 static bool gps_uart_initialized = false;
@@ -650,7 +655,83 @@ typedef struct {
     bool     last_logged_valid;    // last_logged_lat/lon hold a real position
     double   last_logged_lat;
     double   last_logged_lon;
+    // Observation snapshot: position + wall-clock captured at the moment needs_log
+    // was set (first sighting or re-log), so the CSV row carries where/when the AP
+    // was actually seen — not where/when the batch was flushed to SD.
+    bool     obs_gps_valid;
+    double   obs_lat;
+    double   obs_lon;
+    float    obs_alt;
+    float    obs_acc;
+    time_t   obs_time;             // 0 = clock not yet seeded from GPS at capture time
 } wdp_network_t;
+
+// Snapshot the current GPS position + wall-clock into a pending network/BT row.
+// Called from the WiFi/BLE observation callbacks the instant needs_log is set, so
+// the row is stamped where/when it was seen instead of at flush time.
+#define WDP_DECLARE_OBS_SNAPSHOT(TYPE, NAME)                       \
+    static inline void NAME(TYPE *o) {                            \
+        o->obs_gps_valid = current_gps.valid;                     \
+        if (current_gps.valid) {                                  \
+            o->obs_lat = current_gps.latitude;                    \
+            o->obs_lon = current_gps.longitude;                   \
+            o->obs_alt = current_gps.altitude;                    \
+            o->obs_acc = current_gps.accuracy;                    \
+        }                                                         \
+        o->obs_time = g_gps_clock_synced ? time(NULL) : (time_t)0;\
+    }
+WDP_DECLARE_OBS_SNAPSHOT(wdp_network_t, wdp_snapshot_obs)
+
+// ============================================================================
+// Wardrive Trace (KML) — active ONLY during start_wardrive_promisc_trace.
+// Produces a single crash-tolerant KML with the track (successive complete
+// <Placemark><LineString> segments), Wi-Fi POIs, and BLE-device POIs.
+// ============================================================================
+
+// Snapshot of a first-seen Wi-Fi AP or BLE device handed from its radio callback to
+// the wardrive task over a bounded queue. The callbacks never touch the SD card.
+typedef struct {
+    uint8_t          bssid[6];       // Wi-Fi BSSID or BLE advertiser address
+    char             ssid[33];       // Wi-Fi SSID or BLE device name
+    int8_t           rssi;
+    uint8_t          channel;
+    wifi_auth_mode_t authmode;
+    bool             is_ble;
+    bool             is_airtag;
+    bool             is_smarttag;
+    uint16_t         company_id;
+    double           lat;
+    double           lon;
+    float            alt;
+    float            acc;
+    time_t           ts;          // detection time (UTC); 0 = clock not seeded yet
+} wdp_poi_msg_t;
+
+#define WDP_POI_QUEUE_LEN      64       // Wi-Fi/BLE POI snapshots buffered callback -> task
+#define WDP_TRACE_SEG_POINTS   16       // flush a track segment after this many points
+#define WDP_TRACE_SEG_MS       15000    // ...or this long since the last segment write
+#define WDP_TRACE_MIN_STEP_M   3.0      // minimum movement before a new trace vertex
+#define WDP_TRACE_MAX_STEP_M   100.0    // larger jump starts a new line, never a false connector
+
+// Track-segment builder, touched exclusively by wardrive_promisc_task.
+typedef struct {
+    bool    active;
+    double  seg_lat[WDP_TRACE_SEG_POINTS];
+    double  seg_lon[WDP_TRACE_SEG_POINTS];
+    double  seg_alt[WDP_TRACE_SEG_POINTS];
+    int     seg_n;                       // buffered points not yet written
+    bool    have_prev;                   // prev_* holds the last written vertex (stitch)
+    double  prev_lat, prev_lon, prev_alt;
+    bool    have_cur;                    // cur_* holds the last accepted vertex (3 m gate)
+    double  cur_lat, cur_lon;
+    int64_t last_seg_us;                 // esp_timer time of the last segment write
+    int     seg_written;
+    int     poi_written;
+} wdp_trace_ctx_t;
+
+static wdp_trace_ctx_t   wdp_trace;            // reset at task start; task-owned
+static QueueHandle_t     wdp_poi_queue = NULL; // non-NULL only during a trace session
+static volatile uint32_t wdp_poi_dropped = 0;  // POIs dropped because the queue was full
 
 static bool wardrive_promisc_active = false;
 static TaskHandle_t wardrive_promisc_task_handle = NULL;
@@ -762,6 +843,13 @@ typedef struct {
     bool   last_logged_valid;
     double last_logged_lat;
     double last_logged_lon;
+    // Observation snapshot captured when needs_log was set (see wdp_network_t).
+    bool    obs_gps_valid;
+    double  obs_lat;
+    double  obs_lon;
+    float   obs_alt;
+    float   obs_acc;
+    time_t  obs_time;
     // Anti-surveillance tracking (used only while antisurv_active)
     int64_t as_first_us;        // first time this device was seen
     int64_t as_last_us;         // most recent sighting
@@ -771,6 +859,8 @@ typedef struct {
     double  as_max_dist_m;      // furthest we travelled from origin while it stayed visible
     bool    as_alerted;         // already raised as a follower
 } bt_device_info_t;
+
+WDP_DECLARE_OBS_SNAPSHOT(bt_device_info_t, bt_snapshot_obs)
 
 static bt_device_info_t *bt_devices = NULL;                 // ~5.5 KB in PSRAM
 static int bt_device_count = 0;
@@ -1748,6 +1838,8 @@ static sdmmc_card_t *sd_card_handle = NULL;
 #define MAX_SSID_NAME_LEN 32
 #define SSID_PRESET_PATH "/sdcard/lab/ssid.txt"
 #define SSIDS_FILE_PATH  "/sdcard/lab/ssids.txt"
+#define HOME_FILE_PATH   "/sdcard/lab/home.txt"
+#define MAX_HOME_NETWORKS 16
 
 // Whitelist for BSSID protection (allocated in PSRAM)
 #define MAX_WHITELISTED_BSSIDS 150
@@ -1890,6 +1982,7 @@ static int cmd_start_blackout(int argc, char **argv);
 static int cmd_ping(int argc, char **argv);
 static int cmd_boot_button(int argc, char **argv);
 static int cmd_start_portal(int argc, char **argv);
+static int cmd_start_admin_portal(int argc, char **argv);
 static int cmd_start_rogueap(int argc, char **argv);
 static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
@@ -1899,6 +1992,9 @@ static int cmd_list_ssid(int argc, char **argv);
 static int cmd_list_ssids(int argc, char **argv);
 static int cmd_add_ssid(int argc, char **argv);
 static int cmd_remove_ssid(int argc, char **argv);
+static int cmd_home_list(int argc, char **argv);
+static int cmd_home_add(int argc, char **argv);
+static int cmd_home_remove(int argc, char **argv);
 static int cmd_start_beacon_spam_ssids(int argc, char **argv);
 static int start_beacon_spam_internal(void);
 static int cmd_select_html(int argc, char **argv);
@@ -1993,6 +2089,15 @@ static esp_err_t save_handler(httpd_req_t *req);
 static esp_err_t android_captive_handler(httpd_req_t *req);
 static esp_err_t ios_captive_handler(httpd_req_t *req);
 static esp_err_t captive_detection_handler(httpd_req_t *req);
+// Admin portal HTTP handlers
+static esp_err_t admin_root_handler(httpd_req_t *req);
+static esp_err_t admin_list_handler(httpd_req_t *req);
+static esp_err_t admin_download_handler(httpd_req_t *req);
+static esp_err_t admin_read_handler(httpd_req_t *req);
+static esp_err_t admin_upload_handler(httpd_req_t *req);
+static esp_err_t admin_write_handler(httpd_req_t *req);
+static esp_err_t admin_rename_handler(httpd_req_t *req);
+static esp_err_t admin_delete_handler(httpd_req_t *req);
 // Sniffer functions
 static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void sniffer_process_scan_results(void);
@@ -2050,9 +2155,11 @@ static void sd_sync(void);
 static void safe_restart(void);
 static bool parse_gps_nmea(const char* nmea_sentence);
 static void get_timestamp_string(char* buffer, size_t size);
+static void format_epoch_utc(time_t t, char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
 static bool wait_for_gps_fix(int timeout_seconds);
 static int find_next_wardrive_file_number(void);
+static void wardrive_make_session_base(char *out, size_t out_sz);
 // PCAP capture functions
 static int find_next_pcap_file_number(void);
 static void pcap_radio_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
@@ -2172,8 +2279,14 @@ static void bt_stop_scan(void);
 static int wigle_wifi_channel_to_frequency_mhz(int channel);
 static double gps_distance_meters(double lat1, double lon1, double lat2, double lon2);
 static bool wardrive_trace_init_file(const char *path);
-static bool wardrive_trace_append_point(const char *path, double lat, double lon, double alt);
 static void wardrive_trace_finalize_file(const char *path);
+static bool wardrive_kml_finalize_orphan(const char *inprogress_path);
+static void wardrive_kml_repair_orphans(void);
+static int  cmd_wardrive_fix_kml(int argc, char **argv);
+static bool wdp_trace_flush_segment(const char *path, wdp_trace_ctx_t *c);
+static void wdp_trace_add_point(const char *path, wdp_trace_ctx_t *c,
+                                double lat, double lon, double alt, double *dist_accum);
+static bool wdp_trace_write_poi(const char *path, wdp_trace_ctx_t *c, const wdp_poi_msg_t *p);
 static void register_commands(void);
 
 // --- Wi-Fi event handler ---
@@ -5879,8 +5992,9 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         wdp_seen_networks[existing].rssi = cur_rssi;   // keep the latest reading for re-log
 
         // Re-log this AP if its signal or our position moved enough since the last row.
-        // wifi_rssi_delta == 0 keeps the legacy "log once" behavior.
-        if (g_wd_cfg.wifi_rssi_delta > 0 && !wdp_seen_networks[existing].needs_log) {
+        // wifi_rssi_delta == 0 keeps the legacy "log once" behavior. Only re-log with a
+        // valid fix so a row never carries 0,0 — without GPS the observation is useless.
+        if (g_wd_cfg.wifi_rssi_delta > 0 && !wdp_seen_networks[existing].needs_log && current_gps.valid) {
             bool trig = false;
             int rd = cur_rssi - wdp_seen_networks[existing].last_logged_rssi;
             if (rd < 0) rd = -rd;
@@ -5897,11 +6011,17 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
             }
             if (trig) {
                 wdp_seen_networks[existing].needs_log = true;
+                wdp_snapshot_obs(&wdp_seen_networks[existing]);  // stamp this re-observation
                 wdp_relog_pending = true;
             }
         }
         return;
     }
+
+    // First sighting: don't register/log an AP we can't place. Without a GPS fix the
+    // row would be 0,0 (and no POI is created); it will register on the next beacon
+    // once we have a fix, which for a beaconing AP is within a second or two.
+    if (!current_gps.valid) return;
 
     if (wdp_seen_count >= wdp_seen_capacity) {
         wdp_needs_grow = true;
@@ -5917,9 +6037,32 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     wdp_seen_networks[idx].authmode = authmode;
     wdp_seen_networks[idx].needs_log = true;        // pending first write
     wdp_seen_networks[idx].last_logged_valid = false;
+    wdp_snapshot_obs(&wdp_seen_networks[idx]);      // stamp the first sighting (WiGLE FirstSeen)
     wdp_seen_count++;
 
     wdp_dwell_new_networks++;
+
+    // Wardrive Trace: emit one POI per unique BSSID (first sighting only). Runs only
+    // when the trace session is active and we have a GPS fix. The callback must not
+    // touch the SD card, so it just hands a self-contained snapshot to the wardrive
+    // task over a bounded queue; a full queue is counted, never blocked on.
+    if (wardrive_promisc_trace_enabled && wdp_poi_queue && current_gps.valid) {
+        wdp_poi_msg_t poi;
+        memcpy(poi.bssid, ap_bssid, 6);
+        strncpy(poi.ssid, ssid, sizeof(poi.ssid) - 1);
+        poi.ssid[sizeof(poi.ssid) - 1] = '\0';
+        poi.rssi     = (int8_t)pkt->rx_ctrl.rssi;
+        poi.channel  = beacon_channel;
+        poi.authmode = authmode;
+        poi.lat      = current_gps.latitude;
+        poi.lon      = current_gps.longitude;
+        poi.alt      = current_gps.altitude;
+        poi.acc      = current_gps.accuracy;
+        poi.ts       = g_gps_clock_synced ? time(NULL) : (time_t)0;
+        if (xQueueSend(wdp_poi_queue, &poi, 0) != pdTRUE) {
+            wdp_poi_dropped++;
+        }
+    }
 
     char mac_str[18];
     snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -6011,19 +6154,22 @@ static void wardrive_promisc_task(void *pvParameters) {
         ESP_LOGW(TAG, "Failed to set LED for wardrive promisc: %s", esp_err_to_name(led_err));
     }
 
-    int file_number = find_next_wardrive_file_number();
-    MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", file_number);
-    double wdp_total_distance_m = 0.0;
-    double wdp_last_trace_lat = 0.0;
-    double wdp_last_trace_lon = 0.0;
-    bool wdp_has_trace_point = false;
+    // Finalize any trace KML left unclosed by a previous power-loss (e.g. dead battery)
+    // before this session starts writing a new one, so old traces open in Google Earth.
+    wardrive_kml_repair_orphans();
 
-    if (wardrive_promisc_trace_enabled) {
-        snprintf(wardrive_promisc_trace_path, sizeof(wardrive_promisc_trace_path),
-                 "/sdcard/lab/wardrives/w%d_track.kml", file_number);
-    } else {
-        wardrive_promisc_trace_path[0] = '\0';
-    }
+    double wdp_total_distance_m = 0.0;
+    // Session file base + paths are decided AFTER the GPS fix (below) so the names can use
+    // real UTC time. Declared here (before any `goto cleanup`) and left empty until then.
+    char wardrive_base[32] = "";
+    char wardrive_csv_path[80] = "";
+
+    // Trace state (only used when wardrive_promisc_trace_enabled). We write to a
+    // ".inprogress.kml" during the session and atomically rename it to the final
+    // ".kml" on a clean stop, so a power loss leaves a repairable partial file.
+    memset(&wdp_trace, 0, sizeof(wdp_trace));
+    wdp_poi_dropped = 0;
+    wardrive_promisc_trace_path[0] = '\0';
 
     MY_LOG_INFO(TAG, "Waiting for GPS fix (no timeout - use 'stop' to cancel)...");
     oled_display_update_full("> Wardrive Pro", "  Waiting GPS...", "  No timeout", "  Use 'stop'");
@@ -6036,18 +6182,46 @@ static void wardrive_promisc_task(void *pvParameters) {
                 current_gps.latitude, current_gps.longitude);
     oled_display_update_full("> Wardrive Pro", "  GPS fix OK!", "  D-UCB scanning", "");
 
+    // Name the session files from real UTC once the clock is seeded from $GxRMC. That
+    // usually already happened inside wait_for_gps_fix; give RMC a short bounded window
+    // in case it trailed the GGA fix. Falls back to the "wN" counter if no time arrives.
+    if (!external_feed) {
+        int64_t clk_t0 = esp_timer_get_time();
+        while (!g_gps_clock_synced && (esp_timer_get_time() - clk_t0) < 3000000LL &&
+               wardrive_promisc_active && !operation_stop_requested) {
+            int glen = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer,
+                                       GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
+            if (glen > 0) {
+                wardrive_gps_buffer[glen] = '\0';
+                char *gline = strtok(wardrive_gps_buffer, "\r\n");
+                while (gline) { parse_gps_nmea(gline); gline = strtok(NULL, "\r\n"); }
+            }
+        }
+    }
+    wardrive_make_session_base(wardrive_base, sizeof(wardrive_base));
+    snprintf(wardrive_csv_path, sizeof(wardrive_csv_path),
+             "/sdcard/lab/wardrives/%s.log", wardrive_base);
     if (wardrive_promisc_trace_enabled) {
-        if (wardrive_trace_init_file(wardrive_promisc_trace_path)) {
-            wardrive_trace_append_point(wardrive_promisc_trace_path,
-                                        current_gps.latitude,
-                                        current_gps.longitude,
-                                        current_gps.altitude);
-            wdp_last_trace_lat = current_gps.latitude;
-            wdp_last_trace_lon = current_gps.longitude;
-            wdp_has_trace_point = true;
+        snprintf(wardrive_promisc_trace_path, sizeof(wardrive_promisc_trace_path),
+                 "/sdcard/lab/wardrives/%s_track.inprogress.kml", wardrive_base);
+    }
+    MY_LOG_INFO(TAG, "Wardrive session files: %s.log%s (%s)",
+                wardrive_base, wardrive_promisc_trace_enabled ? " + _track.kml" : "",
+                g_gps_clock_synced ? "GPS UTC time" : "counter fallback");
+
+    if (wardrive_promisc_trace_enabled) {
+        wdp_poi_queue = xQueueCreate(WDP_POI_QUEUE_LEN, sizeof(wdp_poi_msg_t));
+        if (wdp_poi_queue && wardrive_trace_init_file(wardrive_promisc_trace_path)) {
+            wdp_trace.active = true;
+            // Seed the first trace vertex from the initial fix.
+            wdp_trace_add_point(wardrive_promisc_trace_path, &wdp_trace,
+                                current_gps.latitude, current_gps.longitude,
+                                current_gps.altitude, &wdp_total_distance_m);
+            wdp_trace.last_seg_us = esp_timer_get_time();
             MY_LOG_INFO(TAG, "Wardrive trace enabled: %s", wardrive_promisc_trace_path);
         } else {
-            MY_LOG_INFO(TAG, "Failed to create wardrive trace file: %s", wardrive_promisc_trace_path);
+            MY_LOG_INFO(TAG, "Failed to start wardrive trace (file/queue): %s", wardrive_promisc_trace_path);
+            if (wdp_poi_queue) { vQueueDelete(wdp_poi_queue); wdp_poi_queue = NULL; }
             wardrive_promisc_trace_enabled = false;
             wardrive_promisc_trace_path[0] = '\0';
         }
@@ -6227,30 +6401,30 @@ static void wardrive_promisc_task(void *pvParameters) {
             gps_fix_lost_count++;
         } else {
             gps_fix_lost_count = 0;
-            if (wardrive_promisc_trace_enabled) {
-                if (!wdp_has_trace_point) {
-                    if (wardrive_trace_append_point(wardrive_promisc_trace_path,
-                                                    current_gps.latitude,
-                                                    current_gps.longitude,
-                                                    current_gps.altitude)) {
-                        wdp_last_trace_lat = current_gps.latitude;
-                        wdp_last_trace_lon = current_gps.longitude;
-                        wdp_has_trace_point = true;
-                    }
-                } else {
-                    double step_m = gps_distance_meters(wdp_last_trace_lat, wdp_last_trace_lon,
-                                                        current_gps.latitude, current_gps.longitude);
-                    if (step_m >= 3.0) {
-                        if (wardrive_trace_append_point(wardrive_promisc_trace_path,
-                                                        current_gps.latitude,
-                                                        current_gps.longitude,
-                                                        current_gps.altitude)) {
-                            wdp_total_distance_m += step_m;
-                            wdp_last_trace_lat = current_gps.latitude;
-                            wdp_last_trace_lon = current_gps.longitude;
-                        }
-                    }
-                }
+            // Trace: buffer a new vertex once we've moved >= 3 m; the buffer is flushed
+            // as a complete <Placemark><LineString> segment inside wdp_trace_add_point
+            // when it fills (16 points), or by the time-based flush below.
+            if (wdp_trace.active) {
+                wdp_trace_add_point(wardrive_promisc_trace_path, &wdp_trace,
+                                    current_gps.latitude, current_gps.longitude,
+                                    current_gps.altitude, &wdp_total_distance_m);
+            }
+        }
+
+        // Trace: drain queued Wi-Fi/BLE POIs (callback -> task) and write them as complete
+        // Placemarks, then flush a partial track segment if 15 s elapsed. All KML file
+        // writes happen here, on the task, never in the callback.
+        if (wdp_trace.active) {
+            wdp_poi_msg_t poi;
+            int drained = 0;
+            while (drained < WDP_POI_QUEUE_LEN && xQueueReceive(wdp_poi_queue, &poi, 0) == pdTRUE) {
+                wdp_trace_write_poi(wardrive_promisc_trace_path, &wdp_trace, &poi);
+                drained++;
+            }
+            if (drained > 0) sd_sync();
+            if (wdp_trace.seg_n > 0 &&
+                (esp_timer_get_time() - wdp_trace.last_seg_us) >= (int64_t)WDP_TRACE_SEG_MS * 1000) {
+                wdp_trace_flush_segment(wardrive_promisc_trace_path, &wdp_trace);
             }
         }
 
@@ -6313,8 +6487,8 @@ static void wardrive_promisc_task(void *pvParameters) {
             // Clear before the write loop; any re-log marked during the loop re-arms it.
             wdp_relog_pending = false;
 
-            char filename[64];
-            snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", file_number);
+            char filename[80];
+            snprintf(filename, sizeof(filename), "%s", wardrive_csv_path);
 
             struct stat st;
             if (stat("/sdcard/lab/wardrives", &st) != 0) {
@@ -6328,9 +6502,6 @@ static void wardrive_promisc_task(void *pvParameters) {
                         fprintf(file, "WigleWifi-1.6,appRelease=v1.1,model=MonsterC5,release=v1.0,device=MonsterC5,display=SPI TFT,board=ESP32C5,brand=LAB5\n");
                         fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n");
                     }
-
-                    char timestamp[32];
-                    get_timestamp_string(timestamp, sizeof(timestamp));
 
                     for (int i = 0; i < current_count; i++) {
                         if (!wdp_seen_networks[i].needs_log) continue;
@@ -6347,24 +6518,31 @@ static void wardrive_promisc_task(void *pvParameters) {
                         const char *auth_str = get_auth_mode_wiggle(wdp_seen_networks[i].authmode);
                         int wifi_freq_mhz = wigle_wifi_channel_to_frequency_mhz(wdp_seen_networks[i].channel);
 
-                        if (current_gps.valid) {
+                        // Stamp the row with the position + time captured when this AP was
+                        // actually observed, not with the flush-time position. If the clock
+                        // was seeded after capture (obs_time==0), fall back to "now".
+                        char timestamp[32];
+                        time_t obs_t = wdp_seen_networks[i].obs_time ? wdp_seen_networks[i].obs_time : time(NULL);
+                        format_epoch_utc(obs_t, timestamp, sizeof(timestamp));
+
+                        if (wdp_seen_networks[i].obs_gps_valid) {
                             fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
                                     mac_str, escaped_ssid, auth_str, timestamp,
                                     wdp_seen_networks[i].channel, wifi_freq_mhz, (int)wdp_seen_networks[i].rssi,
-                                    current_gps.latitude, current_gps.longitude,
-                                    current_gps.altitude, current_gps.accuracy);
+                                    wdp_seen_networks[i].obs_lat, wdp_seen_networks[i].obs_lon,
+                                    wdp_seen_networks[i].obs_alt, wdp_seen_networks[i].obs_acc);
                         } else {
                             fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,0.0000000,0.0000000,0.00,0.00,,,WIFI\n",
                                     mac_str, escaped_ssid, auth_str, timestamp,
                                     wdp_seen_networks[i].channel, wifi_freq_mhz, (int)wdp_seen_networks[i].rssi);
                         }
-                        // Record the baseline for the next re-log decision.
+                        // Record the baseline for the next re-log decision (from where we logged).
                         if (wdp_seen_networks[i].last_logged_valid) wdp_relog_writes++;  // re-observation row
                         wdp_seen_networks[i].needs_log = false;
                         wdp_seen_networks[i].last_logged_rssi = wdp_seen_networks[i].rssi;
-                        if (current_gps.valid) {
-                            wdp_seen_networks[i].last_logged_lat = current_gps.latitude;
-                            wdp_seen_networks[i].last_logged_lon = current_gps.longitude;
+                        if (wdp_seen_networks[i].obs_gps_valid) {
+                            wdp_seen_networks[i].last_logged_lat = wdp_seen_networks[i].obs_lat;
+                            wdp_seen_networks[i].last_logged_lon = wdp_seen_networks[i].obs_lon;
                             wdp_seen_networks[i].last_logged_valid = true;
                         }
                     }
@@ -6386,32 +6564,36 @@ static void wardrive_promisc_task(void *pvParameters) {
                             }
                             const char *bt_cap = bt_devices[i].is_airtag  ? "AirTag [LE]"  :
                                                  bt_devices[i].is_smarttag ? "SmartTag [LE]" : "Misc [LE]";
-                            if (current_gps.valid) {
+                            // Stamp with the observation snapshot (see WiFi rows above).
+                            char bt_ts[32];
+                            time_t bt_obs_t = bt_devices[i].obs_time ? bt_devices[i].obs_time : time(NULL);
+                            format_epoch_utc(bt_obs_t, bt_ts, sizeof(bt_ts));
+                            if (bt_devices[i].obs_gps_valid) {
                                 fprintf(file, "%s,%s,%s,%s,0,,%d,%.7f,%.7f,%.2f,%.2f,,%s,BLE\n",
-                                        bt_mac, escaped_bt_name, bt_cap, timestamp,
+                                        bt_mac, escaped_bt_name, bt_cap, bt_ts,
                                         (int)bt_devices[i].rssi,
-                                        current_gps.latitude, current_gps.longitude,
-                                        current_gps.altitude, current_gps.accuracy, bt_mfgr_id);
+                                        bt_devices[i].obs_lat, bt_devices[i].obs_lon,
+                                        bt_devices[i].obs_alt, bt_devices[i].obs_acc, bt_mfgr_id);
                                 printf("%s,%s,%s,%s,0,,%d,%.7f,%.7f,%.2f,%.2f,,%s,BLE\n",
-                                       bt_mac, escaped_bt_name, bt_cap, timestamp,
+                                       bt_mac, escaped_bt_name, bt_cap, bt_ts,
                                        (int)bt_devices[i].rssi,
-                                       current_gps.latitude, current_gps.longitude,
-                                       current_gps.altitude, current_gps.accuracy, bt_mfgr_id);
+                                       bt_devices[i].obs_lat, bt_devices[i].obs_lon,
+                                       bt_devices[i].obs_alt, bt_devices[i].obs_acc, bt_mfgr_id);
                             } else {
                                 fprintf(file, "%s,%s,%s,%s,0,,%d,0.0000000,0.0000000,0.00,0.00,,%s,BLE\n",
-                                        bt_mac, escaped_bt_name, bt_cap, timestamp,
+                                        bt_mac, escaped_bt_name, bt_cap, bt_ts,
                                         (int)bt_devices[i].rssi, bt_mfgr_id);
                                 printf("%s,%s,%s,%s,0,,%d,0.0000000,0.0000000,0.00,0.00,,%s,BLE\n",
-                                       bt_mac, escaped_bt_name, bt_cap, timestamp,
+                                       bt_mac, escaped_bt_name, bt_cap, bt_ts,
                                        (int)bt_devices[i].rssi, bt_mfgr_id);
                             }
-                            // Baseline for the next re-log decision.
+                            // Baseline for the next re-log decision (from where we logged).
                             if (bt_devices[i].last_logged_valid) wdp_relog_writes++;
                             bt_devices[i].needs_log = false;
                             bt_devices[i].last_logged_rssi = bt_devices[i].rssi;
-                            if (current_gps.valid) {
-                                bt_devices[i].last_logged_lat = current_gps.latitude;
-                                bt_devices[i].last_logged_lon = current_gps.longitude;
+                            if (bt_devices[i].obs_gps_valid) {
+                                bt_devices[i].last_logged_lat = bt_devices[i].obs_lat;
+                                bt_devices[i].last_logged_lon = bt_devices[i].obs_lon;
                                 bt_devices[i].last_logged_valid = true;
                             }
                         }
@@ -6463,11 +6645,46 @@ static void wardrive_promisc_task(void *pvParameters) {
     }
 
 cleanup:
-    if (wardrive_promisc_trace_path[0] != '\0') {
+    if (wdp_trace.active) {
+        // Stop the RX callback from enqueuing more POIs, then drain what's left.
+        esp_wifi_set_promiscuous(false);
+        if (wdp_poi_queue) {
+            wdp_poi_msg_t poi;
+            while (xQueueReceive(wdp_poi_queue, &poi, 0) == pdTRUE) {
+                wdp_trace_write_poi(wardrive_promisc_trace_path, &wdp_trace, &poi);
+            }
+        }
+        // Write the last partial track segment, then close the KML document.
+        wdp_trace_flush_segment(wardrive_promisc_trace_path, &wdp_trace);
         wardrive_trace_finalize_file(wardrive_promisc_trace_path);
-        MY_LOG_INFO(TAG, "Wardrive trace saved to %s (distance %.1fm)", wardrive_promisc_trace_path, wdp_total_distance_m);
-        wardrive_promisc_trace_path[0] = '\0';
+        sd_sync();
+
+        // Publish atomically: rename ".inprogress.kml" -> final ".kml".
+        char final_path[100];
+        snprintf(final_path, sizeof(final_path),
+                 "/sdcard/lab/wardrives/%s_track.kml", wardrive_base);
+        unlink(final_path);
+        if (rename(wardrive_promisc_trace_path, final_path) == 0) {
+            sd_sync();
+            MY_LOG_INFO(TAG,
+                "Wardrive trace saved: %s (segments=%d, POIs=%d, dropped=%u, distance=%.1fm)",
+                final_path, wdp_trace.seg_written, wdp_trace.poi_written,
+                (unsigned)wdp_poi_dropped, wdp_total_distance_m);
+        } else {
+            MY_LOG_INFO(TAG,
+                "Wardrive trace rename failed (errno=%d); kept in-progress: %s "
+                "(segments=%d, POIs=%d, dropped=%u)",
+                errno, wardrive_promisc_trace_path, wdp_trace.seg_written,
+                wdp_trace.poi_written, (unsigned)wdp_poi_dropped);
+        }
+        wdp_trace.active = false;
     }
+    if (wdp_poi_queue) {
+        QueueHandle_t q = wdp_poi_queue;
+        wdp_poi_queue = NULL;
+        vQueueDelete(q);
+    }
+    wardrive_promisc_trace_path[0] = '\0';
     led_err = led_set_idle();
     if (led_err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to restore idle LED after wardrive promisc: %s", esp_err_to_name(led_err));
@@ -8242,6 +8459,132 @@ static bool wardrive_fix_file_soft(const char *filepath, const char *filename,
     return true;
 }
 
+// Finalize a truncated wardrive trace KML: copy everything up to and including the last
+// complete </Placemark>, then append the closing tags and publish as the final
+// "_track.kml". Fixes files left by a hard power-off (dead battery) that Google Earth
+// refuses to open because the document is not closed.
+static bool wardrive_kml_finalize_orphan(const char *inprogress_path) {
+    if (!inprogress_path) return false;
+
+    FILE *in = fopen(inprogress_path, "r");
+    if (!in) return false;
+
+    // Pass 1: byte offset just past the last complete "</Placemark>" line. Anything
+    // after it is a half-written record from the power-loss and gets dropped.
+    long cut = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), in)) {
+        if (strstr(line, "</Placemark>") != NULL) {
+            cut = ftell(in);
+        }
+    }
+    if (cut <= 0) {
+        fclose(in);
+        MY_LOG_INFO(TAG, "wardrive_fix_kml: no complete placemark in %s", inprogress_path);
+        return false;
+    }
+
+    // Derive the final path: "..._track.inprogress.kml" -> "..._track.kml".
+    char final_path[128];
+    snprintf(final_path, sizeof(final_path), "%s", inprogress_path);
+    char *ip = strstr(final_path, ".inprogress.kml");
+    if (ip) {
+        snprintf(ip, sizeof(final_path) - (size_t)(ip - final_path), ".kml");
+    } else {
+        snprintf(final_path, sizeof(final_path), "%s.fixed.kml", inprogress_path);
+    }
+
+    FILE *out = fopen(final_path, "w");
+    if (!out) {
+        fclose(in);
+        return false;
+    }
+
+    // Pass 2: copy the valid prefix, then close the KML document.
+    rewind(in);
+    long remaining = cut;
+    char buf[512];
+    while (remaining > 0) {
+        size_t want = remaining < (long)sizeof(buf) ? (size_t)remaining : sizeof(buf);
+        size_t got = fread(buf, 1, want, in);
+        if (got == 0) break;
+        fwrite(buf, 1, got, out);
+        remaining -= (long)got;
+    }
+    fprintf(out, "  </Folder>\n</Document>\n</kml>\n");
+    fclose(in);
+    fclose(out);
+    sd_sync();
+
+    // Drop the broken in-progress file now that a valid copy exists.
+    unlink(inprogress_path);
+    sd_sync();
+    return true;
+}
+
+// Scan the wardrives folder and finalize any orphaned "*_track.inprogress.kml" left by a
+// session that didn't stop cleanly. Names are collected before repairing so the directory
+// is not modified mid-iteration. Called at wardrive start (SD is mounted then).
+static void wardrive_kml_repair_orphans(void) {
+    DIR *dir = opendir("/sdcard/lab/wardrives");
+    if (!dir) return;
+
+    char names[8][96];
+    int n = 0;
+    const char *suffix = "_track.inprogress.kml";
+    size_t slen = strlen(suffix);
+    struct dirent *entry;
+    while (n < 8 && (entry = readdir(dir)) != NULL) {
+        const char *nm = entry->d_name;
+        size_t len = strlen(nm);
+        if (len > slen && strcmp(nm + len - slen, suffix) == 0) {
+            snprintf(names[n], sizeof(names[n]), "%.95s", nm);
+            n++;
+        }
+    }
+    closedir(dir);
+
+    int fixed = 0;
+    for (int i = 0; i < n; i++) {
+        char path[128];
+        snprintf(path, sizeof(path), "/sdcard/lab/wardrives/%s", names[i]);
+        if (wardrive_kml_finalize_orphan(path)) {
+            fixed++;
+            MY_LOG_INFO(TAG, "Repaired orphaned trace KML: %s", names[i]);
+        }
+    }
+    if (fixed > 0) {
+        MY_LOG_INFO(TAG, "Wardrive: finalized %d orphaned trace KML file(s).", fixed);
+    }
+}
+
+// Command: repair one truncated trace KML on demand (mirrors wardrive_fix for .log).
+static int cmd_wardrive_fix_kml(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: wardrive_fix_kml <file>");
+        return 1;
+    }
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    char path[128];
+    if (argv[1][0] == '/') snprintf(path, sizeof(path), "%s", argv[1]);
+    else snprintf(path, sizeof(path), "/sdcard/lab/wardrives/%s", argv[1]);
+
+    printf("[WARD_FIX_KML] BEGIN\n");
+    if (wardrive_kml_finalize_orphan(path)) {
+        printf("[WARD_FIX_KML] file=%s status=ok\n", argv[1]);
+        printf("[WARD_FIX_KML] END\n");
+        return 0;
+    }
+    printf("[WARD_FIX_KML] file=%s status=failed\n", argv[1]);
+    printf("[WARD_FIX_KML] END\n");
+    return 1;
+}
+
 static bool wardrive_collect_file_id(const char *filepath, long *out_size, uint32_t *out_hash) {
     const size_t CHUNK_SIZE = 2048;
     FILE *f = fopen(filepath, "rb");
@@ -9492,7 +9835,9 @@ static int cmd_wigle_upload(int argc, char **argv) {
         return 1;
     }
     create_sd_directories();
-    wigle_load_key_from_sd();
+    if (wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') {
+        wigle_load_key_from_sd();
+    }
 
     if (wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') {
         MY_LOG_INFO(TAG, "NO WIGLE CREDENTIALS");
@@ -10344,7 +10689,9 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
         return 1;
     }
     create_sd_directories();
-    wdgwars_load_key_from_sd();
+    if (wdgwars_api_key[0] == '\0') {
+        wdgwars_load_key_from_sd();
+    }
 
     if (wdgwars_api_key[0] == '\0') {
         MY_LOG_INFO(TAG, "NO WDGWARS CREDENTIALS");
@@ -12169,6 +12516,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "set_gps_position", " <lat> <lon> [alt] [acc]" },
     { "set_gps_position_cap", " <lat> <lon> [alt] [acc]" },
     { "start_portal", " <SSID>" },
+    { "start_admin_portal", " <password>" },
     { "start_karma", " <index>" },
     { "start_nmap", " [quick|medium|heavy] [IP]" },
     { "start_zig_recon", " [all|11,15,20] [dwell_ms]" },
@@ -12494,6 +12842,28 @@ static bool wifi_lookup_portal_password(const char *ssid, char *out, size_t out_
     return found;
 }
 
+static bool wifi_lookup_home_password(const char *ssid, char *out, size_t out_sz) {
+    FILE *file = fopen(HOME_FILE_PATH, "r");
+    if (!file) {
+        return false;
+    }
+
+    bool found = false;
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        char saved_ssid[64];
+        char saved_pass[96];
+        if (csv_get_quoted_field(line, 0, saved_ssid, sizeof(saved_ssid)) &&
+            csv_get_quoted_field(line, 1, saved_pass, sizeof(saved_pass)) &&
+            strcmp(saved_ssid, ssid) == 0 && saved_pass[0] != '\0') {
+            snprintf(out, out_sz, "%s", saved_pass);
+            found = true;
+        }
+    }
+    fclose(file);
+    return found;
+}
+
 static bool wifi_lookup_known_password(const char *ssid, char *out, size_t out_sz) {
     if (!ssid || !out || out_sz == 0) {
         return false;
@@ -12511,6 +12881,10 @@ static bool wifi_lookup_known_password(const char *ssid, char *out, size_t out_s
     }
     if (wifi_lookup_portal_password(ssid, out, out_sz)) {
         MY_LOG_INFO(TAG, "wifi_connect: using saved password from portals.txt for '%s'", ssid);
+        return true;
+    }
+    if (wifi_lookup_home_password(ssid, out, out_sz)) {
+        MY_LOG_INFO(TAG, "wifi_connect: using saved password from home.txt for '%s'", ssid);
         return true;
     }
     return false;
@@ -16307,6 +16681,196 @@ static int cmd_remove_ssid(int argc, char **argv)
     return 0;
 }
 
+// ---- Home networks (home.txt) for wardrive auto-upload ----
+// File format: "SSID", "password", "BSSID" (one per line, quoted; BSSID optional/empty).
+// BSSID lets us match hidden networks (empty SSID in the wardrive stream) by MAC.
+
+// Load home networks from home.txt. Returns entry count, or -1 if file missing.
+static int load_home_networks(char ssids[][33], char passes[][65], char bssids[][18], int max_entries) {
+    FILE *f = fopen(HOME_FILE_PATH, "r");
+    if (f == NULL) {
+        return -1;
+    }
+    int count = 0;
+    char line[256];
+    while (count < max_entries && fgets(line, sizeof(line), f)) {
+        char ssid[64];
+        char pass[96];
+        char bssid[32];
+        if (!csv_get_quoted_field(line, 0, ssid, sizeof(ssid)) || ssid[0] == '\0') {
+            continue;
+        }
+        if (!csv_get_quoted_field(line, 1, pass, sizeof(pass))) {
+            pass[0] = '\0';
+        }
+        if (!csv_get_quoted_field(line, 2, bssid, sizeof(bssid))) {
+            bssid[0] = '\0';
+        }
+        strncpy(ssids[count], ssid, 32); ssids[count][32] = '\0';
+        strncpy(passes[count], pass, 64); passes[count][64] = '\0';
+        strncpy(bssids[count], bssid, 17); bssids[count][17] = '\0';
+        count++;
+    }
+    fclose(f);
+    return count;
+}
+
+// Rewrite the whole home.txt from the in-memory arrays. Returns true on success.
+static bool home_write_all(char ssids[][33], char passes[][65], char bssids[][18], int count) {
+    FILE *f = fopen(HOME_FILE_PATH, "w");
+    if (f == NULL) {
+        MY_LOG_INFO(TAG, "Failed to open home.txt for writing");
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        fprintf(f, "\"%s\", \"%s\", \"%s\"\n", ssids[i], passes[i], bssids[i]);
+    }
+    fflush(f);
+    fclose(f);
+    sd_sync();
+    return true;
+}
+
+static int cmd_home_list(int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    char ssids[MAX_HOME_NETWORKS][33];
+    char passes[MAX_HOME_NETWORKS][65];
+    char bssids[MAX_HOME_NETWORKS][18];
+    int count = load_home_networks(ssids, passes, bssids, MAX_HOME_NETWORKS);
+    if (count < 0) {
+        count = 0;  // no file yet == empty list
+    }
+
+    MY_LOG_INFO(TAG, "Home networks:");
+    for (int i = 0; i < count; i++) {
+        printf("%d \"%s\" \"%s\"\n", i + 1, ssids[i], bssids[i]);
+    }
+    MY_LOG_INFO(TAG, "Home networks printed");
+    return 0;
+}
+
+static int cmd_home_add(int argc, char **argv) {
+    if (argc < 3) {
+        MY_LOG_INFO(TAG, "Usage: home_add \"<SSID>\" \"<password>\" [BSSID]");
+        return 1;
+    }
+
+    const char *ssid = argv[1];
+    const char *pass = argv[2];
+    const char *bssid = (argc >= 4) ? argv[3] : "";
+    size_t ssid_len = strlen(ssid);
+    if (ssid_len == 0 || ssid_len > 32) {
+        MY_LOG_INFO(TAG, "SSID length must be 1-32 characters");
+        return 1;
+    }
+    if (strlen(pass) > 64) {
+        MY_LOG_INFO(TAG, "Password too long (max 64 characters)");
+        return 1;
+    }
+    if (strlen(bssid) > 17) {
+        MY_LOG_INFO(TAG, "BSSID too long (expected AA:BB:CC:DD:EE:FF)");
+        return 1;
+    }
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    char ssids[MAX_HOME_NETWORKS][33];
+    char passes[MAX_HOME_NETWORKS][65];
+    char bssids[MAX_HOME_NETWORKS][18];
+    int count = load_home_networks(ssids, passes, bssids, MAX_HOME_NETWORKS);
+    if (count < 0) {
+        count = 0;  // file not present yet, start fresh
+    }
+
+    // Update in place if the SSID is already known.
+    for (int i = 0; i < count; i++) {
+        if (strcmp(ssids[i], ssid) == 0) {
+            strncpy(passes[i], pass, 64); passes[i][64] = '\0';
+            strncpy(bssids[i], bssid, 17); bssids[i][17] = '\0';
+            if (!home_write_all(ssids, passes, bssids, count)) {
+                return 1;
+            }
+            MY_LOG_INFO(TAG, "Updated home network: %s", ssid);
+            return 0;
+        }
+    }
+
+    if (count >= MAX_HOME_NETWORKS) {
+        MY_LOG_INFO(TAG, "Home network list full (max %d)", MAX_HOME_NETWORKS);
+        return 1;
+    }
+
+    strncpy(ssids[count], ssid, 32); ssids[count][32] = '\0';
+    strncpy(passes[count], pass, 64); passes[count][64] = '\0';
+    strncpy(bssids[count], bssid, 17); bssids[count][17] = '\0';
+    count++;
+    if (!home_write_all(ssids, passes, bssids, count)) {
+        return 1;
+    }
+    MY_LOG_INFO(TAG, "Added home network: %s", ssid);
+    return 0;
+}
+
+static int cmd_home_remove(int argc, char **argv) {
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: home_remove \"<SSID>\"");
+        return 1;
+    }
+    const char *ssid = argv[1];
+
+    esp_err_t ret = init_sd_card();
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    char ssids[MAX_HOME_NETWORKS][33];
+    char passes[MAX_HOME_NETWORKS][65];
+    char bssids[MAX_HOME_NETWORKS][18];
+    int count = load_home_networks(ssids, passes, bssids, MAX_HOME_NETWORKS);
+    if (count < 0) {
+        MY_LOG_INFO(TAG, "home.txt not found on SD card.");
+        return 1;
+    }
+
+    int out = 0;
+    bool removed = false;
+    for (int i = 0; i < count; i++) {
+        if (!removed && strcmp(ssids[i], ssid) == 0) {
+            removed = true;
+            continue;
+        }
+        if (out != i) {
+            strncpy(ssids[out], ssids[i], 32); ssids[out][32] = '\0';
+            strncpy(passes[out], passes[i], 64); passes[out][64] = '\0';
+            strncpy(bssids[out], bssids[i], 17); bssids[out][17] = '\0';
+        }
+        out++;
+    }
+
+    if (!removed) {
+        MY_LOG_INFO(TAG, "Home network not found: %s", ssid);
+        return 1;
+    }
+
+    if (!home_write_all(ssids, passes, bssids, out)) {
+        return 1;
+    }
+    MY_LOG_INFO(TAG, "Removed home network: %s. %d remaining.", ssid, out);
+    return 0;
+}
+
 // Command: sd_status - Fast SD card presence check (no mount/init)
 static int cmd_sd_status(int argc, char **argv)
 {
@@ -18631,6 +19195,632 @@ static int cmd_start_portal(int argc, char **argv) {
     return 0;
 }
 
+// ===========================================================================
+// Admin portal (start_admin_portal): WPA2 AP "JanOS-Admin" that reuses the
+// captive portal AP/HTTP/DNS technique but serves a web-based file manager
+// restricted to /sdcard/lab (directory tree, upload/download, rename/delete,
+// text editing).
+// ===========================================================================
+
+#define ADMIN_ROOT_DIR "/sdcard/lab"
+#define ADMIN_EDIT_MAX (256 * 1024)   // max bytes served to the text editor
+#define ADMIN_IO_CHUNK 2048
+
+// Single-page admin UI (no external assets, works offline behind captive portal)
+static const char* admin_portal_html =
+"<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+"<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+"<title>JanOS Admin</title><style>"
+":root{color-scheme:dark;--bg:#090a0c;--bg-top:#1b1d22;--panel:#131519;--panel-2:#1a1d22;--panel-3:#23262d;--line:#31353d;--line-strong:#4a4f59;--text:#f4f4f2;--muted:#babec5;--dim:#8c919a;--glow:0 22px 60px rgba(0,0,0,.38);}"
+"*{box-sizing:border-box;}"
+"body{margin:0;min-height:100vh;font-family:'Avenir Next','Segoe UI',sans-serif;background:radial-gradient(circle at top,var(--bg-top) 0%,#111318 34%,var(--bg) 100%);color:var(--text);letter-spacing:.01em;}"
+".shell{max-width:1180px;margin:0 auto;padding:18px 16px 20px;}"
+"header{padding:16px 18px;border:1px solid var(--line);border-radius:20px;background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.02));box-shadow:var(--glow);}"
+".eyebrow{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);margin-bottom:8px;}"
+"h1{margin:0;font-size:24px;line-height:1.05;font-weight:700;}"
+"header p{margin:8px 0 0;color:var(--muted);font-size:13px;max-width:520px;}"
+"#bar{margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:18px;background:rgba(255,255,255,.03);display:flex;gap:8px;align-items:center;flex-wrap:wrap;box-shadow:var(--glow);}"
+".path-wrap{display:flex;flex-direction:column;gap:3px;min-width:220px;padding:8px 12px;border:1px solid var(--line);border-radius:14px;background:var(--panel);}"
+".path-label{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);}"
+"#path{font-family:'SFMono-Regular',Consolas,Monaco,monospace;color:var(--text);word-break:break-all;}"
+".spacer{flex:1 1 auto;}"
+"input[type=file]{max-width:220px;color:var(--muted);font-size:12px;padding:7px 9px;border:1px solid var(--line);border-radius:12px;background:var(--panel);box-shadow:none;}"
+"input[type=file]::file-selector-button{margin-right:8px;padding:7px 10px;border:1px solid var(--line-strong);border-radius:9px;background:#f2f2f0;color:#101114;font-weight:700;cursor:pointer;}"
+"table{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--line);border-radius:20px;overflow:hidden;background:var(--panel);box-shadow:var(--glow);}"
+".table-wrap{margin-top:12px;overflow:hidden;border-radius:20px;}"
+"th,td{padding:11px 12px;text-align:left;font-size:13px;border-bottom:1px solid var(--line);}"
+"thead th{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);background:var(--panel-2);}"
+"tbody tr:last-child td{border-bottom:none;}"
+"tr:hover td{background:rgba(255,255,255,.04);}"
+"td.size{color:var(--muted);white-space:nowrap;width:1%;}"
+"td.actions{width:1%;white-space:nowrap;}"
+"a.name{color:var(--text);cursor:pointer;text-decoration:none;font-weight:600;}"
+"a.name:hover{text-decoration:underline;text-underline-offset:3px;}"
+"button{appearance:none;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--line-strong);border-radius:10px;padding:8px 12px;min-height:36px;background:linear-gradient(180deg,var(--panel-3),var(--panel-2));color:var(--text);cursor:pointer;font-size:12px;font-weight:600;line-height:1.2;text-align:center;white-space:nowrap;word-break:normal;overflow-wrap:normal;transition:background .15s ease,border-color .15s ease,transform .15s ease;}"
+"button:hover{background:linear-gradient(180deg,#2d3138,#20242a);border-color:#656b77;transform:translateY(-1px);}"
+"button.danger{background:linear-gradient(180deg,#f4f4f2,#d8d8d5);color:#111215;border-color:#f4f4f2;}"
+"button.danger:hover{background:linear-gradient(180deg,#ffffff,#e5e5e1);border-color:#ffffff;}"
+".act{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;}"
+"#msg{margin-top:10px;padding:10px 12px;border:1px solid var(--line);border-radius:14px;background:rgba(255,255,255,.035);color:var(--muted);font-size:12px;}"
+"#msg:empty{display:none;}"
+"#editor{position:fixed;inset:0;padding:14px;background:rgba(5,6,8,.76);backdrop-filter:blur(10px);display:none;align-items:center;justify-content:center;z-index:10;}"
+".editor-shell{width:min(1100px,100%);height:min(88vh,100%);display:flex;flex-direction:column;border:1px solid var(--line);border-radius:20px;overflow:hidden;background:var(--panel);box-shadow:var(--glow);}"
+"#editbar{padding:12px 14px;background:var(--panel-2);display:flex;gap:8px;align-items:center;border-bottom:1px solid var(--line);}"
+"#efn{font-family:'SFMono-Regular',Consolas,Monaco,monospace;flex:1;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}"
+"#editor textarea{flex:1;width:100%;background:#0f1114;color:var(--text);border:none;font-family:'SFMono-Regular',Consolas,Monaco,monospace;font-size:13px;line-height:1.5;padding:14px;resize:none;outline:none;}"
+"@media (max-width:760px){.shell{padding:12px 10px 16px;}header{padding:14px 14px 15px;border-radius:16px;}h1{font-size:20px;}header p{font-size:12px;}.eyebrow{margin-bottom:6px;}#bar{padding:10px;align-items:stretch;}.path-wrap{width:100%;min-width:0;}.spacer{display:none;}input[type=file]{max-width:none;width:100%;}#bar>button,#bar>input[type=file],#bar>.path-wrap{width:100%;}table{border:none;background:transparent;box-shadow:none;}thead{display:none;}tbody,tr,td{display:block;width:100%;}tr{margin:0 0 8px;border:1px solid var(--line);border-radius:14px;background:var(--panel);overflow:hidden;box-shadow:var(--glow);}td{padding:8px 10px;border-bottom:1px solid var(--line);}td:last-child{border-bottom:none;}td.size{font-size:12px;white-space:normal;}td.size:before{content:'Size';display:block;margin-bottom:3px;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);}td.actions:before{content:'Actions';display:block;margin-bottom:5px;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);}td.actions{width:100%;max-width:none;white-space:normal;}.act{display:block;width:100%;max-width:none;}.act button{display:flex;width:100%;max-width:none;min-width:100%;min-height:44px;margin:0 0 8px;padding:11px 12px;font-size:14px;line-height:1.25;text-align:center;justify-content:center;white-space:nowrap;word-break:normal;overflow-wrap:normal;}.act button:last-child{margin-bottom:0;}.table-wrap{overflow:visible;border-radius:0;}#editor{padding:6px;}.editor-shell{height:100%;border-radius:14px;}#editbar{padding:10px;flex-wrap:wrap;}#editbar button{width:auto;}}"
+"</style><script>"
+"if(location.hostname!=='172.0.0.1'){location.href='http://172.0.0.1/';}"
+"var cwd='';var editFile='';"
+"function j(p){return encodeURIComponent(p);}"
+"function child(n){return cwd?cwd+'/'+n:n;}"
+"function msg(t){document.getElementById('msg').textContent=t;}"
+"function row(){var tr=document.createElement('tr');var td1=document.createElement('td');"
+"var a=document.createElement('a');td1.appendChild(a);var td2=document.createElement('td');"
+"td2.className='size';var td3=document.createElement('td');td3.className='actions';"
+"var acts=document.createElement('div');acts.className='act';td3.appendChild(acts);"
+"tr.appendChild(td1);tr.appendChild(td2);"
+"tr.appendChild(td3);document.getElementById('tbody').appendChild(tr);return {name:a,size:td2,act:acts};}"
+"function btn(label,fn,cls){var b=document.createElement('button');b.textContent=label;"
+"if(cls)b.className=cls;b.onclick=fn;return b;}"
+"function load(){fetch('/api/list?path='+j(cwd)).then(r=>r.json()).then(items=>{"
+"document.getElementById('path').textContent='/lab/'+cwd;"
+"items.sort((a,b)=>a.dir!==b.dir?(a.dir?-1:1):a.name.localeCompare(b.name));"
+"var tb=document.getElementById('tbody');tb.innerHTML='';"
+"if(cwd){var u=row();u.name.textContent='.. (up)';u.name.className='name';u.name.onclick=up;}"
+"items.forEach(it=>{var r=row();"
+"if(it.dir){r.name.textContent='[DIR] '+it.name;r.name.className='name';r.name.onclick=()=>enter(it.name);"
+"r.size.textContent='';r.act.appendChild(btn('Rename',()=>ren(it.name)));"
+"r.act.appendChild(btn('Delete',()=>del(it.name),'danger'));}"
+"else{r.name.textContent=it.name;r.size.textContent=it.size;"
+"r.act.appendChild(btn('Download',()=>dl(it.name)));r.act.appendChild(btn('Edit',()=>edit(it.name)));"
+"r.act.appendChild(btn('Rename',()=>ren(it.name)));r.act.appendChild(btn('Delete',()=>del(it.name),'danger'));}"
+"});msg('');}).catch(e=>msg('List error: '+e));}"
+"function up(){cwd=cwd.split('/').slice(0,-1).join('/');load();}"
+"function enter(n){cwd=child(n);load();}"
+"function dl(n){location.href='/api/download?path='+j(child(n));}"
+"function del(n){if(!confirm('Delete '+n+'?'))return;"
+"fetch('/api/delete?path='+j(child(n)),{method:'POST'}).then(r=>{msg(r.ok?'Deleted '+n:'Delete failed');load();});}"
+"function ren(n){var nn=prompt('New name for '+n,n);if(!nn||nn===n)return;"
+"var body='from='+j(child(n))+'&to='+j(child(nn));"
+"fetch('/api/rename',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})"
+".then(r=>{msg(r.ok?'Renamed':'Rename failed');load();});}"
+"function edit(n){editFile=child(n);fetch('/api/read?path='+j(editFile)).then(r=>r.text()).then(t=>{"
+"document.getElementById('ta').value=t;document.getElementById('efn').textContent=editFile;"
+"document.getElementById('editor').style.display='flex';});}"
+"function saveEdit(){fetch('/api/write?path='+j(editFile),{method:'POST',body:document.getElementById('ta').value})"
+".then(r=>{msg(r.ok?'Saved '+editFile:'Save failed');closeEdit();load();});}"
+"function closeEdit(){document.getElementById('editor').style.display='none';}"
+"function doUpload(){var f=document.getElementById('file').files[0];if(!f){msg('Choose a file first');return;}"
+"msg('Uploading '+f.name+'...');fetch('/api/upload?path='+j(child(f.name)),{method:'POST',body:f})"
+".then(r=>{msg(r.ok?'Uploaded '+f.name:'Upload failed');load();});}"
+"</script></head><body><div class='shell'>"
+"<header><div class='eyebrow'>JanOS Admin</div><h1>File Manager</h1><p>Direct access to /sdcard/lab.</p></header>"
+"<div id='bar'><button onclick='up()'>Up</button><div class='path-wrap'><span class='path-label'>Current path</span><span id='path'>/lab/</span></div>"
+"<span class='spacer'></span><input type='file' id='file'><button onclick='doUpload()'>Upload</button></div>"
+"<div id='msg'></div>"
+"<div class='table-wrap'><table><thead><tr><th>Name</th><th>Size</th><th>Actions</th></tr></thead><tbody id='tbody'></tbody></table></div></div>"
+"<div id='editor'><div class='editor-shell'><div id='editbar'><span id='efn'></span>"
+"<button onclick='saveEdit()'>Save</button><button class='danger' onclick='closeEdit()'>Close</button></div>"
+"<textarea id='ta' spellcheck='false'></textarea></div></div>"
+"<script>load();</script></body></html>";
+
+// Build an absolute SD path under ADMIN_ROOT_DIR from a caller-supplied
+// relative path. Rejects any path containing ".." to prevent escaping the
+// sandbox. Leading and trailing slashes are trimmed.
+static bool build_admin_path(char *dest, size_t dest_size, const char *rel) {
+    if (!dest || dest_size == 0) {
+        return false;
+    }
+    if (!rel) {
+        rel = "";
+    }
+    while (*rel == '/') {
+        rel++;
+    }
+    if (strstr(rel, "..") != NULL) {
+        return false;
+    }
+    int written;
+    if (rel[0] == '\0') {
+        written = snprintf(dest, dest_size, "%s", ADMIN_ROOT_DIR);
+    } else {
+        written = snprintf(dest, dest_size, "%s/%s", ADMIN_ROOT_DIR, rel);
+    }
+    if (written < 0 || (size_t)written >= dest_size) {
+        return false;
+    }
+    size_t len = strlen(dest);
+    size_t root_len = strlen(ADMIN_ROOT_DIR);
+    while (len > root_len && dest[len - 1] == '/') {
+        dest[--len] = '\0';
+    }
+    return true;
+}
+
+// Decode an application/x-www-form-urlencoded value (%XX and '+').
+static void admin_url_decode(char *dst, const char *src, size_t dst_size) {
+    size_t di = 0;
+    for (const char *p = src; *p && di + 1 < dst_size; p++) {
+        if (*p == '%' && p[1] && p[2]) {
+            char hex[3] = { p[1], p[2], '\0' };
+            dst[di++] = (char)strtol(hex, NULL, 16);
+            p += 2;
+        } else if (*p == '+') {
+            dst[di++] = ' ';
+        } else {
+            dst[di++] = *p;
+        }
+    }
+    dst[di] = '\0';
+}
+
+// Minimal JSON string escaping for file names.
+static void admin_json_escape(char *dst, const char *src, size_t dst_size) {
+    size_t di = 0;
+    for (const char *p = src; *p && di + 7 < dst_size; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\') {
+            dst[di++] = '\\';
+            dst[di++] = c;
+        } else if (c < 0x20) {
+            di += snprintf(dst + di, dst_size - di, "\\u%04x", c);
+        } else {
+            dst[di++] = c;
+        }
+    }
+    dst[di] = '\0';
+}
+
+// Resolve the "path" query parameter of a request into an absolute SD path
+// inside the sandbox. Returns false on missing/invalid path.
+static bool admin_resolve_query_path(httpd_req_t *req, char *full, size_t full_size) {
+    char rel_enc[SD_PATH_MAX];
+    char rel[SD_PATH_MAX];
+    rel_enc[0] = '\0';
+
+    size_t qlen = httpd_req_get_url_query_len(req);
+    if (qlen > 0) {
+        char *query = malloc(qlen + 1);
+        if (query) {
+            if (httpd_req_get_url_query_str(req, query, qlen + 1) == ESP_OK) {
+                if (httpd_query_key_value(query, "path", rel_enc, sizeof(rel_enc)) != ESP_OK) {
+                    rel_enc[0] = '\0';
+                }
+            }
+            free(query);
+        }
+    }
+    admin_url_decode(rel, rel_enc, sizeof(rel));
+    return build_admin_path(full, full_size, rel);
+}
+
+// Stream the request body into an already-open file, in chunks.
+static esp_err_t admin_recv_body_to_file(httpd_req_t *req, const char *full) {
+    FILE *f = fopen(full, "wb");
+    if (!f) {
+        return ESP_FAIL;
+    }
+    char *buf = malloc(ADMIN_IO_CHUNK);
+    if (!buf) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+    esp_err_t res = ESP_OK;
+    int remaining = req->content_len;
+    while (remaining > 0) {
+        int to_read = remaining < ADMIN_IO_CHUNK ? remaining : ADMIN_IO_CHUNK;
+        int received = httpd_req_recv(req, buf, to_read);
+        if (received <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            res = ESP_FAIL;
+            break;
+        }
+        if (fwrite(buf, 1, received, f) != (size_t)received) {
+            res = ESP_FAIL;
+            break;
+        }
+        remaining -= received;
+    }
+    free(buf);
+    fclose(f);
+    return res;
+}
+
+// GET / and catch-all: serve the admin UI.
+static esp_err_t admin_root_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, admin_portal_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// GET /api/list?path=<rel> -> JSON array of {name,dir,size}
+static esp_err_t admin_list_handler(httpd_req_t *req) {
+    char full[SD_PATH_MAX];
+    if (!admin_resolve_query_path(req, full, sizeof(full))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
+        return ESP_FAIL;
+    }
+    if (init_sd_card() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card error");
+        return ESP_FAIL;
+    }
+    DIR *dir = opendir(full);
+    if (!dir) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Directory not found");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr_chunk(req, "[");
+    struct dirent *entry;
+    bool first = true;
+    char item[SD_PATH_MAX + 320];
+    char esc[256];
+    char child[SD_PATH_MAX];
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.' &&
+            (entry->d_name[1] == '\0' ||
+             (entry->d_name[1] == '.' && entry->d_name[2] == '\0'))) {
+            continue;
+        }
+        long size = 0;
+        bool isdir = (entry->d_type == DT_DIR);
+        if (snprintf(child, sizeof(child), "%s/%s", full, entry->d_name) < (int)sizeof(child)) {
+            struct stat st;
+            if (stat(child, &st) == 0) {
+                size = (long)st.st_size;
+                isdir = S_ISDIR(st.st_mode);
+            }
+        }
+        admin_json_escape(esc, entry->d_name, sizeof(esc));
+        snprintf(item, sizeof(item), "%s{\"name\":\"%s\",\"dir\":%s,\"size\":%ld}",
+                 first ? "" : ",", esc, isdir ? "true" : "false", size);
+        httpd_resp_sendstr_chunk(req, item);
+        first = false;
+    }
+    closedir(dir);
+    httpd_resp_sendstr_chunk(req, "]");
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
+
+// GET /api/download?path=<rel> -> raw file (chunked)
+static esp_err_t admin_download_handler(httpd_req_t *req) {
+    char full[SD_PATH_MAX];
+    if (!admin_resolve_query_path(req, full, sizeof(full))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
+        return ESP_FAIL;
+    }
+    if (init_sd_card() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card error");
+        return ESP_FAIL;
+    }
+    FILE *f = fopen(full, "rb");
+    if (!f) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
+        return ESP_FAIL;
+    }
+    const char *base = strrchr(full, '/');
+    base = base ? base + 1 : full;
+    char cd[SD_PATH_MAX + 32];
+    snprintf(cd, sizeof(cd), "attachment; filename=\"%s\"", base);
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Content-Disposition", cd);
+    char *buf = malloc(ADMIN_IO_CHUNK);
+    if (!buf) {
+        fclose(f);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    size_t r;
+    while ((r = fread(buf, 1, ADMIN_IO_CHUNK, f)) > 0) {
+        if (httpd_resp_send_chunk(req, buf, r) != ESP_OK) {
+            break;
+        }
+    }
+    free(buf);
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+// GET /api/read?path=<rel> -> file content as text (capped at ADMIN_EDIT_MAX)
+static esp_err_t admin_read_handler(httpd_req_t *req) {
+    char full[SD_PATH_MAX];
+    if (!admin_resolve_query_path(req, full, sizeof(full))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
+        return ESP_FAIL;
+    }
+    if (init_sd_card() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card error");
+        return ESP_FAIL;
+    }
+    FILE *f = fopen(full, "rb");
+    if (!f) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    char *buf = malloc(ADMIN_IO_CHUNK);
+    if (!buf) {
+        fclose(f);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    size_t total = 0;
+    size_t r;
+    while ((r = fread(buf, 1, ADMIN_IO_CHUNK, f)) > 0) {
+        if (total + r > ADMIN_EDIT_MAX) {
+            size_t allowed = ADMIN_EDIT_MAX - total;
+            if (allowed > 0) {
+                httpd_resp_send_chunk(req, buf, allowed);
+            }
+            break;
+        }
+        if (httpd_resp_send_chunk(req, buf, r) != ESP_OK) {
+            break;
+        }
+        total += r;
+    }
+    free(buf);
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+// POST /api/upload?path=<rel> -> store raw request body as file
+static esp_err_t admin_upload_handler(httpd_req_t *req) {
+    char full[SD_PATH_MAX];
+    if (!admin_resolve_query_path(req, full, sizeof(full))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
+        return ESP_FAIL;
+    }
+    if (init_sd_card() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card error");
+        return ESP_FAIL;
+    }
+    if (admin_recv_body_to_file(req, full) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Write failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+// POST /api/write?path=<rel> -> overwrite file with request body (text editor)
+static esp_err_t admin_write_handler(httpd_req_t *req) {
+    return admin_upload_handler(req);
+}
+
+// POST /api/rename  body: from=<rel>&to=<rel>
+static esp_err_t admin_rename_handler(httpd_req_t *req) {
+    char body[2 * SD_PATH_MAX];
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+        return ESP_FAIL;
+    }
+    body[len] = '\0';
+
+    char from_enc[SD_PATH_MAX];
+    char to_enc[SD_PATH_MAX];
+    if (httpd_query_key_value(body, "from", from_enc, sizeof(from_enc)) != ESP_OK ||
+        httpd_query_key_value(body, "to", to_enc, sizeof(to_enc)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing from/to");
+        return ESP_FAIL;
+    }
+
+    char from_rel[SD_PATH_MAX];
+    char to_rel[SD_PATH_MAX];
+    admin_url_decode(from_rel, from_enc, sizeof(from_rel));
+    admin_url_decode(to_rel, to_enc, sizeof(to_rel));
+
+    char from_full[SD_PATH_MAX];
+    char to_full[SD_PATH_MAX];
+    if (!build_admin_path(from_full, sizeof(from_full), from_rel) ||
+        !build_admin_path(to_full, sizeof(to_full), to_rel)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
+        return ESP_FAIL;
+    }
+    if (init_sd_card() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card error");
+        return ESP_FAIL;
+    }
+    if (rename(from_full, to_full) != 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Rename failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+// POST /api/delete?path=<rel> -> remove file or empty directory
+static esp_err_t admin_delete_handler(httpd_req_t *req) {
+    char full[SD_PATH_MAX];
+    if (!admin_resolve_query_path(req, full, sizeof(full))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
+        return ESP_FAIL;
+    }
+    if (init_sd_card() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card error");
+        return ESP_FAIL;
+    }
+    struct stat st;
+    if (stat(full, &st) != 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
+        return ESP_FAIL;
+    }
+    int rc = S_ISDIR(st.st_mode) ? rmdir(full) : remove(full);
+    if (rc != 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Delete failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+// CLI command: start_admin_portal <password>
+// Brings up a WPA2 AP named "JanOS-Admin" and serves the file-manager UI.
+static int cmd_start_admin_portal(int argc, char **argv) {
+    oled_display_update_full("> Admin Portal",
+        "  JanOS-Admin",
+        "  File manager", "  Active...");
+    log_memory_info("start_admin_portal");
+
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: start_admin_portal <password>");
+        MY_LOG_INFO(TAG, "Example: start_admin_portal MySecret123");
+        return 1;
+    }
+
+    const char *password = argv[1];
+    size_t password_len = strlen(password);
+    if (password_len < 8 || password_len > 63) {
+        MY_LOG_INFO(TAG, "Password length must be between 8 and 63 characters for WPA2");
+        return 1;
+    }
+
+    if (portal_active) {
+        MY_LOG_INFO(TAG, "Portal already running. Use 'stop' to stop it first.");
+        return 0;
+    }
+
+    if (!ensure_wifi_mode()) {
+        return 1;
+    }
+
+    // SD card is required for the file manager
+    if (init_sd_card() != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to initialize SD card. Make sure it is inserted.");
+        return 1;
+    }
+
+    const char *ssid = "JanOS-Admin";
+    size_t ssid_len = strlen(ssid);
+
+    // Store portal SSID for logging/OLED/stop consistency
+    if (portalSSID != NULL) {
+        free(portalSSID);
+    }
+    portalSSID = malloc(ssid_len + 1);
+    if (portalSSID != NULL) {
+        strcpy(portalSSID, ssid);
+    }
+
+    MY_LOG_INFO(TAG, "Starting admin portal AP: %s", ssid);
+
+    esp_netif_t *ap_netif = ensure_ap_mode();
+    if (!ap_netif) {
+        MY_LOG_INFO(TAG, "Failed to enable AP mode");
+        return 1;
+    }
+
+    esp_netif_dhcps_stop(ap_netif);
+
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+    if (esp_netif_set_ip_info(ap_netif, &ip_info) != ESP_OK) {
+        return 1;
+    }
+
+    wifi_config_t ap_config = {0};
+    memcpy(ap_config.ap.ssid, ssid, ssid_len);
+    ap_config.ap.ssid_len = ssid_len;
+    ap_config.ap.channel = 1;
+    strncpy((char*)ap_config.ap.password, password, sizeof(ap_config.ap.password) - 1);
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+
+    esp_err_t ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
+        return 1;
+    }
+
+    ret = esp_netif_dhcps_start(ap_netif);
+    if (ret != ESP_OK) {
+        esp_wifi_stop();
+        return 1;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.max_open_sockets = 7;
+    config.max_uri_handlers = 16;
+    config.uri_match_fn = httpd_uri_match_wildcard;
+
+    esp_err_t http_ret = httpd_start(&portal_server, &config);
+    if (http_ret != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to start HTTP server: %s", esp_err_to_name(http_ret));
+        esp_wifi_stop();
+        return 1;
+    }
+
+    // API endpoints must be registered before the "/*" catch-all so they win
+    // the (registration-order) match under wildcard matching.
+    httpd_uri_t list_uri = { .uri = "/api/list", .method = HTTP_GET, .handler = admin_list_handler };
+    httpd_register_uri_handler(portal_server, &list_uri);
+
+    httpd_uri_t download_uri = { .uri = "/api/download", .method = HTTP_GET, .handler = admin_download_handler };
+    httpd_register_uri_handler(portal_server, &download_uri);
+
+    httpd_uri_t read_uri = { .uri = "/api/read", .method = HTTP_GET, .handler = admin_read_handler };
+    httpd_register_uri_handler(portal_server, &read_uri);
+
+    httpd_uri_t upload_uri = { .uri = "/api/upload", .method = HTTP_POST, .handler = admin_upload_handler };
+    httpd_register_uri_handler(portal_server, &upload_uri);
+
+    httpd_uri_t write_uri = { .uri = "/api/write", .method = HTTP_POST, .handler = admin_write_handler };
+    httpd_register_uri_handler(portal_server, &write_uri);
+
+    httpd_uri_t rename_uri = { .uri = "/api/rename", .method = HTTP_POST, .handler = admin_rename_handler };
+    httpd_register_uri_handler(portal_server, &rename_uri);
+
+    httpd_uri_t delete_uri = { .uri = "/api/delete", .method = HTTP_POST, .handler = admin_delete_handler };
+    httpd_register_uri_handler(portal_server, &delete_uri);
+
+    httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = admin_root_handler };
+    httpd_register_uri_handler(portal_server, &root_uri);
+
+    // Catch-all so OS captive-portal detection URLs also load the admin UI.
+    httpd_uri_t catchall_uri = { .uri = "/*", .method = HTTP_GET, .handler = admin_root_handler };
+    httpd_register_uri_handler(portal_server, &catchall_uri);
+
+    portal_active = true;
+
+    BaseType_t task_ret = xTaskCreate(
+        dns_server_task,
+        "dns_server",
+        4096,
+        NULL,
+        5,
+        &dns_server_task_handle
+    );
+    if (task_ret != pdPASS) {
+        portal_active = false;
+        httpd_stop(portal_server);
+        portal_server = NULL;
+        esp_wifi_stop();
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "Admin portal started. Connect to '%s' (WPA2) and open http://172.0.0.1", ssid);
+
+    esp_err_t led_err = led_set_color(0, 255, 255); // Cyan for admin portal mode
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for admin portal mode: %s", esp_err_to_name(led_err));
+    }
+
+    return 0;
+}
+
 // Start password-protected rogue AP with captive portal and optional deauth
 static int cmd_start_rogueap(int argc, char **argv) {
     oled_display_update_full("> Rogue AP",
@@ -19118,52 +20308,252 @@ static double gps_distance_meters(double lat1, double lon1, double lat2, double 
     return earth_radius_m * c;
 }
 
+// Escape a UTF-8 string for XML text/attribute content. Multi-byte UTF-8 sequences
+// pass through unchanged (valid in a UTF-8 document); C0 control chars are dropped.
+static void xml_escape(const char *in, char *out, size_t outsz)
+{
+    size_t o = 0;
+    if (outsz == 0) return;
+    for (size_t i = 0; in && in[i] && o + 7 < outsz; i++) {
+        unsigned char c = (unsigned char)in[i];
+        const char *rep = NULL;
+        size_t rlen = 0;
+        switch (c) {
+            case '&':  rep = "&amp;";  rlen = 5; break;
+            case '<':  rep = "&lt;";   rlen = 4; break;
+            case '>':  rep = "&gt;";   rlen = 4; break;
+            case '"':  rep = "&quot;"; rlen = 6; break;
+            case '\'': rep = "&#39;";  rlen = 5; break;
+            default: break;
+        }
+        if (rep) {
+            memcpy(out + o, rep, rlen);
+            o += rlen;
+        } else if (c < 0x20 && c != '\n' && c != '\t') {
+            // drop other control characters
+        } else {
+            out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+}
+
+// Open the KML: header + styles (track segments, Wi-Fi security, BLE device types) + one open
+// <Folder>. The Document/Folder stay open for the whole session; every track
+// segment and POI is written as a complete, self-closed <Placemark> inside it, so a
+// power-loss leaves a file that a repair tool can close by finding the last
+// </Placemark>, trimming the tail and appending </Folder></Document></kml>.
 static bool wardrive_trace_init_file(const char *path)
 {
     FILE *file = fopen(path, "w");
     if (!file) {
         return false;
     }
-
-    fprintf(file, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    fprintf(file, "<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n");
-    fprintf(file, "<Document>\n");
-    fprintf(file, "  <name>Wardrive Promisc Trace</name>\n");
-    fprintf(file, "  <Style id=\"traceLine\">\n");
-    fprintf(file, "    <LineStyle><color>ff00ffff</color><width>4</width></LineStyle>\n");
-    fprintf(file, "  </Style>\n");
-    fprintf(file, "  <Placemark>\n");
-    fprintf(file, "    <name>Wardrive Trace</name>\n");
-    fprintf(file, "    <styleUrl>#traceLine</styleUrl>\n");
-    fprintf(file, "    <LineString>\n");
-    fprintf(file, "      <tessellate>1</tessellate>\n");
-    fprintf(file, "      <coordinates>\n");
+    fprintf(file,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n"
+        "<Document>\n"
+        "  <name>Wardrive Promisc Trace</name>\n"
+        "  <Style id=\"traceSeg\">\n"
+        "    <LineStyle><color>ff00ffff</color><width>4</width></LineStyle>\n"
+        "  </Style>\n"
+        // Small dot + visible SSID label. No external <Icon> href: renderers like
+        // GPSVisualizer can't fetch maps.google.com icons (they show as broken
+        // frames), so we let the viewer draw its own small marker in this colour.
+        // KML colours are aabbggrr: open=green, WPA2=blue, WPA3=red.
+        "  <Style id=\"wifiOpen\"><IconStyle><color>ff00cc00</color><scale>0.5</scale></IconStyle><LabelStyle><color>ff00cc00</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiWep\"><IconStyle><color>ff00a5ff</color><scale>0.5</scale></IconStyle><LabelStyle><color>ff00a5ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiWpa\"><IconStyle><color>ffff00ff</color><scale>0.5</scale></IconStyle><LabelStyle><color>ffff00ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiWpa2\"><IconStyle><color>ffff0000</color><scale>0.5</scale></IconStyle><LabelStyle><color>ffff0000</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiWpa3\"><IconStyle><color>ff0000ff</color><scale>0.5</scale></IconStyle><LabelStyle><color>ff0000ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"wifiUnknown\"><IconStyle><color>ffb0b0b0</color><scale>0.5</scale></IconStyle><LabelStyle><color>ffb0b0b0</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"blePoi\"><IconStyle><color>ffffff00</color><scale>0.5</scale></IconStyle><LabelStyle><color>ffffff00</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"airTagPoi\"><IconStyle><color>ffff00ff</color><scale>0.6</scale></IconStyle><LabelStyle><color>ffff00ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Style id=\"smartTagPoi\"><IconStyle><color>ff00d7ff</color><scale>0.6</scale></IconStyle><LabelStyle><color>ff00d7ff</color><scale>0.8</scale></LabelStyle></Style>\n"
+        "  <Folder>\n"
+        "    <name>Wardrive</name>\n");
     fclose(file);
     return true;
 }
 
-static bool wardrive_trace_append_point(const char *path, double lat, double lon, double alt)
+// Write the buffered points as one complete <Placemark><LineString> segment.
+// Segments touch: the first coordinate repeats the last vertex of the previous
+// segment (c->prev_*) so the drawn line is continuous. A segment is only written
+// once it has >= 2 coordinates, so we never emit a degenerate single-point line.
+static bool wdp_trace_flush_segment(const char *path, wdp_trace_ctx_t *c)
 {
+    if (!c || c->seg_n <= 0) return false;
+    int total = c->seg_n + (c->have_prev ? 1 : 0);
+    if (total < 2) return false;   // keep buffering until the line has 2+ points
+
     FILE *file = fopen(path, "a");
-    if (!file) {
-        return false;
+    if (!file) return false;
+    fprintf(file,
+        "    <Placemark>\n"
+        "      <name>seg %d</name>\n"
+        "      <styleUrl>#traceSeg</styleUrl>\n"
+        "      <LineString>\n"
+        "        <tessellate>1</tessellate>\n"
+        "        <coordinates>\n",
+        c->seg_written + 1);
+    if (c->have_prev) {
+        fprintf(file, "          %.7f,%.7f,%.2f\n", c->prev_lon, c->prev_lat, c->prev_alt);
     }
-    fprintf(file, "        %.7f,%.7f,%.2f\n", lon, lat, alt);
+    for (int i = 0; i < c->seg_n; i++) {
+        fprintf(file, "          %.7f,%.7f,%.2f\n", c->seg_lon[i], c->seg_lat[i], c->seg_alt[i]);
+    }
+    fprintf(file,
+        "        </coordinates>\n"
+        "      </LineString>\n"
+        "    </Placemark>\n");
     fclose(file);
+    sd_sync();
+
+    // Remember the last written vertex to stitch the next segment onto, clear buffer.
+    c->prev_lat = c->seg_lat[c->seg_n - 1];
+    c->prev_lon = c->seg_lon[c->seg_n - 1];
+    c->prev_alt = c->seg_alt[c->seg_n - 1];
+    c->have_prev = true;
+    c->seg_written++;
+    c->seg_n = 0;
+    c->last_seg_us = esp_timer_get_time();
     return true;
 }
 
+// Consider a new GPS vertex for the track: keep the existing 3 m sampling, buffer it,
+// accumulate distance, and flush a full segment (16 points) as soon as it fills. A
+// large GPS jump is a discontinuity: close the current segment and start the next one
+// without a connector, rather than drawing a false straight line across a GPS outage.
+static void wdp_trace_add_point(const char *path, wdp_trace_ctx_t *c,
+                                double lat, double lon, double alt, double *dist_accum)
+{
+    if (!c) return;
+    if (c->have_cur) {
+        double step = gps_distance_meters(c->cur_lat, c->cur_lon, lat, lon);
+        if (step < WDP_TRACE_MIN_STEP_M) return;
+        if (step > WDP_TRACE_MAX_STEP_M) {
+            MY_LOG_INFO(TAG,
+                "Wardrive trace discontinuity: GPS jump %.1fm; starting a new segment",
+                step);
+            wdp_trace_flush_segment(path, c);
+            c->have_prev = false;
+            c->seg_n = 0;
+            c->last_seg_us = esp_timer_get_time();
+        } else if (dist_accum) {
+            *dist_accum += step;
+        }
+    }
+    if (c->seg_n < WDP_TRACE_SEG_POINTS) {
+        c->seg_lat[c->seg_n] = lat;
+        c->seg_lon[c->seg_n] = lon;
+        c->seg_alt[c->seg_n] = alt;
+        c->seg_n++;
+    }
+    c->cur_lat = lat;
+    c->cur_lon = lon;
+    c->have_cur = true;
+    if (c->seg_n >= WDP_TRACE_SEG_POINTS) {
+        wdp_trace_flush_segment(path, c);
+    }
+}
+
+static const char *wdp_trace_poi_style(wifi_auth_mode_t authmode)
+{
+    switch (authmode) {
+        case WIFI_AUTH_OPEN:
+            return "#wifiOpen";
+        case WIFI_AUTH_WEP:
+            return "#wifiWep";
+        case WIFI_AUTH_WPA_PSK:
+        case WIFI_AUTH_WPA_WPA2_PSK:
+            return "#wifiWpa";
+        case WIFI_AUTH_WPA2_PSK:
+        case WIFI_AUTH_WPA2_ENTERPRISE:
+            return "#wifiWpa2";
+        case WIFI_AUTH_WPA3_PSK:
+        case WIFI_AUTH_WPA2_WPA3_PSK:
+            return "#wifiWpa3";
+        default:
+            return "#wifiUnknown";
+    }
+}
+
+static const char *wdp_trace_ble_style(const wdp_poi_msg_t *p)
+{
+    if (p->is_airtag) return "#airTagPoi";
+    if (p->is_smarttag) return "#smartTagPoi";
+    return "#blePoi";
+}
+
+// Write one Wi-Fi or BLE POI as a complete <Placemark><Point>. Called only from the
+// task while draining the callback queue. Label and description text are XML-escaped.
+static bool wdp_trace_write_poi(const char *path, wdp_trace_ctx_t *c, const wdp_poi_msg_t *p)
+{
+    if (!c || !p) return false;
+    FILE *file = fopen(path, "a");
+    if (!file) return false;
+
+    char mac[18];
+    snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             p->bssid[0], p->bssid[1], p->bssid[2], p->bssid[3], p->bssid[4], p->bssid[5]);
+
+    char ts[32];
+    if (p->ts) format_epoch_utc(p->ts, ts, sizeof(ts));
+    else       snprintf(ts, sizeof(ts), "unknown");
+
+    char name_raw[64];
+    if (p->is_ble && !p->ssid[0]) snprintf(name_raw, sizeof(name_raw), "BLE %s", mac);
+    else                           snprintf(name_raw, sizeof(name_raw), "%s", p->ssid[0] ? p->ssid : "<hidden>");
+    char name_esc[384];
+    xml_escape(name_raw, name_esc, sizeof(name_esc));
+
+    char desc_raw[256];
+    const char *style = p->is_ble ? wdp_trace_ble_style(p) : wdp_trace_poi_style(p->authmode);
+    if (p->is_ble) {
+        const char *kind = p->is_airtag ? "AirTag [LE]" : p->is_smarttag ? "SmartTag [LE]" : "BLE";
+        if (p->company_id) {
+            snprintf(desc_raw, sizeof(desc_raw),
+                "Address: %s\nType: %s\nRSSI: %d dBm\nManufacturer ID: %u\nTime: %s\nAlt: %.1f m\nAcc: %.1f m",
+                mac, kind, (int)p->rssi, (unsigned)p->company_id, ts, p->alt, p->acc);
+        } else {
+            snprintf(desc_raw, sizeof(desc_raw),
+                "Address: %s\nType: %s\nRSSI: %d dBm\nTime: %s\nAlt: %.1f m\nAcc: %.1f m",
+                mac, kind, (int)p->rssi, ts, p->alt, p->acc);
+        }
+    } else {
+        snprintf(desc_raw, sizeof(desc_raw),
+            "BSSID: %s\nRSSI: %d dBm\nChannel: %d\nAuth: %s\nTime: %s\nAlt: %.1f m\nAcc: %.1f m",
+            mac, (int)p->rssi, (int)p->channel, get_auth_mode_wiggle(p->authmode),
+            ts, p->alt, p->acc);
+    }
+    char desc_esc[384];
+    xml_escape(desc_raw, desc_esc, sizeof(desc_esc));
+
+    fprintf(file,
+        "    <Placemark>\n"
+        "      <name>%s</name>\n"
+        "      <styleUrl>%s</styleUrl>\n"
+        "      <description>%s</description>\n"
+        "      <Point><coordinates>%.7f,%.7f,%.2f</coordinates></Point>\n"
+        "    </Placemark>\n",
+        name_esc, style, desc_esc, p->lon, p->lat, p->alt);
+    fclose(file);
+    c->poi_written++;
+    return true;
+}
+
+// Close the open <Folder>, <Document> and <kml>. On a clean stop this makes the
+// in-progress file a fully valid KML before it is renamed to its final name.
 static void wardrive_trace_finalize_file(const char *path)
 {
     FILE *file = fopen(path, "a");
     if (!file) {
         return;
     }
-    fprintf(file, "      </coordinates>\n");
-    fprintf(file, "    </LineString>\n");
-    fprintf(file, "  </Placemark>\n");
-    fprintf(file, "</Document>\n");
-    fprintf(file, "</kml>\n");
+    fprintf(file,
+        "  </Folder>\n"
+        "</Document>\n"
+        "</kml>\n");
     fclose(file);
 }
 
@@ -19315,7 +20705,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         if (dev_idx >= 0 && wardrive_promisc_active) {
             int8_t cur = desc->rssi;
             bt_devices[dev_idx].rssi = cur;
-            if (g_wd_cfg.ble_rssi_delta > 0 && !bt_devices[dev_idx].needs_log) {
+            if (g_wd_cfg.ble_rssi_delta > 0 && !bt_devices[dev_idx].needs_log && current_gps.valid) {
                 bool trig = false;
                 int rd = cur - bt_devices[dev_idx].last_logged_rssi;
                 if (rd < 0) rd = -rd;
@@ -19331,6 +20721,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
                 }
                 if (trig) {
                     bt_devices[dev_idx].needs_log = true;
+                    bt_snapshot_obs(&bt_devices[dev_idx]);   // stamp this re-observation
                     wdp_relog_pending = true;
                 }
             }
@@ -19356,6 +20747,13 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         return 0;
     }
 
+    // First sighting during a wardrive: don't register a device we can't place, or its
+    // CSV row (and the re-log baseline) would be 0,0. It re-registers on the next advert
+    // once a fix returns. Scoped to wardrive so scan_bt / anti-surveillance are unaffected.
+    if (wardrive_promisc_active && !current_gps.valid) {
+        return 0;
+    }
+
     // Add to found devices list
     if (!bt_add_found_device(desc->addr.val)) {
         return 0;
@@ -19374,6 +20772,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     dev->is_smarttag = false;
     dev->needs_log = true;          // pending first write to SD
     dev->last_logged_valid = false;
+    bt_snapshot_obs(dev);           // stamp the first sighting (WiGLE FirstSeen)
     dev->as_first_us = esp_timer_get_time();
     dev->as_last_us = dev->as_first_us;
     dev->as_has_origin = false;
@@ -19406,6 +20805,29 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         if (!dev->is_airtag && bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
             dev->is_smarttag = true;
             bt_smarttag_count++;
+        }
+    }
+
+    // Wardrive Trace: one KML POI per first-seen BLE advertiser. As with Wi-Fi,
+    // only a compact snapshot crosses the callback/task boundary; the task owns all
+    // KML/SD writes. The observation snapshot keeps its position/time consistent with
+    // the matching BLE CSV row.
+    if (wardrive_promisc_trace_enabled && wdp_poi_queue && dev->obs_gps_valid) {
+        wdp_poi_msg_t poi = {0};
+        memcpy(poi.bssid, dev->addr, sizeof(poi.bssid));
+        strncpy(poi.ssid, dev->name, sizeof(poi.ssid) - 1);
+        poi.rssi        = dev->rssi;
+        poi.is_ble      = true;
+        poi.is_airtag   = dev->is_airtag;
+        poi.is_smarttag = dev->is_smarttag;
+        poi.company_id  = dev->company_id;
+        poi.lat         = dev->obs_lat;
+        poi.lon         = dev->obs_lon;
+        poi.alt         = dev->obs_alt;
+        poi.acc         = dev->obs_acc;
+        poi.ts          = dev->obs_time;
+        if (xQueueSend(wdp_poi_queue, &poi, 0) != pdTRUE) {
+            wdp_poi_dropped++;
         }
     }
     
@@ -20283,6 +21705,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_cleanup_cmd));
 
+    const esp_console_cmd_t wardrive_fix_kml_cmd = {
+        .command = "wardrive_fix_kml",
+        .help = "Close a truncated trace KML and publish _track.kml: wardrive_fix_kml <file>",
+        .hint = NULL,
+        .func = &cmd_wardrive_fix_kml,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wardrive_fix_kml_cmd));
+
     const esp_console_cmd_t wardrive_fix_cmd = {
         .command = "wardrive_fix",
         .help = "Create a soft-fixed WigleWifi copy: wardrive_fix <file>",
@@ -20480,6 +21911,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&portal_cmd));
+
+    const esp_console_cmd_t admin_portal_cmd = {
+        .command = "start_admin_portal",
+        .help = "WPA2 AP JanOS-Admin with a web file manager for /sdcard/lab (tree, upload/download, rename/delete, text edit): start_admin_portal <password>",
+        .hint = "<password>",
+        .func = &cmd_start_admin_portal,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&admin_portal_cmd));
 
     const esp_console_cmd_t darksword_cmd = {
         .command = "start_darksword",
@@ -20832,6 +22272,33 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&remove_ssid_cmd));
 
+    const esp_console_cmd_t home_list_cmd = {
+        .command = "home_list",
+        .help = "List home networks from /sdcard/lab/home.txt",
+        .hint = NULL,
+        .func = &cmd_home_list,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&home_list_cmd));
+
+    const esp_console_cmd_t home_add_cmd = {
+        .command = "home_add",
+        .help = "Add/update home network: home_add \"<SSID>\" \"<password>\"",
+        .hint = NULL,
+        .func = &cmd_home_add,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&home_add_cmd));
+
+    const esp_console_cmd_t home_remove_cmd = {
+        .command = "home_remove",
+        .help = "Remove home network: home_remove \"<SSID>\"",
+        .hint = NULL,
+        .func = &cmd_home_remove,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&home_remove_cmd));
+
     const esp_console_cmd_t file_delete_cmd = {
         .command = "file_delete",
         .help = "Delete a file on SD card: file_delete <path>",
@@ -21060,7 +22527,7 @@ void app_main(void) {
     MY_LOG_INFO(TAG,"Type 'help' to list all commands.");
 
     repl_config.prompt = ">";
-    repl_config.max_cmdline_length = 100;
+    repl_config.max_cmdline_length = 256;
 
     esp_console_register_help_command();
     register_commands();
@@ -21128,6 +22595,26 @@ void app_main(void) {
                     }
                 }
                 fclose(wf);
+            }
+        }
+        // Restore WiGLE credentials from SD only when NVS did not provide a
+        // complete pair. Existing NVS credentials remain authoritative.
+        if ((wigle_api_name[0] == '\0' || wigle_api_token[0] == '\0') &&
+            wigle_load_key_from_sd()) {
+            if (wigle_save_key_to_nvs(wigle_api_name, wigle_api_token)) {
+                MY_LOG_INFO(TAG, "WiGLE credentials restored from SD card into NVS.");
+            } else {
+                MY_LOG_INFO(TAG, "Failed to save WiGLE credentials from SD card to NVS.");
+            }
+        }
+        // Restore the WDGWars key from SD only when no NVS key was loaded.
+        // This keeps an explicitly configured NVS key authoritative, while
+        // allowing /sdcard/lab/wdgwars.txt to recover a cleared/missing key.
+        if (wdgwars_api_key[0] == '\0' && wdgwars_load_key_from_sd()) {
+            if (wdgwars_save_key_to_nvs(wdgwars_api_key)) {
+                MY_LOG_INFO(TAG, "WDGWars key restored from SD card into NVS.");
+            } else {
+                MY_LOG_INFO(TAG, "Failed to save WDGWars key from SD card to NVS.");
             }
         }
         oled_display_update_full(NULL, "  SD: mounted", "  All systems OK", "");
@@ -23161,11 +24648,81 @@ static esp_err_t create_sd_directories(void) {
     return ESP_OK;
 }
 
+// Copy the idx-th comma-separated field of an NMEA sentence into out.
+// Unlike strtok, empty fields are preserved (",," advances the index), which is
+// required for RMC where optional fields (speed/course) may be blank yet later
+// fields (the date) must still land at their fixed positions. Returns false if
+// the field index does not exist.
+static bool nmea_get_field(const char *s, int idx, char *out, size_t outsz) {
+    int f = 0;
+    const char *start = s;
+    for (;; s++) {
+        char c = *s;
+        if (c == ',' || c == '*' || c == '\0') {
+            if (f == idx) {
+                size_t n = (size_t)(s - start);
+                if (n >= outsz) n = outsz - 1;
+                memcpy(out, start, n);
+                out[n] = '\0';
+                return true;
+            }
+            if (c == '\0' || c == '*') break;   // end of sentence / checksum marker
+            f++;
+            start = s + 1;
+        }
+    }
+    return false;
+}
+
+// Seed the ESP32 system clock from a GPS UTC date+time (from $GxRMC). Runs once,
+// then only re-corrects on drift > 2 s so we don't call settimeofday every second.
+static void gps_seed_clock_from_utc(int yy, int mo, int dd, int hh, int mi, int ss) {
+    if (mo < 1 || mo > 12 || dd < 1 || dd > 31 || hh > 23 || mi > 59 || ss > 61) return;
+    static bool tz_set = false;
+    if (!tz_set) { setenv("TZ", "UTC0", 1); tzset(); tz_set = true; }  // mktime() == UTC epoch
+    struct tm t = {0};
+    t.tm_year = (2000 + yy) - 1900;
+    t.tm_mon  = mo - 1;
+    t.tm_mday = dd;
+    t.tm_hour = hh;
+    t.tm_min  = mi;
+    t.tm_sec  = ss;
+    t.tm_isdst = 0;
+    time_t epoch = mktime(&t);
+    if (epoch <= 0) return;
+    time_t now = time(NULL);
+    long drift = (long)(now > epoch ? now - epoch : epoch - now);
+    if (!g_gps_clock_synced || drift > 2) {
+        struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        g_gps_clock_synced = true;
+    }
+}
+
 static bool parse_gps_nmea(const char* nmea_sentence) {
     if (!nmea_sentence || strlen(nmea_sentence) < 10) {
         return false;
     }
-    
+
+    // Parse GPRMC/GNRMC for real UTC date+time and seed the system clock. GGA carries
+    // only time-of-day (no date), so RMC is what makes WiGLE FirstSeen a real timestamp.
+    if (strncmp(nmea_sentence, "$GPRMC", 6) == 0 || strncmp(nmea_sentence, "$GNRMC", 6) == 0) {
+        char utc[16] = "", status[4] = "", date[12] = "";
+        nmea_get_field(nmea_sentence, 1, utc, sizeof(utc));      // HHMMSS(.sss)
+        nmea_get_field(nmea_sentence, 2, status, sizeof(status)); // A=valid, V=void
+        nmea_get_field(nmea_sentence, 9, date, sizeof(date));     // DDMMYY
+        if (status[0] == 'A' && strlen(utc) >= 6 && strlen(date) == 6) {
+            int hh = (utc[0]-'0')*10 + (utc[1]-'0');
+            int mi = (utc[2]-'0')*10 + (utc[3]-'0');
+            int ss = (utc[4]-'0')*10 + (utc[5]-'0');
+            int dd = (date[0]-'0')*10 + (date[1]-'0');
+            int mo = (date[2]-'0')*10 + (date[3]-'0');
+            int yy = (date[4]-'0')*10 + (date[5]-'0');
+            gps_seed_clock_from_utc(yy, mo, dd, hh, mi, ss);
+        }
+        return true;  // RMC handled; lat/lon come from GGA
+    }
+
     // Parse GPGGA sentence for basic GPS data
     if (strncmp(nmea_sentence, "$GPGGA", 6) == 0 || strncmp(nmea_sentence, "$GNGGA", 6) == 0) {
         char sentence[256];
@@ -23241,17 +24798,18 @@ static bool parse_gps_nmea(const char* nmea_sentence) {
     return false;
 }
 
+// Format an absolute UTC epoch as WiGLE-style "YYYY-MM-DD HH:MM:SS".
+static void format_epoch_utc(time_t t, char* buffer, size_t size) {
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    strftime(buffer, size, "%Y-%m-%d %H:%M:%S", &tmv);
+}
+
+// Real wall-clock timestamp (UTC). Requires the clock to have been seeded from GPS
+// $GxRMC (see gps_seed_clock_from_utc). If not yet seeded the epoch is near 1970,
+// which is deliberately obvious rather than a plausible-but-fake value.
 static void get_timestamp_string(char* buffer, size_t size) {
-    // For now, use a simple counter-based timestamp
-    // In a real implementation, you'd use RTC or NTP time
-    static uint32_t timestamp_counter = 0;
-    timestamp_counter++;
-    
-    // Format as a simple date-time string
-    snprintf(buffer, size, "2025-09-26 %02d:%02d:%02d", 
-             (int)((timestamp_counter / 3600) % 24),
-             (int)((timestamp_counter / 60) % 60), 
-             (int)(timestamp_counter % 60));
+    format_epoch_utc(time(NULL), buffer, size);
 }
 
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode) {
@@ -23352,27 +24910,77 @@ static bool wait_for_gps_fix(int timeout_seconds) {
 
 static int find_next_wardrive_file_number(void) {
     int max_number = 0;
-    char filename[64];
-    MY_LOG_INFO(TAG, "Scanning for existing wardrive log files...");
-    // Scan through possible file numbers to find the highest existing one
+    char filename[80];
+    MY_LOG_INFO(TAG, "Scanning for existing wardrive session files...");
+    // A session "occupies" a number if ANY of its artifacts exist: the CSV log, the
+    // finalized track KML, or a not-yet-committed ".inprogress.kml" from a run that
+    // lost power. Considering all three means we never overwrite a partial trace.
     for (int i = 1; i <= 9999; i++) {
+        struct stat st;
+        bool exists = false;
+
         snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", i);
-        
-        struct stat file_stat;
-        if (stat(filename, &file_stat) == 0) {
-            // File exists, update max_number
+        if (stat(filename, &st) == 0) exists = true;
+        if (!exists) {
+            snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d_track.kml", i);
+            if (stat(filename, &st) == 0) exists = true;
+        }
+        if (!exists) {
+            snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d_track.inprogress.kml", i);
+            if (stat(filename, &st) == 0) exists = true;
+        }
+
+        if (exists) {
             max_number = i;
-            MY_LOG_INFO(TAG, "Found existing file: w%d.log", i);
         } else {
-            // First non-existing file number, we can break here for efficiency
+            // First fully-free number; contiguous scan is enough for our sequential naming.
             break;
         }
     }
-    
+
     int next_number = max_number + 1;
-    MY_LOG_INFO(TAG, "Highest existing file number: %d, next will be: %d", max_number, next_number);
-    
+    MY_LOG_INFO(TAG, "Highest existing session number: %d, next will be: %d", max_number, next_number);
+
     return next_number;
+}
+
+// Build the base name for a wardrive session; files are "{base}.log", "{base}_track.kml"
+// and "{base}_track.inprogress.kml". Once the clock is seeded from GPS ($GxRMC), the base
+// is real UTC time "YYYYMMDD_HHMMSS" (same clock as the CSV FirstSeen, chronologically
+// sortable). Without a synced clock it falls back to the legacy "wN" counter. A short
+// numeric suffix is appended if that base is already taken, so nothing is ever overwritten
+// and archived files never collide.
+static void wardrive_make_session_base(char *out, size_t out_sz) {
+    char raw[24];
+    if (g_gps_clock_synced) {
+        time_t now = time(NULL);
+        struct tm tmv;
+        gmtime_r(&now, &tmv);
+        strftime(raw, sizeof(raw), "%Y%m%d_%H%M%S", &tmv);   // UTC
+    } else {
+        snprintf(raw, sizeof(raw), "w%d", find_next_wardrive_file_number());
+    }
+
+    for (int suffix = 0; suffix < 100; suffix++) {
+        if (suffix == 0) snprintf(out, out_sz, "%s", raw);
+        else             snprintf(out, out_sz, "%s_%d", raw, suffix);
+
+        struct stat st;
+        char probe[96];
+        bool taken = false;
+        snprintf(probe, sizeof(probe), "/sdcard/lab/wardrives/%s.log", out);
+        if (stat(probe, &st) == 0) taken = true;
+        if (!taken) {
+            snprintf(probe, sizeof(probe), "/sdcard/lab/wardrives/%s_track.kml", out);
+            if (stat(probe, &st) == 0) taken = true;
+        }
+        if (!taken) {
+            snprintf(probe, sizeof(probe), "/sdcard/lab/wardrives/%s_track.inprogress.kml", out);
+            if (stat(probe, &st) == 0) taken = true;
+        }
+        if (!taken) return;
+    }
+    // 100 collisions in the same second is not realistic; keep the last candidate.
 }
 
 static int find_next_pcap_file_number(void) {

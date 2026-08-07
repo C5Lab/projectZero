@@ -12,9 +12,10 @@ except ImportError:
 # Colors
 RED = "\033[91m"; GREEN = "\033[92m"; YELLOW = "\033[93m"; CYAN = "\033[96m"; RESET = "\033[0m"
 
-VERSION = "v04"
+VERSION = "v05"
 MIN_ESPTOOL_VERSION = "5.2.0"
-DEFAULT_BAUD = 460800  # Original default; can be overridden via CLI
+DEFAULT_BAUD = 921600
+CONSOLE_BAUD = 115200
 REQUIRED_FILES = ["bootloader.bin", "partition-table.bin", "projectZero.bin"]
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 VENV_DIR = os.environ.get("FLASH_BOARD_VENV", os.path.join(SCRIPT_DIR, ".venv"))
@@ -138,10 +139,11 @@ def list_ports():
 def wait_for_new_port(before, timeout=20.0):
     print(f"{CYAN}Hold BOOT and connect the board to enter ROM mode.{RESET}")
     spinner = ['|','/','-','\\']
-    print(f"{YELLOW}Waiting for new serial port...{RESET}")
+    timeout_text = "" if timeout is None else f" (up to {timeout:.0f}s)"
+    print(f"{YELLOW}Waiting for new serial port{timeout_text}...{RESET}")
     t0 = time.time()
     i = 0
-    while time.time() - t0 < timeout:
+    while timeout is None or time.time() - t0 < timeout:
         after = list_ports()
         new_ports = after - before
         sys.stdout.write(f"\r{spinner[i % len(spinner)]} "); sys.stdout.flush()
@@ -152,6 +154,20 @@ def wait_for_new_port(before, timeout=20.0):
         time.sleep(0.15)
     print(f"\n{RED}No new serial port detected.{RESET}")
     sys.exit(1)
+
+def wait_for_next_board(previous_port):
+    """Wait until the flashed board is unplugged, then detect its replacement."""
+    spinner = ['|','/','-','\\']
+    print(f"{GREEN}Flash successful. Disconnect this board to flash the next one (Ctrl+C to stop).{RESET}")
+    i = 0
+    while previous_port in list_ports():
+        sys.stdout.write(f"\r{spinner[i % len(spinner)]} Waiting for {previous_port} to disconnect... ")
+        sys.stdout.flush()
+        i += 1
+        time.sleep(0.15)
+    sys.stdout.write("\r\033[K")
+    sys.stdout.flush()
+    return wait_for_new_port(list_ports(), timeout=None)
 
 def erase_all(port, baud=DEFAULT_BAUD):
     cmd = [sys.executable, "-m", "esptool", "-p", port, "-b", str(baud),
@@ -218,7 +234,7 @@ def reset_to_app(port):
         print(f"{RED}RTS/DTR reset failed: {e}{RESET}")
         print(f"{YELLOW}Press the board's RESET button manually.{RESET}")
 
-def monitor(port, baud=DEFAULT_BAUD):
+def monitor(port, baud=CONSOLE_BAUD):
     print(f"{CYAN}Opening serial monitor on {port} @ {baud} (Ctrl+C to exit)...{RESET}")
     try:
         # A brief delay to let the port re-enumerate after reset
@@ -242,6 +258,8 @@ def main():
     parser.add_argument("baud", nargs="?", type=int, default=DEFAULT_BAUD,
                         help=f"Optional baud rate (default: {DEFAULT_BAUD})")
     parser.add_argument("--monitor", action="store_true", help="Open serial monitor after flashing")
+    parser.add_argument("--loop", action="store_true",
+                        help="Flash boards continuously; wait for unplug/reconnect after each success")
     parser.add_argument("--erase", action="store_true", help="Full erase before flashing (fixes stale NVS/partitions)")
     parser.add_argument("--no-seed-ota1", action="store_true",
                         help="Do not flash projectZero.bin into ota_1 at 0x410000")
@@ -251,33 +269,42 @@ def main():
                         help="Flash frequency (default: 80m). If you see boot loops, try 40m.")
     args = parser.parse_args()
 
+    if args.loop and args.monitor:
+        parser.error("--loop cannot be used with --monitor")
+
     check_files()
 
     print(f"{CYAN}ESP32-C5 flasher version: {VERSION}{RESET}")
     print(f"{CYAN}Using baud rate: {args.baud}{RESET}")
 
-    if args.port:
-        port = args.port
-    else:
-        before = list_ports()
-        port = wait_for_new_port(before)
-
-    print(f"{GREEN}Detected serial port: {port}{RESET}")
-    print(f"{YELLOW}Tip: release the BOOT button before programming finishes.{RESET}")
     seed_ota1 = not args.no_seed_ota1
     if seed_ota1:
         print(f"{YELLOW}Seeding both OTA slots: ota_0 @ {OFFSETS['projectZero.bin']} and ota_1 @ {OFFSETS['projectZero_ota1.bin']}{RESET}")
 
-    if args.erase:
-        erase_all(port, args.baud)
+    port = args.port
+    while True:
+        if port is None:
+            port = wait_for_new_port(list_ports())
 
-    do_flash(port, baud=args.baud, flash_mode=args.flash_mode, flash_freq=args.flash_freq,
-             seed_ota1=seed_ota1)
+        print(f"{GREEN}Detected serial port: {port}{RESET}")
+        print(f"{YELLOW}Tip: release the BOOT button before programming finishes.{RESET}")
 
-    reset_to_app(port)
+        if args.erase:
+            erase_all(port, args.baud)
 
-    if args.monitor:
-        monitor(port, args.baud)
+        do_flash(port, baud=args.baud, flash_mode=args.flash_mode, flash_freq=args.flash_freq,
+                 seed_ota1=seed_ota1)
+        reset_to_app(port)
+
+        if args.monitor:
+            monitor(port)
+
+        if not args.loop:
+            break
+        port = wait_for_next_board(port)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}Flashing loop stopped.{RESET}")

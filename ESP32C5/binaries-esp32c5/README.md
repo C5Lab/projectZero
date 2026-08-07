@@ -33,14 +33,14 @@ pip install --upgrade esptool pyserial
 
 Optional: ensure you have a recent Python 3 installation and pip available. The flasher uses `python -m pip` to install/check packages when needed.
 
-## Flasher usage (v02)
+## Flasher usage (v05)
 
-Default baud is 460800; you can supply your own as a positional argument (e.g., 115200). Examples:
+Default baud is 921600; you can supply your own as a positional argument (e.g., 460800). Examples:
 
 - By default the flasher waits for a newly detected serial device. Supplying `--port` forces a specific port (useful if another device like a Flipper is already connected).
 
 ```bash
-# default 460800
+# default 921600
 python flash_board.py --port COM10
 
 # custom baud
@@ -51,4 +51,10 @@ python flash_board.py --port COM10 --erase
 
 # open serial monitor after flashing
 python flash_board.py --port COM10 --monitor
+
+# continuously flash boards: after each success disconnect the board,
+# then connect the next one in ROM download mode
+python flash_board.py --loop
 ```
+
+`--loop` cannot be combined with `--monitor`, because the monitor intentionally keeps the serial port open. The application serial console always uses 115200 baud, independently of the flashing baud rate.
