@@ -98,6 +98,7 @@
 #include "oled_display.h"
 #include "nrf24_jammer.h"
 #include "zig_recon.h"
+#include "capture_gateway.h"
 #include <math.h>
 
 // NimBLE includes for BLE scanning
@@ -391,7 +392,8 @@ static uint32_t sniffer_last_debug_packet = 0;
 typedef enum {
     PCAP_MODE_NONE = 0,
     PCAP_MODE_RADIO,
-    PCAP_MODE_NET
+    PCAP_MODE_NET,
+    PCAP_MODE_GATEWAY
 } pcap_capture_mode_t;
 
 typedef struct {
@@ -410,6 +412,7 @@ static uint32_t pcap_capture_drop_count = 0;
 static char pcap_capture_filepath[64];
 static netif_input_fn pcap_original_input = NULL;
 static netif_linkoutput_fn pcap_original_linkoutput = NULL;
+static struct netif *pcap_hooked_netif = NULL;
 
 // PCAP ARP spoofing state (net mode MITM)
 #define PCAP_ARP_MAX_HOSTS 64
@@ -2010,6 +2013,7 @@ static int cmd_zig_recon_list(int argc, char **argv);
 static int cmd_zig_recon_nodes(int argc, char **argv);
 static int cmd_zig_recon_clear(int argc, char **argv);
 static int cmd_wifi_connect(int argc, char **argv);
+static int cmd_capture_gateway(int argc, char **argv);
 static int cmd_list_hosts(int argc, char **argv);
 static int cmd_list_hosts_vendor(int argc, char **argv);
 static int cmd_start_nmap(int argc, char **argv);
@@ -2379,6 +2383,14 @@ static void wifi_event_handler(void *event_handler_arg,
             const wifi_event_ap_staconnected_t *e = (const wifi_event_ap_staconnected_t *)event_data;
             MY_LOG_INFO(TAG, "AP: Client connected - MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
                        e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
+
+            if (capture_gateway_is_active()) {
+                capture_gateway_client_connected();
+                capture_gateway_status_t status;
+                capture_gateway_get_status(&status);
+                MY_LOG_INFO(TAG, "Capture Gateway: client joined, clients=%u", status.connected_clients);
+                break;
+            }
             
             // Increment connected clients counter
             portal_connected_clients++;
@@ -2411,6 +2423,14 @@ static void wifi_event_handler(void *event_handler_arg,
             const wifi_event_ap_stadisconnected_t *e = (const wifi_event_ap_stadisconnected_t *)event_data;
             MY_LOG_INFO(TAG, "AP: Client disconnected - MAC: %02X:%02X:%02X:%02X:%02X:%02X, AID: %u, reason: %u",
                         e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5], e->aid, e->reason);
+
+            if (capture_gateway_is_active()) {
+                capture_gateway_client_disconnected();
+                capture_gateway_status_t status;
+                capture_gateway_get_status(&status);
+                MY_LOG_INFO(TAG, "Capture Gateway: client left, clients=%u", status.connected_clients);
+                break;
+            }
             
             // Decrement connected clients counter
             if (portal_connected_clients > 0) {
@@ -2530,6 +2550,19 @@ static void wifi_event_handler(void *event_handler_arg,
             if (wifi_connect_result == 0) {
                 wifi_connect_result = -1;
                 wifi_connect_fail_reason = (int)e->reason;
+            }
+
+            if (capture_gateway_is_active()) {
+                capture_gateway_set_upstream_ready(false);
+                MY_LOG_INFO(TAG, "Capture Gateway: upstream down (reason=%d)", (int)e->reason);
+                if (!operation_stop_requested) {
+                    esp_err_t reconnect_err = esp_wifi_connect();
+                    if (reconnect_err != ESP_OK) {
+                        MY_LOG_INFO(TAG, "Capture Gateway: reconnect request failed: %s",
+                                    esp_err_to_name(reconnect_err));
+                    }
+                }
+                break;
             }
             
             if (applicationState == EVIL_TWIN_PASS_CHECK) {
@@ -3182,6 +3215,15 @@ static void ip_event_handler(void *event_handler_arg,
     (void)event_data;
 
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        if (capture_gateway_is_active()) {
+            esp_err_t err = capture_gateway_refresh_upstream();
+            if (err == ESP_OK) {
+                MY_LOG_INFO(TAG, "Capture Gateway: upstream IPv4 and DNS refreshed");
+            } else {
+                MY_LOG_INFO(TAG, "Capture Gateway: upstream refresh failed: %s",
+                            esp_err_to_name(err));
+            }
+        }
         if (ota_auto_on_ip && !ota_check_started) {
             if (ota_start_check(NULL, false)) {
                 ota_check_started = true;
@@ -3734,6 +3776,11 @@ static void wait_or_cancel_wifi_scan(void)
  */
 static bool ensure_ble_mode(void)
 {
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway owns the WiFi radio. Stop it before switching to BLE.");
+        return false;
+    }
+
     switch (current_radio_mode) {
         case RADIO_MODE_BLE:
             // Already in BLE mode
@@ -3780,6 +3827,11 @@ static bool ensure_ble_mode(void)
 
 static bool ensure_ieee802154_mode(void)
 {
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway owns the WiFi radio. Stop it before switching to 802.15.4.");
+        return false;
+    }
+
     switch (current_radio_mode) {
         case RADIO_MODE_IEEE802154:
             return true;
@@ -3819,6 +3871,11 @@ static bool ensure_ieee802154_mode(void)
  */
 static esp_netif_t *ensure_ap_mode(void)
 {
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway already owns AP mode");
+        return NULL;
+    }
+
     if (current_radio_mode != RADIO_MODE_WIFI) {
         MY_LOG_INFO(TAG, "WiFi must be initialized first");
         return NULL;
@@ -3898,6 +3955,11 @@ static esp_netif_t *ensure_ap_mode(void)
 
 // --- Start background scan ---
 static esp_err_t start_background_scan(uint32_t min_time, uint32_t max_time) {
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Cannot scan while Capture Gateway is active. Use 'stop' first.");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     if (wardrive_active || wardrive_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Cannot start background scan: wardrive is active. Use 'stop' first.");
         return ESP_ERR_INVALID_STATE;
@@ -11557,8 +11619,9 @@ static int cmd_stop(int argc, char **argv) {
 
         if (pcap_capture_mode == PCAP_MODE_RADIO) {
             esp_wifi_set_promiscuous(false);
-        } else if (pcap_capture_mode == PCAP_MODE_NET) {
-            if (pcap_arp_active) {
+        } else if (pcap_capture_mode == PCAP_MODE_NET ||
+                   pcap_capture_mode == PCAP_MODE_GATEWAY) {
+            if (pcap_capture_mode == PCAP_MODE_NET && pcap_arp_active) {
                 pcap_arp_active = false;
                 for (int i = 0; i < 60 && pcap_arp_task_handle != NULL; i++) {
                     vTaskDelay(pdMS_TO_TICKS(100));
@@ -11571,16 +11634,13 @@ static int cmd_stop(int argc, char **argv) {
                 pcap_arp_host_count = 0;
             }
 
-            esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-            if (sta) {
-                struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(sta);
-                if (lwip_nif) {
-                    if (pcap_original_input) lwip_nif->input = pcap_original_input;
-                    if (pcap_original_linkoutput) lwip_nif->linkoutput = pcap_original_linkoutput;
-                }
+            if (pcap_hooked_netif) {
+                if (pcap_original_input) pcap_hooked_netif->input = pcap_original_input;
+                if (pcap_original_linkoutput) pcap_hooked_netif->linkoutput = pcap_original_linkoutput;
             }
             pcap_original_input = NULL;
             pcap_original_linkoutput = NULL;
+            pcap_hooked_netif = NULL;
         }
 
         for (int i = 0; i < 40 && pcap_writer_task_handle != NULL; i++) {
@@ -11611,6 +11671,16 @@ static int cmd_stop(int argc, char **argv) {
                     (unsigned long)pcap_capture_frame_count,
                     (unsigned long)pcap_capture_drop_count);
         pcap_capture_mode = PCAP_MODE_NONE;
+    }
+
+    // Disable routed gateway only after any gateway PCAP hook has been restored.
+    if (capture_gateway_is_active()) {
+        esp_err_t gateway_err = capture_gateway_stop();
+        if (gateway_err == ESP_OK) {
+            MY_LOG_INFO(TAG, "Capture Gateway stopped");
+        } else {
+            MY_LOG_INFO(TAG, "Capture Gateway stop warning: %s", esp_err_to_name(gateway_err));
+        }
     }
 
     // Stop handshake attack task if running
@@ -12076,6 +12146,7 @@ static bool zig_recon_radio_busy(char *reason, size_t reason_len)
     else if (ap_locator_active || ap_locator_task_handle != NULL) why = "ap_locator";
     else if (channel_view_active || channel_view_task_handle != NULL) why = "channel_view";
     else if (pcap_capture_active || pcap_writer_task_handle != NULL) why = "pcap";
+    else if (capture_gateway_is_active()) why = "capture_gateway";
     else if (deauth_attack_active || deauth_attack_task_handle != NULL) why = "deauth";
     else if (blackout_attack_active || blackout_attack_task_handle != NULL) why = "blackout";
     else if (sae_attack_active || sae_attack_task_handle != NULL) why = "sae_overflow";
@@ -12526,6 +12597,8 @@ static const cli_hint_t k_cli_hints[] = {
     { "led", " set <on|off> | level <1-100> | read" },
     { "channel_time", " set <min|max> <ms> | read <min|max>" },
     { "wifi_connect", " <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
+    { "capture_gateway", " start <capture_ssid> <capture_password> | status | stop" },
+    { "start_pcap", " radio|net|gateway" },
     { "ota_channel", " [main|dev]" },
     { "ota_boot", " <ota_0|ota_1>" },
     { "arp_ban", " <MAC> [IP]" },
@@ -12716,6 +12789,11 @@ static int cmd_wifi_disconnect(int argc, char **argv) {
     if (argc != 1) {
         MY_LOG_INFO(TAG, "Usage: wifi_disconnect");
         return 0;
+    }
+
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway is active. Use 'capture_gateway stop' or 'stop' first.");
+        return 1;
     }
 
     if (current_radio_mode != RADIO_MODE_WIFI || !wifi_initialized) {
@@ -12921,6 +12999,11 @@ static int cmd_wifi_connect(int argc, char **argv) {
     if (argc < 2 || argc > 9) {
         MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
         return 0;
+    }
+
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway is active. Use 'capture_gateway stop' or 'stop' first.");
+        return 1;
     }
     
     const char *ssid = argv[1];
@@ -13135,6 +13218,196 @@ static int cmd_wifi_connect(int argc, char **argv) {
         MY_LOG_INFO(TAG, "TIMEOUT: Connection to '%s' timed out", ssid);
         return 0;
     }
+}
+
+static bool capture_gateway_wait_for_upstream(int timeout_ms,
+                                              wifi_ap_record_t *ap_info,
+                                              esp_netif_ip_info_t *ip_info)
+{
+    int loops = timeout_ms / 100;
+    for (int i = 0; i <= loops; i++) {
+        wifi_ap_record_t current_ap = {0};
+        esp_netif_ip_info_t current_ip = {0};
+        esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (sta != NULL &&
+            esp_wifi_sta_get_ap_info(&current_ap) == ESP_OK &&
+            esp_netif_get_ip_info(sta, &current_ip) == ESP_OK &&
+            current_ip.ip.addr != 0) {
+            if (ap_info != NULL) {
+                *ap_info = current_ap;
+            }
+            if (ip_info != NULL) {
+                *ip_info = current_ip;
+            }
+            return true;
+        }
+        if (i < loops) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+    return false;
+}
+
+static void capture_gateway_print_status(void)
+{
+    capture_gateway_status_t status;
+    capture_gateway_get_status(&status);
+    if (!status.active) {
+        MY_LOG_INFO(TAG, "Capture Gateway: idle");
+        printf("[CGW] status active=0\n");
+        printf("[CGW] END\n");
+        return;
+    }
+
+    MY_LOG_INFO(TAG, "Capture Gateway: active SSID='%s' clients=%u channel=%u upstream=%s NAPT=%s",
+                status.ssid,
+                status.connected_clients,
+                status.channel,
+                status.upstream_ready ? "up" : "down",
+                status.napt_enabled ? "on" : "off");
+    MY_LOG_INFO(TAG, "Capture Gateway: AP=" IPSTR " STA=" IPSTR " DNS=" IPSTR,
+                IP2STR(&status.downstream_ip.ip),
+                IP2STR(&status.upstream_ip.ip),
+                IP2STR(&status.upstream_dns.ip.u_addr.ip4));
+    printf("[CGW] status active=1 upstream=%d napt=%d clients=%u channel=%u\n",
+           status.upstream_ready ? 1 : 0,
+           status.napt_enabled ? 1 : 0,
+           status.connected_clients,
+           status.channel);
+    printf("[CGW] ssid=%s upstream_ssid=%s\n", status.ssid, status.upstream_ssid);
+    printf("[CGW] ap_ip=" IPSTR " sta_ip=" IPSTR " dns=" IPSTR "\n",
+           IP2STR(&status.downstream_ip.ip),
+           IP2STR(&status.upstream_ip.ip),
+           IP2STR(&status.upstream_dns.ip.u_addr.ip4));
+    printf("[CGW] END\n");
+}
+
+static int cmd_capture_gateway(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: capture_gateway start <capture_ssid> <capture_password> | status | stop");
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "status") == 0) {
+        if (argc != 2) {
+            MY_LOG_INFO(TAG, "Usage: capture_gateway status");
+            return 1;
+        }
+        capture_gateway_print_status();
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "stop") == 0) {
+        if (argc != 2) {
+            MY_LOG_INFO(TAG, "Usage: capture_gateway stop");
+            return 1;
+        }
+        if (!capture_gateway_is_active()) {
+            MY_LOG_INFO(TAG, "Capture Gateway is not active");
+            return 0;
+        }
+        if (pcap_capture_active && pcap_capture_mode == PCAP_MODE_GATEWAY) {
+            MY_LOG_INFO(TAG, "Gateway PCAP is active. Use 'stop' so the writer and hooks are finalized first.");
+            return 1;
+        }
+
+        esp_err_t err = capture_gateway_stop();
+        esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Capture Gateway stop warning: %s", esp_err_to_name(err));
+        }
+        if (mode_err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to return WiFi to STA mode: %s", esp_err_to_name(mode_err));
+            return 1;
+        }
+        oled_display_update_full("> Capture GW", "  Gateway stopped", "  STA remains up", "  > Idle");
+        MY_LOG_INFO(TAG, "Capture Gateway stopped; STA connection preserved");
+        printf("[CGW] stopped\n[CGW] END\n");
+        return err == ESP_OK ? 0 : 1;
+    }
+
+    if (strcasecmp(argv[1], "start") != 0 || argc != 4) {
+        MY_LOG_INFO(TAG, "Usage: capture_gateway start <capture_ssid> <capture_password> | status | stop");
+        return 1;
+    }
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway is already active");
+        capture_gateway_print_status();
+        return 1;
+    }
+
+    size_t ssid_len = strlen(argv[2]);
+    size_t password_len = strlen(argv[3]);
+    if (ssid_len == 0 || ssid_len > CAPTURE_GATEWAY_SSID_MAX_LEN ||
+        password_len < CAPTURE_GATEWAY_PASSWORD_MIN_LEN ||
+        password_len > CAPTURE_GATEWAY_PASSWORD_MAX_LEN) {
+        MY_LOG_INFO(TAG, "Capture SSID must be 1-32 bytes and password 8-63 bytes");
+        return 1;
+    }
+
+    char busy[32] = {0};
+    if (zig_recon_radio_busy(busy, sizeof(busy))) {
+        MY_LOG_INFO(TAG, "Cannot start Capture Gateway: radio busy (%s). Use 'stop' first.", busy);
+        return 1;
+    }
+    if (current_radio_mode != RADIO_MODE_WIFI || !wifi_initialized) {
+        MY_LOG_INFO(TAG, "WiFi is not initialized. Use 'wifi_connect' first.");
+        return 1;
+    }
+
+    wifi_ap_record_t upstream_ap = {0};
+    esp_netif_ip_info_t upstream_ip = {0};
+    if (!capture_gateway_wait_for_upstream(0, &upstream_ap, &upstream_ip)) {
+        MY_LOG_INFO(TAG, "No upstream IPv4 connection. Use 'wifi_connect' first.");
+        return 1;
+    }
+
+    esp_netif_t *ap_netif = ensure_ap_mode();
+    if (ap_netif == NULL) {
+        MY_LOG_INFO(TAG, "Failed to enable APSTA mode");
+        return 1;
+    }
+
+    if (!capture_gateway_wait_for_upstream(500, &upstream_ap, &upstream_ip)) {
+        esp_err_t connect_err = esp_wifi_connect();
+        if (connect_err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Capture Gateway: STA reconnect request: %s",
+                        esp_err_to_name(connect_err));
+        }
+        if (!capture_gateway_wait_for_upstream(15000, &upstream_ap, &upstream_ip)) {
+            esp_wifi_set_mode(WIFI_MODE_STA);
+            MY_LOG_INFO(TAG, "Capture Gateway: upstream did not recover after APSTA switch");
+            return 1;
+        }
+    }
+
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta_netif == NULL) {
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        MY_LOG_INFO(TAG, "Capture Gateway: STA netif not found");
+        return 1;
+    }
+
+    capture_gateway_config_t config = {
+        .ssid = argv[2],
+        .password = argv[3],
+        .channel = upstream_ap.primary,
+        .max_clients = CAPTURE_GATEWAY_DEFAULT_MAX_CLIENTS,
+    };
+    esp_err_t err = capture_gateway_start(ap_netif, sta_netif, &config);
+    if (err != ESP_OK) {
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        MY_LOG_INFO(TAG, "Capture Gateway start failed: %s", esp_err_to_name(err));
+        return 1;
+    }
+
+    operation_stop_requested = false;
+    oled_display_update_full("> Capture GW", argv[2], "  APSTA + NAPT", "  > start_pcap gateway");
+    MY_LOG_INFO(TAG, "Capture Gateway ready. Connect authorized clients to '%s'.", argv[2]);
+    MY_LOG_INFO(TAG, "Start downstream capture with: start_pcap gateway");
+    capture_gateway_print_status();
+    return 0;
 }
 
 static int cmd_ota_check(int argc, char **argv) {
@@ -15053,14 +15326,25 @@ static int cmd_start_pcap(int argc, char **argv) {
             mode = PCAP_MODE_NET;
         } else if (strcasecmp(argv[1], "radio") == 0) {
             mode = PCAP_MODE_RADIO;
+        } else if (strcasecmp(argv[1], "gateway") == 0) {
+            mode = PCAP_MODE_GATEWAY;
         } else {
-            MY_LOG_INFO(TAG, "Usage: start_pcap radio|net");
+            MY_LOG_INFO(TAG, "Usage: start_pcap radio|net|gateway");
             return 1;
         }
     }
 
     if (pcap_capture_active) {
         MY_LOG_INFO(TAG, "PCAP capture already active. Use 'stop' first.");
+        return 1;
+    }
+
+    if (mode == PCAP_MODE_GATEWAY && !capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway is not active. Start it before 'start_pcap gateway'.");
+        return 1;
+    }
+    if (mode != PCAP_MODE_GATEWAY && capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway is active; only 'start_pcap gateway' is allowed.");
         return 1;
     }
 
@@ -15148,9 +15432,12 @@ static int cmd_start_pcap(int argc, char **argv) {
         oled_display_update_full("> PCAP Radio", "  Promiscuous", "  Capturing...", pcap_capture_filepath + 18);
         MY_LOG_INFO(TAG, "PCAP radio capture started -> %s", pcap_capture_filepath);
     } else {
-        esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-        if (!sta_netif) {
-            MY_LOG_INFO(TAG, "Failed to get STA netif");
+        esp_netif_t *capture_netif = mode == PCAP_MODE_GATEWAY
+                                         ? capture_gateway_get_ap_netif()
+                                         : esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (!capture_netif) {
+            MY_LOG_INFO(TAG, "Failed to get %s netif",
+                        mode == PCAP_MODE_GATEWAY ? "Capture Gateway AP" : "STA");
             pcap_capture_active = false;
             fclose(pcap_capture_file);
             pcap_capture_file = NULL;
@@ -15159,7 +15446,7 @@ static int cmd_start_pcap(int argc, char **argv) {
             return 1;
         }
 
-        struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(sta_netif);
+        struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(capture_netif);
         if (!lwip_nif) {
             MY_LOG_INFO(TAG, "Failed to get lwIP netif");
             pcap_capture_active = false;
@@ -15170,12 +15457,13 @@ static int cmd_start_pcap(int argc, char **argv) {
             return 1;
         }
 
-        // --- ARP spoof MITM setup ---
-        esp_wifi_get_mac(WIFI_IF_STA, pcap_arp_own_mac);
+        if (mode == PCAP_MODE_NET) {
+            // --- Legacy ARP spoof MITM setup ---
+            esp_wifi_get_mac(WIFI_IF_STA, pcap_arp_own_mac);
 
-        esp_netif_ip_info_t ip_info;
-        esp_netif_get_ip_info(sta_netif, &ip_info);
-        pcap_arp_gateway_ip = ip_info.gw.addr;
+            esp_netif_ip_info_t ip_info;
+            esp_netif_get_ip_info(capture_netif, &ip_info);
+            pcap_arp_gateway_ip = ip_info.gw.addr;
 
         bool gw_found = false;
         for (int i = 0; i < ARP_TABLE_SIZE; i++) {
@@ -15257,19 +15545,26 @@ static int cmd_start_pcap(int argc, char **argv) {
                 MY_LOG_INFO(TAG, "PCAP net: ARP spoof MITM started (IP forwarding enabled)");
             }
         }
-        // --- End ARP spoof setup ---
+            // --- End legacy ARP spoof setup ---
+        }
 
         pcap_original_input = lwip_nif->input;
         pcap_original_linkoutput = lwip_nif->linkoutput;
+        pcap_hooked_netif = lwip_nif;
         lwip_nif->input = pcap_netif_input_hook;
         lwip_nif->linkoutput = pcap_netif_linkoutput_hook;
 
-        {
+        if (mode == PCAP_MODE_GATEWAY) {
+            oled_display_update_full("> PCAP Gateway", "  AP pre-NAT", "  Ethernet RX/TX",
+                                     pcap_capture_filepath + 18);
+            MY_LOG_INFO(TAG, "PCAP gateway capture started on downstream AP -> %s",
+                        pcap_capture_filepath);
+        } else {
             char oled_l3[32];
             snprintf(oled_l3, sizeof(oled_l3), "  MITM %d hosts", pcap_arp_host_count);
             oled_display_update_full("> PCAP Net", "  Ethernet RX/TX", oled_l3, pcap_capture_filepath + 18);
+            MY_LOG_INFO(TAG, "PCAP net capture started -> %s", pcap_capture_filepath);
         }
-        MY_LOG_INFO(TAG, "PCAP net capture started -> %s", pcap_capture_filepath);
     }
 
     MY_LOG_INFO(TAG, "Use 'stop' to stop capture and save file.");
@@ -22004,8 +22299,8 @@ static void register_commands(void)
 
     const esp_console_cmd_t pcap_cmd = {
         .command = "start_pcap",
-        .help = "Capture WiFi traffic to PCAP: start_pcap radio|net",
-        .hint = "radio|net",
+        .help = "Capture WiFi traffic to PCAP: start_pcap radio|net|gateway",
+        .hint = "radio|net|gateway",
         .func = &cmd_start_pcap,
         .argtable = NULL
     };
@@ -22091,6 +22386,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_connect_cmd));
+
+    const esp_console_cmd_t capture_gateway_cmd = {
+        .command = "capture_gateway",
+        .help = "Authorized APSTA/NAPT capture gateway: capture_gateway start <capture_ssid> <capture_password> | status | stop",
+        .hint = "start <capture_ssid> <capture_password> | status | stop",
+        .func = &cmd_capture_gateway,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&capture_gateway_cmd));
 
     const esp_console_cmd_t wifi_disconnect_cmd = {
         .command = "wifi_disconnect",

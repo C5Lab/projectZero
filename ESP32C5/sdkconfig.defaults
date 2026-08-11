@@ -62,8 +62,11 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 CONFIG_ESP_WIFI_TX_BA_WIN=6
 CONFIG_ESP_WIFI_RX_BA_WIN=6
 
-# lwIP IP forwarding for MITM (same-interface forwarding enabled via CMakeLists.txt)
+# lwIP forwarding and IPv4 NAPT for the routed Capture Gateway.
+# Same-interface forwarding remains enabled via the project CMakeLists for the
+# legacy ARP MITM mode, but the gateway uses separate AP and STA netifs.
 CONFIG_LWIP_IP_FORWARD=y
+CONFIG_LWIP_IPV4_NAPT=y
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 
 # FatFs Long File Name support (required for SD card directories >8 chars)

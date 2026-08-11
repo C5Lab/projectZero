@@ -232,7 +232,7 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 - `start_ap_locator` — lock onto one selected AP's channel and print its RSSI once per second (`[AP Locator] ...`). Needs exactly one selected network.
 - `packet_monitor <channel>` — packets‑per‑second on one channel (1‑14).
 - `channel_view` — continuous Wi‑Fi channel utilization.
-- `start_pcap [radio|net]` — capture to PCAP on SD. `radio` = promiscuous all‑frame capture; `net` = requires `wifi_connect`, captures + ARP‑spoof MITM. Stop with `stop`; saves to `/sdcard/lab/pcaps/sniff_N.pcap`.
+- `start_pcap [radio|net|gateway]` — capture to PCAP on SD. `radio` = promiscuous all-frame capture; `net` = legacy ARP-spoof MITM after `wifi_connect`; `gateway` = downstream Ethernet capture on an active JanOS Capture Gateway, before NAPT and without ARP poisoning. Stop with `stop`; saves to `/sdcard/lab/pcaps/sniff_N.pcap`.
 
 ## Attacks
 
@@ -256,6 +256,14 @@ All attacks stop with `stop`.
 
 - `wifi_connect <SSID> [Password|--saved] [ota] [<IP> <Mask> <GW> [DNS1] [DNS2]]` — join an AP. If password is omitted, tries open auth. Use `--saved` to explicitly load a saved password from `/sdcard/lab/eviltwin.txt` or `/sdcard/lab/portals.txt`. `ota` triggers an update check; optional static IP. Success marker `SUCCESS`, failure `FAILED`/`TIMEOUT`.
 - `wifi_disconnect` — disconnect from the current AP.
+
+## JanOS Capture Gateway
+
+- `capture_gateway start <capture_ssid> <capture_password>` — after `wifi_connect`, starts a dedicated WPA2 SoftAP on `10.42.0.1/24`, DHCP/DNS advertisement and IPv4 NAPT through the current STA connection. SSID is 1-32 bytes; password is 8-63 bytes.
+- `capture_gateway status` — prints human status plus machine-readable `[CGW]` lines: upstream, NAPT, clients, channel and AP/STA/DNS addresses. Passwords are never returned.
+- `capture_gateway stop` — disables NAPT/DHCP and returns to STA-only mode when PCAP is not running. During `start_pcap gateway`, use universal `stop` so capture hooks and the writer are finalized first.
+- Recommended flow: `wifi_connect ...` -> `capture_gateway start ...` -> `start_pcap gateway` -> `stop`.
+- The mode captures routed IPv4 for authorized clients connected to the dedicated SSID. It is not a TLS proxy; HTTPS/QUIC/VPN payloads remain encrypted. See [JanOS Capture Gateway](janos-capture-gateway.md) for architecture, limits and acceptance tests.
 
 ## ARP & LAN
 
