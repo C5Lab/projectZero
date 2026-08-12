@@ -12709,7 +12709,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "ota_boot", " <ota_0|ota_1>" },
     { "arp_ban", " <MAC> [IP]" },
     { "show_pass", " [portal|evil]" },
-    { "list_dir", " [path]" },
+    { "list_dir", " [path] [-s]" },
     { "file_delete", " <path>" },
     { "select_html", " <index>" },
     { "set_html", " <html>" },
@@ -17858,10 +17858,22 @@ static bool build_sd_path(char *dest, size_t dest_size, const char *input_path)
     return dest[0] != '\0';
 }
 
-// Command: list_dir [path] - Lists files inside a directory on SD card
+// Command: list_dir [path] [-s] - Lists files inside a directory on SD card
 static int cmd_list_dir(int argc, char **argv)
 {
-    const char *input_path = (argc >= 2) ? argv[1] : "lab/handshakes";
+    const char *input_path = NULL;
+    bool with_size = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-s") == 0) {
+            with_size = true;
+        } else if (input_path == NULL) {
+            input_path = argv[i];
+        }
+    }
+    if (input_path == NULL) {
+        input_path = "lab/handshakes";
+    }
+
     char full_path[SD_PATH_MAX];
 
     if (!build_sd_path(full_path, sizeof(full_path), input_path)) {
@@ -17893,7 +17905,18 @@ static int cmd_list_dir(int argc, char **argv)
             continue;
         }
         file_count++;
-        printf("%d %s\n", file_count, entry->d_name);
+        if (with_size) {
+            char item[SD_PATH_MAX];
+            struct stat st;
+            unsigned long long size = 0;
+            int item_len = snprintf(item, sizeof(item), "%s/%s", full_path, entry->d_name);
+            if (item_len >= 0 && item_len < (int)sizeof(item) && stat(item, &st) == 0) {
+                size = (unsigned long long)st.st_size;
+            }
+            printf("%d %llu %s\n", file_count, size, entry->d_name);
+        } else {
+            printf("%d %s\n", file_count, entry->d_name);
+        }
     }
 
     closedir(dir);
@@ -20328,6 +20351,8 @@ static esp_err_t admin_list_handler(httpd_req_t *req) {
 
 // GET /api/download?path=<rel> -> raw file (chunked)
 static esp_err_t admin_download_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
+
     char full[SD_PATH_MAX];
     if (!admin_resolve_query_path(req, full, sizeof(full))) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
@@ -20342,6 +20367,82 @@ static esp_err_t admin_download_handler(httpd_req_t *req) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
         return ESP_FAIL;
     }
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "File size error");
+        return ESP_FAIL;
+    }
+    long file_size_long = ftell(f);
+    if (file_size_long < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "File size error");
+        return ESP_FAIL;
+    }
+
+    uint64_t file_size = (uint64_t)file_size_long;
+    uint64_t range_start = 0;
+    uint64_t range_end = file_size > 0 ? file_size - 1 : 0;
+    bool partial = false;
+    bool range_unsatisfiable = false;
+    char range_hdr[64];
+
+    if (httpd_req_get_hdr_value_str(req, "Range", range_hdr, sizeof(range_hdr)) == ESP_OK &&
+        strncmp(range_hdr, "bytes=", 6) == 0) {
+        const char *start_text = range_hdr + 6;
+        if (isdigit((unsigned char)*start_text)) {
+            char *after_start;
+            errno = 0;
+            unsigned long long parsed_start = strtoull(start_text, &after_start, 10);
+            if (errno != ERANGE && after_start != start_text && *after_start == '-') {
+                const char *end_text = after_start + 1;
+                unsigned long long parsed_end = 0;
+                bool valid_end = (*end_text == '\0');
+                if (!valid_end && isdigit((unsigned char)*end_text)) {
+                    char *after_end;
+                    errno = 0;
+                    parsed_end = strtoull(end_text, &after_end, 10);
+                    valid_end = (errno != ERANGE && after_end != end_text && *after_end == '\0');
+                }
+
+                if (valid_end && (*end_text == '\0' || parsed_end >= parsed_start)) {
+                    range_start = (uint64_t)parsed_start;
+                    if (range_start >= file_size) {
+                        range_unsatisfiable = true;
+                    } else {
+                        range_end = *end_text == '\0' ? file_size - 1 : (uint64_t)parsed_end;
+                        if (range_end >= file_size) {
+                            range_end = file_size - 1;
+                        }
+                        partial = true;
+                    }
+                }
+            }
+        }
+    }
+
+    char content_range[80];
+    if (range_unsatisfiable) {
+        snprintf(content_range, sizeof(content_range), "bytes */%" PRIu64, file_size);
+        httpd_resp_set_status(req, "416 Range Not Satisfiable");
+        httpd_resp_set_hdr(req, "Content-Range", content_range);
+        fclose(f);
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    if (partial) {
+        if (fseek(f, (long)range_start, SEEK_SET) != 0) {
+            fclose(f);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "File seek error");
+            return ESP_FAIL;
+        }
+        snprintf(content_range, sizeof(content_range), "bytes %" PRIu64 "-%" PRIu64 "/%" PRIu64,
+                 range_start, range_end, file_size);
+        httpd_resp_set_status(req, "206 Partial Content");
+        httpd_resp_set_hdr(req, "Content-Range", content_range);
+    }
+
     const char *base = strrchr(full, '/');
     base = base ? base + 1 : full;
     char cd[SD_PATH_MAX + 32];
@@ -20354,10 +20455,20 @@ static esp_err_t admin_download_handler(httpd_req_t *req) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
         return ESP_FAIL;
     }
+    uint64_t remaining = partial ? range_end - range_start + 1 : 0;
     size_t r;
-    while ((r = fread(buf, 1, ADMIN_IO_CHUNK, f)) > 0) {
+    while (!partial || remaining > 0) {
+        size_t to_read = partial && remaining < ADMIN_IO_CHUNK ?
+                         (size_t)remaining : ADMIN_IO_CHUNK;
+        r = fread(buf, 1, to_read, f);
+        if (r == 0) {
+            break;
+        }
         if (httpd_resp_send_chunk(req, buf, r) != ESP_OK) {
             break;
+        }
+        if (partial) {
+            remaining -= r;
         }
     }
     free(buf);
@@ -23086,7 +23197,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t list_dir_cmd = {
         .command = "list_dir",
-        .help = "List files inside a directory on SD card: list_dir [path]",
+        .help = "List files inside a directory on SD card: list_dir [path] [-s]",
         .hint = NULL,
         .func = &cmd_list_dir,
         .argtable = NULL

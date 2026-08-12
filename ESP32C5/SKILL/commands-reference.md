@@ -705,8 +705,8 @@ HTML files found on SD card:
 - **Description**: Sets portal HTML directly from command line.
 
 ### `list_dir`
-- **Syntax**: `list_dir [path]`
-- **Description**: Lists files in a directory. Default path: `lab/handshakes`.
+- **Syntax**: `list_dir [path] [-s]`
+- **Description**: Lists files in a directory. Default path: `lab/handshakes`. Add `-s` in any argument position to print each file's decimal byte size before its name.
 - **Example**: `list_dir /sdcard/lab/handshakes`
 - **Output**:
 ```
@@ -716,6 +716,7 @@ Files in /sdcard/lab/handshakes:
 3 AX3_2.4_3C3F64_405785.pcap
 Found 6 file(s) in /sdcard/lab/handshakes
 ```
+- **Size output**: `list_dir -s /sdcard/lab/handshakes` prints file lines as `<index> <size_bytes> <name>`. If the size cannot be read, it prints `0` and keeps the file in the list.
 - **Parse**: Filter `.pcap` files, skip `.hccapx`. Strip extension for display name.
 
 ### `file_delete`

@@ -316,7 +316,7 @@ Recon PAN/node tables and CLI snapshots are allocated in PSRAM. The RX queue rem
 - `list_sd` — list HTML portal files (`N filename.html`). Header `HTML files found`.
 - `select_html <index>` — load an HTML file by index for portal / rogue AP / evil twin.
 - `set_html <html_string>` — set portal HTML directly from the command line.
-- `list_dir [path]` — list files in a directory (default `lab/handshakes`).
+- `list_dir [path] [-s]` — list files in a directory (default `lab/handshakes`); `-s` adds the decimal byte size before each filename.
 - `file_delete <path>` — delete a file, e.g. `file_delete lab/handshakes/sample.pcap`.
 - `list_ssids` (alias `list_ssid`) — list SSIDs from `/sdcard/lab/ssids.txt` with index.
 - `add_ssid <SSID>` — append an SSID (1‑32 chars) to the file.
