@@ -8,10 +8,10 @@ Part 2 is the **full catalog** of every other command.
 
 ## How to invoke commands
 
-JanOS exposes a plain‑text CLI over **UART (115200 baud, 8N1)** and over the USB serial console.
+JanOS exposes a CLI over **UART (115200 baud after boot, 8N1)** and over the USB serial console.
 
 - Type a command and press **Enter**. Over a raw UART link, terminate each command with `\r\n`.
-- Responses are **line‑based text**. Many long‑running commands stream output until stopped.
+- Responses are normally **line‑based text**. `send_file` temporarily switches the UART0 console to a framed binary stream after its text header.
 - **`stop`** is the universal cancel — it halts every running operation (scan, attack, wardrive, anti‑surveillance, jammer…). Always send it before starting a new mode if one might be active.
 - **`help`** lists all commands; **`help <command>`** shows help for one.
 - All indices are **1‑based**.
@@ -309,6 +309,61 @@ Recon PAN/node tables and CLI snapshots are allocated in PSRAM. The RX queue rem
 - `set_gps_position_cap <lat> <lon> [alt] [acc]` — same for the CAP feed.
 - `start_gps_raw [baud]` — print raw NMEA sentences. Stop with `stop`.
 
+## Console UART and binary file transfer
+
+These commands operate on UART0, the same line used by the interactive console. The selected baud rate is deliberately not stored in NVS: every boot starts at 115200 so bootloader and JanOS startup messages remain readable.
+
+- `uart_baud <rate>` — change the UART0 console rate. Allowed rates are `115200`, `230400`, `460800`, `921600`, and `2000000`. JanOS first sends the following response at the old rate, waits until TX is empty, and only then changes the UART rate:
+  ```text
+  [UARTB] switching rate=<rate> confirm_within=10s
+  [UARTB] END
+  ```
+  Change the client/terminal rate after receiving `[UARTB] END`, then issue `uart_baud_confirm`. If JanOS does not receive confirmation within 10 seconds, it automatically returns to 115200.
+- `uart_baud_confirm` — accept the current rate and cancel the automatic fallback:
+  ```text
+  [UARTB] confirmed rate=<rate>
+  [UARTB] END
+  ```
+- `uart_baud_status` — report the current rate and whether the confirmation window is active:
+  ```text
+  [UARTB] status rate=<rate> pending=<yes|no>
+  [UARTB] END
+  ```
+- `send_file <path> [offset]` — read a file from the SD card and transfer it over UART0. Relative paths are rooted at `/sdcard`; `offset` defaults to `0` and permits resuming a partial download. The command does not modify the file or SD card.
+
+On success, `send_file` emits a text header followed by an empty line:
+
+```text
+[FT] begin size=<total-file-size> offset=<offset> bsize=4096 crc32=<crc32-from-offset>
+[FT] END
+
+```
+
+After the empty line, each block is binary and is not escaped:
+
+| Field | Size | Encoding |
+|---|---:|---|
+| magic | 4 bytes | `FTB\x01` |
+| index | 4 bytes | little-endian, starting at 0 |
+| length | 4 bytes | little-endian, payload length up to 4096 |
+| crc32 | 4 bytes | little-endian CRC32 of this payload only |
+| payload | `length` bytes | raw file bytes |
+
+After every block, the receiver must send exactly one response byte within 5 seconds:
+
+- `0x06` (ACK) — accept the block and continue.
+- `0x15` (NAK) — retransmit the same block, up to three total attempts.
+- `0x18` (CAN) — cancel the transfer. A 5-second response timeout is also treated as cancellation.
+
+A completed transfer ends with:
+
+```text
+[FT] done sent=<bytes-from-offset> crc32=<crc32-from-offset>
+[FT] END
+```
+
+Cancellation ends with `[FT] cancelled` and `[FT] END`. Validation, SD, open, seek, read, UART, or retry-limit failures use `[FT] error <reason>` followed by `[FT] END`. The console resumes normal line-oriented command handling after any of these endings.
+
 ## SD card
 
 - `sd_status` — fast presence check; `SD_OK` or `SD_NONE` (~200 ms, no mount).
@@ -317,6 +372,7 @@ Recon PAN/node tables and CLI snapshots are allocated in PSRAM. The RX queue rem
 - `select_html <index>` — load an HTML file by index for portal / rogue AP / evil twin.
 - `set_html <html_string>` — set portal HTML directly from the command line.
 - `list_dir [path] [-s]` — list files in a directory (default `lab/handshakes`); `-s` adds the decimal byte size before each filename.
+- `send_file <path> [offset]` — transfer an SD file over UART0 using the resumable binary protocol documented above.
 - `file_delete <path>` — delete a file, e.g. `file_delete lab/handshakes/sample.pcap`.
 - `list_ssids` (alias `list_ssid`) — list SSIDs from `/sdcard/lab/ssids.txt` with index.
 - `add_ssid <SSID>` — append an SSID (1‑32 chars) to the file.

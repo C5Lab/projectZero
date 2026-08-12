@@ -19,6 +19,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "esp_system.h"
 #include "esp_log.h"
@@ -66,6 +67,7 @@
 #define HAS_MBEDTLS_CTR_DRBG 0
 #endif
 #include "esp_timer.h"
+#include "esp_rom_crc.h"
 #include "esp_app_format.h"
 
 #include "esp_http_server.h"
@@ -12710,6 +12712,10 @@ static const cli_hint_t k_cli_hints[] = {
     { "arp_ban", " <MAC> [IP]" },
     { "show_pass", " [portal|evil]" },
     { "list_dir", " [path] [-s]" },
+    { "send_file", " <path> [offset]" },
+    { "uart_baud", " <115200|230400|460800|921600|2000000>" },
+    { "uart_baud_confirm", "" },
+    { "uart_baud_status", "" },
     { "file_delete", " <path>" },
     { "select_html", " <index>" },
     { "set_html", " <html>" },
@@ -17856,6 +17862,404 @@ static bool build_sd_path(char *dest, size_t dest_size, const char *input_path)
     }
 
     return dest[0] != '\0';
+}
+
+#define JANOS_UART_NUM              UART_NUM_0
+#define JANOS_UART_DEFAULT_BAUD     115200U
+#define UART_BAUD_CONFIRM_US        (10ULL * 1000ULL * 1000ULL)
+
+#define FT_BLOCK_SIZE               4096U
+#define FT_ACK_TIMEOUT_MS           5000U
+#define FT_MAX_BLOCK_ATTEMPTS       3U
+#define FT_ACK                      0x06U
+#define FT_NAK                      0x15U
+#define FT_CAN                      0x18U
+
+static SemaphoreHandle_t uart_baud_mutex;
+static esp_timer_handle_t uart_baud_confirm_timer;
+static uint32_t uart_current_baud = JANOS_UART_DEFAULT_BAUD;
+static bool uart_baud_confirmation_pending;
+
+static void uart_baud_timeout_cb(void *arg)
+{
+    (void)arg;
+
+    if (uart_baud_mutex == NULL) {
+        return;
+    }
+
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+    if (uart_baud_confirmation_pending) {
+        uart_baud_confirmation_pending = false;
+        if (uart_set_baudrate(JANOS_UART_NUM, JANOS_UART_DEFAULT_BAUD) == ESP_OK) {
+            uart_current_baud = JANOS_UART_DEFAULT_BAUD;
+        }
+    }
+    xSemaphoreGive(uart_baud_mutex);
+}
+
+static esp_err_t uart_baud_control_init(void)
+{
+    uart_baud_mutex = xSemaphoreCreateMutex();
+    if (uart_baud_mutex == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    const esp_timer_create_args_t timer_args = {
+        .callback = uart_baud_timeout_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "uart_baud_confirm",
+        .skip_unhandled_events = true,
+    };
+    esp_err_t err = esp_timer_create(&timer_args, &uart_baud_confirm_timer);
+    if (err != ESP_OK) {
+        vSemaphoreDelete(uart_baud_mutex);
+        uart_baud_mutex = NULL;
+    }
+    return err;
+}
+
+static bool uart_baud_is_allowed(uint32_t rate)
+{
+    return rate == 115200U || rate == 230400U || rate == 460800U ||
+           rate == 921600U || rate == 2000000U;
+}
+
+static int cmd_uart_baud(int argc, char **argv)
+{
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = (argc == 2) ? strtoull(argv[1], &end, 10) : 0;
+    if (argc != 2 || errno == ERANGE || end == argv[1] || *end != '\0' ||
+        parsed > UINT32_MAX || !uart_baud_is_allowed((uint32_t)parsed)) {
+        printf("[UARTB] error allowed=115200,230400,460800,921600,2000000\n");
+        printf("[UARTB] END\n");
+        return 0;
+    }
+
+    uint32_t rate = (uint32_t)parsed;
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+
+    uart_baud_confirmation_pending = false;
+    (void)esp_timer_stop(uart_baud_confirm_timer);
+
+    printf("[UARTB] switching rate=%" PRIu32 " confirm_within=10s\n", rate);
+    printf("[UARTB] END\n");
+    fflush(stdout);
+
+    esp_err_t err = uart_wait_tx_done(JANOS_UART_NUM, pdMS_TO_TICKS(2000));
+    if (err == ESP_OK) {
+        err = uart_set_baudrate(JANOS_UART_NUM, rate);
+    }
+
+    if (err == ESP_OK) {
+        uart_current_baud = rate;
+        uart_baud_confirmation_pending = true;
+        err = esp_timer_start_once(uart_baud_confirm_timer, UART_BAUD_CONFIRM_US);
+    }
+
+    if (err != ESP_OK) {
+        uart_baud_confirmation_pending = false;
+        (void)uart_set_baudrate(JANOS_UART_NUM, JANOS_UART_DEFAULT_BAUD);
+        uart_current_baud = JANOS_UART_DEFAULT_BAUD;
+    }
+
+    xSemaphoreGive(uart_baud_mutex);
+    return 0;
+}
+
+static int cmd_uart_baud_confirm(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+    uart_baud_confirmation_pending = false;
+    (void)esp_timer_stop(uart_baud_confirm_timer);
+    uint32_t rate = uart_current_baud;
+    xSemaphoreGive(uart_baud_mutex);
+
+    printf("[UARTB] confirmed rate=%" PRIu32 "\n", rate);
+    printf("[UARTB] END\n");
+    return 0;
+}
+
+static int cmd_uart_baud_status(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+    uint32_t rate = uart_current_baud;
+    bool pending = uart_baud_confirmation_pending;
+    xSemaphoreGive(uart_baud_mutex);
+
+    printf("[UARTB] status rate=%" PRIu32 " pending=%s\n",
+           rate, pending ? "yes" : "no");
+    printf("[UARTB] END\n");
+    return 0;
+}
+
+static bool ft_uart_write_all(const void *data, size_t length)
+{
+    const uint8_t *bytes = (const uint8_t *)data;
+    while (length > 0) {
+        int written = uart_write_bytes(JANOS_UART_NUM, bytes, length);
+        if (written <= 0) {
+            return false;
+        }
+        bytes += written;
+        length -= (size_t)written;
+    }
+    return true;
+}
+
+static void ft_send_error(const char *reason)
+{
+    char response[256];
+    int len = snprintf(response, sizeof(response),
+                       "[FT] error %s\r\n[FT] END\r\n", reason);
+    if (len > 0) {
+        size_t send_len = (size_t)len < sizeof(response) ? (size_t)len : sizeof(response) - 1;
+        (void)ft_uart_write_all(response, send_len);
+        (void)uart_wait_tx_done(JANOS_UART_NUM, pdMS_TO_TICKS(2000));
+    }
+}
+
+static void ft_put_le32(uint8_t *dest, uint32_t value)
+{
+    dest[0] = (uint8_t)value;
+    dest[1] = (uint8_t)(value >> 8);
+    dest[2] = (uint8_t)(value >> 16);
+    dest[3] = (uint8_t)(value >> 24);
+}
+
+static int ft_wait_for_response(uint8_t *response)
+{
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)FT_ACK_TIMEOUT_MS * 1000;
+    while (esp_timer_get_time() < deadline_us) {
+        int64_t remaining_ms = (deadline_us - esp_timer_get_time() + 999) / 1000;
+        TickType_t wait_ticks = pdMS_TO_TICKS((uint32_t)remaining_ms);
+        if (wait_ticks == 0) {
+            wait_ticks = 1;
+        }
+        int read = uart_read_bytes(JANOS_UART_NUM, response, 1, wait_ticks);
+        if (read == 1) {
+            return 1;
+        }
+        if (read < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int cmd_send_file(int argc, char **argv)
+{
+    FILE *file = NULL;
+    uint8_t *buffer = NULL;
+    char full_path[SD_PATH_MAX];
+    char reason[160];
+    uint64_t offset = 0;
+    uint64_t total_size = 0;
+    uint64_t remaining = 0;
+    uint64_t sent = 0;
+    uint32_t expected_crc = 0;
+    uint32_t sent_crc = 0;
+    uint32_t block_index = 0;
+    bool cancelled = false;
+
+    flockfile(stdout);
+    fflush(stdout);
+
+    if (argc < 2 || argc > 3) {
+        ft_send_error("usage: send_file <path> [offset]");
+        goto cleanup;
+    }
+
+    if (!build_sd_path(full_path, sizeof(full_path), argv[1])) {
+        ft_send_error("invalid path");
+        goto cleanup;
+    }
+
+    if (argc == 3) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(argv[2], &end, 10);
+        if (errno == ERANGE || end == argv[2] || *end != '\0' || argv[2][0] == '-') {
+            ft_send_error("invalid offset");
+            goto cleanup;
+        }
+        offset = (uint64_t)parsed;
+    }
+
+    esp_err_t sd_err = init_sd_card();
+    if (sd_err != ESP_OK) {
+        snprintf(reason, sizeof(reason), "SD unavailable: %s", esp_err_to_name(sd_err));
+        ft_send_error(reason);
+        goto cleanup;
+    }
+
+    struct stat st;
+    if (stat(full_path, &st) != 0) {
+        snprintf(reason, sizeof(reason), "open failed: %s", strerror(errno));
+        ft_send_error(reason);
+        goto cleanup;
+    }
+    if (!S_ISREG(st.st_mode) || st.st_size < 0) {
+        ft_send_error("path is not a regular file");
+        goto cleanup;
+    }
+
+    total_size = (uint64_t)st.st_size;
+    if (offset > total_size || offset > (uint64_t)INT64_MAX) {
+        ft_send_error("offset exceeds file size");
+        goto cleanup;
+    }
+
+    file = fopen(full_path, "rb");
+    if (file == NULL) {
+        snprintf(reason, sizeof(reason), "open failed: %s", strerror(errno));
+        ft_send_error(reason);
+        goto cleanup;
+    }
+
+    buffer = malloc(FT_BLOCK_SIZE);
+    if (buffer == NULL) {
+        ft_send_error("out of memory");
+        goto cleanup;
+    }
+
+    if (fseeko(file, (off_t)offset, SEEK_SET) != 0) {
+        snprintf(reason, sizeof(reason), "seek failed: %s", strerror(errno));
+        ft_send_error(reason);
+        goto cleanup;
+    }
+
+    remaining = total_size - offset;
+    uint64_t crc_remaining = remaining;
+    uint32_t crc_chunks = 0;
+    while (crc_remaining > 0) {
+        size_t wanted = crc_remaining > FT_BLOCK_SIZE ? FT_BLOCK_SIZE : (size_t)crc_remaining;
+        size_t got = fread(buffer, 1, wanted, file);
+        if (got != wanted) {
+            ft_send_error(ferror(file) ? "read failed while calculating CRC32" :
+                                        "file changed while calculating CRC32");
+            goto cleanup;
+        }
+        expected_crc = esp_rom_crc32_le(expected_crc, buffer, (uint32_t)got);
+        crc_remaining -= got;
+        if ((++crc_chunks & 0x3FU) == 0) {
+            vTaskDelay(1);
+        }
+    }
+
+    if (fseeko(file, (off_t)offset, SEEK_SET) != 0) {
+        snprintf(reason, sizeof(reason), "seek failed: %s", strerror(errno));
+        ft_send_error(reason);
+        goto cleanup;
+    }
+    clearerr(file);
+
+    /* linenoise consumes CR but a terminal sending CRLF may leave LF in the UART ring. */
+    if (uart_flush_input(JANOS_UART_NUM) != ESP_OK) {
+        ft_send_error("could not clear UART input");
+        goto cleanup;
+    }
+
+    char header[192];
+    int header_len = snprintf(header, sizeof(header),
+                              "[FT] begin size=%" PRIu64 " offset=%" PRIu64
+                              " bsize=%u crc32=%08" PRIx32 "\r\n"
+                              "[FT] END\r\n\r\n",
+                              total_size, offset, FT_BLOCK_SIZE, expected_crc);
+    if (header_len <= 0 || (size_t)header_len >= sizeof(header) ||
+        !ft_uart_write_all(header, (size_t)header_len) ||
+        uart_wait_tx_done(JANOS_UART_NUM, pdMS_TO_TICKS(2000)) != ESP_OK) {
+        goto cleanup;
+    }
+
+    while (remaining > 0) {
+        size_t wanted = remaining > FT_BLOCK_SIZE ? FT_BLOCK_SIZE : (size_t)remaining;
+        size_t payload_len = fread(buffer, 1, wanted, file);
+        if (payload_len != wanted) {
+            ft_send_error(ferror(file) ? "read failed" : "file changed during transfer");
+            goto cleanup;
+        }
+
+        uint8_t block_header[16] = { 'F', 'T', 'B', 0x01 };
+        ft_put_le32(block_header + 4, block_index);
+        ft_put_le32(block_header + 8, (uint32_t)payload_len);
+        ft_put_le32(block_header + 12,
+                    esp_rom_crc32_le(0, buffer, (uint32_t)payload_len));
+
+        bool acknowledged = false;
+        for (uint32_t attempt = 0; attempt < FT_MAX_BLOCK_ATTEMPTS; attempt++) {
+            if (!ft_uart_write_all(block_header, sizeof(block_header)) ||
+                !ft_uart_write_all(buffer, payload_len) ||
+                uart_wait_tx_done(JANOS_UART_NUM, pdMS_TO_TICKS(FT_ACK_TIMEOUT_MS)) != ESP_OK) {
+                ft_send_error("UART write failed");
+                goto cleanup;
+            }
+
+            uint8_t response = 0;
+            int response_status = ft_wait_for_response(&response);
+            if (response_status == 0 || response == FT_CAN) {
+                cancelled = true;
+                goto transfer_end;
+            }
+            if (response_status < 0) {
+                ft_send_error("UART read failed");
+                goto cleanup;
+            }
+            if (response == FT_ACK) {
+                acknowledged = true;
+                break;
+            }
+            if (response != FT_NAK) {
+                snprintf(reason, sizeof(reason), "invalid response 0x%02x", response);
+                ft_send_error(reason);
+                goto cleanup;
+            }
+        }
+
+        if (!acknowledged) {
+            snprintf(reason, sizeof(reason), "retry limit index=%" PRIu32, block_index);
+            ft_send_error(reason);
+            goto cleanup;
+        }
+
+        sent_crc = esp_rom_crc32_le(sent_crc, buffer, (uint32_t)payload_len);
+        sent += payload_len;
+        remaining -= payload_len;
+        block_index++;
+        vTaskDelay(1);
+    }
+
+transfer_end:
+    if (cancelled) {
+        static const char cancelled_response[] = "[FT] cancelled\r\n[FT] END\r\n";
+        (void)ft_uart_write_all(cancelled_response, sizeof(cancelled_response) - 1);
+    } else {
+        char done[128];
+        int done_len = snprintf(done, sizeof(done),
+                                "[FT] done sent=%" PRIu64 " crc32=%08" PRIx32
+                                "\r\n[FT] END\r\n",
+                                sent, sent_crc);
+        if (done_len > 0 && (size_t)done_len < sizeof(done)) {
+            (void)ft_uart_write_all(done, (size_t)done_len);
+        }
+    }
+    (void)uart_wait_tx_done(JANOS_UART_NUM, pdMS_TO_TICKS(2000));
+
+cleanup:
+    if (file != NULL) {
+        fclose(file);
+    }
+    free(buffer);
+    funlockfile(stdout);
+    return 0;
 }
 
 // Command: list_dir [path] [-s] - Lists files inside a directory on SD card
@@ -23204,6 +23608,42 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&list_dir_cmd));
 
+    const esp_console_cmd_t send_file_cmd = {
+        .command = "send_file",
+        .help = "Transfer an SD file over UART: send_file <path> [offset]",
+        .hint = "<path> [offset]",
+        .func = &cmd_send_file,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&send_file_cmd));
+
+    const esp_console_cmd_t uart_baud_cmd = {
+        .command = "uart_baud",
+        .help = "Change console UART rate with a 10 second confirmation window",
+        .hint = "<115200|230400|460800|921600|2000000>",
+        .func = &cmd_uart_baud,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&uart_baud_cmd));
+
+    const esp_console_cmd_t uart_baud_confirm_cmd = {
+        .command = "uart_baud_confirm",
+        .help = "Confirm the current console UART rate",
+        .hint = NULL,
+        .func = &cmd_uart_baud_confirm,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&uart_baud_confirm_cmd));
+
+    const esp_console_cmd_t uart_baud_status_cmd = {
+        .command = "uart_baud_status",
+        .help = "Show console UART rate and confirmation state",
+        .hint = NULL,
+        .func = &cmd_uart_baud_status,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&uart_baud_status_cmd));
+
     const esp_console_cmd_t list_ssid_cmd = {
         .command = "list_ssid",
         .help = "Lists SSIDs from /sdcard/lab/ssid.txt",
@@ -23497,10 +23937,12 @@ void app_main(void) {
     repl_config.prompt = ">";
     repl_config.max_cmdline_length = 256;
 
+    ESP_ERROR_CHECK(uart_baud_control_init());
     esp_console_register_help_command();
     register_commands();
 
     esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    hw_config.baud_rate = JANOS_UART_DEFAULT_BAUD;
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
 
     linenoiseSetHintsCallback((linenoiseHintsCallback *)&janos_console_hint);
