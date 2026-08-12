@@ -324,6 +324,7 @@ These commands operate on UART0, the same line used by the interactive console. 
   [UARTB] confirmed rate=<rate>
   [UARTB] END
   ```
+  After confirmation, JanOS also returns to 115200 if no valid console command is executed for 60 seconds. The idle fallback is completely suspended while `send_file` is active, so neither a baud-rate change nor an `[UARTB]` message can interrupt the binary stream. Every transmitted block refreshes activity, and the 60-second window starts again when the transfer finishes or is cancelled. The fallback is announced at 115200 with `[UARTB] idle revert rate=115200`.
 - `uart_baud_status` — report the current rate and whether the confirmation window is active:
   ```text
   [UARTB] status rate=<rate> pending=<yes|no>
@@ -334,10 +335,12 @@ These commands operate on UART0, the same line used by the interactive console. 
 On success, `send_file` emits a text header followed by an empty line:
 
 ```text
-[FT] begin size=<total-file-size> offset=<offset> bsize=4096 crc32=<crc32-from-offset>
+[FT] begin size=<total-file-size> offset=<offset> bsize=4096 crc32=00000000
 [FT] END
 
 ```
+
+The opening CRC32 is intentionally zero so transmission can begin immediately without reading the file twice. Verify the received data using the authoritative running CRC32 reported by the final `[FT] done` line.
 
 After the empty line, each block is binary and is not escaped:
 
@@ -353,7 +356,9 @@ After every block, the receiver must send exactly one response byte within 5 sec
 
 - `0x06` (ACK) — accept the block and continue.
 - `0x15` (NAK) — retransmit the same block, up to three total attempts.
-- `0x18` (CAN) — cancel the transfer. A 5-second response timeout is also treated as cancellation.
+- `0x18` (CAN) — cancel the transfer.
+
+If no response byte arrives within 5 seconds, JanOS ends the transfer with `[FT] error ACK timeout` followed by `[FT] END`, releases the file and transfer buffer, and returns control to the console REPL.
 
 A completed transfer ends with:
 

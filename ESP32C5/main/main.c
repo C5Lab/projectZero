@@ -17867,6 +17867,9 @@ static bool build_sd_path(char *dest, size_t dest_size, const char *input_path)
 #define JANOS_UART_NUM              UART_NUM_0
 #define JANOS_UART_DEFAULT_BAUD     115200U
 #define UART_BAUD_CONFIRM_US        (10ULL * 1000ULL * 1000ULL)
+#define UART_BAUD_IDLE_REVERT_US    (60ULL * 1000ULL * 1000ULL)
+#define UART_BAUD_IDLE_CHECK_US     (1ULL * 1000ULL * 1000ULL)
+#define JANOS_CONSOLE_MAX_COMMANDS  128U
 
 #define FT_BLOCK_SIZE               4096U
 #define FT_ACK_TIMEOUT_MS           5000U
@@ -17877,8 +17880,45 @@ static bool build_sd_path(char *dest, size_t dest_size, const char *input_path)
 
 static SemaphoreHandle_t uart_baud_mutex;
 static esp_timer_handle_t uart_baud_confirm_timer;
+static esp_timer_handle_t uart_baud_idle_timer;
 static uint32_t uart_current_baud = JANOS_UART_DEFAULT_BAUD;
 static bool uart_baud_confirmation_pending;
+static bool uart_file_transfer_active;
+static int64_t uart_last_command_us;
+
+typedef struct {
+    esp_console_cmd_func_t func;
+    esp_console_cmd_func_with_context_t func_w_context;
+    void *context;
+} janos_console_cmd_context_t;
+
+static janos_console_cmd_context_t janos_console_cmd_contexts[JANOS_CONSOLE_MAX_COMMANDS];
+static size_t janos_console_cmd_context_count;
+
+static void uart_baud_note_activity(void)
+{
+    if (uart_baud_mutex == NULL) {
+        return;
+    }
+
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+    uart_last_command_us = esp_timer_get_time();
+    xSemaphoreGive(uart_baud_mutex);
+}
+
+static void uart_baud_set_file_transfer_active(bool active)
+{
+    if (uart_baud_mutex == NULL) {
+        return;
+    }
+
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+    uart_file_transfer_active = active;
+    if (!active) {
+        uart_last_command_us = esp_timer_get_time();
+    }
+    xSemaphoreGive(uart_baud_mutex);
+}
 
 static void uart_baud_timeout_cb(void *arg)
 {
@@ -17896,6 +17936,36 @@ static void uart_baud_timeout_cb(void *arg)
         }
     }
     xSemaphoreGive(uart_baud_mutex);
+}
+
+static void uart_baud_idle_cb(void *arg)
+{
+    (void)arg;
+
+    if (uart_baud_mutex == NULL) {
+        return;
+    }
+
+    bool reverted = false;
+    int64_t now_us = esp_timer_get_time();
+
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+    if (!uart_file_transfer_active &&
+        !uart_baud_confirmation_pending &&
+        uart_current_baud != JANOS_UART_DEFAULT_BAUD &&
+        now_us - uart_last_command_us >= (int64_t)UART_BAUD_IDLE_REVERT_US) {
+        if (uart_set_baudrate(JANOS_UART_NUM, JANOS_UART_DEFAULT_BAUD) == ESP_OK) {
+            uart_current_baud = JANOS_UART_DEFAULT_BAUD;
+            uart_last_command_us = now_us;
+            reverted = true;
+        }
+    }
+    xSemaphoreGive(uart_baud_mutex);
+
+    if (reverted) {
+        printf("[UARTB] idle revert rate=115200\n");
+        fflush(stdout);
+    }
 }
 
 static esp_err_t uart_baud_control_init(void)
@@ -17916,6 +17986,76 @@ static esp_err_t uart_baud_control_init(void)
     if (err != ESP_OK) {
         vSemaphoreDelete(uart_baud_mutex);
         uart_baud_mutex = NULL;
+        return err;
+    }
+
+    const esp_timer_create_args_t idle_timer_args = {
+        .callback = uart_baud_idle_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "uart_baud_idle",
+        .skip_unhandled_events = true,
+    };
+    err = esp_timer_create(&idle_timer_args, &uart_baud_idle_timer);
+    if (err != ESP_OK) {
+        (void)esp_timer_delete(uart_baud_confirm_timer);
+        uart_baud_confirm_timer = NULL;
+        vSemaphoreDelete(uart_baud_mutex);
+        uart_baud_mutex = NULL;
+        return err;
+    }
+
+    uart_last_command_us = esp_timer_get_time();
+    err = esp_timer_start_periodic(uart_baud_idle_timer, UART_BAUD_IDLE_CHECK_US);
+    if (err != ESP_OK) {
+        (void)esp_timer_delete(uart_baud_idle_timer);
+        uart_baud_idle_timer = NULL;
+        (void)esp_timer_delete(uart_baud_confirm_timer);
+        uart_baud_confirm_timer = NULL;
+        vSemaphoreDelete(uart_baud_mutex);
+        uart_baud_mutex = NULL;
+    }
+    return err;
+}
+
+static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
+{
+    janos_console_cmd_context_t *cmd_context =
+        (janos_console_cmd_context_t *)context;
+
+    uart_baud_note_activity();
+    if (cmd_context->func != NULL) {
+        return cmd_context->func(argc, argv);
+    }
+    return cmd_context->func_w_context(cmd_context->context, argc, argv);
+}
+
+static esp_err_t janos_console_cmd_register(const esp_console_cmd_t *cmd)
+{
+    if (cmd == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if ((cmd->func == NULL) == (cmd->func_w_context == NULL)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (janos_console_cmd_context_count >= JANOS_CONSOLE_MAX_COMMANDS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    janos_console_cmd_context_t *context =
+        &janos_console_cmd_contexts[janos_console_cmd_context_count];
+    context->func = cmd->func;
+    context->func_w_context = cmd->func_w_context;
+    context->context = cmd->context;
+
+    esp_console_cmd_t wrapped_cmd = *cmd;
+    wrapped_cmd.func = NULL;
+    wrapped_cmd.func_w_context = janos_console_cmd_dispatch;
+    wrapped_cmd.context = context;
+
+    esp_err_t err = esp_console_cmd_register(&wrapped_cmd);
+    if (err == ESP_OK) {
+        janos_console_cmd_context_count++;
     }
     return err;
 }
@@ -18065,11 +18205,11 @@ static int cmd_send_file(int argc, char **argv)
     uint64_t total_size = 0;
     uint64_t remaining = 0;
     uint64_t sent = 0;
-    uint32_t expected_crc = 0;
     uint32_t sent_crc = 0;
     uint32_t block_index = 0;
     bool cancelled = false;
 
+    uart_baud_set_file_transfer_active(true);
     flockfile(stdout);
     fflush(stdout);
 
@@ -18138,29 +18278,6 @@ static int cmd_send_file(int argc, char **argv)
     }
 
     remaining = total_size - offset;
-    uint64_t crc_remaining = remaining;
-    uint32_t crc_chunks = 0;
-    while (crc_remaining > 0) {
-        size_t wanted = crc_remaining > FT_BLOCK_SIZE ? FT_BLOCK_SIZE : (size_t)crc_remaining;
-        size_t got = fread(buffer, 1, wanted, file);
-        if (got != wanted) {
-            ft_send_error(ferror(file) ? "read failed while calculating CRC32" :
-                                        "file changed while calculating CRC32");
-            goto cleanup;
-        }
-        expected_crc = esp_rom_crc32_le(expected_crc, buffer, (uint32_t)got);
-        crc_remaining -= got;
-        if ((++crc_chunks & 0x3FU) == 0) {
-            vTaskDelay(1);
-        }
-    }
-
-    if (fseeko(file, (off_t)offset, SEEK_SET) != 0) {
-        snprintf(reason, sizeof(reason), "seek failed: %s", strerror(errno));
-        ft_send_error(reason);
-        goto cleanup;
-    }
-    clearerr(file);
 
     /* linenoise consumes CR but a terminal sending CRLF may leave LF in the UART ring. */
     if (uart_flush_input(JANOS_UART_NUM) != ESP_OK) {
@@ -18171,9 +18288,9 @@ static int cmd_send_file(int argc, char **argv)
     char header[192];
     int header_len = snprintf(header, sizeof(header),
                               "[FT] begin size=%" PRIu64 " offset=%" PRIu64
-                              " bsize=%u crc32=%08" PRIx32 "\r\n"
+                              " bsize=%u crc32=00000000\r\n"
                               "[FT] END\r\n\r\n",
-                              total_size, offset, FT_BLOCK_SIZE, expected_crc);
+                              total_size, offset, FT_BLOCK_SIZE);
     if (header_len <= 0 || (size_t)header_len >= sizeof(header) ||
         !ft_uart_write_all(header, (size_t)header_len) ||
         uart_wait_tx_done(JANOS_UART_NUM, pdMS_TO_TICKS(2000)) != ESP_OK) {
@@ -18202,10 +18319,15 @@ static int cmd_send_file(int argc, char **argv)
                 ft_send_error("UART write failed");
                 goto cleanup;
             }
+            uart_baud_note_activity();
 
             uint8_t response = 0;
             int response_status = ft_wait_for_response(&response);
-            if (response_status == 0 || response == FT_CAN) {
+            if (response_status == 0) {
+                ft_send_error("ACK timeout");
+                goto cleanup;
+            }
+            if (response == FT_CAN) {
                 cancelled = true;
                 goto transfer_end;
             }
@@ -18258,6 +18380,7 @@ cleanup:
         fclose(file);
     }
     free(buffer);
+    uart_baud_set_file_transfer_active(false);
     funlockfile(stdout);
     return 0;
 }
@@ -22750,6 +22873,7 @@ static int cmd_start_jammer24(int argc, char **argv) {
 }
 
 // --- Command registration in esp_console ---
+#define esp_console_cmd_register(cmd) janos_console_cmd_register(cmd)
 static void register_commands(void)
 {
     const esp_console_cmd_t scan_cmd = {
@@ -23762,6 +23886,7 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&version_cmd));
 }
+#undef esp_console_cmd_register
 
 void app_main(void) {
 
