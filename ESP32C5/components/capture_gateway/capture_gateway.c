@@ -15,6 +15,7 @@ static esp_netif_t *s_sta_netif;
 static bool s_active;
 static bool s_upstream_ready;
 static bool s_napt_enabled;
+static bool s_open_network;
 static uint8_t s_connected_clients;
 static uint8_t s_channel;
 static char s_ssid[CAPTURE_GATEWAY_SSID_MAX_LEN + 1];
@@ -25,15 +26,16 @@ static esp_netif_dns_info_t s_upstream_dns;
 
 static bool capture_gateway_valid_config(const capture_gateway_config_t *config)
 {
-    if (config == NULL || config->ssid == NULL || config->password == NULL) {
+    if (config == NULL || config->ssid == NULL) {
         return false;
     }
 
     size_t ssid_len = strlen(config->ssid);
-    size_t password_len = strlen(config->password);
+    size_t password_len = config->password != NULL ? strlen(config->password) : 0;
     return ssid_len >= 1 && ssid_len <= CAPTURE_GATEWAY_SSID_MAX_LEN &&
-           password_len >= CAPTURE_GATEWAY_PASSWORD_MIN_LEN &&
-           password_len <= CAPTURE_GATEWAY_PASSWORD_MAX_LEN;
+           (password_len == 0 ||
+            (password_len >= CAPTURE_GATEWAY_PASSWORD_MIN_LEN &&
+             password_len <= CAPTURE_GATEWAY_PASSWORD_MAX_LEN));
 }
 
 static esp_err_t capture_gateway_stop_dhcp(esp_netif_t *ap_netif)
@@ -131,14 +133,17 @@ esp_err_t capture_gateway_start(esp_netif_t *ap_netif,
     size_t ssid_len = strlen(config->ssid);
     memcpy(ap_config.ap.ssid, config->ssid, ssid_len);
     ap_config.ap.ssid_len = ssid_len;
-    strlcpy((char *)ap_config.ap.password, config->password,
-            sizeof(ap_config.ap.password));
+    size_t password_len = config->password != NULL ? strlen(config->password) : 0;
+    if (password_len > 0) {
+        strlcpy((char *)ap_config.ap.password, config->password,
+                sizeof(ap_config.ap.password));
+    }
     ap_config.ap.channel = config->channel != 0 ? config->channel : upstream.primary;
     ap_config.ap.max_connection = config->max_clients != 0
                                       ? config->max_clients
                                       : CAPTURE_GATEWAY_DEFAULT_MAX_CLIENTS;
-    ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
-    ap_config.ap.pmf_cfg.capable = true;
+    ap_config.ap.authmode = password_len > 0 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    ap_config.ap.pmf_cfg.capable = password_len > 0;
     ap_config.ap.pmf_cfg.required = false;
 
     err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
@@ -192,10 +197,12 @@ esp_err_t capture_gateway_start(esp_netif_t *ap_netif,
     }
 
     s_napt_enabled = true;
+    s_open_network = password_len == 0;
     s_connected_clients = 0;
     s_active = true;
-    ESP_LOGI(TAG, "Capture gateway active: SSID='%s' channel=%u AP=" IPSTR,
-             s_ssid, s_channel, IP2STR(&s_downstream_ip.ip));
+    ESP_LOGI(TAG, "Capture gateway active: SSID='%s' security=%s channel=%u AP=" IPSTR,
+             s_ssid, s_open_network ? "open" : "wpa2", s_channel,
+             IP2STR(&s_downstream_ip.ip));
     return ESP_OK;
 
 fail:
@@ -204,6 +211,7 @@ fail:
     s_active = false;
     s_upstream_ready = false;
     s_napt_enabled = false;
+    s_open_network = false;
     s_connected_clients = 0;
     memset(s_ssid, 0, sizeof(s_ssid));
     memset(s_upstream_ssid, 0, sizeof(s_upstream_ssid));
@@ -236,6 +244,7 @@ esp_err_t capture_gateway_stop(void)
     s_active = false;
     s_upstream_ready = false;
     s_napt_enabled = false;
+    s_open_network = false;
     s_connected_clients = 0;
     s_channel = 0;
     memset(s_ssid, 0, sizeof(s_ssid));
@@ -291,6 +300,7 @@ void capture_gateway_get_status(capture_gateway_status_t *status)
     status->active = s_active;
     status->upstream_ready = s_upstream_ready;
     status->napt_enabled = s_napt_enabled;
+    status->open_network = s_open_network;
     status->connected_clients = s_connected_clients;
     status->channel = s_channel;
     strlcpy(status->ssid, s_ssid, sizeof(status->ssid));

@@ -232,7 +232,7 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 - `start_ap_locator` — lock onto one selected AP's channel and print its RSSI once per second (`[AP Locator] ...`). Needs exactly one selected network.
 - `packet_monitor <channel>` — packets‑per‑second on one channel (1‑14).
 - `channel_view` — continuous Wi‑Fi channel utilization.
-- `start_pcap [radio|net|gateway]` — capture to PCAP on SD. `radio` = promiscuous all-frame capture; `net` = legacy ARP-spoof MITM after `wifi_connect`; `gateway` = downstream Ethernet capture on an active JanOS Capture Gateway, before NAPT and without ARP poisoning. Stop with `stop`; saves to `/sdcard/lab/pcaps/sniff_N.pcap`.
+- `start_pcap [radio|net|gateway]` — capture to PCAP on SD. `radio` = promiscuous all-frame capture; `net` = ARP-spoof MITM after `wifi_connect`, retained for observing devices already present on an authorized LAN; `gateway` = compatibility/idempotency command because `capture_gateway start` now arms downstream capture automatically. Stop with `stop`; saves to `/sdcard/lab/pcaps/sniff_N.pcap`.
 
 ## Attacks
 
@@ -259,11 +259,11 @@ All attacks stop with `stop`.
 
 ## JanOS Capture Gateway
 
-- `capture_gateway start <capture_ssid> <capture_password>` — after `wifi_connect`, starts a dedicated WPA2 SoftAP on `10.42.0.1/24`, DHCP/DNS advertisement and IPv4 NAPT through the current STA connection. SSID is 1-32 bytes; password is 8-63 bytes.
-- `capture_gateway status` — prints human status plus machine-readable `[CGW]` lines: upstream, NAPT, clients, channel and AP/STA/DNS addresses. Passwords are never returned.
+- `capture_gateway start <capture_ssid> [capture_password] [--pcap-name <name>]` — after `wifi_connect`, starts a dedicated SoftAP on `10.42.0.1/24`, DHCP/DNS advertisement and IPv4 NAPT through the current STA connection, and immediately arms downstream PCAP before reporting ready. It does not wait for a client. Omit the password for an open SSID; supply 8-63 bytes for WPA2-PSK. Tab5 can pass a dated custom basename such as `--pcap-name office_20260812_143000`; `.pcap` is appended if absent. Safe basename characters are letters, digits, `.`, `_` and `-`. Existing files are not overwritten. Without the option, the filename remains `sniff_N.pcap`. Capture Gateway always applies a firmware-fixed aggregate upload+download ceiling of 4096 kbps. Its adaptive token bucket automatically reduces the effective rate when the recorder queue reaches 50/75%, pauses above 90%, and resumes after it drains to 50%. If recorder or limiter setup fails, gateway startup is rolled back.
+- `capture_gateway status` — prints human status plus machine-readable `[CGW]` lines: `security=open|wpa2`, upstream, NAPT, clients, channel, AP/STA/DNS addresses, capture filename, `packets`, total recorder `drops`, exact serialized `file_bytes`, split `drop_alloc|drop_queue|drop_write`, recorder queue depth/high-water, configured `rate_limit_kbps`, live `rate_effective_kbps`, adaptive throttle/pause counters, limiter queue depth/high-water/drops and the current `client_isolation=off` capability state. The legacy-equivalent `frames` field is retained for parsers. Each currently associated client gets a `[CGW_CLIENT] mac=... ip=...` line. Passwords are never returned.
 - `capture_gateway stop` — disables NAPT/DHCP and returns to STA-only mode when PCAP is not running. During `start_pcap gateway`, use universal `stop` so capture hooks and the writer are finalized first.
-- Recommended flow: `wifi_connect ...` -> `capture_gateway start ...` -> `start_pcap gateway` -> `stop`.
-- The mode captures routed IPv4 for authorized clients connected to the dedicated SSID. It is not a TLS proxy; HTTPS/QUIC/VPN payloads remain encrypted. See [JanOS Capture Gateway](janos-capture-gateway.md) for architecture, limits and acceptance tests.
+- Recommended flow: `wifi_connect ...` -> `capture_gateway start ...` -> clients may join at any later time -> `stop`.
+- The mode captures routed IPv4 for authorized clients connected to the dedicated SSID. It complements rather than replaces `start_pcap net`, is not a TLS proxy, and does not yet guarantee SoftAP client isolation. HTTPS/QUIC/VPN payloads remain encrypted. Plain HTTP payloads can be viewed offline in ESPShark's Follow Stream view. See [JanOS Capture Gateway](janos-capture-gateway.md) for architecture, limits and acceptance tests.
 
 ## ARP & LAN
 
@@ -312,6 +312,7 @@ Recon PAN/node tables and CLI snapshots are allocated in PSRAM. The RX queue rem
 ## SD card
 
 - `sd_status` — fast presence check; `SD_OK` or `SD_NONE` (~200 ms, no mount).
+- `sd_benchmark [size_mb]` — destructive only to JanOS's own temporary file `/sdcard/lab/.janos_sd_benchmark.tmp`; measures sequential SD writes using the same 64 KiB chunk/buffer size as the PCAP path, then deletes the file. Size range is 1-256 MiB, default 32 MiB. Reports durable average KiB/s and kbps, `p50/p95/p99/max` `fwrite` latency, final `fflush`/`fsync` latency and a heuristic `conservative_50pct_kbps`. It refuses to run while PCAP, Capture Gateway or wardrive is active. Run `stop` first. The 50% number is a starting point for gateway tests, not a lossless guarantee.
 - `list_sd` — list HTML portal files (`N filename.html`). Header `HTML files found`.
 - `select_html <index>` — load an HTML file by index for portal / rogue AP / evil twin.
 - `set_html <html_string>` — set portal HTML directly from the command line.

@@ -17,6 +17,7 @@ extern "C" {
 
 typedef struct {
     const char *ssid;
+    /** NULL/empty creates an open SoftAP; otherwise use an 8-63 byte WPA2 PSK. */
     const char *password;
     uint8_t channel;
     uint8_t max_clients;
@@ -26,6 +27,7 @@ typedef struct {
     bool active;
     bool upstream_ready;
     bool napt_enabled;
+    bool open_network;
     uint8_t connected_clients;
     uint8_t channel;
     char ssid[CAPTURE_GATEWAY_SSID_MAX_LEN + 1];

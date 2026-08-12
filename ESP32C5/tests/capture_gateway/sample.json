@@ -1,0 +1,6 @@
+{
+  "source": "janos-capture-gateway-test",
+  "transport": "plain-http",
+  "visible": true,
+  "sequence": [1, 2, 3]
+}

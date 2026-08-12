@@ -3,6 +3,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <inttypes.h>
 #include <errno.h>
 #include <sys/stat.h>
@@ -27,6 +28,7 @@
 #include "nvs.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_wifi_ap_get_sta_list.h"
 #include "esp_event.h"
 
 #include "esp_mac.h"
@@ -402,17 +404,74 @@ typedef struct {
     uint8_t data[];
 } pcap_queued_frame_t;
 
+typedef enum {
+    PCAP_RATE_PACKET_INPUT = 0,
+    PCAP_RATE_PACKET_LINKOUTPUT,
+} pcap_rate_packet_direction_t;
+
+typedef struct {
+    struct netif *netif;
+    pcap_rate_packet_direction_t direction;
+    uint16_t len;
+    int64_t timestamp_us;
+    uint8_t data[];
+} pcap_rate_queued_packet_t;
+
+typedef struct {
+    uint32_t packets;
+    uint32_t drops;
+    uint32_t drop_alloc;
+    uint32_t drop_queue;
+    uint32_t drop_write;
+    uint32_t queue_depth;
+    uint32_t queue_high_water;
+    uint32_t rate_queue_drops;
+    uint32_t rate_queue_high_water;
+    uint32_t rate_effective_kbps;
+    uint32_t rate_throttle_events;
+    uint32_t rate_pause_events;
+    uint64_t file_bytes;
+} pcap_stats_snapshot_t;
+
 static volatile bool pcap_capture_active = false;
 static pcap_capture_mode_t pcap_capture_mode = PCAP_MODE_NONE;
 static FILE *pcap_capture_file = NULL;
+static uint8_t *pcap_stdio_buffer = NULL;
 static TaskHandle_t pcap_writer_task_handle = NULL;
 static QueueHandle_t pcap_packet_queue = NULL;
 static uint32_t pcap_capture_frame_count = 0;
 static uint32_t pcap_capture_drop_count = 0;
-static char pcap_capture_filepath[64];
+static uint32_t pcap_capture_drop_alloc_count = 0;
+static uint32_t pcap_capture_drop_queue_count = 0;
+static uint32_t pcap_capture_drop_write_count = 0;
+static uint32_t pcap_capture_queue_high_water = 0;
+static uint64_t pcap_capture_file_byte_count = 0;
+static portMUX_TYPE pcap_stats_lock = portMUX_INITIALIZER_UNLOCKED;
+#define PCAP_PACKET_QUEUE_LENGTH 1024
+#define PCAP_WRITE_BATCH_SIZE (64 * 1024)
+#define PCAP_RATE_QUEUE_LENGTH 1024
+#define PCAP_GATEWAY_RATE_LIMIT_KBPS 4096U
+#define PCAP_RATE_LIMIT_MIN_KBPS 64
+#define SD_BENCH_CONSERVATIVE_MAX_KBPS 100000U
+#define PCAP_RATE_BURST_MIN_BYTES (4 * 1600)
+#define PCAP_ADAPTIVE_HALF_DEPTH (PCAP_PACKET_QUEUE_LENGTH / 2)
+#define PCAP_ADAPTIVE_THREE_QUARTER_DEPTH ((PCAP_PACKET_QUEUE_LENGTH * 3) / 4)
+#define PCAP_ADAPTIVE_PAUSE_DEPTH ((PCAP_PACKET_QUEUE_LENGTH * 9) / 10)
+#define PCAP_CAPTURE_DIR "/sdcard/lab/pcaps"
+#define PCAP_BASENAME_MAX_LEN 95
+static char pcap_capture_filepath[sizeof(PCAP_CAPTURE_DIR) + PCAP_BASENAME_MAX_LEN + 2];
+static char pcap_next_basename[PCAP_BASENAME_MAX_LEN + 1];
 static netif_input_fn pcap_original_input = NULL;
 static netif_linkoutput_fn pcap_original_linkoutput = NULL;
 static struct netif *pcap_hooked_netif = NULL;
+static QueueHandle_t pcap_rate_packet_queue = NULL;
+static TaskHandle_t pcap_rate_task_handle = NULL;
+static volatile bool pcap_rate_active = false;
+static uint32_t pcap_rate_queue_drop_count = 0;
+static uint32_t pcap_rate_queue_high_water = 0;
+static uint32_t pcap_rate_effective_kbps = 0;
+static uint32_t pcap_rate_throttle_event_count = 0;
+static uint32_t pcap_rate_pause_event_count = 0;
 
 // PCAP ARP spoofing state (net mode MITM)
 #define PCAP_ARP_MAX_HOSTS 64
@@ -1837,6 +1896,7 @@ static int sd_html_count = 0;
 static char* custom_portal_html = NULL;
 static bool sd_card_mounted = false;
 static sdmmc_card_t *sd_card_handle = NULL;
+static int sd_mount_freq_khz = 0;
 #define MAX_SSID_PRESETS 64
 #define MAX_SSID_NAME_LEN 32
 #define SSID_PRESET_PATH "/sdcard/lab/ssid.txt"
@@ -1990,6 +2050,7 @@ static int cmd_start_rogueap(int argc, char **argv);
 static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
 static int cmd_sd_status(int argc, char **argv);
+static int cmd_sd_benchmark(int argc, char **argv);
 static int cmd_list_dir(int argc, char **argv);
 static int cmd_list_ssid(int argc, char **argv);
 static int cmd_list_ssids(int argc, char **argv);
@@ -2168,9 +2229,18 @@ static void wardrive_make_session_base(char *out, size_t out_sz);
 static int find_next_pcap_file_number(void);
 static void pcap_radio_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
 static void pcap_enqueue_frame(const uint8_t *data, uint16_t len);
+static void pcap_enqueue_frame_at(const uint8_t *data, uint16_t len,
+                                  int64_t timestamp_us);
 static void pcap_writer_task(void *param);
+static void pcap_abort_start(void);
+static void pcap_stats_snapshot(pcap_stats_snapshot_t *snapshot);
+static bool pcap_normalize_basename(const char *requested, char *normalized,
+                                     size_t normalized_size);
 static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp);
 static err_t pcap_netif_linkoutput_hook(struct netif *netif, struct pbuf *p);
+static bool pcap_rate_limiter_start(void);
+static void pcap_rate_limiter_stop(void);
+static void pcap_rate_limiter_task(void *param);
 static void pcap_arp_spoof_task(void *param);
 
 static bool wigle_split_key_pair(const char *input,
@@ -11615,6 +11685,20 @@ static int cmd_stop(int argc, char **argv) {
 
     // Stop PCAP capture if running
     if (pcap_capture_active) {
+        if (pcap_capture_mode == PCAP_MODE_GATEWAY) {
+            // Stop admitting new packets before draining the limiter. The saved
+            // callbacks stay available to forward packets already accepted by
+            // the limiter task.
+            if (pcap_hooked_netif != NULL) {
+                if (pcap_original_input != NULL) {
+                    pcap_hooked_netif->input = pcap_original_input;
+                }
+                if (pcap_original_linkoutput != NULL) {
+                    pcap_hooked_netif->linkoutput = pcap_original_linkoutput;
+                }
+            }
+            pcap_rate_limiter_stop();
+        }
         pcap_capture_active = false;
 
         if (pcap_capture_mode == PCAP_MODE_RADIO) {
@@ -11634,6 +11718,9 @@ static int cmd_stop(int argc, char **argv) {
                 pcap_arp_host_count = 0;
             }
 
+            // Idempotent for non-gateway capture and already-drained gateway.
+            pcap_rate_limiter_stop();
+
             if (pcap_hooked_netif) {
                 if (pcap_original_input) pcap_hooked_netif->input = pcap_original_input;
                 if (pcap_original_linkoutput) pcap_hooked_netif->linkoutput = pcap_original_linkoutput;
@@ -11643,7 +11730,7 @@ static int cmd_stop(int argc, char **argv) {
             pcap_hooked_netif = NULL;
         }
 
-        for (int i = 0; i < 40 && pcap_writer_task_handle != NULL; i++) {
+        for (int i = 0; i < 200 && pcap_writer_task_handle != NULL; i++) {
             vTaskDelay(pdMS_TO_TICKS(50));
         }
         if (pcap_writer_task_handle != NULL) {
@@ -11654,7 +11741,11 @@ static int cmd_stop(int argc, char **argv) {
         if (pcap_packet_queue) {
             pcap_queued_frame_t *leftover = NULL;
             while (xQueueReceive(pcap_packet_queue, &leftover, 0) == pdTRUE) {
-                free(leftover);
+                heap_caps_free(leftover);
+                portENTER_CRITICAL(&pcap_stats_lock);
+                pcap_capture_drop_count++;
+                pcap_capture_drop_queue_count++;
+                portEXIT_CRITICAL(&pcap_stats_lock);
             }
             vQueueDelete(pcap_packet_queue);
             pcap_packet_queue = NULL;
@@ -11665,11 +11756,25 @@ static int cmd_stop(int argc, char **argv) {
             pcap_capture_file = NULL;
             sd_sync();
         }
+        if (pcap_stdio_buffer != NULL) {
+            heap_caps_free(pcap_stdio_buffer);
+            pcap_stdio_buffer = NULL;
+        }
 
         MY_LOG_INFO(TAG, "PCAP saved: %s (%lu frames, %lu drops)",
                     pcap_capture_filepath,
                     (unsigned long)pcap_capture_frame_count,
                     (unsigned long)pcap_capture_drop_count);
+        printf("[PCAP_FINAL] file=%s frames=%lu drops=%lu drop_alloc=%lu drop_queue=%lu drop_write=%lu rate_queue_drops=%lu throttle_events=%lu pause_events=%lu\n",
+               pcap_capture_filepath,
+               (unsigned long)pcap_capture_frame_count,
+               (unsigned long)pcap_capture_drop_count,
+               (unsigned long)pcap_capture_drop_alloc_count,
+               (unsigned long)pcap_capture_drop_queue_count,
+               (unsigned long)pcap_capture_drop_write_count,
+               (unsigned long)pcap_rate_queue_drop_count,
+               (unsigned long)pcap_rate_throttle_event_count,
+               (unsigned long)pcap_rate_pause_event_count);
         pcap_capture_mode = PCAP_MODE_NONE;
     }
 
@@ -12597,7 +12702,8 @@ static const cli_hint_t k_cli_hints[] = {
     { "led", " set <on|off> | level <1-100> | read" },
     { "channel_time", " set <min|max> <ms> | read <min|max>" },
     { "wifi_connect", " <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
-    { "capture_gateway", " start <capture_ssid> <capture_password> | status | stop" },
+    { "capture_gateway", " start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop" },
+    { "sd_benchmark", " [size_mb]" },
     { "start_pcap", " radio|net|gateway" },
     { "ota_channel", " [main|dev]" },
     { "ota_boot", " <ota_0|ota_1>" },
@@ -13259,8 +13365,9 @@ static void capture_gateway_print_status(void)
         return;
     }
 
-    MY_LOG_INFO(TAG, "Capture Gateway: active SSID='%s' clients=%u channel=%u upstream=%s NAPT=%s",
+    MY_LOG_INFO(TAG, "Capture Gateway: active SSID='%s' security=%s clients=%u channel=%u upstream=%s NAPT=%s",
                 status.ssid,
+                status.open_network ? "open" : "wpa2",
                 status.connected_clients,
                 status.channel,
                 status.upstream_ready ? "up" : "down",
@@ -13274,18 +13381,77 @@ static void capture_gateway_print_status(void)
            status.napt_enabled ? 1 : 0,
            status.connected_clients,
            status.channel);
-    printf("[CGW] ssid=%s upstream_ssid=%s\n", status.ssid, status.upstream_ssid);
+    printf("[CGW] ssid=%s security=%s upstream_ssid=%s\n",
+           status.ssid, status.open_network ? "open" : "wpa2",
+           status.upstream_ssid);
     printf("[CGW] ap_ip=" IPSTR " sta_ip=" IPSTR " dns=" IPSTR "\n",
            IP2STR(&status.downstream_ip.ip),
            IP2STR(&status.upstream_ip.ip),
            IP2STR(&status.upstream_dns.ip.u_addr.ip4));
+
+    bool gateway_capture_active = pcap_capture_active &&
+                                  pcap_capture_mode == PCAP_MODE_GATEWAY;
+    pcap_stats_snapshot_t capture_stats = {0};
+    pcap_stats_snapshot(&capture_stats);
+    UBaseType_t rate_queue_depth = pcap_rate_packet_queue != NULL
+                                      ? uxQueueMessagesWaiting(pcap_rate_packet_queue)
+                                      : 0;
+    MY_LOG_INFO(TAG, "Capture Gateway PCAP: packets=%lu drops=%lu size=%" PRIu64 " bytes queue=%lu/%d",
+                (unsigned long)capture_stats.packets,
+                (unsigned long)capture_stats.drops,
+                capture_stats.file_bytes,
+                (unsigned long)capture_stats.queue_depth,
+                PCAP_PACKET_QUEUE_LENGTH);
+    printf("[CGW] capture=%s file=%s packets=%lu frames=%lu drops=%lu file_bytes=%" PRIu64 "\n",
+           gateway_capture_active ? "active" : "inactive",
+           gateway_capture_active ? pcap_capture_filepath : "-",
+           (unsigned long)capture_stats.packets,
+           (unsigned long)capture_stats.packets,
+           (unsigned long)capture_stats.drops,
+           capture_stats.file_bytes);
+    printf("[CGW] recorder drop_alloc=%lu drop_queue=%lu drop_write=%lu queue_depth=%lu queue_capacity=%d queue_high_water=%lu\n",
+           (unsigned long)capture_stats.drop_alloc,
+           (unsigned long)capture_stats.drop_queue,
+           (unsigned long)capture_stats.drop_write,
+           (unsigned long)capture_stats.queue_depth,
+           PCAP_PACKET_QUEUE_LENGTH,
+           (unsigned long)capture_stats.queue_high_water);
+    printf("[CGW] rate_limit_kbps=%lu rate_effective_kbps=%lu adaptive=%s throttle_events=%lu pause_events=%lu rate_queue_depth=%lu rate_queue_capacity=%d rate_queue_drops=%lu rate_queue_high_water=%lu\n",
+           (unsigned long)PCAP_GATEWAY_RATE_LIMIT_KBPS,
+           (unsigned long)capture_stats.rate_effective_kbps,
+           "on",
+           (unsigned long)capture_stats.rate_throttle_events,
+           (unsigned long)capture_stats.rate_pause_events,
+           (unsigned long)rate_queue_depth,
+           PCAP_RATE_QUEUE_LENGTH,
+           (unsigned long)capture_stats.rate_queue_drops,
+           (unsigned long)capture_stats.rate_queue_high_water);
+    printf("[CGW] client_isolation=off\n");
+
+    wifi_sta_list_t wifi_clients = {0};
+    wifi_sta_mac_ip_list_t ip_clients = {0};
+    esp_err_t clients_err = esp_wifi_ap_get_sta_list(&wifi_clients);
+    if (clients_err == ESP_OK) {
+        clients_err = esp_wifi_ap_get_sta_list_with_ip(&wifi_clients, &ip_clients);
+    }
+    if (clients_err == ESP_OK) {
+        for (int i = 0; i < ip_clients.num; i++) {
+            printf("[CGW_CLIENT] mac=%02X:%02X:%02X:%02X:%02X:%02X ip=" IPSTR "\n",
+                   ip_clients.sta[i].mac[0], ip_clients.sta[i].mac[1],
+                   ip_clients.sta[i].mac[2], ip_clients.sta[i].mac[3],
+                   ip_clients.sta[i].mac[4], ip_clients.sta[i].mac[5],
+                   IP2STR(&ip_clients.sta[i].ip));
+        }
+    } else {
+        printf("[CGW] client_inventory_error=%s\n", esp_err_to_name(clients_err));
+    }
     printf("[CGW] END\n");
 }
 
 static int cmd_capture_gateway(int argc, char **argv)
 {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: capture_gateway start <capture_ssid> <capture_password> | status | stop");
+        MY_LOG_INFO(TAG, "Usage: capture_gateway start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop");
         return 1;
     }
 
@@ -13327,8 +13493,8 @@ static int cmd_capture_gateway(int argc, char **argv)
         return err == ESP_OK ? 0 : 1;
     }
 
-    if (strcasecmp(argv[1], "start") != 0 || argc != 4) {
-        MY_LOG_INFO(TAG, "Usage: capture_gateway start <capture_ssid> <capture_password> | status | stop");
+    if (strcasecmp(argv[1], "start") != 0 || argc < 3) {
+        MY_LOG_INFO(TAG, "Usage: capture_gateway start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop");
         return 1;
     }
     if (capture_gateway_is_active()) {
@@ -13338,11 +13504,42 @@ static int cmd_capture_gateway(int argc, char **argv)
     }
 
     size_t ssid_len = strlen(argv[2]);
-    size_t password_len = strlen(argv[3]);
+    const char *capture_password = "";
+    const char *requested_pcap_name = NULL;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--pcap-name") == 0) {
+            if (requested_pcap_name != NULL || i + 1 >= argc) {
+                MY_LOG_INFO(TAG, "--pcap-name requires exactly one filename");
+                return 1;
+            }
+            requested_pcap_name = argv[++i];
+        } else if (strncmp(argv[i], "--", 2) == 0) {
+            MY_LOG_INFO(TAG, "Unexpected option: %s", argv[i]);
+            return 1;
+        } else if (capture_password[0] == '\0') {
+            capture_password = argv[i];
+        } else {
+            MY_LOG_INFO(TAG, "Unexpected argument: %s", argv[i]);
+            return 1;
+        }
+    }
+
+    char normalized_pcap_name[PCAP_BASENAME_MAX_LEN + 1] = {0};
+    if (requested_pcap_name != NULL &&
+        !pcap_normalize_basename(requested_pcap_name, normalized_pcap_name,
+                                 sizeof(normalized_pcap_name))) {
+        MY_LOG_INFO(TAG,
+                    "PCAP name must fit in %d characters including optional .pcap and use only letters, digits, '.', '_' or '-'; paths are not allowed",
+                    PCAP_BASENAME_MAX_LEN);
+        return 1;
+    }
+
+    size_t password_len = strlen(capture_password);
     if (ssid_len == 0 || ssid_len > CAPTURE_GATEWAY_SSID_MAX_LEN ||
-        password_len < CAPTURE_GATEWAY_PASSWORD_MIN_LEN ||
-        password_len > CAPTURE_GATEWAY_PASSWORD_MAX_LEN) {
-        MY_LOG_INFO(TAG, "Capture SSID must be 1-32 bytes and password 8-63 bytes");
+        (password_len > 0 &&
+         (password_len < CAPTURE_GATEWAY_PASSWORD_MIN_LEN ||
+          password_len > CAPTURE_GATEWAY_PASSWORD_MAX_LEN))) {
+        MY_LOG_INFO(TAG, "Capture SSID must be 1-32 bytes; optional password must be 8-63 bytes");
         return 1;
     }
 
@@ -13391,7 +13588,7 @@ static int cmd_capture_gateway(int argc, char **argv)
 
     capture_gateway_config_t config = {
         .ssid = argv[2],
-        .password = argv[3],
+        .password = capture_password,
         .channel = upstream_ap.primary,
         .max_clients = CAPTURE_GATEWAY_DEFAULT_MAX_CLIENTS,
     };
@@ -13403,9 +13600,27 @@ static int cmd_capture_gateway(int argc, char **argv)
     }
 
     operation_stop_requested = false;
-    oled_display_update_full("> Capture GW", argv[2], "  APSTA + NAPT", "  > start_pcap gateway");
-    MY_LOG_INFO(TAG, "Capture Gateway ready. Connect authorized clients to '%s'.", argv[2]);
-    MY_LOG_INFO(TAG, "Start downstream capture with: start_pcap gateway");
+    strlcpy(pcap_next_basename, normalized_pcap_name, sizeof(pcap_next_basename));
+    char *pcap_argv[] = {"start_pcap", "gateway"};
+    if (cmd_start_pcap(2, pcap_argv) != 0) {
+        esp_err_t rollback_err = capture_gateway_stop();
+        esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_STA);
+        MY_LOG_INFO(TAG, "Capture Gateway: recorder failed to arm; gateway rolled back");
+        if (rollback_err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Capture Gateway rollback warning: %s",
+                        esp_err_to_name(rollback_err));
+        }
+        if (mode_err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Capture Gateway STA mode rollback warning: %s",
+                        esp_err_to_name(mode_err));
+        }
+        return 1;
+    }
+
+    oled_display_update_full("> Capture GW", argv[2], "  APSTA + NAPT", "  PCAP armed");
+    MY_LOG_INFO(TAG,
+                "Capture Gateway ready and recording. Any authorized client joining '%s' is captured.",
+                argv[2]);
     capture_gateway_print_status();
     return 0;
 }
@@ -15318,7 +15533,71 @@ static int cmd_start_sniffer(int argc, char **argv) {
     return 0;
 }
 
+static void pcap_abort_start(void)
+{
+    pcap_capture_active = false;
+    pcap_rate_limiter_stop();
+    for (int i = 0; i < 40 && pcap_writer_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (pcap_writer_task_handle != NULL) {
+        vTaskDelete(pcap_writer_task_handle);
+        pcap_writer_task_handle = NULL;
+    }
+    if (pcap_packet_queue != NULL) {
+        pcap_queued_frame_t *leftover = NULL;
+        while (xQueueReceive(pcap_packet_queue, &leftover, 0) == pdTRUE) {
+            heap_caps_free(leftover);
+        }
+        vQueueDelete(pcap_packet_queue);
+        pcap_packet_queue = NULL;
+    }
+    if (pcap_capture_file != NULL) {
+        fclose(pcap_capture_file);
+        pcap_capture_file = NULL;
+        sd_sync();
+    }
+    if (pcap_stdio_buffer != NULL) {
+        heap_caps_free(pcap_stdio_buffer);
+        pcap_stdio_buffer = NULL;
+    }
+    pcap_capture_mode = PCAP_MODE_NONE;
+}
+
+static bool pcap_normalize_basename(const char *requested, char *normalized,
+                                    size_t normalized_size)
+{
+    if (requested == NULL || normalized == NULL || normalized_size < 6) {
+        return false;
+    }
+    size_t length = strlen(requested);
+    if (length == 0 || requested[0] == '.' || length > PCAP_BASENAME_MAX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)requested[i];
+        if (!isalnum(c) && c != '.' && c != '_' && c != '-') {
+            return false;
+        }
+    }
+
+    bool has_extension = length >= 5 &&
+                         strcasecmp(requested + length - 5, ".pcap") == 0;
+    size_t final_length = length + (has_extension ? 0 : 5);
+    if (final_length > PCAP_BASENAME_MAX_LEN || final_length >= normalized_size) {
+        return false;
+    }
+    strlcpy(normalized, requested, normalized_size);
+    if (!has_extension) {
+        strlcat(normalized, ".pcap", normalized_size);
+    }
+    return true;
+}
+
 static int cmd_start_pcap(int argc, char **argv) {
+    char requested_basename[PCAP_BASENAME_MAX_LEN + 1] = {0};
+    strlcpy(requested_basename, pcap_next_basename, sizeof(requested_basename));
+    pcap_next_basename[0] = '\0';
     pcap_capture_mode_t mode = PCAP_MODE_RADIO;
 
     if (argc >= 2) {
@@ -15335,6 +15614,12 @@ static int cmd_start_pcap(int argc, char **argv) {
     }
 
     if (pcap_capture_active) {
+        if (mode == PCAP_MODE_GATEWAY && pcap_capture_mode == PCAP_MODE_GATEWAY &&
+            capture_gateway_is_active()) {
+            MY_LOG_INFO(TAG, "Gateway PCAP is already armed -> %s",
+                        pcap_capture_filepath);
+            return 0;
+        }
         MY_LOG_INFO(TAG, "PCAP capture already active. Use 'stop' first.");
         return 1;
     }
@@ -15372,21 +15657,50 @@ static int cmd_start_pcap(int argc, char **argv) {
     }
 
     struct stat st;
-    if (stat("/sdcard/lab/pcaps", &st) != 0) {
-        if (mkdir("/sdcard/lab/pcaps", 0755) != 0) {
-            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/pcaps directory");
+    if (stat(PCAP_CAPTURE_DIR, &st) != 0) {
+        if (mkdir(PCAP_CAPTURE_DIR, 0755) != 0) {
+            MY_LOG_INFO(TAG, "Failed to create %s directory", PCAP_CAPTURE_DIR);
             return 1;
         }
         sd_sync();
     }
 
-    int file_num = find_next_pcap_file_number();
-    snprintf(pcap_capture_filepath, sizeof(pcap_capture_filepath),
-             "/sdcard/lab/pcaps/sniff_%d.pcap", file_num);
+    if (requested_basename[0] != '\0') {
+        snprintf(pcap_capture_filepath, sizeof(pcap_capture_filepath),
+                 PCAP_CAPTURE_DIR "/%s", requested_basename);
+        if (stat(pcap_capture_filepath, &st) == 0) {
+            MY_LOG_INFO(TAG, "PCAP file already exists; refusing to overwrite: %s",
+                        pcap_capture_filepath);
+            return 1;
+        }
+    } else {
+        int file_num = find_next_pcap_file_number();
+        snprintf(pcap_capture_filepath, sizeof(pcap_capture_filepath),
+                 PCAP_CAPTURE_DIR "/sniff_%d.pcap", file_num);
+    }
 
     pcap_capture_file = fopen(pcap_capture_filepath, "wb");
     if (!pcap_capture_file) {
         MY_LOG_INFO(TAG, "Failed to open %s for writing", pcap_capture_filepath);
+        return 1;
+    }
+
+    pcap_stdio_buffer = heap_caps_malloc(PCAP_WRITE_BATCH_SIZE,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (pcap_stdio_buffer == NULL) {
+        pcap_stdio_buffer = heap_caps_malloc(PCAP_WRITE_BATCH_SIZE,
+                                             MALLOC_CAP_8BIT);
+    }
+    if (pcap_stdio_buffer == NULL ||
+        setvbuf(pcap_capture_file, (char *)pcap_stdio_buffer, _IOFBF,
+                PCAP_WRITE_BATCH_SIZE) != 0) {
+        MY_LOG_INFO(TAG, "Failed to allocate/configure PCAP write buffer");
+        if (pcap_stdio_buffer != NULL) {
+            heap_caps_free(pcap_stdio_buffer);
+            pcap_stdio_buffer = NULL;
+        }
+        fclose(pcap_capture_file);
+        pcap_capture_file = NULL;
         return 1;
     }
 
@@ -15400,24 +15714,54 @@ static int cmd_start_pcap(int argc, char **argv) {
         .snaplen = 65535,
         .network = linktype
     };
-    fwrite(&ghdr, 1, sizeof(ghdr), pcap_capture_file);
+    size_t header_written = fwrite(&ghdr, 1, sizeof(ghdr), pcap_capture_file);
+    if (header_written != sizeof(ghdr)) {
+        MY_LOG_INFO(TAG, "Failed to write PCAP header to %s", pcap_capture_filepath);
+        fclose(pcap_capture_file);
+        pcap_capture_file = NULL;
+        heap_caps_free(pcap_stdio_buffer);
+        pcap_stdio_buffer = NULL;
+        return 1;
+    }
     fflush(pcap_capture_file);
 
+    portENTER_CRITICAL(&pcap_stats_lock);
     pcap_capture_frame_count = 0;
     pcap_capture_drop_count = 0;
+    pcap_capture_drop_alloc_count = 0;
+    pcap_capture_drop_queue_count = 0;
+    pcap_capture_drop_write_count = 0;
+    pcap_capture_queue_high_water = 0;
+    pcap_capture_file_byte_count = header_written;
+    pcap_rate_queue_drop_count = 0;
+    pcap_rate_queue_high_water = 0;
+    pcap_rate_effective_kbps = mode == PCAP_MODE_GATEWAY
+                                   ? PCAP_GATEWAY_RATE_LIMIT_KBPS
+                                   : 0;
+    pcap_rate_throttle_event_count = 0;
+    pcap_rate_pause_event_count = 0;
+    portEXIT_CRITICAL(&pcap_stats_lock);
 
-    pcap_packet_queue = xQueueCreate(256, sizeof(pcap_queued_frame_t *));
+    pcap_packet_queue = xQueueCreate(PCAP_PACKET_QUEUE_LENGTH,
+                                     sizeof(pcap_queued_frame_t *));
     if (!pcap_packet_queue) {
         MY_LOG_INFO(TAG, "Failed to create PCAP packet queue");
         fclose(pcap_capture_file);
         pcap_capture_file = NULL;
+        heap_caps_free(pcap_stdio_buffer);
+        pcap_stdio_buffer = NULL;
         return 1;
     }
 
     pcap_capture_mode = mode;
     pcap_capture_active = true;
 
-    xTaskCreate(pcap_writer_task, "pcap_writer", 4096, NULL, 5, &pcap_writer_task_handle);
+    if (xTaskCreate(pcap_writer_task, "pcap_writer", 4096, NULL, 17,
+                    &pcap_writer_task_handle) != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create PCAP writer task");
+        pcap_abort_start();
+        return 1;
+    }
 
     if (mode == PCAP_MODE_RADIO) {
         wifi_promiscuous_filter_t filter = {
@@ -15438,22 +15782,14 @@ static int cmd_start_pcap(int argc, char **argv) {
         if (!capture_netif) {
             MY_LOG_INFO(TAG, "Failed to get %s netif",
                         mode == PCAP_MODE_GATEWAY ? "Capture Gateway AP" : "STA");
-            pcap_capture_active = false;
-            fclose(pcap_capture_file);
-            pcap_capture_file = NULL;
-            vQueueDelete(pcap_packet_queue);
-            pcap_packet_queue = NULL;
+            pcap_abort_start();
             return 1;
         }
 
         struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(capture_netif);
         if (!lwip_nif) {
             MY_LOG_INFO(TAG, "Failed to get lwIP netif");
-            pcap_capture_active = false;
-            fclose(pcap_capture_file);
-            pcap_capture_file = NULL;
-            vQueueDelete(pcap_packet_queue);
-            pcap_packet_queue = NULL;
+            pcap_abort_start();
             return 1;
         }
 
@@ -15554,11 +15890,24 @@ static int cmd_start_pcap(int argc, char **argv) {
         lwip_nif->input = pcap_netif_input_hook;
         lwip_nif->linkoutput = pcap_netif_linkoutput_hook;
 
+        if (mode == PCAP_MODE_GATEWAY && !pcap_rate_limiter_start()) {
+            lwip_nif->input = pcap_original_input;
+            lwip_nif->linkoutput = pcap_original_linkoutput;
+            pcap_original_input = NULL;
+            pcap_original_linkoutput = NULL;
+            pcap_hooked_netif = NULL;
+            MY_LOG_INFO(TAG, "Capture Gateway rate limiter failed to start");
+            pcap_abort_start();
+            return 1;
+        }
+
         if (mode == PCAP_MODE_GATEWAY) {
             oled_display_update_full("> PCAP Gateway", "  AP pre-NAT", "  Ethernet RX/TX",
                                      pcap_capture_filepath + 18);
             MY_LOG_INFO(TAG, "PCAP gateway capture started on downstream AP -> %s",
                         pcap_capture_filepath);
+            MY_LOG_INFO(TAG, "Capture Gateway adaptive traffic ceiling: %lu kbps",
+                        (unsigned long)PCAP_GATEWAY_RATE_LIMIT_KBPS);
         } else {
             char oled_l3[32];
             snprintf(oled_l3, sizeof(oled_l3), "  MITM %d hosts", pcap_arp_host_count);
@@ -17177,6 +17526,201 @@ static int cmd_sd_status(int argc, char **argv)
         MY_LOG_INFO(TAG, "SD_NONE");
     }
     return 0;
+}
+
+#define SD_BENCH_DEFAULT_MB 32U
+#define SD_BENCH_MIN_MB 1U
+#define SD_BENCH_MAX_MB 256U
+#define SD_BENCH_CHUNK_SIZE (64U * 1024U)
+#define SD_BENCH_PATH "/sdcard/lab/.janos_sd_benchmark.tmp"
+
+static int sd_benchmark_compare_u32(const void *left, const void *right)
+{
+    uint32_t a = *(const uint32_t *)left;
+    uint32_t b = *(const uint32_t *)right;
+    return (a > b) - (a < b);
+}
+
+// Sequential write benchmark shaped like the PCAP writer: 64 KiB chunks and a
+// 64 KiB stdio buffer. The temporary file is always removed after the test.
+static int cmd_sd_benchmark(int argc, char **argv)
+{
+    if (argc > 2) {
+        MY_LOG_INFO(TAG, "Usage: sd_benchmark [size_mb]");
+        return 1;
+    }
+    if (pcap_capture_active || capture_gateway_is_active() || wardrive_active) {
+        MY_LOG_INFO(TAG, "SD benchmark requires idle capture/wardrive state. Use 'stop' first.");
+        return 1;
+    }
+
+    uint32_t size_mb = SD_BENCH_DEFAULT_MB;
+    if (argc == 2) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long parsed = strtoul(argv[1], &end, 10);
+        if (errno != 0 || end == argv[1] || *end != '\0' ||
+            parsed < SD_BENCH_MIN_MB || parsed > SD_BENCH_MAX_MB) {
+            MY_LOG_INFO(TAG, "size_mb must be an integer from %u to %u",
+                        SD_BENCH_MIN_MB, SD_BENCH_MAX_MB);
+            return 1;
+        }
+        size_mb = (uint32_t)parsed;
+    }
+
+    esp_err_t mount_err = init_sd_card();
+    if (mount_err != ESP_OK) {
+        MY_LOG_INFO(TAG, "SD benchmark mount failed: %s", esp_err_to_name(mount_err));
+        printf("[SD_BENCH] result=error stage=mount error=%s\n",
+               esp_err_to_name(mount_err));
+        return 1;
+    }
+    if (!sd_mkdir_recursive("/sdcard/lab")) {
+        MY_LOG_INFO(TAG, "SD benchmark could not create /sdcard/lab");
+        printf("[SD_BENCH] result=error stage=directory\n");
+        return 1;
+    }
+
+    const uint64_t total_bytes = (uint64_t)size_mb * 1024ULL * 1024ULL;
+    const uint32_t sample_capacity = (uint32_t)(total_bytes / SD_BENCH_CHUNK_SIZE);
+    uint8_t *write_buffer = heap_caps_malloc(SD_BENCH_CHUNK_SIZE,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *stdio_buffer = heap_caps_malloc(SD_BENCH_CHUNK_SIZE,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint32_t *latency_us = heap_caps_malloc(sample_capacity * sizeof(uint32_t),
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (write_buffer == NULL) {
+        write_buffer = heap_caps_malloc(SD_BENCH_CHUNK_SIZE, MALLOC_CAP_8BIT);
+    }
+    if (stdio_buffer == NULL) {
+        stdio_buffer = heap_caps_malloc(SD_BENCH_CHUNK_SIZE, MALLOC_CAP_8BIT);
+    }
+    if (latency_us == NULL) {
+        latency_us = heap_caps_malloc(sample_capacity * sizeof(uint32_t),
+                                      MALLOC_CAP_8BIT);
+    }
+    if (write_buffer == NULL || stdio_buffer == NULL || latency_us == NULL) {
+        MY_LOG_INFO(TAG, "SD benchmark buffer allocation failed");
+        printf("[SD_BENCH] result=error stage=allocate\n");
+        heap_caps_free(write_buffer);
+        heap_caps_free(stdio_buffer);
+        heap_caps_free(latency_us);
+        return 1;
+    }
+
+    for (size_t i = 0; i < SD_BENCH_CHUNK_SIZE; i++) {
+        write_buffer[i] = (uint8_t)((i * 31U + 17U) & 0xffU);
+    }
+
+    unlink(SD_BENCH_PATH); // remove only the benchmark's own stale temp file
+    FILE *file = fopen(SD_BENCH_PATH, "wb");
+    if (file == NULL) {
+        MY_LOG_INFO(TAG, "SD benchmark open failed: %s", strerror(errno));
+        printf("[SD_BENCH] result=error stage=open errno=%d\n", errno);
+        heap_caps_free(write_buffer);
+        heap_caps_free(stdio_buffer);
+        heap_caps_free(latency_us);
+        return 1;
+    }
+    if (setvbuf(file, (char *)stdio_buffer, _IOFBF, SD_BENCH_CHUNK_SIZE) != 0) {
+        MY_LOG_INFO(TAG, "SD benchmark setvbuf failed");
+        printf("[SD_BENCH] result=error stage=setvbuf\n");
+        fclose(file);
+        unlink(SD_BENCH_PATH);
+        heap_caps_free(write_buffer);
+        heap_caps_free(stdio_buffer);
+        heap_caps_free(latency_us);
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "SD benchmark: writing %lu MiB in 64 KiB chunks...",
+                (unsigned long)size_mb);
+    printf("[SD_BENCH] start size_mb=%lu chunk_bytes=%u bus_khz=%d path=%s\n",
+           (unsigned long)size_mb, SD_BENCH_CHUNK_SIZE, sd_mount_freq_khz,
+           SD_BENCH_PATH);
+
+    uint64_t bytes_written = 0;
+    uint32_t sample_count = 0;
+    int saved_errno = 0;
+    int64_t start_us = esp_timer_get_time();
+    uint64_t next_progress = 4ULL * 1024ULL * 1024ULL;
+    while (bytes_written < total_bytes) {
+        int64_t write_start_us = esp_timer_get_time();
+        size_t written = fwrite(write_buffer, 1, SD_BENCH_CHUNK_SIZE, file);
+        int64_t write_elapsed_us = esp_timer_get_time() - write_start_us;
+        latency_us[sample_count++] = write_elapsed_us > UINT32_MAX
+                                         ? UINT32_MAX
+                                         : (uint32_t)write_elapsed_us;
+        bytes_written += written;
+        if (written != SD_BENCH_CHUNK_SIZE) {
+            saved_errno = errno;
+            break;
+        }
+        if (bytes_written >= next_progress) {
+            int64_t elapsed_us = esp_timer_get_time() - start_us;
+            uint64_t avg_kib_s = elapsed_us > 0
+                                     ? (bytes_written * 1000000ULL) /
+                                           ((uint64_t)elapsed_us * 1024ULL)
+                                     : 0;
+            printf("[SD_BENCH] progress bytes=%" PRIu64 " avg_kib_s=%" PRIu64 "\n",
+                   bytes_written, avg_kib_s);
+            next_progress += 4ULL * 1024ULL * 1024ULL;
+        }
+    }
+
+    int64_t flush_start_us = esp_timer_get_time();
+    int flush_result = fflush(file);
+    uint64_t flush_us = (uint64_t)(esp_timer_get_time() - flush_start_us);
+    int descriptor = fileno(file);
+    int64_t sync_start_us = esp_timer_get_time();
+    int sync_result = descriptor >= 0 ? fsync(descriptor) : -1;
+    uint64_t sync_us = (uint64_t)(esp_timer_get_time() - sync_start_us);
+    int64_t end_us = esp_timer_get_time();
+    int close_result = fclose(file);
+    file = NULL;
+
+    bool write_ok = bytes_written == total_bytes && flush_result == 0 &&
+                    sync_result == 0 && close_result == 0;
+    if (!write_ok && saved_errno == 0) {
+        saved_errno = errno;
+    }
+
+    qsort(latency_us, sample_count, sizeof(uint32_t), sd_benchmark_compare_u32);
+    uint32_t p50_us = sample_count > 0 ? latency_us[(sample_count - 1U) * 50U / 100U] : 0;
+    uint32_t p95_us = sample_count > 0 ? latency_us[(sample_count - 1U) * 95U / 100U] : 0;
+    uint32_t p99_us = sample_count > 0 ? latency_us[(sample_count - 1U) * 99U / 100U] : 0;
+    uint32_t max_us = sample_count > 0 ? latency_us[sample_count - 1U] : 0;
+    uint64_t elapsed_us = end_us > start_us ? (uint64_t)(end_us - start_us) : 1ULL;
+    uint64_t avg_kib_s = (bytes_written * 1000000ULL) / (elapsed_us * 1024ULL);
+    uint64_t avg_kbps = (bytes_written * 8000ULL) / elapsed_us;
+    uint64_t conservative_kbps = avg_kbps / 2ULL;
+    if (conservative_kbps > SD_BENCH_CONSERVATIVE_MAX_KBPS) {
+        conservative_kbps = SD_BENCH_CONSERVATIVE_MAX_KBPS;
+    }
+
+    printf("[SD_BENCH] result=%s bytes=%" PRIu64 " elapsed_ms=%" PRIu64
+           " avg_kib_s=%" PRIu64 " avg_kbps=%" PRIu64
+           " p50_write_us=%lu p95_write_us=%lu p99_write_us=%lu max_write_us=%lu"
+           " flush_ms=%" PRIu64 " sync_ms=%" PRIu64
+           " conservative_50pct_kbps=%" PRIu64 " bus_khz=%d errno=%d\n",
+           write_ok ? "ok" : "error", bytes_written, elapsed_us / 1000ULL,
+           avg_kib_s, avg_kbps,
+           (unsigned long)p50_us, (unsigned long)p95_us,
+           (unsigned long)p99_us, (unsigned long)max_us,
+           flush_us / 1000ULL, sync_us / 1000ULL,
+           conservative_kbps, sd_mount_freq_khz, saved_errno);
+    MY_LOG_INFO(TAG,
+                "SD benchmark %s: %" PRIu64 " KiB/s, p99=%lu us, max=%lu us, flush=%" PRIu64 " ms, sync=%" PRIu64 " ms",
+                write_ok ? "passed" : "failed", avg_kib_s,
+                (unsigned long)p99_us, (unsigned long)max_us,
+                flush_us / 1000ULL, sync_us / 1000ULL);
+
+    unlink(SD_BENCH_PATH);
+    sd_sync();
+    heap_caps_free(write_buffer);
+    heap_caps_free(stdio_buffer);
+    heap_caps_free(latency_us);
+    return write_ok ? 0 : 1;
 }
 
 // Command: list_sd - Lists HTML files on SD card
@@ -22389,8 +22933,8 @@ static void register_commands(void)
 
     const esp_console_cmd_t capture_gateway_cmd = {
         .command = "capture_gateway",
-        .help = "Authorized APSTA/NAPT capture gateway: capture_gateway start <capture_ssid> <capture_password> | status | stop",
-        .hint = "start <capture_ssid> <capture_password> | status | stop",
+        .help = "Authorized APSTA/NAPT capture gateway with fixed adaptive 4096 kbps ceiling: capture_gateway start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop",
+        .hint = "start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop",
         .func = &cmd_capture_gateway,
         .argtable = NULL
     };
@@ -22521,6 +23065,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sd_status_cmd));
+
+    const esp_console_cmd_t sd_benchmark_cmd = {
+        .command = "sd_benchmark",
+        .help = "Sequential SD write benchmark: sd_benchmark [size_mb] (1-256, default 32)",
+        .hint = NULL,
+        .func = &cmd_sd_benchmark,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&sd_benchmark_cmd));
 
     const esp_console_cmd_t show_pass_cmd = {
         .command = "show_pass",
@@ -23702,20 +24255,71 @@ static void sniffer_channel_task(void *pvParameters) {
 // PCAP capture functions
 // ============================================================================
 
-static void pcap_enqueue_frame(const uint8_t *data, uint16_t len) {
+static void pcap_stats_snapshot(pcap_stats_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
+    portENTER_CRITICAL(&pcap_stats_lock);
+    snapshot->packets = pcap_capture_frame_count;
+    snapshot->drops = pcap_capture_drop_count;
+    snapshot->drop_alloc = pcap_capture_drop_alloc_count;
+    snapshot->drop_queue = pcap_capture_drop_queue_count;
+    snapshot->drop_write = pcap_capture_drop_write_count;
+    snapshot->queue_high_water = pcap_capture_queue_high_water;
+    snapshot->rate_queue_drops = pcap_rate_queue_drop_count;
+    snapshot->rate_queue_high_water = pcap_rate_queue_high_water;
+    snapshot->rate_effective_kbps = pcap_rate_effective_kbps;
+    snapshot->rate_throttle_events = pcap_rate_throttle_event_count;
+    snapshot->rate_pause_events = pcap_rate_pause_event_count;
+    snapshot->file_bytes = pcap_capture_file_byte_count;
+    portEXIT_CRITICAL(&pcap_stats_lock);
+    snapshot->queue_depth = pcap_packet_queue != NULL
+                                ? (uint32_t)uxQueueMessagesWaiting(pcap_packet_queue)
+                                : 0;
+}
+
+static void pcap_enqueue_frame_at(const uint8_t *data, uint16_t len,
+                                  int64_t timestamp_us) {
     if (!pcap_capture_active || !pcap_packet_queue || len == 0) return;
 
-    pcap_queued_frame_t *frame = malloc(sizeof(pcap_queued_frame_t) + len);
-    if (!frame) return;
+    pcap_queued_frame_t *frame = heap_caps_malloc(sizeof(pcap_queued_frame_t) + len,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!frame) {
+        frame = heap_caps_malloc(sizeof(pcap_queued_frame_t) + len,
+                                 MALLOC_CAP_8BIT);
+    }
+    if (!frame) {
+        portENTER_CRITICAL(&pcap_stats_lock);
+        pcap_capture_drop_count++;
+        pcap_capture_drop_alloc_count++;
+        portEXIT_CRITICAL(&pcap_stats_lock);
+        return;
+    }
 
     frame->len = len;
-    frame->timestamp_us = esp_timer_get_time();
+    frame->timestamp_us = timestamp_us;
     memcpy(frame->data, data, len);
 
     if (xQueueSend(pcap_packet_queue, &frame, 0) != pdTRUE) {
-        free(frame);
+        heap_caps_free(frame);
+        portENTER_CRITICAL(&pcap_stats_lock);
         pcap_capture_drop_count++;
+        pcap_capture_drop_queue_count++;
+        portEXIT_CRITICAL(&pcap_stats_lock);
+    } else {
+        uint32_t depth = (uint32_t)uxQueueMessagesWaiting(pcap_packet_queue);
+        portENTER_CRITICAL(&pcap_stats_lock);
+        if (depth > pcap_capture_queue_high_water) {
+            pcap_capture_queue_high_water = depth;
+        }
+        portEXIT_CRITICAL(&pcap_stats_lock);
     }
+}
+
+static void pcap_enqueue_frame(const uint8_t *data, uint16_t len) {
+    pcap_enqueue_frame_at(data, len, esp_timer_get_time());
 }
 
 static void pcap_radio_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
@@ -23726,7 +24330,8 @@ static void pcap_radio_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
     pcap_enqueue_frame(pkt->payload, len);
 }
 
-static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp) {
+static void pcap_capture_pbuf(struct pbuf *p)
+{
     if (pcap_capture_active && p && p->tot_len > 0 && p->tot_len <= 1600) {
         uint8_t tmp[1600];
         uint16_t copied = pbuf_copy_partial(p, tmp, p->tot_len, 0);
@@ -23734,18 +24339,294 @@ static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp) {
             pcap_enqueue_frame(tmp, copied);
         }
     }
+}
+
+static void pcap_rate_note_queued(void)
+{
+    uint32_t depth = pcap_rate_packet_queue != NULL
+                         ? (uint32_t)uxQueueMessagesWaiting(pcap_rate_packet_queue)
+                         : 0;
+    portENTER_CRITICAL(&pcap_stats_lock);
+    if (depth > pcap_rate_queue_high_water) {
+        pcap_rate_queue_high_water = depth;
+    }
+    portEXIT_CRITICAL(&pcap_stats_lock);
+}
+
+static void pcap_rate_note_drop(void)
+{
+    portENTER_CRITICAL(&pcap_stats_lock);
+    pcap_rate_queue_drop_count++;
+    portEXIT_CRITICAL(&pcap_stats_lock);
+}
+
+static bool pcap_rate_enqueue(struct pbuf *p, struct netif *netif,
+                              pcap_rate_packet_direction_t direction)
+{
+    if (!pcap_rate_active || pcap_rate_packet_queue == NULL || p == NULL ||
+        p->tot_len == 0 || p->tot_len > 1600) {
+        return false;
+    }
+    pcap_rate_queued_packet_t *packet = heap_caps_malloc(sizeof(*packet) + p->tot_len,
+                                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (packet == NULL) {
+        packet = heap_caps_malloc(sizeof(*packet) + p->tot_len,
+                                  MALLOC_CAP_8BIT);
+    }
+    if (packet == NULL) {
+        pcap_rate_note_drop();
+        return false;
+    }
+    packet->netif = netif;
+    packet->direction = direction;
+    packet->len = p->tot_len;
+    packet->timestamp_us = esp_timer_get_time();
+    if (pbuf_copy_partial(p, packet->data, packet->len, 0) != packet->len) {
+        heap_caps_free(packet);
+        pcap_rate_note_drop();
+        return false;
+    }
+    if (xQueueSend(pcap_rate_packet_queue, &packet, 0) != pdTRUE) {
+        heap_caps_free(packet);
+        pcap_rate_note_drop();
+        return false;
+    }
+    pcap_rate_note_queued();
+    return true;
+}
+
+static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp) {
+    if (pcap_capture_mode == PCAP_MODE_GATEWAY && pcap_rate_active) {
+        // Copy out of the driver-owned RX buffer; holding that pbuf in a slow
+        // queue could exhaust the Wi-Fi driver's finite RX buffer pool.
+        pcap_rate_enqueue(p, inp, PCAP_RATE_PACKET_INPUT);
+        if (p != NULL) {
+            pbuf_free(p);
+        }
+        return ERR_OK;
+    }
+    pcap_capture_pbuf(p);
     return pcap_original_input(p, inp);
 }
 
 static err_t pcap_netif_linkoutput_hook(struct netif *netif, struct pbuf *p) {
-    if (pcap_capture_active && p && p->tot_len > 0 && p->tot_len <= 1600) {
-        uint8_t tmp[1600];
-        uint16_t copied = pbuf_copy_partial(p, tmp, p->tot_len, 0);
-        if (copied > 0) {
-            pcap_enqueue_frame(tmp, copied);
+    if (pcap_capture_mode == PCAP_MODE_GATEWAY && pcap_rate_active) {
+        if (pcap_rate_enqueue(p, netif, PCAP_RATE_PACKET_LINKOUTPUT)) {
+            return ERR_OK;
         }
+        // The caller still owns its reference. Returning ERR_MEM lets TCP/lwIP
+        // retry instead of pretending that the frame was transmitted.
+        return ERR_MEM;
     }
+    pcap_capture_pbuf(p);
     return pcap_original_linkoutput(netif, p);
+}
+
+static bool pcap_rate_limiter_start(void)
+{
+    pcap_rate_packet_queue = xQueueCreate(PCAP_RATE_QUEUE_LENGTH,
+                                          sizeof(pcap_rate_queued_packet_t *));
+    if (pcap_rate_packet_queue == NULL) {
+        return false;
+    }
+    pcap_rate_active = true;
+    if (xTaskCreate(pcap_rate_limiter_task, "pcap_rate", 4096, NULL, 16,
+                    &pcap_rate_task_handle) != pdPASS) {
+        pcap_rate_active = false;
+        vQueueDelete(pcap_rate_packet_queue);
+        pcap_rate_packet_queue = NULL;
+        return false;
+    }
+    return true;
+}
+
+static void pcap_rate_limiter_stop(void)
+{
+    pcap_rate_active = false;
+    for (int i = 0; i < 500 && pcap_rate_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (pcap_rate_task_handle != NULL) {
+        vTaskDelete(pcap_rate_task_handle);
+        pcap_rate_task_handle = NULL;
+    }
+    if (pcap_rate_packet_queue != NULL) {
+        pcap_rate_queued_packet_t *packet = NULL;
+        while (xQueueReceive(pcap_rate_packet_queue, &packet, 0) == pdTRUE) {
+            if (packet != NULL) {
+                heap_caps_free(packet);
+                pcap_rate_note_drop();
+            }
+        }
+        vQueueDelete(pcap_rate_packet_queue);
+        pcap_rate_packet_queue = NULL;
+    }
+    portENTER_CRITICAL(&pcap_stats_lock);
+    pcap_rate_effective_kbps = 0;
+    portEXIT_CRITICAL(&pcap_stats_lock);
+}
+
+static uint32_t pcap_rate_for_recorder_depth(uint32_t max_kbps,
+                                             uint32_t recorder_depth)
+{
+    uint32_t effective_kbps = max_kbps;
+    if (recorder_depth >= PCAP_ADAPTIVE_PAUSE_DEPTH) {
+        return 0;
+    }
+    if (recorder_depth >= PCAP_ADAPTIVE_THREE_QUARTER_DEPTH) {
+        effective_kbps = max_kbps / 4U;
+    } else if (recorder_depth >= PCAP_ADAPTIVE_HALF_DEPTH) {
+        effective_kbps = max_kbps / 2U;
+    }
+    if (effective_kbps > 0 && effective_kbps < PCAP_RATE_LIMIT_MIN_KBPS) {
+        effective_kbps = PCAP_RATE_LIMIT_MIN_KBPS;
+    }
+    return effective_kbps;
+}
+
+static void pcap_rate_publish_effective(uint32_t effective_kbps,
+                                        bool throttle_transition,
+                                        bool pause_transition)
+{
+    portENTER_CRITICAL(&pcap_stats_lock);
+    pcap_rate_effective_kbps = effective_kbps;
+    if (throttle_transition) {
+        pcap_rate_throttle_event_count++;
+    }
+    if (pause_transition) {
+        pcap_rate_pause_event_count++;
+    }
+    portEXIT_CRITICAL(&pcap_stats_lock);
+}
+
+static void pcap_rate_limiter_task(void *param)
+{
+    (void)param;
+    const uint32_t max_kbps = PCAP_GATEWAY_RATE_LIMIT_KBPS;
+    const uint64_t max_bytes_per_second =
+        ((uint64_t)max_kbps * 1000ULL) / 8ULL;
+    uint64_t burst_bytes = max_bytes_per_second / 4ULL;
+    if (burst_bytes < PCAP_RATE_BURST_MIN_BYTES) {
+        burst_bytes = PCAP_RATE_BURST_MIN_BYTES;
+    }
+    if (burst_bytes > PCAP_WRITE_BATCH_SIZE) {
+        burst_bytes = PCAP_WRITE_BATCH_SIZE;
+    }
+    uint64_t tokens = burst_bytes;
+    int64_t last_refill_us = esp_timer_get_time();
+    pcap_rate_queued_packet_t *packet = NULL;
+    uint32_t last_effective_kbps = max_kbps;
+    bool recorder_paused = false;
+
+    pcap_rate_publish_effective(max_kbps, false, false);
+
+    while (pcap_rate_active ||
+           (pcap_rate_packet_queue != NULL &&
+            uxQueueMessagesWaiting(pcap_rate_packet_queue) > 0)) {
+        if (xQueueReceive(pcap_rate_packet_queue, &packet,
+                          pdMS_TO_TICKS(100)) != pdTRUE) {
+            continue;
+        }
+
+        while (pcap_rate_active && max_bytes_per_second > 0) {
+            int64_t now_us = esp_timer_get_time();
+            uint32_t recorder_depth = pcap_packet_queue != NULL
+                                          ? (uint32_t)uxQueueMessagesWaiting(pcap_packet_queue)
+                                          : 0;
+            bool pause_transition = false;
+            if (recorder_paused) {
+                if (recorder_depth <= PCAP_ADAPTIVE_HALF_DEPTH) {
+                    recorder_paused = false;
+                }
+            } else if (recorder_depth >= PCAP_ADAPTIVE_PAUSE_DEPTH) {
+                recorder_paused = true;
+                pause_transition = true;
+            }
+
+            uint32_t effective_kbps = recorder_paused
+                                          ? 0
+                                          : pcap_rate_for_recorder_depth(max_kbps,
+                                                                         recorder_depth);
+            if (effective_kbps != last_effective_kbps || pause_transition) {
+                bool throttle_transition = effective_kbps > 0 &&
+                                           effective_kbps < last_effective_kbps;
+                if (effective_kbps < last_effective_kbps) {
+                    // Do not spend tokens accumulated at the faster rate after
+                    // the recorder has requested backpressure.
+                    tokens = 0;
+                }
+                last_effective_kbps = effective_kbps;
+                last_refill_us = now_us;
+                pcap_rate_publish_effective(effective_kbps,
+                                            throttle_transition,
+                                            pause_transition);
+            }
+            if (effective_kbps == 0) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+
+            uint64_t bytes_per_second =
+                ((uint64_t)effective_kbps * 1000ULL) / 8ULL;
+            int64_t elapsed_us = now_us - last_refill_us;
+            if (elapsed_us > 0) {
+                uint64_t added = ((uint64_t)elapsed_us * bytes_per_second) /
+                                 1000000ULL;
+                tokens = tokens + added > burst_bytes ? burst_bytes : tokens + added;
+                last_refill_us = now_us;
+            }
+            uint64_t packet_bytes = packet != NULL ? packet->len : 0;
+            if (tokens >= packet_bytes) {
+                tokens -= packet_bytes;
+                break;
+            }
+            uint64_t missing = packet_bytes - tokens;
+            uint64_t wait_us = (missing * 1000000ULL + bytes_per_second - 1ULL) /
+                               bytes_per_second;
+            TickType_t wait_ticks = pdMS_TO_TICKS((wait_us + 999ULL) / 1000ULL);
+            vTaskDelay(wait_ticks > 0 ? wait_ticks : 1);
+        }
+
+        if (packet == NULL) {
+            continue;
+        }
+        // During stop the hooks have already been restored, so no new packets
+        // enter the limiter. Drain accepted packets without overflowing PCAP.
+        while (!pcap_rate_active && pcap_capture_active &&
+               pcap_packet_queue != NULL &&
+               uxQueueMessagesWaiting(pcap_packet_queue) >=
+                   PCAP_ADAPTIVE_THREE_QUARTER_DEPTH) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        pcap_enqueue_frame_at(packet->data, packet->len, packet->timestamp_us);
+        struct pbuf *forward = pbuf_alloc(PBUF_RAW, packet->len, PBUF_RAM);
+        if (forward == NULL || pbuf_take(forward, packet->data, packet->len) != ERR_OK) {
+            if (forward != NULL) {
+                pbuf_free(forward);
+            }
+            heap_caps_free(packet);
+            packet = NULL;
+            pcap_rate_note_drop();
+            continue;
+        }
+        if (packet->direction == PCAP_RATE_PACKET_INPUT) {
+            if (pcap_original_input == NULL ||
+                pcap_original_input(forward, packet->netif) != ERR_OK) {
+                pbuf_free(forward);
+            }
+        } else {
+            if (pcap_original_linkoutput != NULL) {
+                pcap_original_linkoutput(packet->netif, forward);
+            }
+            pbuf_free(forward);
+        }
+        heap_caps_free(packet);
+        packet = NULL;
+    }
+
+    pcap_rate_publish_effective(0, false, false);
+    pcap_rate_task_handle = NULL;
+    vTaskDelete(NULL);
 }
 
 static void pcap_writer_task(void *param) {
@@ -23763,12 +24644,20 @@ static void pcap_writer_task(void *param) {
                 .incl_len = frame->len,
                 .orig_len = frame->len
             };
-            fwrite(&rec, 1, sizeof(rec), pcap_capture_file);
-            fwrite(frame->data, 1, frame->len, pcap_capture_file);
-            free(frame);
-            pcap_capture_frame_count++;
+            size_t record_bytes = fwrite(&rec, 1, sizeof(rec), pcap_capture_file);
+            size_t payload_bytes = fwrite(frame->data, 1, frame->len, pcap_capture_file);
+            heap_caps_free(frame);
+            portENTER_CRITICAL(&pcap_stats_lock);
+            pcap_capture_file_byte_count += record_bytes + payload_bytes;
+            if (record_bytes == sizeof(rec) && payload_bytes == rec.incl_len) {
+                pcap_capture_frame_count++;
+            } else {
+                pcap_capture_drop_count++;
+                pcap_capture_drop_write_count++;
+            }
+            portEXIT_CRITICAL(&pcap_stats_lock);
             flush_counter++;
-            if (flush_counter >= 50) {
+            if (flush_counter >= 512) {
                 fflush(pcap_capture_file);
                 flush_counter = 0;
             }
@@ -23782,15 +24671,27 @@ static void pcap_writer_task(void *param) {
             .incl_len = frame->len,
             .orig_len = frame->len
         };
-        fwrite(&rec, 1, sizeof(rec), pcap_capture_file);
-        fwrite(frame->data, 1, frame->len, pcap_capture_file);
-        free(frame);
-        pcap_capture_frame_count++;
+        size_t record_bytes = fwrite(&rec, 1, sizeof(rec), pcap_capture_file);
+        size_t payload_bytes = fwrite(frame->data, 1, frame->len, pcap_capture_file);
+        heap_caps_free(frame);
+        portENTER_CRITICAL(&pcap_stats_lock);
+        pcap_capture_file_byte_count += record_bytes + payload_bytes;
+        if (record_bytes == sizeof(rec) && payload_bytes == rec.incl_len) {
+            pcap_capture_frame_count++;
+        } else {
+            pcap_capture_drop_count++;
+            pcap_capture_drop_write_count++;
+        }
+        portEXIT_CRITICAL(&pcap_stats_lock);
     }
 
     fflush(pcap_capture_file);
     fclose(pcap_capture_file);
     pcap_capture_file = NULL;
+    if (pcap_stdio_buffer != NULL) {
+        heap_caps_free(pcap_stdio_buffer);
+        pcap_stdio_buffer = NULL;
+    }
     sd_sync();
 
     MY_LOG_INFO(TAG, "PCAP writer done: %s (%lu frames, %lu drops)",
@@ -24782,6 +25683,7 @@ static void safe_restart(void) {
         esp_vfs_fat_sdcard_unmount("/sdcard", sd_card_handle);
         sd_card_mounted = false;
         sd_card_handle = NULL;
+        sd_mount_freq_khz = 0;
     }
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
@@ -24841,12 +25743,14 @@ static esp_err_t init_sd_card(void) {
         attempted_freqs[i] = host.max_freq_khz;
         ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &sd_card_handle);
         if (ret == ESP_OK) {
+            sd_mount_freq_khz = host.max_freq_khz;
             break;
         }
         vTaskDelay(pdMS_TO_TICKS(60));
     }
     
     if (ret != ESP_OK) {
+        sd_mount_freq_khz = 0;
         sd_last_init_error = ret;
         if (ret == ESP_FAIL) {
             MY_LOG_INFO(TAG, "SD: not mounted (filesystem unsupported/corrupted). File-backed features disabled.");
