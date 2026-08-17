@@ -71,6 +71,35 @@ capture_gateway status
 stop
 ```
 
+### 3.0. Rogue lure + GITM (`start_rogue_gitm`)
+
+When the SoftAP should mirror a known WPA2 SSID/password and optionally deauth
+selected APs onto that mirror (instead of a captive portal), use:
+
+```text
+wifi_connect <upstream_ssid> <password|--saved>   # Internet uplink — NOT the deauth victim BSSID
+scan_networks
+select_networks <indices...>   # victim AP(s); same channel as STA; must not be the STA uplink BSSID
+start_rogue_gitm <mirror_ssid> <mirror_password> [--pcap-name <name>]
+capture_gateway status
+stop
+```
+
+Happy path example: STA on `MYUPSTREAMWIFI`, deauth/select `TARGETWIFI` on the
+same channel, SoftAP mirror named `TARGETWIFI`. Clients on the SoftAP get NAPT
+Internet from the upstream STA. PCAP hooks only the SoftAP (`10.42.0.1` pre-NAT);
+there is no ARP-spoof on the upstream LAN, so other `MYUPSTREAMWIFI` clients are
+not recorded. Expect SoftAP client addresses in `10.42.0.0/24` in the PCAP.
+
+This command requires the same upstream STA IPv4 prerequisite as
+`capture_gateway start`. It does **not** use `select_html` or a captive portal:
+it starts the Capture Gateway session (SoftAP + NAPT + adaptive PCAP) and, when
+networks are selected, runs same-channel deauth beside it without channel
+hopping (STA+SoftAP stay parked). Cross-channel targets and selecting the
+current STA uplink BSSID are refused before any SoftAP is created. Status and
+stop remain the standard GITM contract (`[CGW]` / universal `stop`). Classic
+`start_rogueap` (portal) is unchanged.
+
 Omit `capture_password` to create an open capture SSID:
 
 ```text

