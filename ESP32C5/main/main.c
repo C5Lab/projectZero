@@ -432,6 +432,7 @@ typedef struct {
     uint32_t rate_effective_kbps;
     uint32_t rate_throttle_events;
     uint32_t rate_pause_events;
+    uint32_t gateway_filtered;
     uint64_t file_bytes;
 } pcap_stats_snapshot_t;
 
@@ -474,6 +475,7 @@ static uint32_t pcap_rate_queue_high_water = 0;
 static uint32_t pcap_rate_effective_kbps = 0;
 static uint32_t pcap_rate_throttle_event_count = 0;
 static uint32_t pcap_rate_pause_event_count = 0;
+static uint32_t pcap_gateway_filtered_frame_count = 0;
 
 // PCAP ARP spoofing state (net mode MITM)
 #define PCAP_ARP_MAX_HOSTS 64
@@ -11781,7 +11783,7 @@ static int cmd_stop(int argc, char **argv) {
                     pcap_capture_filepath,
                     (unsigned long)pcap_capture_frame_count,
                     (unsigned long)pcap_capture_drop_count);
-        printf("[PCAP_FINAL] file=%s frames=%lu drops=%lu drop_alloc=%lu drop_queue=%lu drop_write=%lu rate_queue_drops=%lu throttle_events=%lu pause_events=%lu\n",
+        printf("[PCAP_FINAL] file=%s frames=%lu drops=%lu drop_alloc=%lu drop_queue=%lu drop_write=%lu rate_queue_drops=%lu throttle_events=%lu pause_events=%lu filter_drops=%lu\n",
                pcap_capture_filepath,
                (unsigned long)pcap_capture_frame_count,
                (unsigned long)pcap_capture_drop_count,
@@ -11790,7 +11792,8 @@ static int cmd_stop(int argc, char **argv) {
                (unsigned long)pcap_capture_drop_write_count,
                (unsigned long)pcap_rate_queue_drop_count,
                (unsigned long)pcap_rate_throttle_event_count,
-               (unsigned long)pcap_rate_pause_event_count);
+               (unsigned long)pcap_rate_pause_event_count,
+               (unsigned long)pcap_gateway_filtered_frame_count);
         pcap_capture_mode = PCAP_MODE_NONE;
     }
 
@@ -13394,9 +13397,12 @@ static void capture_gateway_print_status(void)
                 status.channel,
                 status.upstream_ready ? "up" : "down",
                 status.napt_enabled ? "on" : "off");
-    MY_LOG_INFO(TAG, "Capture Gateway: AP=" IPSTR " STA=" IPSTR " DNS=" IPSTR,
+    MY_LOG_INFO(TAG, "Capture Gateway: AP=" IPSTR " STA=" IPSTR " DNS=" IPSTR
+                " (proxy=%s upstream_dns=" IPSTR ")",
                 IP2STR(&status.downstream_ip.ip),
                 IP2STR(&status.upstream_ip.ip),
+                IP2STR(&status.advertised_dns.ip.u_addr.ip4),
+                status.dns_proxy ? "on" : "off",
                 IP2STR(&status.upstream_dns.ip.u_addr.ip4));
     printf("[CGW] status active=1 upstream=%d napt=%d clients=%u channel=%u\n",
            status.upstream_ready ? 1 : 0,
@@ -13406,9 +13412,12 @@ static void capture_gateway_print_status(void)
     printf("[CGW] ssid=%s security=%s upstream_ssid=%s\n",
            status.ssid, status.open_network ? "open" : "wpa2",
            status.upstream_ssid);
-    printf("[CGW] ap_ip=" IPSTR " sta_ip=" IPSTR " dns=" IPSTR "\n",
+    printf("[CGW] ap_ip=" IPSTR " sta_ip=" IPSTR " dns=" IPSTR
+           " dns_proxy=%s upstream_dns=" IPSTR "\n",
            IP2STR(&status.downstream_ip.ip),
            IP2STR(&status.upstream_ip.ip),
+           IP2STR(&status.advertised_dns.ip.u_addr.ip4),
+           status.dns_proxy ? "on" : "off",
            IP2STR(&status.upstream_dns.ip.u_addr.ip4));
 
     bool gateway_capture_active = pcap_capture_active &&
@@ -13448,6 +13457,8 @@ static void capture_gateway_print_status(void)
            PCAP_RATE_QUEUE_LENGTH,
            (unsigned long)capture_stats.rate_queue_drops,
            (unsigned long)capture_stats.rate_queue_high_water);
+    printf("[CGW] pcap_scope=softap_10_42 filter_drops=%lu\n",
+           (unsigned long)capture_stats.gateway_filtered);
     printf("[CGW] client_isolation=off\n");
 
     wifi_sta_list_t wifi_clients = {0};
@@ -15964,6 +15975,7 @@ static int cmd_start_pcap(int argc, char **argv) {
                                    : 0;
     pcap_rate_throttle_event_count = 0;
     pcap_rate_pause_event_count = 0;
+    pcap_gateway_filtered_frame_count = 0;
     portEXIT_CRITICAL(&pcap_stats_lock);
 
     pcap_packet_queue = xQueueCreate(PCAP_PACKET_QUEUE_LENGTH,
@@ -16128,6 +16140,8 @@ static int cmd_start_pcap(int argc, char **argv) {
         if (mode == PCAP_MODE_GATEWAY) {
             esp_netif_ip_info_t ap_ip = {0};
             esp_netif_get_ip_info(capture_netif, &ap_ip);
+            capture_gateway_status_t cgw = {0};
+            capture_gateway_get_status(&cgw);
             oled_display_update_full("> PCAP Gateway", "  AP pre-NAT", "  Ethernet RX/TX",
                                      pcap_capture_filepath + 18);
             MY_LOG_INFO(TAG, "PCAP gateway capture started on downstream AP -> %s",
@@ -16135,6 +16149,11 @@ static int cmd_start_pcap(int argc, char **argv) {
             MY_LOG_INFO(TAG,
                         "PCAP gateway hooked netif AP IP=" IPSTR " (pre-NAT SoftAP only; no STA ARP-spoof)",
                         IP2STR(&ap_ip.ip));
+            MY_LOG_INFO(TAG,
+                        "PCAP gateway DNS: downstream_dns=" IPSTR " upstream_dns=" IPSTR " dns_proxy=%s",
+                        IP2STR(&cgw.advertised_dns.ip.u_addr.ip4),
+                        IP2STR(&cgw.upstream_dns.ip.u_addr.ip4),
+                        cgw.dns_proxy ? "on" : "off");
             MY_LOG_INFO(TAG, "Capture Gateway adaptive traffic ceiling: %lu kbps",
                         (unsigned long)PCAP_GATEWAY_RATE_LIMIT_KBPS);
         } else {
@@ -25184,6 +25203,7 @@ static void pcap_stats_snapshot(pcap_stats_snapshot_t *snapshot)
     snapshot->rate_effective_kbps = pcap_rate_effective_kbps;
     snapshot->rate_throttle_events = pcap_rate_throttle_event_count;
     snapshot->rate_pause_events = pcap_rate_pause_event_count;
+    snapshot->gateway_filtered = pcap_gateway_filtered_frame_count;
     snapshot->file_bytes = pcap_capture_file_byte_count;
     portEXIT_CRITICAL(&pcap_stats_lock);
     snapshot->queue_depth = pcap_packet_queue != NULL
@@ -25191,9 +25211,57 @@ static void pcap_stats_snapshot(pcap_stats_snapshot_t *snapshot)
                                 : 0;
 }
 
+/** Gateway PCAP: keep only IPv4 frames that involve SoftAP subnet 10.42.0.0/24. */
+static bool pcap_gateway_should_record(const uint8_t *data, uint16_t len)
+{
+    if (pcap_capture_mode != PCAP_MODE_GATEWAY) {
+        return true;
+    }
+    if (data == NULL || len < 14) {
+        return false;
+    }
+
+    size_t ip_off = 14;
+    uint16_t ethertype = ((uint16_t)data[12] << 8) | data[13];
+    if (ethertype == 0x8100) {
+        if (len < 18) {
+            return false;
+        }
+        ethertype = ((uint16_t)data[16] << 8) | data[17];
+        ip_off = 18;
+    }
+    if (ethertype != 0x0800) {
+        return false;
+    }
+    if (len < ip_off + 20) {
+        return false;
+    }
+
+    uint32_t src_n;
+    uint32_t dst_n;
+    memcpy(&src_n, data + ip_off + 12, 4);
+    memcpy(&dst_n, data + ip_off + 16, 4);
+    uint32_t src_h = ntohl(src_n);
+    uint32_t dst_h = ntohl(dst_n);
+    const uint32_t softap_net = 0x0A2A0000U; /* 10.42.0.0 */
+    const uint32_t softap_mask = 0xFFFFFF00U;
+    bool src_softap = (src_h & softap_mask) == softap_net;
+    bool dst_softap = (dst_h & softap_mask) == softap_net;
+    return src_softap || dst_softap;
+}
+
 static void pcap_enqueue_frame_at(const uint8_t *data, uint16_t len,
                                   int64_t timestamp_us) {
-    if (!pcap_capture_active || !pcap_packet_queue || len == 0) return;
+    if (!pcap_capture_active || !pcap_packet_queue || len == 0 || data == NULL) {
+        return;
+    }
+
+    if (!pcap_gateway_should_record(data, len)) {
+        portENTER_CRITICAL(&pcap_stats_lock);
+        pcap_gateway_filtered_frame_count++;
+        portEXIT_CRITICAL(&pcap_stats_lock);
+        return;
+    }
 
     pcap_queued_frame_t *frame = heap_caps_malloc(sizeof(pcap_queued_frame_t) + len,
                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);

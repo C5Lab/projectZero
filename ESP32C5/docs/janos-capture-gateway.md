@@ -52,9 +52,10 @@ JanOS STA -> upstream AP/router -> Internet
 The feature is a routed **capture gateway**, not an HTTP/SOCKS proxy and not a
 transparent TLS proxy. The realistic guarantee is:
 
-> Capture all routed IPv4 packets observed by the JanOS downstream netif for
-> clients connected to the dedicated capture SSID, while reporting every known
-> recorder drop.
+> Capture all routed IPv4 packets observed by the JanOS downstream SoftAP netif
+> for clients in `10.42.0.0/24` (src or dst in that subnet), while reporting
+> every known recorder drop. DNS for SoftAP clients is proxied through
+> `10.42.0.1` so upstream LAN resolvers are not SoftAP peers.
 
 It does not promise every RF frame, traffic from clients attached to another
 AP, decrypted HTTPS/QUIC/VPN content, or mathematically zero packet loss. A
@@ -89,7 +90,19 @@ Happy path example: STA on `MYUPSTREAMWIFI`, deauth/select `TARGETWIFI` on the
 same channel, SoftAP mirror named `TARGETWIFI`. Clients on the SoftAP get NAPT
 Internet from the upstream STA. PCAP hooks only the SoftAP (`10.42.0.1` pre-NAT);
 there is no ARP-spoof on the upstream LAN, so other `MYUPSTREAMWIFI` clients are
-not recorded. Expect SoftAP client addresses in `10.42.0.0/24` in the PCAP.
+not recorded.
+
+DHCP advertises DNS as `10.42.0.1`. JanOS runs a SoftAP DNS proxy that forwards
+queries to the real upstream resolver over the STA path (outside the SoftAP PCAP
+hook). Clients therefore talk DNS to `10.42.0.1`, not to `192.168.x.1` on the
+upstream LAN. Gateway PCAP additionally filters to IPv4 frames where src or dst
+is in `10.42.0.0/24`. Analyzer rows for upstream routers as DNS peers, or for
+IPs that appear only inside DNS/mDNS payloads (e.g. `192.168.0.x` from a phone's
+previous network), are expected noise from content decoding — not evidence of
+upstream ARP MITM.
+
+Status reports `dns=10.42.0.1`, `dns_proxy=on`, `upstream_dns=<resolver>`, and
+`pcap_scope=softap_10_42` with `filter_drops`.
 
 This command requires the same upstream STA IPv4 prerequisite as
 `capture_gateway start`. It does **not** use `select_html` or a captive portal:
@@ -192,7 +205,7 @@ started recorder is active so the AP cannot disappear underneath a live hook.
 
 - validation and configuration of the dedicated open or WPA2 SoftAP;
 - downstream address `10.42.0.1/24` and DHCP server lifecycle;
-- propagation of the upstream DNS server through DHCP;
+- propagation of upstream DNS via a SoftAP DNS proxy (DHCP advertises `10.42.0.1`);
 - default-route selection on the STA netif;
 - `esp_netif_napt_enable()` / `esp_netif_napt_disable()` lifecycle;
 - active/upstream/client status without storing either Wi-Fi password;
@@ -401,7 +414,7 @@ An active example is:
 ```text
 [CGW] status active=1 upstream=1 napt=1 clients=2 channel=6
 [CGW] ssid=JanOS Lab security=open upstream_ssid=Office WiFi
-[CGW] ap_ip=10.42.0.1 sta_ip=192.168.1.27 dns=192.168.1.1
+[CGW] ap_ip=10.42.0.1 sta_ip=192.168.1.27 dns=10.42.0.1 dns_proxy=on upstream_dns=192.168.1.1
 [CGW] capture=active file=/sdcard/lab/pcaps/iot-lab_20260812_143000.pcap packets=18742 frames=18742 drops=0 file_bytes=9238164
 [CGW] recorder drop_alloc=0 drop_queue=0 drop_write=0 queue_depth=3 queue_capacity=1024 queue_high_water=41
 [CGW] rate_limit_kbps=4096 rate_effective_kbps=2048 adaptive=on throttle_events=3 pause_events=0 rate_queue_depth=27 rate_queue_capacity=1024 rate_queue_drops=0 rate_queue_high_water=545
@@ -435,7 +448,9 @@ zero. Clear the active session model when the complete idle block is received.
 | `upstream_ssid` | current upstream SSID; may contain spaces |
 | `ap_ip` | downstream gateway address, currently `10.42.0.1` |
 | `sta_ip` | JanOS address on the upstream network |
-| `dns` | DNS address advertised to downstream clients |
+| `dns` | DNS address advertised to SoftAP clients; normally `10.42.0.1` |
+| `dns_proxy` | `on` when the SoftAP DNS forwarder is running |
+| `upstream_dns` | real upstream resolver used by the DNS proxy |
 | `capture` | `active` or `inactive` recorder state |
 | `file` | full remote path on the JanOS SD card |
 | `packets` | successfully serialized PCAP packet records (`uint32_t`) |
@@ -853,7 +868,8 @@ ESPShark under the controller-generated name.
   threshold, `throttle_events` increases, the limiter queue remains bounded and
   final `[PCAP_FINAL]` reports zero recorder drops. Any `rate_queue_drops` means
   the network shaper still overloaded and the run is degraded.
-- [ ] Confirm DHCP address in `10.42.0.0/24`, gateway `10.42.0.1`, and working DNS.
+- [ ] Confirm DHCP address in `10.42.0.0/24`, gateway `10.42.0.1`, DNS `10.42.0.1`
+  with `dns_proxy=on`, and working name resolution through the SoftAP proxy.
 - [ ] Confirm ping, HTTP, HTTPS and a sustained TCP transfer reach the Internet.
 - [ ] Verify both directions and original client IP in Wireshark without
   ARP-spoof traffic.

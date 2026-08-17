@@ -28,12 +28,17 @@ typedef struct {
     bool upstream_ready;
     bool napt_enabled;
     bool open_network;
+    /** DHCP advertises SoftAP DNS (10.42.0.1); JanOS forwards to upstream_dns. */
+    bool dns_proxy;
     uint8_t connected_clients;
     uint8_t channel;
     char ssid[CAPTURE_GATEWAY_SSID_MAX_LEN + 1];
     char upstream_ssid[CAPTURE_GATEWAY_SSID_MAX_LEN + 1];
     esp_netif_ip_info_t downstream_ip;
     esp_netif_ip_info_t upstream_ip;
+    /** DNS advertised to SoftAP clients (normally 10.42.0.1). */
+    esp_netif_dns_info_t advertised_dns;
+    /** Real upstream resolver used by the SoftAP DNS proxy. */
     esp_netif_dns_info_t upstream_dns;
 } capture_gateway_status_t;
 

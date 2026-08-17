@@ -1,12 +1,18 @@
 #include "capture_gateway.h"
 
+#include <errno.h>
 #include <string.h>
 
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/sockets.h"
 
 #define CAPTURE_GATEWAY_DHCPS_OFFER_DNS 0x02
+#define CAPTURE_GATEWAY_DNS_PORT 53
+#define CAPTURE_GATEWAY_DNS_MAX_PACKET 512
 
 static const char *TAG = "capture_gateway";
 
@@ -16,6 +22,7 @@ static bool s_active;
 static bool s_upstream_ready;
 static bool s_napt_enabled;
 static bool s_open_network;
+static bool s_dns_proxy;
 static uint8_t s_connected_clients;
 static uint8_t s_channel;
 static char s_ssid[CAPTURE_GATEWAY_SSID_MAX_LEN + 1];
@@ -23,6 +30,11 @@ static char s_upstream_ssid[CAPTURE_GATEWAY_SSID_MAX_LEN + 1];
 static esp_netif_ip_info_t s_downstream_ip;
 static esp_netif_ip_info_t s_upstream_ip;
 static esp_netif_dns_info_t s_upstream_dns;
+static esp_netif_dns_info_t s_advertised_dns;
+
+static TaskHandle_t s_dns_task;
+static volatile bool s_dns_task_running;
+static int s_dns_listen_sock = -1;
 
 static bool capture_gateway_valid_config(const capture_gateway_config_t *config)
 {
@@ -56,6 +68,181 @@ static esp_err_t capture_gateway_start_dhcp(esp_netif_t *ap_netif)
     return err;
 }
 
+static void capture_gateway_dns_forward_task(void *arg)
+{
+    (void)arg;
+    uint8_t query[CAPTURE_GATEWAY_DNS_MAX_PACKET];
+    uint8_t reply[CAPTURE_GATEWAY_DNS_MAX_PACKET];
+
+    int listen_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (listen_fd < 0) {
+        ESP_LOGE(TAG, "DNS proxy: listen socket failed errno=%d", errno);
+        s_dns_task = NULL;
+        s_dns_task_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int reuse = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    struct sockaddr_in listen_addr = {0};
+    listen_addr.sin_family = AF_INET;
+    listen_addr.sin_port = htons(CAPTURE_GATEWAY_DNS_PORT);
+    listen_addr.sin_addr.s_addr = s_downstream_ip.ip.addr;
+
+    if (bind(listen_fd, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) < 0) {
+        ESP_LOGE(TAG, "DNS proxy: bind " IPSTR ":53 failed errno=%d",
+                 IP2STR(&s_downstream_ip.ip), errno);
+        close(listen_fd);
+        s_dns_task = NULL;
+        s_dns_task_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct timeval listen_tv = {.tv_sec = 0, .tv_usec = 500000};
+    setsockopt(listen_fd, SOL_SOCKET, SO_RCVTIMEO, &listen_tv, sizeof(listen_tv));
+
+    int upstream_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (upstream_fd < 0) {
+        ESP_LOGE(TAG, "DNS proxy: upstream socket failed errno=%d", errno);
+        close(listen_fd);
+        s_dns_task = NULL;
+        s_dns_task_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    struct timeval ups_tv = {.tv_sec = 1, .tv_usec = 500000};
+    setsockopt(upstream_fd, SOL_SOCKET, SO_RCVTIMEO, &ups_tv, sizeof(ups_tv));
+
+    s_dns_listen_sock = listen_fd;
+    ESP_LOGI(TAG, "DNS proxy listening on " IPSTR ":53 -> upstream " IPSTR,
+             IP2STR(&s_downstream_ip.ip),
+             IP2STR(&s_upstream_dns.ip.u_addr.ip4));
+
+    while (s_dns_task_running) {
+        struct sockaddr_in client = {0};
+        socklen_t client_len = sizeof(client);
+        int n = recvfrom(listen_fd, query, sizeof(query), 0,
+                         (struct sockaddr *)&client, &client_len);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                continue;
+            }
+            if (!s_dns_task_running) {
+                break;
+            }
+            ESP_LOGW(TAG, "DNS proxy: recvfrom errno=%d", errno);
+            continue;
+        }
+        if (n < 12) {
+            continue;
+        }
+
+        uint32_t ups_ip = s_upstream_dns.ip.u_addr.ip4.addr;
+        if (s_upstream_dns.ip.type != ESP_IPADDR_TYPE_V4 || ups_ip == 0) {
+            continue;
+        }
+
+        struct sockaddr_in ups = {0};
+        ups.sin_family = AF_INET;
+        ups.sin_port = htons(CAPTURE_GATEWAY_DNS_PORT);
+        ups.sin_addr.s_addr = ups_ip;
+
+        if (sendto(upstream_fd, query, n, 0, (struct sockaddr *)&ups, sizeof(ups)) < 0) {
+            ESP_LOGW(TAG, "DNS proxy: upstream send errno=%d", errno);
+            continue;
+        }
+
+        uint16_t txid = ((uint16_t)query[0] << 8) | query[1];
+        for (int attempt = 0; attempt < 4 && s_dns_task_running; attempt++) {
+            struct sockaddr_in from = {0};
+            socklen_t from_len = sizeof(from);
+            int m = recvfrom(upstream_fd, reply, sizeof(reply), 0,
+                             (struct sockaddr *)&from, &from_len);
+            if (m < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if (m < 12) {
+                continue;
+            }
+            uint16_t rtxid = ((uint16_t)reply[0] << 8) | reply[1];
+            if (rtxid != txid) {
+                continue;
+            }
+            if (sendto(listen_fd, reply, m, 0, (struct sockaddr *)&client,
+                       client_len) < 0) {
+                ESP_LOGW(TAG, "DNS proxy: client reply errno=%d", errno);
+            }
+            break;
+        }
+    }
+
+    if (upstream_fd >= 0) {
+        close(upstream_fd);
+    }
+    if (listen_fd >= 0) {
+        close(listen_fd);
+    }
+    s_dns_listen_sock = -1;
+    s_dns_task = NULL;
+    s_dns_task_running = false;
+    vTaskDelete(NULL);
+}
+
+static void capture_gateway_dns_stop(void)
+{
+    s_dns_task_running = false;
+    if (s_dns_listen_sock >= 0) {
+        shutdown(s_dns_listen_sock, SHUT_RDWR);
+        close(s_dns_listen_sock);
+        s_dns_listen_sock = -1;
+    }
+    for (int i = 0; i < 50 && s_dns_task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (s_dns_task != NULL) {
+        vTaskDelete(s_dns_task);
+        s_dns_task = NULL;
+    }
+    s_dns_proxy = false;
+}
+
+static esp_err_t capture_gateway_dns_start(void)
+{
+    if (s_dns_task != NULL) {
+        return ESP_OK;
+    }
+    if (s_downstream_ip.ip.addr == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_upstream_dns.ip.type != ESP_IPADDR_TYPE_V4 ||
+        s_upstream_dns.ip.u_addr.ip4.addr == 0) {
+        ESP_LOGW(TAG, "DNS proxy: no upstream DNS yet; proxy not started");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_dns_task_running = true;
+    BaseType_t ok = xTaskCreate(capture_gateway_dns_forward_task,
+                                "cgw_dns",
+                                4096,
+                                NULL,
+                                5,
+                                &s_dns_task);
+    if (ok != pdPASS) {
+        s_dns_task_running = false;
+        s_dns_task = NULL;
+        ESP_LOGE(TAG, "DNS proxy: task create failed");
+        return ESP_ERR_NO_MEM;
+    }
+    s_dns_proxy = true;
+    return ESP_OK;
+}
+
 static esp_err_t capture_gateway_apply_upstream(void)
 {
     if (s_sta_netif == NULL || s_ap_netif == NULL) {
@@ -80,7 +267,7 @@ static esp_err_t capture_gateway_apply_upstream(void)
         sta_ip.gw.addr != 0) {
         dns.ip.type = ESP_IPADDR_TYPE_V4;
         dns.ip.u_addr.ip4 = sta_ip.gw;
-        ESP_LOGW(TAG, "Upstream DNS missing; advertising upstream gateway as DNS fallback");
+        ESP_LOGW(TAG, "Upstream DNS missing; using upstream gateway as DNS fallback");
     }
 
     err = esp_netif_set_default_netif(s_sta_netif);
@@ -88,14 +275,27 @@ static esp_err_t capture_gateway_apply_upstream(void)
         return err;
     }
 
-    err = esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
+    /* Advertise SoftAP gateway as DNS so clients never peer with upstream LAN. */
+    esp_netif_dns_info_t advertised = {0};
+    advertised.ip.type = ESP_IPADDR_TYPE_V4;
+    advertised.ip.u_addr.ip4 = s_downstream_ip.ip;
+    err = esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &advertised);
     if (err != ESP_OK) {
         return err;
     }
 
     s_upstream_ip = sta_ip;
     s_upstream_dns = dns;
+    s_advertised_dns = advertised;
     s_upstream_ready = true;
+
+    ESP_LOGI(TAG, "DNS: advertise " IPSTR " (proxy), upstream resolver " IPSTR,
+             IP2STR(&s_advertised_dns.ip.u_addr.ip4),
+             IP2STR(&s_upstream_dns.ip.u_addr.ip4));
+
+    if (s_active && !s_dns_proxy) {
+        (void)capture_gateway_dns_start();
+    }
     return ESP_OK;
 }
 
@@ -200,30 +400,45 @@ esp_err_t capture_gateway_start(esp_netif_t *ap_netif,
     s_open_network = password_len == 0;
     s_connected_clients = 0;
     s_active = true;
-    ESP_LOGI(TAG, "Capture gateway active: SSID='%s' security=%s channel=%u AP=" IPSTR,
+
+    err = capture_gateway_dns_start();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "DNS proxy failed to start (%s); clients may lack DNS",
+                 esp_err_to_name(err));
+        /* SoftAP/NAPT still useful; do not roll back for DNS alone. */
+    }
+
+    ESP_LOGI(TAG, "Capture gateway active: SSID='%s' security=%s channel=%u AP=" IPSTR
+             " dns_proxy=%s",
              s_ssid, s_open_network ? "open" : "wpa2", s_channel,
-             IP2STR(&s_downstream_ip.ip));
+             IP2STR(&s_downstream_ip.ip),
+             s_dns_proxy ? "on" : "off");
     return ESP_OK;
 
 fail:
+    capture_gateway_dns_stop();
     s_ap_netif = NULL;
     s_sta_netif = NULL;
     s_active = false;
     s_upstream_ready = false;
     s_napt_enabled = false;
     s_open_network = false;
+    s_dns_proxy = false;
     s_connected_clients = 0;
     memset(s_ssid, 0, sizeof(s_ssid));
     memset(s_upstream_ssid, 0, sizeof(s_upstream_ssid));
     memset(&s_downstream_ip, 0, sizeof(s_downstream_ip));
     memset(&s_upstream_ip, 0, sizeof(s_upstream_ip));
     memset(&s_upstream_dns, 0, sizeof(s_upstream_dns));
+    memset(&s_advertised_dns, 0, sizeof(s_advertised_dns));
     return err;
 }
 
 esp_err_t capture_gateway_stop(void)
 {
     esp_err_t first_error = ESP_OK;
+
+    capture_gateway_dns_stop();
 
     if (s_napt_enabled && s_ap_netif != NULL) {
         esp_err_t err = esp_netif_napt_disable(s_ap_netif);
@@ -245,6 +460,7 @@ esp_err_t capture_gateway_stop(void)
     s_upstream_ready = false;
     s_napt_enabled = false;
     s_open_network = false;
+    s_dns_proxy = false;
     s_connected_clients = 0;
     s_channel = 0;
     memset(s_ssid, 0, sizeof(s_ssid));
@@ -252,6 +468,7 @@ esp_err_t capture_gateway_stop(void)
     memset(&s_downstream_ip, 0, sizeof(s_downstream_ip));
     memset(&s_upstream_ip, 0, sizeof(s_upstream_ip));
     memset(&s_upstream_dns, 0, sizeof(s_upstream_dns));
+    memset(&s_advertised_dns, 0, sizeof(s_advertised_dns));
     return first_error;
 }
 
@@ -301,12 +518,14 @@ void capture_gateway_get_status(capture_gateway_status_t *status)
     status->upstream_ready = s_upstream_ready;
     status->napt_enabled = s_napt_enabled;
     status->open_network = s_open_network;
+    status->dns_proxy = s_dns_proxy;
     status->connected_clients = s_connected_clients;
     status->channel = s_channel;
     strlcpy(status->ssid, s_ssid, sizeof(status->ssid));
     strlcpy(status->upstream_ssid, s_upstream_ssid, sizeof(status->upstream_ssid));
     status->downstream_ip = s_downstream_ip;
     status->upstream_ip = s_upstream_ip;
+    status->advertised_dns = s_advertised_dns;
     status->upstream_dns = s_upstream_dns;
 }
 

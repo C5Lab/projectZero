@@ -296,7 +296,7 @@ Connect to 'duap' WiFi network to access the captive portal
 - **Args**: SSID (1-32 chars), password (8-63 chars WPA2), optional `--pcap-name` (same rules as `capture_gateway`).
 - **Prerequisite**: `wifi_connect` with upstream IPv4. Optional `scan_networks` + `select_networks` (every selected AP must be on the STA channel and must not be the STA uplink BSSID).
 - **Output**: Same machine-readable `[CGW]` block as a successful `capture_gateway start` (`active=1`, `capture=active`, … `[CGW] END`), plus human lines such as `Rogue GITM started successfully!`.
-- **Monitor for**: `[CGW]` / `[CGW_CLIENT]` via `capture_gateway status`; deauth runs silently when enabled. PCAP sources should be SoftAP `10.42.0.x` (no upstream ARP-spoof).
+- **Monitor for**: `[CGW]` / `[CGW_CLIENT]` via `capture_gateway status`; deauth runs silently when enabled. Expect `dns=10.42.0.1`, `dns_proxy=on`. PCAP sources should be SoftAP `10.42.0.x` peers (no upstream ARP-spoof; upstream router should not appear as the client's DNS peer).
 - **Errors**:
   - `"No upstream IPv4 connection. Use 'wifi_connect' first."`
   - `"Rogue GITM refused: all selected deauth targets must share the upstream STA channel"`
