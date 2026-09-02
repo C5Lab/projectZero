@@ -290,6 +290,21 @@ typedef enum {
 // Wardrive state
 static bool wardrive_active = false;
 static int wardrive_file_counter = 1;
+// Basename of the .log the running wardrive session currently has open, or "" when
+// idle. The scan cache must never store a row for it: FAT keeps mtime at 2 s
+// granularity and the file grows between flushes, so a cached (size, mtime) pair can
+// look settled while the session is still appending. The two wardrive tasks name
+// their files differently ("YYYYMMDD_HHMMSS.log" for promisc, "wN.log" for the
+// classic scan), so this is the only shared point of truth about which file is live.
+static char wardrive_active_log_name[64] = "";
+
+static void wardrive_set_active_log(const char *name) {
+    if (name && name[0] != '\0') {
+        snprintf(wardrive_active_log_name, sizeof(wardrive_active_log_name), "%s", name);
+    } else {
+        wardrive_active_log_name[0] = '\0';
+    }
+}
 static gps_data_t current_gps = {0};
 // Set true once a valid $GxRMC seeded the system clock (settimeofday) with real UTC.
 // Until then, observation timestamps fall back to time(NULL) at flush.
@@ -6351,6 +6366,11 @@ static void wardrive_promisc_task(void *pvParameters) {
     wardrive_make_session_base(wardrive_base, sizeof(wardrive_base));
     snprintf(wardrive_csv_path, sizeof(wardrive_csv_path),
              "/sdcard/lab/wardrives/%s.log", wardrive_base);
+    {
+        char active_name[64];
+        snprintf(active_name, sizeof(active_name), "%s.log", wardrive_base);
+        wardrive_set_active_log(active_name);
+    }
     if (wardrive_promisc_trace_enabled) {
         snprintf(wardrive_promisc_trace_path, sizeof(wardrive_promisc_trace_path),
                  "/sdcard/lab/wardrives/%s_track.inprogress.kml", wardrive_base);
@@ -6795,6 +6815,9 @@ static void wardrive_promisc_task(void *pvParameters) {
     }
 
 cleanup:
+    // Released before the trace is finalized: from here on nothing appends to the
+    // session log, so the scan cache may treat it like any other file again.
+    wardrive_set_active_log(NULL);
     if (wdp_trace.active) {
         // Stop the RX callback from enqueuing more POIs, then drain what's left.
         esp_wifi_set_promiscuous(false);
@@ -8247,6 +8270,27 @@ static bool wigle_split_key_pair(const char *input,
     return true;
 }
 
+// True for the output of wardrive_fix. That file used to land straight in the working
+// directory as "<base>.fixed.log", where the directory scans picked it up as a second
+// upload candidate sitting next to its own original — which is how
+// 20260826_102219.fixed.log came to be uploaded alongside the file it was repaired
+// from. Repaired copies now go to /sdcard/lab/wardrives/fixed/ (see
+// wardrive_build_fixed_path), and the suffix stays excluded here so any file left over
+// from the old layout is ignored too.
+//
+// Deliberately NOT folded into wigle_is_upload_candidate() /
+// wdgwars_is_upload_candidate(): those two also back wigle_resolve_upload_target() and
+// wdgwars_resolve_upload_target(), which wardrive_fix uses to resolve its own INPUT and
+// which an explicit "wigle_upload <file>" goes through. Rejecting the suffix there
+// would make a repaired file impossible to re-fix or to upload by hand.
+static bool wardrive_is_fixed_output(const char *filename) {
+    if (!filename) {
+        return false;
+    }
+    size_t len = strlen(filename);
+    return len > 10 && strcasecmp(filename + len - 10, ".fixed.log") == 0;
+}
+
 static bool wigle_is_upload_candidate(const char *filename) {
     if (!filename) {
         return false;
@@ -8418,6 +8462,80 @@ static bool csv_last_field_is_type(const char *line, const char *type) {
     return strcasecmp(last, type) == 0;
 }
 
+// The same single-pass classification wdgwars_sanitize_wigle_file() performs, minus the
+// sanitized copy. Listing and cleanup only ever wanted the counts, but the only way to
+// get them was to run the sanitizer — which read the file a second time and wrote a full
+// copy of it that was unlinked moments later. For 63 files that was 25.7 MB read and
+// 25.7 MB written per listing, on a card the host is waiting on.
+//
+// Produces a byte-identical wdgwars_wigle_stats_t (including the .gz and unreadable-file
+// cases) and stays silent: the per-file "Preflight WigleWifi-1.6: ..." lines doubled the
+// UART traffic of a listing that the host then had to skip over.
+static bool wdgwars_scan_wigle_stats(const char *filepath, wdgwars_wigle_stats_t *stats) {
+    if (!stats) {
+        return false;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+    if (!filepath) {
+        return false;
+    }
+
+    size_t path_len = strlen(filepath);
+    if (path_len > 3 && strcasecmp(filepath + path_len - 3, ".gz") == 0) {
+        // Compressed: not inspectable without inflating, reported as all-zero exactly
+        // as the sanitizer's early return does.
+        return true;
+    }
+
+    FILE *in = fopen(filepath, "r");
+    if (!in) {
+        return false;
+    }
+
+    char line[512];
+    while (fgets(line, sizeof(line), in)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') {
+            continue;
+        }
+
+        if (strncmp(line, "WigleWifi-1.6", 13) == 0) {
+            stats->has_wigle_header = true;
+            continue;
+        }
+        if (strcmp(line, WDGWARS_WIGLE_SCHEMA) == 0) {
+            stats->has_schema_header = true;
+            continue;
+        }
+        if (strncmp(line, "MAC,SSID,", 9) == 0) {
+            stats->bad_rows++;
+            continue;
+        }
+
+        if (count_csv_fields_simple(line) != 14) {
+            stats->bad_rows++;
+            continue;
+        }
+
+        if (csv_last_field_is_type(line, "WIFI")) {
+            stats->wifi_rows++;
+        } else if (csv_last_field_is_type(line, "BLE")) {
+            stats->ble_rows++;
+        } else if (csv_last_field_is_type(line, "BT")) {
+            stats->bt_rows++;
+        } else {
+            stats->bad_rows++;
+            continue;
+        }
+
+        stats->data_rows++;
+    }
+
+    fclose(in);
+    return true;
+}
+
 static bool wdgwars_sanitize_wigle_file(const char *filepath, wdgwars_wigle_stats_t *stats, bool *use_sanitized) {
     if (use_sanitized) {
         *use_sanitized = false;
@@ -8516,6 +8634,16 @@ static bool wdgwars_sanitize_wigle_file(const char *filepath, wdgwars_wigle_stat
     return true;
 }
 
+#define WARDRIVE_FIXED_DIR "/sdcard/lab/wardrives/fixed"
+
+// Repaired copies go to a sibling directory, not back into the working directory.
+// Writing "<base>.fixed.log" next to its original made it a second upload candidate
+// for the very same data, and both got uploaded.
+//
+// The alternative — replacing the original in place — was rejected: it changes the
+// file's size and hash, and upload_state.csv keys its rows on exactly that pair. Every
+// journal row for that file would stop resolving and an already-uploaded wardrive would
+// come back as "pending", which is the failure the journal exists to prevent.
 static void wardrive_build_fixed_path(const char *filename, char *out, size_t out_sz) {
     char base[128];
     snprintf(base, sizeof(base), "%s", filename ? filename : "wardrive.log");
@@ -8523,7 +8651,7 @@ static void wardrive_build_fixed_path(const char *filename, char *out, size_t ou
     if (dot && dot != base) {
         *dot = '\0';
     }
-    snprintf(out, out_sz, "/sdcard/lab/wardrives/%s.fixed.log", base);
+    snprintf(out, out_sz, WARDRIVE_FIXED_DIR "/%s.fixed.log", base);
 }
 
 static bool wardrive_fix_file_soft(const char *filepath, const char *filename,
@@ -8547,6 +8675,7 @@ static bool wardrive_fix_file_soft(const char *filepath, const char *filename,
     }
 
     wardrive_build_fixed_path(filename, out_path, out_path_sz);
+    sd_mkdir_recursive(WARDRIVE_FIXED_DIR);
     FILE *out = fopen(out_path, "w");
     if (!out) {
         fclose(in);
@@ -8781,6 +8910,255 @@ static bool wardrive_collect_file_id(const char *filepath, long *out_size, uint3
     return true;
 }
 
+/* ---------------------------------------------------------------------------
+ * Wardrive scan cache
+ *
+ * Listing and cleanup used to cost O(all bytes in /sdcard/lab/wardrives): every
+ * candidate was hashed in full and then run through the sanitizer, which read it
+ * again and wrote a complete copy that was immediately unlinked. For a real card
+ * with 63 files and 25.7 MB that is ~52 MB read and ~26 MB written per command,
+ * which is why `wardrive_files` produced 48 of 63 entries in 131 s and never
+ * reached its END marker before the host gave up at 120 s.
+ *
+ * A row here records what a full scan of one file produced, keyed on the triple
+ * (filename, size, mtime). All three must match for a hit; anything else falls
+ * through to the original full-scan path, so a missing or unparsable cache simply
+ * costs what the command cost before.
+ *
+ * This is deliberately a separate file from upload_state.csv. That one is the
+ * durable upload journal whose rows must keep resolving for files that no longer
+ * exist; this one is a disposable accelerator that may be deleted at any moment.
+ * ------------------------------------------------------------------------- */
+#define WARDRIVE_SCAN_CACHE_PATH   "/sdcard/lab/wardrives/.scan_cache.csv"
+#define WARDRIVE_SCAN_CACHE_TMP    "/sdcard/lab/wardrives/.scan_cache.tmp"
+#define WARDRIVE_SCAN_CACHE_HEADER "filename,size,mtime,hash,rows,wifi,ble,bt,bad"
+#define WARDRIVE_SCAN_CACHE_MAX_ROWS 512
+#define WARDRIVE_SCAN_CACHE_NAME_MAX 128
+/* FAT timestamps advance in 2 s steps, so a file written "now" can carry a stamp a
+ * couple of seconds stale, and a clock stepped by a GPS fix can briefly put it in the
+ * future. Anything inside this window is treated as still moving. */
+#define WARDRIVE_SCAN_CACHE_FRESH_S  5
+/* 1980-01-01, the FAT epoch. A system clock below this has not been seeded yet, so
+ * "now" carries no information and no freshness test based on it can be trusted. */
+#define WARDRIVE_CLOCK_VALID_EPOCH   315532800L
+
+typedef struct {
+    char name[WARDRIVE_SCAN_CACHE_NAME_MAX];
+    long size;
+    long mtime;
+    uint32_t hash;
+    int rows;
+    int wifi;
+    int ble;
+    int bt;
+    int bad;
+} wardrive_scan_cache_row_t;
+
+typedef struct {
+    wardrive_scan_cache_row_t *rows;
+    int count;
+    int capacity;
+    bool dirty;
+} wardrive_scan_cache_t;
+
+static bool wardrive_scan_cache_init(wardrive_scan_cache_t *cache) {
+    if (!cache) {
+        return false;
+    }
+    memset(cache, 0, sizeof(*cache));
+
+    size_t bytes = (size_t)WARDRIVE_SCAN_CACHE_MAX_ROWS * sizeof(wardrive_scan_cache_row_t);
+    cache->rows = (wardrive_scan_cache_row_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!cache->rows) {
+        cache->rows = (wardrive_scan_cache_row_t *)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+    }
+    if (!cache->rows) {
+        return false;
+    }
+    cache->capacity = WARDRIVE_SCAN_CACHE_MAX_ROWS;
+    return true;
+}
+
+static void wardrive_scan_cache_free(wardrive_scan_cache_t *cache) {
+    if (!cache) {
+        return;
+    }
+    free(cache->rows);
+    cache->rows = NULL;
+    cache->count = 0;
+    cache->capacity = 0;
+}
+
+/* Read once per command. A malformed row is skipped rather than invalidating the
+ * whole file: it simply becomes a miss and gets recomputed and rewritten. */
+static void wardrive_scan_cache_load(wardrive_scan_cache_t *cache) {
+    if (!cache || !cache->rows) {
+        return;
+    }
+
+    FILE *f = fopen(WARDRIVE_SCAN_CACHE_PATH, "r");
+    if (!f) {
+        return;
+    }
+
+    char line[320];
+    while (cache->count < cache->capacity && fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0' || strncmp(line, "filename,", 9) == 0) {
+            continue;
+        }
+
+        char *fields[9] = {0};
+        int n = 0;
+        char *save = NULL;
+        char *tok = strtok_r(line, ",", &save);
+        while (tok && n < 9) {
+            fields[n++] = tok;
+            tok = strtok_r(NULL, ",", &save);
+        }
+        if (n < 9) {
+            continue;
+        }
+
+        wardrive_scan_cache_row_t *row = &cache->rows[cache->count];
+        snprintf(row->name, sizeof(row->name), "%s", fields[0]);
+        row->size  = strtol(fields[1], NULL, 10);
+        row->mtime = strtol(fields[2], NULL, 10);
+        row->hash  = (uint32_t)strtoul(fields[3], NULL, 16);
+        row->rows  = atoi(fields[4]);
+        row->wifi  = atoi(fields[5]);
+        row->ble   = atoi(fields[6]);
+        row->bt    = atoi(fields[7]);
+        row->bad   = atoi(fields[8]);
+        cache->count++;
+    }
+    fclose(f);
+}
+
+/* One gate, consulted both before trusting a row and before storing one. Splitting
+ * the two checks would let a file that must never be cached still be served from a
+ * row written earlier under different conditions — after a GPS fix seeds the clock,
+ * for instance. */
+static bool wardrive_scan_cache_is_cacheable(const char *name, const struct stat *st, time_t now) {
+    if (!name || !st) {
+        return false;
+    }
+    if ((long)now < WARDRIVE_CLOCK_VALID_EPOCH) {
+        return false;
+    }
+    if (st->st_mtime <= 0) {
+        return false;
+    }
+    /* llabs, not (now - mtime): FatFs stamps 1980 while the clock still reads 1970,
+     * which would make a plain subtraction look comfortably old. */
+    if (llabs((long long)now - (long long)st->st_mtime) < WARDRIVE_SCAN_CACHE_FRESH_S) {
+        return false;
+    }
+    if (strchr(name, ',') != NULL) {
+        return false;
+    }
+    if (strlen(name) >= WARDRIVE_SCAN_CACHE_NAME_MAX) {
+        /* Truncating the name would let two files share a cache key. */
+        return false;
+    }
+    if (wardrive_active_log_name[0] != '\0' && strcmp(name, wardrive_active_log_name) == 0) {
+        return false;
+    }
+    return true;
+}
+
+static bool wardrive_scan_cache_lookup(const wardrive_scan_cache_t *cache, const char *name,
+                                       long size, long mtime, wardrive_scan_cache_row_t *out) {
+    if (!cache || !cache->rows || !name) {
+        return false;
+    }
+    for (int i = 0; i < cache->count; i++) {
+        const wardrive_scan_cache_row_t *row = &cache->rows[i];
+        if (row->size == size && row->mtime == mtime && strcmp(row->name, name) == 0) {
+            if (out) {
+                *out = *row;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void wardrive_scan_cache_put(wardrive_scan_cache_t *cache, const char *name, long size,
+                                    long mtime, uint32_t hash, const wdgwars_wigle_stats_t *stats) {
+    if (!cache || !cache->rows || !name || !stats) {
+        return;
+    }
+
+    wardrive_scan_cache_row_t *row = NULL;
+    for (int i = 0; i < cache->count; i++) {
+        if (strcmp(cache->rows[i].name, name) == 0) {
+            /* Same file, new size or mtime: the old row is stale by definition. */
+            row = &cache->rows[i];
+            break;
+        }
+    }
+    if (!row) {
+        if (cache->count >= cache->capacity) {
+            /* Full: this file just stays uncached and is rescanned next time. */
+            return;
+        }
+        row = &cache->rows[cache->count++];
+    }
+
+    snprintf(row->name, sizeof(row->name), "%s", name);
+    row->size  = size;
+    row->mtime = mtime;
+    row->hash  = hash;
+    row->rows  = stats->data_rows;
+    row->wifi  = stats->wifi_rows;
+    row->ble   = stats->ble_rows;
+    row->bt    = stats->bt_rows;
+    row->bad   = stats->bad_rows;
+    cache->dirty = true;
+}
+
+/* Written once, at the end of a command, and only when something changed. Rows whose
+ * file has disappeared are dropped here — that is the whole garbage collection story,
+ * and it is why wardrive_cleanup (which renames files out of the directory) has to
+ * call this too rather than leaving dozens of dead rows behind. */
+static void wardrive_scan_cache_writeback(wardrive_scan_cache_t *cache) {
+    if (!cache || !cache->rows || !cache->dirty) {
+        return;
+    }
+
+    FILE *f = fopen(WARDRIVE_SCAN_CACHE_TMP, "w");
+    if (!f) {
+        return;
+    }
+
+    fprintf(f, "%s\n", WARDRIVE_SCAN_CACHE_HEADER);
+    for (int i = 0; i < cache->count; i++) {
+        const wardrive_scan_cache_row_t *row = &cache->rows[i];
+        char path[300];
+        struct stat st;
+        snprintf(path, sizeof(path), "/sdcard/lab/wardrives/%s", row->name);
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+        fprintf(f, "%s,%ld,%ld,%08lX,%d,%d,%d,%d,%d\n",
+                row->name, row->size, row->mtime, (unsigned long)row->hash,
+                row->rows, row->wifi, row->ble, row->bt, row->bad);
+    }
+    fclose(f);
+
+    /* FatFs f_rename refuses an existing target, so the old file has to go first.
+     * That leaves a brief window with no cache at all; the worst outcome of losing
+     * the race is a cold rebuild on the next command, never a half-written cache
+     * being trusted. */
+    unlink(WARDRIVE_SCAN_CACHE_PATH);
+    if (rename(WARDRIVE_SCAN_CACHE_TMP, WARDRIVE_SCAN_CACHE_PATH) != 0) {
+        unlink(WARDRIVE_SCAN_CACHE_TMP);
+        return;
+    }
+    cache->dirty = false;
+}
+
 static bool upload_state_ensure_file(void) {
     struct stat st;
     if (stat(UPLOAD_STATE_PATH, &st) == 0) {
@@ -8921,6 +9299,219 @@ static void upload_state_get_status(const char *service, const char *filename, l
     fclose(f);
 }
 
+/* ---------------------------------------------------------------------------
+ * upload_state.csv, resolved once into RAM
+ *
+ * upload_state_get_status() reopens and rescans the whole journal for every file and
+ * every service — 126 opens and full scans for a 63-file listing. Loading it once and
+ * answering from memory removes that entirely.
+ *
+ * The two lookups below are NOT interchangeable and must stay separate. Cleanup
+ * decides what to archive with get_status, the upload loops decide what to skip with
+ * is_done; collapsing them into one rule would make the "Archive done" button move a
+ * different set of files than the listing had just shown as done.
+ * ------------------------------------------------------------------------- */
+#define UPLOAD_STATE_TBL_MAX_ROWS 1024
+
+typedef struct {
+    char service[16];
+    char filename[128];
+    long size;
+    uint32_t hash;
+    char status[16];
+} upload_state_row_t;
+
+typedef struct {
+    upload_state_row_t *rows;
+    int count;
+    /* The journal is append-only and grows with every upload attempt, so it can
+     * eventually outgrow the table. Rather than silently answering from a partial
+     * copy, an overflowed table defers to the original file-scanning functions:
+     * slow, but it cannot report a file as pending that the journal says is done. */
+    bool overflow;
+} upload_state_table_t;
+
+static bool upload_state_table_load(upload_state_table_t *tbl) {
+    if (!tbl) {
+        return false;
+    }
+    memset(tbl, 0, sizeof(*tbl));
+
+    size_t bytes = (size_t)UPLOAD_STATE_TBL_MAX_ROWS * sizeof(upload_state_row_t);
+    tbl->rows = (upload_state_row_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!tbl->rows) {
+        tbl->rows = (upload_state_row_t *)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+    }
+    if (!tbl->rows) {
+        return false;
+    }
+
+    FILE *f = fopen(UPLOAD_STATE_PATH, "r");
+    if (!f) {
+        /* No journal yet: every lookup resolves to "pending", as before. */
+        return true;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (tbl->count >= UPLOAD_STATE_TBL_MAX_ROWS) {
+            tbl->overflow = true;
+            break;
+        }
+        line[strcspn(line, "\r\n")] = '\0';
+        upload_state_row_t *row = &tbl->rows[tbl->count];
+        if (!upload_state_parse_line(line, row->service, sizeof(row->service),
+                                     row->filename, sizeof(row->filename),
+                                     &row->size, &row->hash,
+                                     row->status, sizeof(row->status),
+                                     NULL, NULL, NULL, NULL)) {
+            continue;
+        }
+        tbl->count++;
+    }
+    fclose(f);
+    return true;
+}
+
+static void upload_state_table_free(upload_state_table_t *tbl) {
+    if (!tbl) {
+        return;
+    }
+    free(tbl->rows);
+    tbl->rows = NULL;
+    tbl->count = 0;
+}
+
+/* Mirrors upload_state_get_status(): the last matching row wins, except that "done"
+ * latches — once seen it cannot be downgraded by a later row. */
+static void upload_tbl_get_status(const upload_state_table_t *tbl, const char *service,
+                                  const char *filename, long size, uint32_t hash,
+                                  char *out, size_t out_sz) {
+    if (!tbl || !tbl->rows || tbl->overflow) {
+        upload_state_get_status(service, filename, size, hash, out, out_sz);
+        return;
+    }
+
+    snprintf(out, out_sz, "pending");
+    for (int i = 0; i < tbl->count; i++) {
+        const upload_state_row_t *row = &tbl->rows[i];
+        if (row->size != size || row->hash != hash) {
+            continue;
+        }
+        if (strcmp(row->service, service) != 0 || strcmp(row->filename, filename) != 0) {
+            continue;
+        }
+        if (strcmp(out, "done") == 0) {
+            continue;
+        }
+        snprintf(out, out_sz, "%s", row->status);
+    }
+}
+
+/* Mirrors upload_state_is_done(): order-independent, any matching row marked done. */
+static bool upload_tbl_is_done(const upload_state_table_t *tbl, const char *service,
+                               const char *filename, long size, uint32_t hash) {
+    if (!tbl || !tbl->rows || tbl->overflow) {
+        return upload_state_is_done(service, filename, size, hash);
+    }
+
+    for (int i = 0; i < tbl->count; i++) {
+        const upload_state_row_t *row = &tbl->rows[i];
+        if (row->size != size || row->hash != hash) {
+            continue;
+        }
+        if (strcmp(row->service, service) != 0 || strcmp(row->filename, filename) != 0) {
+            continue;
+        }
+        if (strcmp(row->status, "done") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The single place a wardrive file's identity (size + FNV-1a hash) and its row
+ * statistics come from, cached or freshly computed. Six call sites used to derive this
+ * inline, each with its own error handling; wiring a cache into all six separately
+ * would have turned one behaviour into six subtly different ones. Callers keep their
+ * own reporting — only the work is shared.
+ *
+ * The three outcomes are distinct because the listing has to account for every file it
+ * announced. WARDRIVE_ID_ABSENT means the name is no longer a regular file and no row
+ * should exist for it at all; WARDRIVE_ID_READ_FAILED means the file is there but could
+ * not be read, and `*out_size` still carries the size stat() reported so the caller can
+ * emit an honest row instead of dropping the file silently. */
+typedef enum {
+    WARDRIVE_ID_OK = 0,       /* size, hash and stats are all real */
+    WARDRIVE_ID_READ_FAILED,  /* exists but unreadable; size from stat(), hash 0, stats zeroed */
+    WARDRIVE_ID_ABSENT,       /* not a regular file any more: emit nothing */
+} wardrive_identity_t;
+
+static wardrive_identity_t wardrive_file_identity(const char *filepath, const char *name,
+                                                  wardrive_scan_cache_t *cache,
+                                                  long *out_size, uint32_t *out_hash,
+                                                  wdgwars_wigle_stats_t *out_stats) {
+    if (out_size) *out_size = 0;
+    if (out_hash) *out_hash = 0;
+    if (out_stats) memset(out_stats, 0, sizeof(*out_stats));
+
+    if (!filepath || !name) {
+        return WARDRIVE_ID_ABSENT;
+    }
+
+    struct stat st;
+    if (stat(filepath, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return WARDRIVE_ID_ABSENT;
+    }
+    bool cacheable = cache && cache->rows &&
+                     wardrive_scan_cache_is_cacheable(name, &st, time(NULL));
+
+    if (cacheable) {
+        wardrive_scan_cache_row_t row;
+        if (wardrive_scan_cache_lookup(cache, name, (long)st.st_size, (long)st.st_mtime, &row)) {
+            if (out_size) *out_size = row.size;
+            if (out_hash) *out_hash = row.hash;
+            if (out_stats) {
+                out_stats->data_rows = row.rows;
+                out_stats->wifi_rows = row.wifi;
+                out_stats->ble_rows  = row.ble;
+                out_stats->bt_rows   = row.bt;
+                out_stats->bad_rows  = row.bad;
+            }
+            return WARDRIVE_ID_OK;
+        }
+    }
+
+    long size = 0;
+    uint32_t hash = 0;
+    if (!wardrive_collect_file_id(filepath, &size, &hash)) {
+        /* Hand back what stat() knows. The listing announced this file in its count
+         * and has to print a row for it; a silent skip is what made the host's
+         * completeness check fire on listings that were in fact complete. */
+        if (out_size) *out_size = (long)st.st_size;
+        return WARDRIVE_ID_READ_FAILED;
+    }
+
+    /* Return value deliberately ignored, matching what the listing has always done:
+     * a file that cannot be reopened for the stats pass reports zero rows rather than
+     * disappearing from the listing. The scanner zeroes the struct on entry. */
+    wdgwars_wigle_stats_t stats;
+    (void)wdgwars_scan_wigle_stats(filepath, &stats);
+
+    if (out_size) *out_size = size;
+    if (out_hash) *out_hash = hash;
+    if (out_stats) *out_stats = stats;
+
+    /* Only cache what this pass actually measured. wardrive_collect_file_id() reports
+     * the number of bytes it read, which is what every marker line prints as `size=`;
+     * storing that while keying on st_size would let a hit print a different size than
+     * the cold run did for a file that grew between the two syscalls. */
+    if (cacheable && size == (long)st.st_size) {
+        wardrive_scan_cache_put(cache, name, size, (long)st.st_mtime, hash, &stats);
+    }
+    return WARDRIVE_ID_OK;
+}
+
 static int cmd_upload_state(int argc, char **argv) {
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
@@ -8967,20 +9558,11 @@ static int cmd_wardrive_files(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
-    esp_err_t ret = init_sd_card();
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
-        return 1;
-    }
-    upload_state_ensure_file();
-
-    DIR *dir = opendir("/sdcard/lab/wardrives");
-    if (!dir) {
-        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
-        return 1;
-    }
-
-    printf("[WARD_FILE] BEGIN\n");
+    /* Every exit runs through `out:` so the host always receives BEGIN, a SUMMARY and
+     * END. This used to return early when the SD card or the directory could not be
+     * opened, leaving the Tab5 blocked until its own 120 s timeout waiting for a
+     * terminator that was never going to arrive. */
+    int rc = 0;
     int total_files = 0;
     long total_bytes = 0;
     int total_rows = 0;
@@ -8997,9 +9579,79 @@ static int cmd_wardrive_files(int argc, char **argv) {
     int wdgwars_failed = 0;
     int wdgwars_rate_limited = 0;
 
-    struct dirent *entry;
+    DIR *dir = NULL;
+    struct dirent *entry = NULL;
+    wardrive_scan_cache_t cache;
+    upload_state_table_t upload_tbl;
+    bool cache_ready = false;
+    bool tbl_ready = false;
+    int candidates = 0;
+    int scanning_idx = 0;
+    esp_err_t ret = init_sd_card();
+
+    if (ret != ESP_OK) {
+        printf("[WARD_FILE] BEGIN count=0\n");
+        printf("[WARD_FILE] ERROR reason=sd_init detail=%s\n", esp_err_to_name(ret));
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        rc = 1;
+        goto out;
+    }
+    upload_state_ensure_file();
+
+    dir = opendir("/sdcard/lab/wardrives");
+    if (!dir) {
+        printf("[WARD_FILE] BEGIN count=0\n");
+        printf("[WARD_FILE] ERROR reason=opendir path=/sdcard/lab/wardrives errno=%d\n", errno);
+        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
+        rc = 1;
+        goto out;
+    }
+
+    /* One stat() per name and nothing else. This number is the host's completeness
+     * check — it compares the filename= lines it parsed against it and shows a
+     * "listing truncated" banner when they differ — so it has to be the count *after*
+     * every filter and skip, not the raw directory enumeration. That holds only
+     * because the loop below emits a row for every file counted here, including one
+     * that turns out to be unreadable. Counting before the per-file work and then
+     * dropping a failed file would put the host in a permanent false alarm on a
+     * listing that was in fact complete.
+     *
+     * Nothing is opened here, and nothing may be slow: the host aborts the read if it
+     * sees 1.5 s of silence before BEGIN arrives. */
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
+            continue;
+        }
+        if (!wigle_is_upload_candidate(entry->d_name) && !wdgwars_is_upload_candidate(entry->d_name)) {
+            continue;
+        }
+
+        char probe_path[280];
+        struct stat probe_st;
+        snprintf(probe_path, sizeof(probe_path), "/sdcard/lab/wardrives/%s", entry->d_name);
+        if (stat(probe_path, &probe_st) != 0 || !S_ISREG(probe_st.st_mode)) {
+            continue;
+        }
+        candidates++;
+    }
+    rewinddir(dir);
+
+    printf("[WARD_FILE] BEGIN count=%d\n", candidates);
+
+    cache_ready = wardrive_scan_cache_init(&cache);
+    if (cache_ready) {
+        wardrive_scan_cache_load(&cache);
+    }
+    tbl_ready = upload_state_table_load(&upload_tbl);
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
             continue;
         }
         if (!wigle_is_upload_candidate(entry->d_name) && !wdgwars_is_upload_candidate(entry->d_name)) {
@@ -9008,22 +9660,32 @@ static int cmd_wardrive_files(int argc, char **argv) {
 
         char filepath[280];
         snprintf(filepath, sizeof(filepath), "/sdcard/lab/wardrives/%s", entry->d_name);
+
+        /* Emitted before the work, not after: on a cold cache hashing and scanning a
+         * 3 MB log takes tens of seconds, and silence is indistinguishable from a dead
+         * module. The key is `name=`, deliberately not `filename=`, because the host
+         * counts "[WARD_FILE] filename=" occurrences to drive its progress display and
+         * reusing that key would count every file twice. */
+        scanning_idx++;
+        printf("[WARD_FILE] SCANNING %d/%d name=%s\n", scanning_idx, candidates, entry->d_name);
+
         long size = 0;
         uint32_t hash = 0;
-        if (!wardrive_collect_file_id(filepath, &size, &hash)) {
+        wdgwars_wigle_stats_t stats;
+        wardrive_identity_t id = wardrive_file_identity(filepath, entry->d_name,
+                                                        cache_ready ? &cache : NULL,
+                                                        &size, &hash, &stats);
+        if (id == WARDRIVE_ID_ABSENT) {
+            /* No longer a regular file. The counting pass applied the same stat()
+             * predicate, so it was not counted either and the total stays exact. */
             continue;
         }
 
-        wdgwars_wigle_stats_t stats = {0};
-        bool use_sanitized = false;
-        wdgwars_sanitize_wigle_file(filepath, &stats, &use_sanitized);
-        if (use_sanitized) {
-            unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
-        }
-
         char wigle_status[16], wdgwars_status[16];
-        upload_state_get_status("wigle", entry->d_name, size, hash, wigle_status, sizeof(wigle_status));
-        upload_state_get_status("wdgwars", entry->d_name, size, hash, wdgwars_status, sizeof(wdgwars_status));
+        upload_tbl_get_status(tbl_ready ? &upload_tbl : NULL, "wigle", entry->d_name, size, hash,
+                              wigle_status, sizeof(wigle_status));
+        upload_tbl_get_status(tbl_ready ? &upload_tbl : NULL, "wdgwars", entry->d_name, size, hash,
+                              wdgwars_status, sizeof(wdgwars_status));
 
         total_files++;
         total_bytes += size;
@@ -9053,18 +9715,35 @@ static int cmd_wardrive_files(int argc, char **argv) {
             wdgwars_pending++;
         }
 
-        printf("[WARD_FILE] filename=%s size=%ld hash=%08lX wifi=%d ble=%d bt=%d bad=%d wigle=%s wdgwars=%s\n",
+        /* An unreadable file still gets a row, with the size stat() reported, a zero
+         * hash, zeroed counts and a trailing error=read. The field is appended, so a
+         * host that does not know it ignores it and simply shows the file with empty
+         * counts — which beats the file disappearing from a listing that announced it. */
+        printf("[WARD_FILE] filename=%s size=%ld hash=%08lX wifi=%d ble=%d bt=%d bad=%d wigle=%s wdgwars=%s%s\n",
                entry->d_name, size, (unsigned long)hash,
                stats.wifi_rows, stats.ble_rows, stats.bt_rows, stats.bad_rows,
-               wigle_status, wdgwars_status);
+               wigle_status, wdgwars_status,
+               (id == WARDRIVE_ID_READ_FAILED) ? " error=read" : "");
     }
-    closedir(dir);
+
+out:
+    if (dir) {
+        closedir(dir);
+    }
+    if (cache_ready) {
+        wardrive_scan_cache_writeback(&cache);
+        wardrive_scan_cache_free(&cache);
+    }
+    if (tbl_ready) {
+        upload_state_table_free(&upload_tbl);
+    }
+
     printf("[WARD_FILE] SUMMARY files=%d bytes=%ld rows=%d devices=%d wifi=%d ble=%d bt=%d bad=%d wigle_ok=%d wigle_pending=%d wigle_failed=%d wigle_rate_limited=%d wdgwars_ok=%d wdgwars_pending=%d wdgwars_failed=%d wdgwars_rate_limited=%d\n",
            total_files, total_bytes, total_rows, total_rows, total_wifi, total_ble, total_bt, total_bad,
            wigle_ok, wigle_pending, wigle_failed, wigle_rate_limited,
            wdgwars_ok, wdgwars_pending, wdgwars_failed, wdgwars_rate_limited);
     printf("[WARD_FILE] END\n");
-    return 0;
+    return rc;
 }
 
 static bool wardrive_cleanup_valid_service(const char *service) {
@@ -9196,42 +9875,105 @@ static int cmd_wardrive_cleanup(int argc, char **argv) {
     const char *dest_subdir = (argc >= 5) ? argv[4] : NULL;
 
     if (dest_subdir && !wardrive_cleanup_valid_subdir(dest_subdir)) {
-        printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=move target=\n", service, status);
+        printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=move target= count=0\n", service, status);
         printf("[WARD_CLEANUP] filename=destination action=failed reason=invalid_destination destination=%s\n", dest_subdir ? dest_subdir : "");
         printf("[WARD_CLEANUP] SUMMARY scanned=0 matched=0 moved=0 failed=1 dry_run=0\n");
         printf("[WARD_CLEANUP] END\n");
         return 1;
     }
 
-    esp_err_t ret = init_sd_card();
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
-        return 1;
-    }
-    upload_state_ensure_file();
-
-    char target_dir[384];
-    if (!wardrive_cleanup_ensure_dir(service, status, dest_subdir, target_dir, sizeof(target_dir))) {
-        MY_LOG_INFO(TAG, "wardrive_cleanup: failed to prepare target directory");
-        return 1;
-    }
-
-    DIR *dir = opendir("/sdcard/lab/wardrives");
-    if (!dir) {
-        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
-        return 1;
-    }
-
-    printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=%s target=%s\n",
-           service, status, do_move ? "move" : "dry-run", target_dir);
-
+    /* Like the listing, this backs a button on the host ("Archive done") and so has to
+     * terminate its own output on every path, including the failures that used to
+     * return silently. */
     int scanned = 0;
     int matched = 0;
     int moved = 0;
     int failed = 0;
-    struct dirent *entry;
+    int candidates = 0;
+    int scanning_idx = 0;
+    DIR *dir = NULL;
+    struct dirent *entry = NULL;
+    wardrive_scan_cache_t cache;
+    upload_state_table_t upload_tbl;
+    bool cache_ready = false;
+    bool tbl_ready = false;
+    char target_dir[384];
+    esp_err_t ret;
+
+    target_dir[0] = '\0';
+
+    ret = init_sd_card();
+    if (ret != ESP_OK) {
+        printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=%s target= count=0\n",
+               service, status, do_move ? "move" : "dry-run");
+        printf("[WARD_CLEANUP] ERROR reason=sd_init detail=%s\n", esp_err_to_name(ret));
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        failed++;
+        goto out;
+    }
+    upload_state_ensure_file();
+
+    if (!wardrive_cleanup_ensure_dir(service, status, dest_subdir, target_dir, sizeof(target_dir))) {
+        printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=%s target= count=0\n",
+               service, status, do_move ? "move" : "dry-run");
+        printf("[WARD_CLEANUP] ERROR reason=target_dir\n");
+        MY_LOG_INFO(TAG, "wardrive_cleanup: failed to prepare target directory");
+        failed++;
+        goto out;
+    }
+
+    dir = opendir("/sdcard/lab/wardrives");
+    if (!dir) {
+        printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=%s target=%s count=0\n",
+               service, status, do_move ? "move" : "dry-run", target_dir);
+        printf("[WARD_CLEANUP] ERROR reason=opendir path=/sdcard/lab/wardrives errno=%d\n", errno);
+        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
+        failed++;
+        goto out;
+    }
+
+    /* Must end up equal to the `scanned` the SUMMARY reports, so it applies exactly the
+     * predicate the loop below uses before it increments `scanned`: the name filters,
+     * a stat() that says regular file, and the same path-length limit. One stat() per
+     * name, nothing opened — the host aborts on 1.5 s of silence before BEGIN. */
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
+            continue;
+        }
+        if (!wigle_is_upload_candidate(entry->d_name) && !wdgwars_is_upload_candidate(entry->d_name)) {
+            continue;
+        }
+
+        char probe_path[384];
+        struct stat probe_st;
+        int probe_len = snprintf(probe_path, sizeof(probe_path), "/sdcard/lab/wardrives/%s", entry->d_name);
+        if (probe_len <= 0 || probe_len >= (int)sizeof(probe_path)) {
+            continue;
+        }
+        if (stat(probe_path, &probe_st) != 0 || !S_ISREG(probe_st.st_mode)) {
+            continue;
+        }
+        candidates++;
+    }
+    rewinddir(dir);
+
+    printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=%s target=%s count=%d\n",
+           service, status, do_move ? "move" : "dry-run", target_dir, candidates);
+
+    cache_ready = wardrive_scan_cache_init(&cache);
+    if (cache_ready) {
+        wardrive_scan_cache_load(&cache);
+    }
+    tbl_ready = upload_state_table_load(&upload_tbl);
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
             continue;
         }
         if (!wigle_is_upload_candidate(entry->d_name) && !wdgwars_is_upload_candidate(entry->d_name)) {
@@ -9245,16 +9987,39 @@ static int cmd_wardrive_cleanup(int argc, char **argv) {
             printf("[WARD_CLEANUP] filename=%s action=failed reason=path_too_long\n", entry->d_name);
             continue;
         }
+        /* Heartbeat before the work, same reason and same `name=` key as the listing:
+         * the cleanup popup on the host has a live log panel, and on a cold cache this
+         * loop is silent for tens of seconds per file. */
+        scanning_idx++;
+        printf("[WARD_CLEANUP] SCANNING %d/%d name=%s\n", scanning_idx, candidates, entry->d_name);
+
         long size = 0;
         uint32_t hash = 0;
-        if (!wardrive_collect_file_id(filepath, &size, &hash)) {
+        wardrive_identity_t id = wardrive_file_identity(filepath, entry->d_name,
+                                                        cache_ready ? &cache : NULL,
+                                                        &size, &hash, NULL);
+        if (id == WARDRIVE_ID_ABSENT) {
+            /* The counting pass applied the same stat() predicate and skipped it too,
+             * so `scanned` still matches the count announced on BEGIN. */
             continue;
         }
         scanned++;
 
+        if (id == WARDRIVE_ID_READ_FAILED) {
+            /* Counted, reported, but never matched or moved. The status lookup would
+             * be keyed on a zero hash and could match the wanted status by accident —
+             * archiving a file whose contents could not be read is not a risk worth
+             * taking to save one line of output. */
+            printf("[WARD_CLEANUP] filename=%s size=%ld action=skipped reason=read_error\n",
+                   entry->d_name, size);
+            continue;
+        }
+
         char wigle_status[16], wdgwars_status[16];
-        upload_state_get_status("wigle", entry->d_name, size, hash, wigle_status, sizeof(wigle_status));
-        upload_state_get_status("wdgwars", entry->d_name, size, hash, wdgwars_status, sizeof(wdgwars_status));
+        upload_tbl_get_status(tbl_ready ? &upload_tbl : NULL, "wigle", entry->d_name, size, hash,
+                              wigle_status, sizeof(wigle_status));
+        upload_tbl_get_status(tbl_ready ? &upload_tbl : NULL, "wdgwars", entry->d_name, size, hash,
+                              wdgwars_status, sizeof(wdgwars_status));
 
         if (!wardrive_cleanup_status_matches(service, status, wigle_status, wdgwars_status)) {
             continue;
@@ -9322,7 +10087,20 @@ static int cmd_wardrive_cleanup(int argc, char **argv) {
         }
     }
 
-    closedir(dir);
+out:
+    if (dir) {
+        closedir(dir);
+    }
+    /* Runs after the renames, so the garbage collection pass inside sees the moved
+     * files as gone and drops their rows. Without it an "Archive done" of sixty files
+     * would leave sixty dead entries behind for the next command to walk. */
+    if (cache_ready) {
+        wardrive_scan_cache_writeback(&cache);
+        wardrive_scan_cache_free(&cache);
+    }
+    if (tbl_ready) {
+        upload_state_table_free(&upload_tbl);
+    }
     if (do_move && moved > 0) {
         sd_sync();
     }
@@ -9367,11 +10145,16 @@ static int cmd_wardrive_fix(int argc, char **argv) {
     uint32_t fixed_hash = 0;
     wardrive_collect_file_id(fixed_path, &fixed_size, &fixed_hash);
 
-    printf("[WARD_FIX] filename=%s output=%s size=%ld hash=%08lX kept=%d dropped=%d wifi=%d ble=%d bt=%d bad=%d status=ok\n",
+    // The repaired copy is reported with its directory, because it no longer sits next
+    // to the original: it goes to /sdcard/lab/wardrives/fixed/ and the upload scans skip
+    // "*.fixed.log", so it cannot become a second upload candidate for the same data.
+    printf("[WARD_FIX] filename=%s output=fixed/%s size=%ld hash=%08lX kept=%d dropped=%d wifi=%d ble=%d bt=%d bad=%d status=ok\n",
            upload_name, fixed_name ? fixed_name : fixed_path,
            fixed_size, (unsigned long)fixed_hash,
            stats.data_rows, stats.bad_rows,
            stats.wifi_rows, stats.ble_rows, stats.bt_rows, stats.bad_rows);
+    printf("[WARD_FIX] note=output_dir=%s excluded_from_uploads=yes\n", WARDRIVE_FIXED_DIR);
+    MY_LOG_INFO(TAG, "wardrive_fix: repaired copy written to %s (excluded from upload scans)", fixed_path);
     printf("[WARD_FIX] END\n");
     return 0;
 }
@@ -10006,6 +10789,14 @@ static int cmd_wigle_upload(int argc, char **argv) {
         int total_files = argc - 1;
         MY_LOG_INFO(TAG, "Uploading %d selected Wardrive file(s) to api.wigle.net...", total_files);
 
+        wardrive_scan_cache_t cache;
+        upload_state_table_t upload_tbl;
+        bool cache_ready = wardrive_scan_cache_init(&cache);
+        if (cache_ready) {
+            wardrive_scan_cache_load(&cache);
+        }
+        bool tbl_ready = upload_state_table_load(&upload_tbl);
+
         for (int i = 1; i < argc; i++) {
             const char *arg = argv[i];
             char filepath[280];
@@ -10017,31 +10808,33 @@ static int cmd_wigle_upload(int argc, char **argv) {
                 continue;
             }
 
-            struct stat st;
             long fsize = 0;
-            if (stat(filepath, &st) == 0) {
-                fsize = (long)st.st_size;
-            }
-
             uint32_t hash = 0;
-            if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+            wdgwars_wigle_stats_t wigle_stats;
+            if (wardrive_file_identity(filepath, upload_name, cache_ready ? &cache : NULL,
+                                       &fsize, &hash, &wigle_stats) != WARDRIVE_ID_OK) {
                 MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", i, total_files, upload_name);
                 failed++;
                 continue;
             }
 
-            wdgwars_wigle_stats_t wigle_stats;
+            /* Settled before any sanitizing. Building the tmp copy costs a full read
+             * plus a full write of the file, and on a real card nearly every candidate
+             * turns out to be uploaded already — 62 of 63 files each paying for a
+             * sanitized copy that was unlinked seconds later without being sent. */
+            if (upload_tbl_is_done(tbl_ready ? &upload_tbl : NULL, "wigle", upload_name, fsize, hash)) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", i, total_files, upload_name, fsize);
+                skipped++;
+                continue;
+            }
+
+            /* Only files that are really going to be sent get a sanitized copy. The
+             * stats it recomputes match what the identity pass already produced; what
+             * is wanted here is the tmp file itself. */
             bool use_sanitized = false;
             if (!wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
                 MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED (preflight)", i, total_files, upload_name, fsize);
                 failed++;
-                continue;
-            }
-
-            if (upload_state_is_done("wigle", upload_name, fsize, hash)) {
-                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", i, total_files, upload_name, fsize);
-                skipped++;
-                if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
                 continue;
             }
 
@@ -10073,6 +10866,14 @@ static int cmd_wigle_upload(int argc, char **argv) {
             vTaskDelay(pdMS_TO_TICKS(250));
         }
 
+        if (cache_ready) {
+            wardrive_scan_cache_writeback(&cache);
+            wardrive_scan_cache_free(&cache);
+        }
+        if (tbl_ready) {
+            upload_state_table_free(&upload_tbl);
+        }
+
         MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
         if (auth_failed) {
             return 1;
@@ -10090,6 +10891,9 @@ static int cmd_wigle_upload(int argc, char **argv) {
     int total_files = 0;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
             continue;
         }
         if (wigle_is_upload_candidate(entry->d_name)) {
@@ -10110,8 +10914,19 @@ static int cmd_wigle_upload(int argc, char **argv) {
     rewinddir(dir);
     int current = 0;
 
+    wardrive_scan_cache_t cache;
+    upload_state_table_t upload_tbl;
+    bool cache_ready = wardrive_scan_cache_init(&cache);
+    if (cache_ready) {
+        wardrive_scan_cache_load(&cache);
+    }
+    bool tbl_ready = upload_state_table_load(&upload_tbl);
+
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
             continue;
         }
         if (!wigle_is_upload_candidate(entry->d_name)) {
@@ -10122,31 +10937,27 @@ static int cmd_wigle_upload(int argc, char **argv) {
         char filepath[280];
         snprintf(filepath, sizeof(filepath), "/sdcard/lab/wardrives/%s", entry->d_name);
 
-        struct stat st;
         long fsize = 0;
-        if (stat(filepath, &st) == 0) {
-            fsize = (long)st.st_size;
-        }
-
         uint32_t hash = 0;
-        if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+        wdgwars_wigle_stats_t wigle_stats;
+        if (wardrive_file_identity(filepath, entry->d_name, cache_ready ? &cache : NULL,
+                                   &fsize, &hash, &wigle_stats) != WARDRIVE_ID_OK) {
             MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", current, total_files, entry->d_name);
             failed++;
             continue;
         }
 
-        wdgwars_wigle_stats_t wigle_stats;
+        /* Settled before any sanitizing: see the selected-files branch above. */
+        if (!force_all && upload_tbl_is_done(tbl_ready ? &upload_tbl : NULL, "wigle", entry->d_name, fsize, hash)) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", current, total_files, entry->d_name, fsize);
+            skipped++;
+            continue;
+        }
+
         bool use_sanitized = false;
         if (!wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
             MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED (preflight)", current, total_files, entry->d_name, fsize);
             failed++;
-            continue;
-        }
-
-        if (!force_all && upload_state_is_done("wigle", entry->d_name, fsize, hash)) {
-            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", current, total_files, entry->d_name, fsize);
-            skipped++;
-            if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
             continue;
         }
 
@@ -10179,6 +10990,13 @@ static int cmd_wigle_upload(int argc, char **argv) {
     }
 
     closedir(dir);
+    if (cache_ready) {
+        wardrive_scan_cache_writeback(&cache);
+        wardrive_scan_cache_free(&cache);
+    }
+    if (tbl_ready) {
+        upload_state_table_free(&upload_tbl);
+    }
 
     MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
     if (auth_failed) {
@@ -10864,6 +11682,14 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
         int total_files = argc - 1;
         MY_LOG_INFO(TAG, "Uploading %d selected Wardrive file(s) to wdgwars.pl...", total_files);
 
+        wardrive_scan_cache_t cache;
+        upload_state_table_t upload_tbl;
+        bool cache_ready = wardrive_scan_cache_init(&cache);
+        if (cache_ready) {
+            wardrive_scan_cache_load(&cache);
+        }
+        bool tbl_ready = upload_state_table_load(&upload_tbl);
+
         for (int i = 1; i < argc; i++) {
             const char *arg = argv[i];
             char filepath[280];
@@ -10877,27 +11703,28 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
 
             struct stat st;
             long fsize = 0;
-            if (stat(filepath, &st) == 0) {
-                fsize = (long)st.st_size;
-            }
-
             wdgwars_wigle_stats_t wigle_stats;
             bool use_sanitized = false;
             uint32_t hash = 0;
-            if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+            if (wardrive_file_identity(filepath, upload_name, cache_ready ? &cache : NULL,
+                                       &fsize, &hash, &wigle_stats) != WARDRIVE_ID_OK) {
                 MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", i, total_files, upload_name);
                 failed++;
                 continue;
             }
 
-            if (wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
-                if (upload_state_is_done("wdgwars", upload_name, fsize, hash)) {
-                    MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", i, total_files, upload_name, fsize);
-                    skipped++;
-                    if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
-                    continue;
-                }
+            /* Settled before any sanitizing. Building the tmp copy reads and rewrites
+             * the whole file, and on a real card nearly every candidate turns out to be
+             * uploaded already — that is where the 200 s to send one file and skip 62
+             * was going. */
+            if (upload_tbl_is_done(tbl_ready ? &upload_tbl : NULL, "wdgwars", upload_name, fsize, hash)) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", i, total_files, upload_name, fsize);
+                skipped++;
+                continue;
+            }
 
+            /* Only files that are really going to be sent get a sanitized copy. */
+            if (wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
                 const char *upload_path = use_sanitized ? WDGWARS_SANITIZED_UPLOAD_PATH : filepath;
                 if (use_sanitized && stat(upload_path, &st) == 0) {
                     /* Keep fsize/hash from the original file for upload_state identity. */
@@ -10939,6 +11766,14 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
             vTaskDelay(pdMS_TO_TICKS(250));
         }
 
+        if (cache_ready) {
+            wardrive_scan_cache_writeback(&cache);
+            wardrive_scan_cache_free(&cache);
+        }
+        if (tbl_ready) {
+            upload_state_table_free(&upload_tbl);
+        }
+
         MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed, %d rate_limited", uploaded, skipped, failed, rate_limited);
         if (auth_failed) {
             return 1;
@@ -10956,6 +11791,9 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
     int total_files = 0;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
             continue;
         }
         if (wdgwars_is_upload_candidate(entry->d_name)) {
@@ -10976,8 +11814,19 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
     rewinddir(dir);
     int current = 0;
 
+    wardrive_scan_cache_t cache;
+    upload_state_table_t upload_tbl;
+    bool cache_ready = wardrive_scan_cache_init(&cache);
+    if (cache_ready) {
+        wardrive_scan_cache_load(&cache);
+    }
+    bool tbl_ready = upload_state_table_load(&upload_tbl);
+
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
             continue;
         }
         if (!wdgwars_is_upload_candidate(entry->d_name)) {
@@ -10990,27 +11839,25 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
 
         struct stat st;
         long fsize = 0;
-        if (stat(filepath, &st) == 0) {
-            fsize = (long)st.st_size;
-        }
-
         wdgwars_wigle_stats_t wigle_stats;
         bool use_sanitized = false;
         uint32_t hash = 0;
-        if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+        if (wardrive_file_identity(filepath, entry->d_name, cache_ready ? &cache : NULL,
+                                   &fsize, &hash, &wigle_stats) != WARDRIVE_ID_OK) {
             MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", current, total_files, entry->d_name);
             failed++;
             continue;
         }
 
-        if (wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
-            if (!force_all && upload_state_is_done("wdgwars", entry->d_name, fsize, hash)) {
-                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", current, total_files, entry->d_name, fsize);
-                skipped++;
-                if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
-                continue;
-            }
+        /* Settled before any sanitizing: see the selected-files branch above. */
+        if (!force_all && upload_tbl_is_done(tbl_ready ? &upload_tbl : NULL, "wdgwars", entry->d_name, fsize, hash)) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", current, total_files, entry->d_name, fsize);
+            skipped++;
+            continue;
+        }
 
+        /* Only files that are really going to be sent get a sanitized copy. */
+        if (wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
             const char *upload_path = use_sanitized ? WDGWARS_SANITIZED_UPLOAD_PATH : filepath;
             if (use_sanitized && stat(upload_path, &st) == 0) {
                 /* Keep fsize/hash from the original file for upload_state identity. */
@@ -11053,6 +11900,13 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
     }
 
     closedir(dir);
+    if (cache_ready) {
+        wardrive_scan_cache_writeback(&cache);
+        wardrive_scan_cache_free(&cache);
+    }
+    if (tbl_ready) {
+        upload_state_table_free(&upload_tbl);
+    }
 
     MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed, %d rate_limited", uploaded, skipped, failed, rate_limited);
     if (auth_failed) {
@@ -11680,7 +12534,15 @@ static int cmd_stop(int argc, char **argv) {
     (void)argc; (void)argv;
     oled_display_update_full("> STOPPED", "  All ops halted", "", "  > Idle");
     MY_LOG_INFO(TAG, "Stop command received - stopping all operations...");
-    
+
+    // Sampled before any flag is cleared, so the acknowledgement at the end can tell
+    // the host whether this stop actually stopped a wardrive or found nothing running.
+    // The host stops and restarts scans back to back and had no way to confirm the
+    // module went idle, so it needed a run generation counter to keep an old reader
+    // task from being revived by the next start.
+    bool wardrive_was_running = (wardrive_active || wardrive_task_handle != NULL ||
+                                 wardrive_promisc_active || wardrive_promisc_task_handle != NULL);
+
     // Set global stop flags
     operation_stop_requested = true;
     wardrive_active = false;
@@ -12091,6 +12953,11 @@ static int cmd_stop(int argc, char **argv) {
         }
     }
 
+    // Both wardrive tasks clear this on their own way out, but a vTaskDelete above skips
+    // their cleanup entirely. Left set, the name would keep the scan cache refusing to
+    // store that log for the rest of the boot, so every listing would rehash it.
+    wardrive_set_active_log(NULL);
+
     // Stop anti-surveillance task if running
     if (antisurv_active || antisurv_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Stopping anti-surveillance task...");
@@ -12259,6 +13126,11 @@ static int cmd_stop(int argc, char **argv) {
     }
     
     MY_LOG_INFO(TAG, "All operations stopped.");
+    // Deterministic and idempotent: printed on every stop, including one that found
+    // nothing running, so the host can wait for a known state instead of flushing the
+    // UART and assuming. The human-readable "Wardrive promisc stopped ..." line the
+    // monitor task greps is emitted by the task itself and is untouched.
+    printf("[WARDRIVE] STOPPED running=%d\n", wardrive_was_running ? 1 : 0);
     return 0;
 }
 
@@ -12735,7 +13607,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "uart_baud", " <115200|230400|460800|921600|2000000>" },
     { "uart_baud_confirm", "" },
     { "uart_baud_status", "" },
-    { "file_delete", " <path>" },
+    { "file_delete", " <path> [path2 ...]" },
     { "select_html", " <index>" },
     { "set_html", " <html>" },
     { "wpasec_key", " set <key> | read" },
@@ -18092,8 +18964,18 @@ static bool build_sd_path(char *dest, size_t dest_size, const char *input_path)
     }
 
     if (input_path[0] == '/') {
-        strncpy(dest, input_path, dest_size - 1);
-        dest[dest_size - 1] = '\0';
+        // An absolute path used to be taken verbatim, so "list_dir /lab/handshakes"
+        // tried to open "/lab/handshakes" and failed while "/sdcard/lab/handshakes"
+        // worked — the same directory named two ways, one of which silently did not
+        // exist. Anything not already under the mount point is rebased onto it.
+        bool already_rooted = (strncmp(input_path, "/sdcard", 7) == 0) &&
+                              (input_path[7] == '\0' || input_path[7] == '/');
+        if (already_rooted) {
+            strncpy(dest, input_path, dest_size - 1);
+            dest[dest_size - 1] = '\0';
+        } else {
+            snprintf(dest, dest_size, "/sdcard%s", input_path);
+        }
     } else {
         snprintf(dest, dest_size, "/sdcard/%s", input_path);
     }
@@ -18699,46 +19581,82 @@ static int cmd_list_dir(int argc, char **argv)
     return 0;
 }
 
-// Command: file_delete <path> - Deletes a file on SD card
+// Command: file_delete <path> [path2 ...] - Deletes one or more files on SD card
 static int cmd_file_delete(int argc, char **argv)
 {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: file_delete <path>");
+        MY_LOG_INFO(TAG, "Usage: file_delete <path> [path2 ...]");
         MY_LOG_INFO(TAG, "Example: file_delete lab/handshakes/sample.pcap");
-        return 1;
-    }
-
-    char full_path[SD_PATH_MAX];
-    if (!build_sd_path(full_path, sizeof(full_path), argv[1])) {
-        MY_LOG_INFO(TAG, "Invalid path provided.");
         return 1;
     }
 
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        // Still one line per path: returning here with no markers at all would leave the
+        // host counting a short batch and retrying paths one at a time against a card
+        // that is not mounted. Nothing was deleted, and every path says so.
+        for (int i = 1; i < argc; i++) {
+            printf("[FILE_DELETE] path=%s result=failed\n", argv[i]);
+        }
         return 1;
     }
 
-    struct stat st;
-    if (stat(full_path, &st) != 0) {
-        MY_LOG_INFO(TAG, "File not found: %s (errno: %d)", full_path, errno);
-        return 1;
+    // Exactly one [FILE_DELETE] line per path, in argv order, whatever happens to any
+    // of them: the host maps results positionally, because its marker parser cuts a
+    // value at the first whitespace and handshake filenames come from SSIDs and can
+    // contain spaces. A missing or reordered marker would mark the wrong file as
+    // deleted, and a short batch makes the host discard the whole result and retry the
+    // paths one at a time. So no early return, no skipped path, and no batch-level
+    // result code. Quoting is the host's job and esp_console_split_argv already undoes
+    // it, so a path arrives whole even with spaces in it.
+    int failed = 0;
+    bool deleted_any = false;
+
+    for (int i = 1; i < argc; i++) {
+        char full_path[SD_PATH_MAX];
+        if (!build_sd_path(full_path, sizeof(full_path), argv[i])) {
+            MY_LOG_INFO(TAG, "Invalid path provided.");
+            printf("[FILE_DELETE] path=%s result=failed\n", argv[i]);
+            failed++;
+            continue;
+        }
+
+        struct stat st;
+        if (stat(full_path, &st) != 0) {
+            MY_LOG_INFO(TAG, "File not found: %s (errno: %d)", full_path, errno);
+            printf("[FILE_DELETE] path=%s result=not_found\n", full_path);
+            failed++;
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            MY_LOG_INFO(TAG, "Refusing to delete directory: %s", full_path);
+            printf("[FILE_DELETE] path=%s result=is_dir\n", full_path);
+            failed++;
+            continue;
+        }
+
+        if (unlink(full_path) != 0) {
+            MY_LOG_INFO(TAG, "Failed to delete %s: %s", full_path, strerror(errno));
+            printf("[FILE_DELETE] path=%s result=failed\n", full_path);
+            failed++;
+            continue;
+        }
+
+        // Printed before the sync, not after. The host waits about 900 ms for
+        // "Deleted "; creating, fsyncing and unlinking /sdcard/.sync can outlast that
+        // window, so the file was gone but the UI reported a failure.
+        deleted_any = true;
+        MY_LOG_INFO(TAG, "Deleted %s", full_path);
+        printf("[FILE_DELETE] path=%s result=ok\n", full_path);
     }
 
-    if (S_ISDIR(st.st_mode)) {
-        MY_LOG_INFO(TAG, "Refusing to delete directory: %s", full_path);
-        return 1;
+    // One sync for the whole batch rather than one per file.
+    if (deleted_any) {
+        sd_sync();
     }
-
-    if (unlink(full_path) != 0) {
-        MY_LOG_INFO(TAG, "Failed to delete %s: %s", full_path, strerror(errno));
-        return 1;
-    }
-    sd_sync();
-
-    MY_LOG_INFO(TAG, "Deleted %s", full_path);
-    return 0;
+    return failed > 0 ? 1 : 0;
 }
 
 // Command: select_html [index] - Loads HTML file from SD card
@@ -19114,6 +20032,14 @@ static void wardrive_task(void *pvParameters) {
     // Find the next file number by scanning existing files
     wardrive_file_counter = find_next_wardrive_file_number();
     MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", wardrive_file_counter);
+    {
+        // Claimed up front rather than inside the scan loop: the counter is fixed for
+        // the whole session, and the file has to be off-limits to the scan cache from
+        // the moment it can first be created.
+        char active_name[64];
+        snprintf(active_name, sizeof(active_name), "w%d.log", wardrive_file_counter);
+        wardrive_set_active_log(active_name);
+    }
     
     // Wait for GPS fix before starting
     MY_LOG_INFO(TAG, "Waiting for GPS fix...");
@@ -19348,6 +20274,7 @@ static void wardrive_task(void *pvParameters) {
     
     wardrive_active = false;
     wardrive_task_handle = NULL;
+    wardrive_set_active_log(NULL);
     MY_LOG_INFO(TAG, "Wardrive stopped after %d scans. Last file: w%d.log", scan_counter, wardrive_file_counter);
     
     vTaskDelete(NULL); // Delete this task
@@ -24084,7 +25011,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t file_delete_cmd = {
         .command = "file_delete",
-        .help = "Delete a file on SD card: file_delete <path>",
+        .help = "Delete files on SD card: file_delete <path> [path2 ...]",
         .hint = NULL,
         .func = &cmd_file_delete,
         .argtable = NULL
