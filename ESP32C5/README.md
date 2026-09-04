@@ -5,6 +5,11 @@ Project Zero is an ESP32-C5 firmware that bundles Wi-Fi assessment tooling, cons
 
 The firmware boots into an `esp_console` REPL, so most capabilities are exposed as CLI commands (`start_blackout`, `start_sniffer_dog`, `start_portal`, and more). Refer to the serial console banner for the full list after flashing.
 
+Documentation:
+
+- [Command Manual](docs/command-manual.md)
+- [JanOS Capture Gateway](docs/janos-capture-gateway.md) — instrumented APSTA/NAPT gateway for authorized traffic analysis.
+
 ## Build Note: exFAT
 This repo auto-patches your local ESP-IDF `ffconf.h` during CMake configure to force:
 - `FF_FS_EXFAT = 1`

@@ -5,7 +5,7 @@ idf_component_register(SRCS "oled_display.c" "main.c" "attack_handshake.c"
                                 esp_http_client esp_https_ota app_update cjson
                                 lwip sdmmc espressif__led_strip bt
                                 frame_analyzer hccapx_serializer pcap_serializer sniffer
-                                nrf24_jammer zig_recon
+                                nrf24_jammer zig_recon capture_gateway
                                 esp_driver_uart esp_driver_gpio esp_driver_spi esp_driver_sdspi
                                 esp_lcd esp_driver_i2c)
 

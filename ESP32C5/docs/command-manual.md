@@ -8,10 +8,10 @@ Part 2 is the **full catalog** of every other command.
 
 ## How to invoke commands
 
-JanOS exposes a plain‑text CLI over **UART (115200 baud, 8N1)** and over the USB serial console.
+JanOS exposes a CLI over **UART (115200 baud after boot, 8N1)** and over the USB serial console.
 
 - Type a command and press **Enter**. Over a raw UART link, terminate each command with `\r\n`.
-- Responses are **line‑based text**. Many long‑running commands stream output until stopped.
+- Responses are normally **line‑based text**. `send_file` temporarily switches the UART0 console to a framed binary stream after its text header.
 - **`stop`** is the universal cancel — it halts every running operation (scan, attack, wardrive, anti‑surveillance, jammer…). Always send it before starting a new mode if one might be active.
 - **`help`** lists all commands; **`help <command>`** shows help for one.
 - All indices are **1‑based**.
@@ -232,7 +232,7 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 - `start_ap_locator` — lock onto one selected AP's channel and print its RSSI once per second (`[AP Locator] ...`). Needs exactly one selected network.
 - `packet_monitor <channel>` — packets‑per‑second on one channel (1‑14).
 - `channel_view` — continuous Wi‑Fi channel utilization.
-- `start_pcap [radio|net]` — capture to PCAP on SD. `radio` = promiscuous all‑frame capture; `net` = requires `wifi_connect`, captures + ARP‑spoof MITM. Stop with `stop`; saves to `/sdcard/lab/pcaps/sniff_N.pcap`.
+- `start_pcap [radio|net|gateway]` — capture to PCAP on SD. `radio` = promiscuous all-frame capture; `net` = ARP-spoof MITM after `wifi_connect`, retained for observing devices already present on an authorized LAN; `gateway` = compatibility/idempotency command because `capture_gateway start` now arms downstream capture automatically. Stop with `stop`; saves to `/sdcard/lab/pcaps/sniff_N.pcap`.
 
 ## Attacks
 
@@ -247,6 +247,7 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 - `start_portal <SSID>` — open captive portal (no password to join). Optional `select_html`.
 - `start_admin_portal <password>` — WPA2 AP `JanOS-Admin` serving a web file manager for `/sdcard/lab` (directory tree, upload/download, rename/delete, text editing). Stop with `stop`.
 - `start_rogueap <SSID> <password>` — WPA2 rogue AP with captive portal (password 8‑63 chars).
+- `start_rogue_gitm <SSID> <password> [--pcap-name <name>]` — WPA2 SoftAP mirror + Capture Gateway (GITM) instead of a captive portal. Requires prior `wifi_connect` with IPv4 (uplink BSSID must not be a deauth target). Optional `select_networks` starts same-channel deauth; other-channel targets or the STA uplink BSSID are refused. No `select_html`. DHCP DNS is `10.42.0.1` (proxied to upstream). PCAP records SoftAP IPv4 involving `10.42.0.0/24` only — not ARP-spoof on the upstream LAN. Status via `capture_gateway status`; stop with universal `stop`.
 - `start_karma <index>` — Karma attack using a probe‑list SSID (`list_probes` for indices). Needs `select_html`.
 - `start_darksword` — advanced attack/exfil module. Run `help start_darksword` for current options. Stop with `stop`.
 
@@ -256,6 +257,14 @@ All attacks stop with `stop`.
 
 - `wifi_connect <SSID> [Password|--saved] [ota] [<IP> <Mask> <GW> [DNS1] [DNS2]]` — join an AP. If password is omitted, tries open auth. Use `--saved` to explicitly load a saved password from `/sdcard/lab/eviltwin.txt` or `/sdcard/lab/portals.txt`. `ota` triggers an update check; optional static IP. Success marker `SUCCESS`, failure `FAILED`/`TIMEOUT`.
 - `wifi_disconnect` — disconnect from the current AP.
+
+## JanOS Capture Gateway
+
+- `capture_gateway start <capture_ssid> [capture_password] [--pcap-name <name>]` — after `wifi_connect`, starts a dedicated SoftAP on `10.42.0.1/24`, DHCP/DNS advertisement and IPv4 NAPT through the current STA connection, and immediately arms downstream PCAP before reporting ready. It does not wait for a client. Omit the password for an open SSID; supply 8-63 bytes for WPA2-PSK. Tab5 can pass a dated custom basename such as `--pcap-name office_20260812_143000`; `.pcap` is appended if absent. Safe basename characters are letters, digits, `.`, `_` and `-`. Existing files are not overwritten. Without the option, the filename remains `sniff_N.pcap`. Capture Gateway always applies a firmware-fixed aggregate upload+download ceiling of 4096 kbps. Its adaptive token bucket automatically reduces the effective rate when the recorder queue reaches 50/75%, pauses above 90%, and resumes after it drains to 50%. If recorder or limiter setup fails, gateway startup is rolled back.
+- `capture_gateway status` — prints human status plus machine-readable `[CGW]` lines: `security=open|wpa2`, upstream, NAPT, clients, channel, AP/STA addresses, advertised SoftAP `dns` (normally `10.42.0.1`), `dns_proxy=on|off`, real `upstream_dns`, capture filename, `packets`, total recorder `drops`, exact serialized `file_bytes`, split `drop_alloc|drop_queue|drop_write`, recorder queue depth/high-water, configured `rate_limit_kbps`, live `rate_effective_kbps`, adaptive throttle/pause counters, limiter queue depth/high-water/drops, `pcap_scope=softap_10_42` with `filter_drops`, and the current `client_isolation=off` capability state. The legacy-equivalent `frames` field is retained for parsers. Each currently associated client gets a `[CGW_CLIENT] mac=... ip=...` line. Passwords are never returned.
+- `capture_gateway stop` — disables NAPT/DHCP and returns to STA-only mode when PCAP is not running. During `start_pcap gateway`, use universal `stop` so capture hooks and the writer are finalized first.
+- Recommended flow: `wifi_connect ...` -> `capture_gateway start ...` -> clients may join at any later time -> `stop`.
+- The mode captures routed IPv4 for authorized clients connected to the dedicated SSID. It complements rather than replaces `start_pcap net`, is not a TLS proxy, and does not yet guarantee SoftAP client isolation. HTTPS/QUIC/VPN payloads remain encrypted. Plain HTTP payloads can be viewed offline in ESPShark's Follow Stream view. See [JanOS Capture Gateway](janos-capture-gateway.md) for architecture, limits and acceptance tests.
 
 ## ARP & LAN
 
@@ -301,14 +310,76 @@ Recon PAN/node tables and CLI snapshots are allocated in PSRAM. The RX queue rem
 - `set_gps_position_cap <lat> <lon> [alt] [acc]` — same for the CAP feed.
 - `start_gps_raw [baud]` — print raw NMEA sentences. Stop with `stop`.
 
+## Console UART and binary file transfer
+
+These commands operate on UART0, the same line used by the interactive console. The selected baud rate is deliberately not stored in NVS: every boot starts at 115200 so bootloader and JanOS startup messages remain readable.
+
+- `uart_baud <rate>` — change the UART0 console rate. Allowed rates are `115200`, `230400`, `460800`, `921600`, and `2000000`. JanOS first sends the following response at the old rate, waits until TX is empty, and only then changes the UART rate:
+  ```text
+  [UARTB] switching rate=<rate> confirm_within=10s
+  [UARTB] END
+  ```
+  Change the client/terminal rate after receiving `[UARTB] END`, then issue `uart_baud_confirm`. If JanOS does not receive confirmation within 10 seconds, it automatically returns to 115200.
+- `uart_baud_confirm` — accept the current rate and cancel the automatic fallback:
+  ```text
+  [UARTB] confirmed rate=<rate>
+  [UARTB] END
+  ```
+  After confirmation, JanOS also returns to 115200 if no valid console command is executed for 60 seconds. The idle fallback is completely suspended while `send_file` is active, so neither a baud-rate change nor an `[UARTB]` message can interrupt the binary stream. Every transmitted block refreshes activity, and the 60-second window starts again when the transfer finishes or is cancelled. The fallback is announced at 115200 with `[UARTB] idle revert rate=115200`.
+- `uart_baud_status` — report the current rate and whether the confirmation window is active:
+  ```text
+  [UARTB] status rate=<rate> pending=<yes|no>
+  [UARTB] END
+  ```
+- `send_file <path> [offset]` — read a file from the SD card and transfer it over UART0. Relative paths are rooted at `/sdcard`; `offset` defaults to `0` and permits resuming a partial download. The command does not modify the file or SD card.
+
+On success, `send_file` emits a text header followed by an empty line:
+
+```text
+[FT] begin size=<total-file-size> offset=<offset> bsize=4096 crc32=00000000
+[FT] END
+
+```
+
+The opening CRC32 is intentionally zero so transmission can begin immediately without reading the file twice. Verify the received data using the authoritative running CRC32 reported by the final `[FT] done` line.
+
+After the empty line, each block is binary and is not escaped:
+
+| Field | Size | Encoding |
+|---|---:|---|
+| magic | 4 bytes | `FTB\x01` |
+| index | 4 bytes | little-endian, starting at 0 |
+| length | 4 bytes | little-endian, payload length up to 4096 |
+| crc32 | 4 bytes | little-endian CRC32 of this payload only |
+| payload | `length` bytes | raw file bytes |
+
+After every block, the receiver must send exactly one response byte within 5 seconds:
+
+- `0x06` (ACK) — accept the block and continue.
+- `0x15` (NAK) — retransmit the same block, up to three total attempts.
+- `0x18` (CAN) — cancel the transfer.
+
+If no response byte arrives within 5 seconds, JanOS ends the transfer with `[FT] error ACK timeout` followed by `[FT] END`, releases the file and transfer buffer, and returns control to the console REPL.
+
+A completed transfer ends with:
+
+```text
+[FT] done sent=<bytes-from-offset> crc32=<crc32-from-offset>
+[FT] END
+```
+
+Cancellation ends with `[FT] cancelled` and `[FT] END`. Validation, SD, open, seek, read, UART, or retry-limit failures use `[FT] error <reason>` followed by `[FT] END`. The console resumes normal line-oriented command handling after any of these endings.
+
 ## SD card
 
 - `sd_status` — fast presence check; `SD_OK` or `SD_NONE` (~200 ms, no mount).
+- `sd_benchmark [size_mb]` — destructive only to JanOS's own temporary file `/sdcard/lab/.janos_sd_benchmark.tmp`; measures sequential SD writes using the same 64 KiB chunk/buffer size as the PCAP path, then deletes the file. Size range is 1-256 MiB, default 32 MiB. Reports durable average KiB/s and kbps, `p50/p95/p99/max` `fwrite` latency, final `fflush`/`fsync` latency and a heuristic `conservative_50pct_kbps`. It refuses to run while PCAP, Capture Gateway or wardrive is active. Run `stop` first. The 50% number is a starting point for gateway tests, not a lossless guarantee.
 - `list_sd` — list HTML portal files (`N filename.html`). Header `HTML files found`.
 - `select_html <index>` — load an HTML file by index for portal / rogue AP / evil twin.
 - `set_html <html_string>` — set portal HTML directly from the command line.
-- `list_dir [path]` — list files in a directory (default `lab/handshakes`).
-- `file_delete <path>` — delete a file, e.g. `file_delete lab/handshakes/sample.pcap`.
+- `list_dir [path] [-s]` — list files in a directory (default `lab/handshakes`); `-s` adds the decimal byte size before each filename.
+- `send_file <path> [offset]` — transfer an SD file over UART0 using the resumable binary protocol documented above.
+- `file_delete <path> [path2 ...]` — delete one or more files, e.g. `file_delete lab/handshakes/sample.pcap`. Each path produces the human line `Deleted <path>` plus a machine-readable `[FILE_DELETE] path=<path> result=ok|not_found|is_dir|failed`. The result is printed before the card is synced, and a batch is synced once at the end. Exactly one marker line is emitted per path, in the order the paths were given, whatever happens to any of them — the host maps results positionally, so a missing or reordered line would attribute a result to the wrong file. Quote any path containing a space; `esp_console_split_argv` undoes the quoting, so it arrives as one argument. An absolute path that does not start with `/sdcard` is rebased onto it, so `/lab/handshakes` and `/sdcard/lab/handshakes` now mean the same directory.
 - `list_ssids` (alias `list_ssid`) — list SSIDs from `/sdcard/lab/ssids.txt` with index.
 - `add_ssid <SSID>` — append an SSID (1‑32 chars) to the file.
 - `remove_ssid <index>` — remove SSID by index; remaining are reindexed.
@@ -322,9 +393,9 @@ Recon PAN/node tables and CLI snapshots are allocated in PSRAM. The RX queue rem
 - `wigle_upload [file ...|all]` — upload wardrive files to WiGLE. No args = only files not marked `wigle=done` in `/sdcard/lab/wardrives/upload_state.csv`; `all` ignores the local manifest. Prereq WiFi + key.
 - `wdgwars_key set <key>` / `wdgwars_key read` / `wdgwars_key clear` plus `wdgwars_upload [file ...|all]` — WardrivingWars integration. `clear` removes the NVS-stored key. When no key is present in NVS at boot, `/sdcard/lab/wdgwars.txt` is loaded and saved to NVS; an existing NVS key takes precedence. Uses `X-API-Key` and multipart field `file`; accepts `.log`, `.csv`, and `.gz` wardrive files through the v2 queued upload API (max 60 MB). Before upload, validates the WigleWifi-1.6 schema and prints local `wifi/ble/bt/bad` row counts; if needed, uploads a temporary sanitized copy with bad rows removed and canonical headers added, leaving the original file unchanged. No args = only files not marked `wdgwars=done`; `all` ignores the local manifest. HTTP 429 opens a local circuit breaker/backoff and stops the batch to avoid Cloudflare spam. After upload, checks `/api/upload-history?limit=5` and prints the import counters when the file appears there.
 - `upload_state [clear]` — print or clear the local upload manifest. Output is marker-delimited with `[UPLOAD_STATE] ...` lines for ADV/Tab5 parsing.
-- `wardrive_files` — list local wardrive files with `size`, `hash`, `wifi/ble/bt/bad`, and `wigle`/`wdgwars` status. Output is marker-delimited with `[WARD_FILE] ...` lines and includes a final `[WARD_FILE] SUMMARY ...` before `END` with total `files/bytes/rows/wifi/ble/bt/bad` plus per-service `ok/pending/failed/rate_limited` counts.
-- `wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move [destination]]` — dry-run or move matching wardrive files to `/sdcard/lab/wardrives/uploaded/<service>/<status>/`, or with a safe destination token to `/sdcard/lab/wardrives/uploaded/<service>/<status>/<destination>/`. Without `move`, only prints `[WARD_CLEANUP] ... action=would_move`. `ok` = `done`, `fail` = `failed`. `all done` matches only files done for both WiGLE and WDGWars.
-- `wardrive_fix <file>` — create a soft-fixed `.fixed.log` copy with canonical WigleWifi-1.6 headers and only valid 14-field `WIFI/BLE/BT` rows. The original file is unchanged. Output is marker-delimited with `[WARD_FIX] ...` lines.
+- `wardrive_files` — list local wardrive files with `size`, `hash`, `wifi/ble/bt/bad`, and `wigle`/`wdgwars` status. Output is marker-delimited with `[WARD_FILE] ...` lines and includes a final `[WARD_FILE] SUMMARY ...` before `END` with total `files/bytes/rows/wifi/ble/bt/bad` plus per-service `ok/pending/failed/rate_limited` counts. `BEGIN` carries the count of files that will actually be listed (`[WARD_FILE] BEGIN count=63`) — it is taken after every filter, and every file it counts produces exactly one `filename=` line, so a host comparing the two can trust a mismatch. A file that stats as a candidate but cannot be read is still listed, with the size from `stat()`, `hash=00000000`, zeroed counts and a trailing `error=read`, rather than being dropped. `BEGIN`/`SUMMARY`/`END` are printed on every path — a failure to mount the card or open the directory emits a `[WARD_FILE] ERROR reason=...` line inside that frame instead of returning silently. Before each file a progress line `[WARD_FILE] SCANNING <i>/<n> name=<filename>` is emitted (key `name=`, not `filename=`, so it does not disturb a host counting listing entries); on a cold cache it is the only sign the module is alive while a large log is hashed. Per-file results are cached in `/sdcard/lab/wardrives/.scan_cache.csv`, keyed on `(filename, size, mtime)`, so a warm listing costs one `stat()` per file instead of reading and rewriting every byte in the directory; delete that file to force a full rescan. The active wardrive session's own log is never cached.
+- `wardrive_cleanup <wigle|wdgwars|all> <pending|done|ok|failed|fail|rate_limited> [move [destination]]` — dry-run or move matching wardrive files to `/sdcard/lab/wardrives/uploaded/<service>/<status>/`, or with a safe destination token to `/sdcard/lab/wardrives/uploaded/<service>/<status>/<destination>/`. Without `move`, only prints `[WARD_CLEANUP] ... action=would_move`. `ok` = `done`, `fail` = `failed`. `all done` matches only files done for both WiGLE and WDGWars. `BEGIN` carries a count equal to the `scanned` the SUMMARY will report, and, like `wardrive_files`, the `BEGIN`/`SUMMARY`/`END` frame is emitted even when the card or directory cannot be opened. Each file is preceded by `[WARD_CLEANUP] SCANNING <i>/<n> name=<filename>`. A file that cannot be read is counted in `scanned` and reported as `action=skipped reason=read_error`, but is never matched or moved — its status would be keyed on a zero hash. Uses the same `.scan_cache.csv` and drops rows for files it has moved away.
+- `wardrive_fix <file>` — create a soft-fixed `.fixed.log` copy with canonical WigleWifi-1.6 headers and only valid 14-field `WIFI/BLE/BT` rows. The original file is unchanged. The repaired copy is written to `/sdcard/lab/wardrives/fixed/`, not next to the original, and `*.fixed.log` is excluded from the upload and cleanup directory scans — otherwise the repaired file became a second upload candidate for the same data and was uploaded alongside the file it came from. Output is marker-delimited with `[WARD_FIX] ...` lines; `output=` now carries the `fixed/` prefix and a `[WARD_FIX] note=output_dir=... excluded_from_uploads=yes` line follows it. Explicitly naming a `.fixed.log` file in `wigle_upload`/`wdgwars_upload`/`wardrive_fix` still works — only the directory scans skip it.
 
 ## Settings
 
@@ -351,7 +422,7 @@ Requires an nRF24L01+ wired to SPI2 (SCK=6, MOSI=7, MISO=2, CSN=3, CE=4).
 
 ## System
 
-- `stop` — stop ALL running operations. The universal cancel.
+- `stop` — stop ALL running operations. The universal cancel. Always acknowledges with `[WARDRIVE] STOPPED running=0|1`, including when nothing was running, so a host can wait for a known idle state instead of flushing the UART and assuming; `running=1` means a wardrive was active when the stop arrived. The human-readable "Wardrive promisc stopped ..." line is unchanged and still comes from the task itself.
 - `reboot` — reboot the device.
 - `ping` — connectivity test; replies `pong`.
 - `version` — print firmware version (`JanOS version: X.Y.Z`).

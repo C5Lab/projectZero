@@ -3,6 +3,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <inttypes.h>
 #include <errno.h>
 #include <sys/stat.h>
@@ -18,6 +19,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "esp_system.h"
 #include "esp_log.h"
@@ -27,6 +29,7 @@
 #include "nvs.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_wifi_ap_get_sta_list.h"
 #include "esp_event.h"
 
 #include "esp_mac.h"
@@ -64,6 +67,7 @@
 #define HAS_MBEDTLS_CTR_DRBG 0
 #endif
 #include "esp_timer.h"
+#include "esp_rom_crc.h"
 #include "esp_app_format.h"
 
 #include "esp_http_server.h"
@@ -98,6 +102,7 @@
 #include "oled_display.h"
 #include "nrf24_jammer.h"
 #include "zig_recon.h"
+#include "capture_gateway.h"
 #include <math.h>
 
 // NimBLE includes for BLE scanning
@@ -127,7 +132,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.1"
+#define JANOS_VERSION "1.7.2"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -285,6 +290,21 @@ typedef enum {
 // Wardrive state
 static bool wardrive_active = false;
 static int wardrive_file_counter = 1;
+// Basename of the .log the running wardrive session currently has open, or "" when
+// idle. The scan cache must never store a row for it: FAT keeps mtime at 2 s
+// granularity and the file grows between flushes, so a cached (size, mtime) pair can
+// look settled while the session is still appending. The two wardrive tasks name
+// their files differently ("YYYYMMDD_HHMMSS.log" for promisc, "wN.log" for the
+// classic scan), so this is the only shared point of truth about which file is live.
+static char wardrive_active_log_name[64] = "";
+
+static void wardrive_set_active_log(const char *name) {
+    if (name && name[0] != '\0') {
+        snprintf(wardrive_active_log_name, sizeof(wardrive_active_log_name), "%s", name);
+    } else {
+        wardrive_active_log_name[0] = '\0';
+    }
+}
 static gps_data_t current_gps = {0};
 // Set true once a valid $GxRMC seeded the system clock (settimeofday) with real UTC.
 // Until then, observation timestamps fall back to time(NULL) at flush.
@@ -391,7 +411,8 @@ static uint32_t sniffer_last_debug_packet = 0;
 typedef enum {
     PCAP_MODE_NONE = 0,
     PCAP_MODE_RADIO,
-    PCAP_MODE_NET
+    PCAP_MODE_NET,
+    PCAP_MODE_GATEWAY
 } pcap_capture_mode_t;
 
 typedef struct {
@@ -400,16 +421,76 @@ typedef struct {
     uint8_t data[];
 } pcap_queued_frame_t;
 
+typedef enum {
+    PCAP_RATE_PACKET_INPUT = 0,
+    PCAP_RATE_PACKET_LINKOUTPUT,
+} pcap_rate_packet_direction_t;
+
+typedef struct {
+    struct netif *netif;
+    pcap_rate_packet_direction_t direction;
+    uint16_t len;
+    int64_t timestamp_us;
+    uint8_t data[];
+} pcap_rate_queued_packet_t;
+
+typedef struct {
+    uint32_t packets;
+    uint32_t drops;
+    uint32_t drop_alloc;
+    uint32_t drop_queue;
+    uint32_t drop_write;
+    uint32_t queue_depth;
+    uint32_t queue_high_water;
+    uint32_t rate_queue_drops;
+    uint32_t rate_queue_high_water;
+    uint32_t rate_effective_kbps;
+    uint32_t rate_throttle_events;
+    uint32_t rate_pause_events;
+    uint32_t gateway_filtered;
+    uint64_t file_bytes;
+} pcap_stats_snapshot_t;
+
 static volatile bool pcap_capture_active = false;
 static pcap_capture_mode_t pcap_capture_mode = PCAP_MODE_NONE;
 static FILE *pcap_capture_file = NULL;
+static uint8_t *pcap_stdio_buffer = NULL;
 static TaskHandle_t pcap_writer_task_handle = NULL;
 static QueueHandle_t pcap_packet_queue = NULL;
 static uint32_t pcap_capture_frame_count = 0;
 static uint32_t pcap_capture_drop_count = 0;
-static char pcap_capture_filepath[64];
+static uint32_t pcap_capture_drop_alloc_count = 0;
+static uint32_t pcap_capture_drop_queue_count = 0;
+static uint32_t pcap_capture_drop_write_count = 0;
+static uint32_t pcap_capture_queue_high_water = 0;
+static uint64_t pcap_capture_file_byte_count = 0;
+static portMUX_TYPE pcap_stats_lock = portMUX_INITIALIZER_UNLOCKED;
+#define PCAP_PACKET_QUEUE_LENGTH 1024
+#define PCAP_WRITE_BATCH_SIZE (64 * 1024)
+#define PCAP_RATE_QUEUE_LENGTH 1024
+#define PCAP_GATEWAY_RATE_LIMIT_KBPS 4096U
+#define PCAP_RATE_LIMIT_MIN_KBPS 64
+#define SD_BENCH_CONSERVATIVE_MAX_KBPS 100000U
+#define PCAP_RATE_BURST_MIN_BYTES (4 * 1600)
+#define PCAP_ADAPTIVE_HALF_DEPTH (PCAP_PACKET_QUEUE_LENGTH / 2)
+#define PCAP_ADAPTIVE_THREE_QUARTER_DEPTH ((PCAP_PACKET_QUEUE_LENGTH * 3) / 4)
+#define PCAP_ADAPTIVE_PAUSE_DEPTH ((PCAP_PACKET_QUEUE_LENGTH * 9) / 10)
+#define PCAP_CAPTURE_DIR "/sdcard/lab/pcaps"
+#define PCAP_BASENAME_MAX_LEN 95
+static char pcap_capture_filepath[sizeof(PCAP_CAPTURE_DIR) + PCAP_BASENAME_MAX_LEN + 2];
+static char pcap_next_basename[PCAP_BASENAME_MAX_LEN + 1];
 static netif_input_fn pcap_original_input = NULL;
 static netif_linkoutput_fn pcap_original_linkoutput = NULL;
+static struct netif *pcap_hooked_netif = NULL;
+static QueueHandle_t pcap_rate_packet_queue = NULL;
+static TaskHandle_t pcap_rate_task_handle = NULL;
+static volatile bool pcap_rate_active = false;
+static uint32_t pcap_rate_queue_drop_count = 0;
+static uint32_t pcap_rate_queue_high_water = 0;
+static uint32_t pcap_rate_effective_kbps = 0;
+static uint32_t pcap_rate_throttle_event_count = 0;
+static uint32_t pcap_rate_pause_event_count = 0;
+static uint32_t pcap_gateway_filtered_frame_count = 0;
 
 // PCAP ARP spoofing state (net mode MITM)
 #define PCAP_ARP_MAX_HOSTS 64
@@ -575,6 +656,7 @@ static httpd_handle_t portal_server = NULL;
 static volatile bool portal_active = false;
 static volatile bool karma_mode_active = false;
 static volatile bool rogueap_mode_active = false;
+static volatile bool rogue_gitm_mode_active = false;
 static TaskHandle_t dns_server_task_handle = NULL;
 static int dns_server_socket = -1;
 
@@ -1439,16 +1521,19 @@ int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
 void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size) {
     ESP_LOG_BUFFER_HEXDUMP(TAG, frame_buffer, size, ESP_LOG_DEBUG);
 
-
     esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, frame_buffer, size, false);
     if (err == ESP_ERR_NO_MEM) {
-        //give it a breath:
-        vTaskDelay(pdMS_TO_TICKS(20));
-        MY_LOG_INFO(TAG, "esp_wifi_80211_tx returned ESP_ERR_NO_MEM: %d", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-        return; // lub ponów próbę później
+        // Wi-Fi driver TX queue full (common under APSTA+NAPT+deauth), not app heap OOM.
+        static int64_t last_nomem_log_us = 0;
+        int64_t now_us = esp_timer_get_time();
+        vTaskDelay(pdMS_TO_TICKS(rogue_gitm_mode_active || capture_gateway_is_active() ? 80 : 20));
+        if (now_us - last_nomem_log_us > 2000000) {
+            last_nomem_log_us = now_us;
+            MY_LOG_INFO(TAG, "esp_wifi_80211_tx returned ESP_ERR_NO_MEM (internal free=%d)",
+                        heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        }
+        return;
     }
-
-    //ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_STA, frame_buffer, size, false));
 }
 
 /**
@@ -1834,6 +1919,7 @@ static int sd_html_count = 0;
 static char* custom_portal_html = NULL;
 static bool sd_card_mounted = false;
 static sdmmc_card_t *sd_card_handle = NULL;
+static int sd_mount_freq_khz = 0;
 #define MAX_SSID_PRESETS 64
 #define MAX_SSID_NAME_LEN 32
 #define SSID_PRESET_PATH "/sdcard/lab/ssid.txt"
@@ -1984,9 +2070,11 @@ static int cmd_boot_button(int argc, char **argv);
 static int cmd_start_portal(int argc, char **argv);
 static int cmd_start_admin_portal(int argc, char **argv);
 static int cmd_start_rogueap(int argc, char **argv);
+static int cmd_start_rogue_gitm(int argc, char **argv);
 static int cmd_start_karma(int argc, char **argv);
 static int cmd_list_sd(int argc, char **argv);
 static int cmd_sd_status(int argc, char **argv);
+static int cmd_sd_benchmark(int argc, char **argv);
 static int cmd_list_dir(int argc, char **argv);
 static int cmd_list_ssid(int argc, char **argv);
 static int cmd_list_ssids(int argc, char **argv);
@@ -2010,6 +2098,7 @@ static int cmd_zig_recon_list(int argc, char **argv);
 static int cmd_zig_recon_nodes(int argc, char **argv);
 static int cmd_zig_recon_clear(int argc, char **argv);
 static int cmd_wifi_connect(int argc, char **argv);
+static int cmd_capture_gateway(int argc, char **argv);
 static int cmd_list_hosts(int argc, char **argv);
 static int cmd_list_hosts_vendor(int argc, char **argv);
 static int cmd_start_nmap(int argc, char **argv);
@@ -2164,9 +2253,18 @@ static void wardrive_make_session_base(char *out, size_t out_sz);
 static int find_next_pcap_file_number(void);
 static void pcap_radio_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
 static void pcap_enqueue_frame(const uint8_t *data, uint16_t len);
+static void pcap_enqueue_frame_at(const uint8_t *data, uint16_t len,
+                                  int64_t timestamp_us);
 static void pcap_writer_task(void *param);
+static void pcap_abort_start(void);
+static void pcap_stats_snapshot(pcap_stats_snapshot_t *snapshot);
+static bool pcap_normalize_basename(const char *requested, char *normalized,
+                                     size_t normalized_size);
 static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp);
 static err_t pcap_netif_linkoutput_hook(struct netif *netif, struct pbuf *p);
+static bool pcap_rate_limiter_start(void);
+static void pcap_rate_limiter_stop(void);
+static void pcap_rate_limiter_task(void *param);
 static void pcap_arp_spoof_task(void *param);
 
 static bool wigle_split_key_pair(const char *input,
@@ -2379,6 +2477,14 @@ static void wifi_event_handler(void *event_handler_arg,
             const wifi_event_ap_staconnected_t *e = (const wifi_event_ap_staconnected_t *)event_data;
             MY_LOG_INFO(TAG, "AP: Client connected - MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
                        e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
+
+            if (capture_gateway_is_active()) {
+                capture_gateway_client_connected();
+                capture_gateway_status_t status;
+                capture_gateway_get_status(&status);
+                MY_LOG_INFO(TAG, "Capture Gateway: client joined, clients=%u", status.connected_clients);
+                break;
+            }
             
             // Increment connected clients counter
             portal_connected_clients++;
@@ -2411,6 +2517,14 @@ static void wifi_event_handler(void *event_handler_arg,
             const wifi_event_ap_stadisconnected_t *e = (const wifi_event_ap_stadisconnected_t *)event_data;
             MY_LOG_INFO(TAG, "AP: Client disconnected - MAC: %02X:%02X:%02X:%02X:%02X:%02X, AID: %u, reason: %u",
                         e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5], e->aid, e->reason);
+
+            if (capture_gateway_is_active()) {
+                capture_gateway_client_disconnected();
+                capture_gateway_status_t status;
+                capture_gateway_get_status(&status);
+                MY_LOG_INFO(TAG, "Capture Gateway: client left, clients=%u", status.connected_clients);
+                break;
+            }
             
             // Decrement connected clients counter
             if (portal_connected_clients > 0) {
@@ -2530,6 +2644,19 @@ static void wifi_event_handler(void *event_handler_arg,
             if (wifi_connect_result == 0) {
                 wifi_connect_result = -1;
                 wifi_connect_fail_reason = (int)e->reason;
+            }
+
+            if (capture_gateway_is_active()) {
+                capture_gateway_set_upstream_ready(false);
+                MY_LOG_INFO(TAG, "Capture Gateway: upstream down (reason=%d)", (int)e->reason);
+                if (!operation_stop_requested) {
+                    esp_err_t reconnect_err = esp_wifi_connect();
+                    if (reconnect_err != ESP_OK) {
+                        MY_LOG_INFO(TAG, "Capture Gateway: reconnect request failed: %s",
+                                    esp_err_to_name(reconnect_err));
+                    }
+                }
+                break;
             }
             
             if (applicationState == EVIL_TWIN_PASS_CHECK) {
@@ -3182,6 +3309,15 @@ static void ip_event_handler(void *event_handler_arg,
     (void)event_data;
 
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        if (capture_gateway_is_active()) {
+            esp_err_t err = capture_gateway_refresh_upstream();
+            if (err == ESP_OK) {
+                MY_LOG_INFO(TAG, "Capture Gateway: upstream IPv4 and DNS refreshed");
+            } else {
+                MY_LOG_INFO(TAG, "Capture Gateway: upstream refresh failed: %s",
+                            esp_err_to_name(err));
+            }
+        }
         if (ota_auto_on_ip && !ota_check_started) {
             if (ota_start_check(NULL, false)) {
                 ota_check_started = true;
@@ -3734,6 +3870,11 @@ static void wait_or_cancel_wifi_scan(void)
  */
 static bool ensure_ble_mode(void)
 {
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway owns the WiFi radio. Stop it before switching to BLE.");
+        return false;
+    }
+
     switch (current_radio_mode) {
         case RADIO_MODE_BLE:
             // Already in BLE mode
@@ -3780,6 +3921,11 @@ static bool ensure_ble_mode(void)
 
 static bool ensure_ieee802154_mode(void)
 {
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway owns the WiFi radio. Stop it before switching to 802.15.4.");
+        return false;
+    }
+
     switch (current_radio_mode) {
         case RADIO_MODE_IEEE802154:
             return true;
@@ -3819,6 +3965,11 @@ static bool ensure_ieee802154_mode(void)
  */
 static esp_netif_t *ensure_ap_mode(void)
 {
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway already owns AP mode");
+        return NULL;
+    }
+
     if (current_radio_mode != RADIO_MODE_WIFI) {
         MY_LOG_INFO(TAG, "WiFi must be initialized first");
         return NULL;
@@ -3898,6 +4049,11 @@ static esp_netif_t *ensure_ap_mode(void)
 
 // --- Start background scan ---
 static esp_err_t start_background_scan(uint32_t min_time, uint32_t max_time) {
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Cannot scan while Capture Gateway is active. Use 'stop' first.");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     if (wardrive_active || wardrive_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Cannot start background scan: wardrive is active. Use 'stop' first.");
         return ESP_ERR_INVALID_STATE;
@@ -5437,8 +5593,11 @@ static void deauth_attack_task(void *pvParameters) {
         }
         
         // Check if it's time for channel monitoring (every 5 minutes)
-        // Only perform periodic re-scan during active deauth attacks (DEAUTH and DEAUTH_EVIL_TWIN)
-        if ((applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) && check_channel_changes()) {
+        // Only perform periodic re-scan during active deauth attacks (DEAUTH and DEAUTH_EVIL_TWIN).
+        // Skip while Capture Gateway / Rogue GITM is active — a scan would disrupt STA/NAPT.
+        if ((applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) &&
+            !capture_gateway_is_active() &&
+            check_channel_changes()) {
             // Set flag to suppress logs during periodic re-scan
             periodic_rescan_in_progress = true;
             
@@ -5498,7 +5657,12 @@ static void deauth_attack_task(void *pvParameters) {
                 } else if (applicationState == DEAUTH_EVIL_TWIN) {
                     char l2[64], l4[64];
                     snprintf(l2, sizeof(l2), ">> %s", target_bssids[0].ssid);
-                    if (last_password_wrong) {
+                    if (rogue_gitm_mode_active) {
+                        capture_gateway_status_t cgw_st = {0};
+                        capture_gateway_get_status(&cgw_st);
+                        snprintf(l4, sizeof(l4), "  Clients: %u", cgw_st.connected_clients);
+                        oled_display_update_full("> Rogue GITM", l2, "  Deauth+GITM", l4);
+                    } else if (last_password_wrong) {
                         snprintf(l4, sizeof(l4), "  Clients: %d", portal_connected_clients);
                         oled_display_update_full("> Evil Twin", l2, "  Wrong password!", l4);
                     } else {
@@ -5514,8 +5678,9 @@ static void deauth_attack_task(void *pvParameters) {
             }
         }
         
-        // Delay and yield to allow UART console processing
-        vTaskDelay(pdMS_TO_TICKS(100));
+        // Delay and yield to allow UART console processing.
+        // Rogue GITM shares the radio with STA/NAPT/PCAP — slow deauth to avoid TX NO_MEM.
+        vTaskDelay(pdMS_TO_TICKS(rogue_gitm_mode_active || capture_gateway_is_active() ? 400 : 100));
         taskYIELD(); // Give other tasks (including console) a chance to run
     }
     
@@ -6201,6 +6366,11 @@ static void wardrive_promisc_task(void *pvParameters) {
     wardrive_make_session_base(wardrive_base, sizeof(wardrive_base));
     snprintf(wardrive_csv_path, sizeof(wardrive_csv_path),
              "/sdcard/lab/wardrives/%s.log", wardrive_base);
+    {
+        char active_name[64];
+        snprintf(active_name, sizeof(active_name), "%s.log", wardrive_base);
+        wardrive_set_active_log(active_name);
+    }
     if (wardrive_promisc_trace_enabled) {
         snprintf(wardrive_promisc_trace_path, sizeof(wardrive_promisc_trace_path),
                  "/sdcard/lab/wardrives/%s_track.inprogress.kml", wardrive_base);
@@ -6645,6 +6815,9 @@ static void wardrive_promisc_task(void *pvParameters) {
     }
 
 cleanup:
+    // Released before the trace is finalized: from here on nothing appends to the
+    // session log, so the scan cache may treat it like any other file again.
+    wardrive_set_active_log(NULL);
     if (wdp_trace.active) {
         // Stop the RX callback from enqueuing more POIs, then drain what's left.
         esp_wifi_set_promiscuous(false);
@@ -8097,6 +8270,27 @@ static bool wigle_split_key_pair(const char *input,
     return true;
 }
 
+// True for the output of wardrive_fix. That file used to land straight in the working
+// directory as "<base>.fixed.log", where the directory scans picked it up as a second
+// upload candidate sitting next to its own original — which is how
+// 20260826_102219.fixed.log came to be uploaded alongside the file it was repaired
+// from. Repaired copies now go to /sdcard/lab/wardrives/fixed/ (see
+// wardrive_build_fixed_path), and the suffix stays excluded here so any file left over
+// from the old layout is ignored too.
+//
+// Deliberately NOT folded into wigle_is_upload_candidate() /
+// wdgwars_is_upload_candidate(): those two also back wigle_resolve_upload_target() and
+// wdgwars_resolve_upload_target(), which wardrive_fix uses to resolve its own INPUT and
+// which an explicit "wigle_upload <file>" goes through. Rejecting the suffix there
+// would make a repaired file impossible to re-fix or to upload by hand.
+static bool wardrive_is_fixed_output(const char *filename) {
+    if (!filename) {
+        return false;
+    }
+    size_t len = strlen(filename);
+    return len > 10 && strcasecmp(filename + len - 10, ".fixed.log") == 0;
+}
+
 static bool wigle_is_upload_candidate(const char *filename) {
     if (!filename) {
         return false;
@@ -8268,6 +8462,80 @@ static bool csv_last_field_is_type(const char *line, const char *type) {
     return strcasecmp(last, type) == 0;
 }
 
+// The same single-pass classification wdgwars_sanitize_wigle_file() performs, minus the
+// sanitized copy. Listing and cleanup only ever wanted the counts, but the only way to
+// get them was to run the sanitizer — which read the file a second time and wrote a full
+// copy of it that was unlinked moments later. For 63 files that was 25.7 MB read and
+// 25.7 MB written per listing, on a card the host is waiting on.
+//
+// Produces a byte-identical wdgwars_wigle_stats_t (including the .gz and unreadable-file
+// cases) and stays silent: the per-file "Preflight WigleWifi-1.6: ..." lines doubled the
+// UART traffic of a listing that the host then had to skip over.
+static bool wdgwars_scan_wigle_stats(const char *filepath, wdgwars_wigle_stats_t *stats) {
+    if (!stats) {
+        return false;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+    if (!filepath) {
+        return false;
+    }
+
+    size_t path_len = strlen(filepath);
+    if (path_len > 3 && strcasecmp(filepath + path_len - 3, ".gz") == 0) {
+        // Compressed: not inspectable without inflating, reported as all-zero exactly
+        // as the sanitizer's early return does.
+        return true;
+    }
+
+    FILE *in = fopen(filepath, "r");
+    if (!in) {
+        return false;
+    }
+
+    char line[512];
+    while (fgets(line, sizeof(line), in)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') {
+            continue;
+        }
+
+        if (strncmp(line, "WigleWifi-1.6", 13) == 0) {
+            stats->has_wigle_header = true;
+            continue;
+        }
+        if (strcmp(line, WDGWARS_WIGLE_SCHEMA) == 0) {
+            stats->has_schema_header = true;
+            continue;
+        }
+        if (strncmp(line, "MAC,SSID,", 9) == 0) {
+            stats->bad_rows++;
+            continue;
+        }
+
+        if (count_csv_fields_simple(line) != 14) {
+            stats->bad_rows++;
+            continue;
+        }
+
+        if (csv_last_field_is_type(line, "WIFI")) {
+            stats->wifi_rows++;
+        } else if (csv_last_field_is_type(line, "BLE")) {
+            stats->ble_rows++;
+        } else if (csv_last_field_is_type(line, "BT")) {
+            stats->bt_rows++;
+        } else {
+            stats->bad_rows++;
+            continue;
+        }
+
+        stats->data_rows++;
+    }
+
+    fclose(in);
+    return true;
+}
+
 static bool wdgwars_sanitize_wigle_file(const char *filepath, wdgwars_wigle_stats_t *stats, bool *use_sanitized) {
     if (use_sanitized) {
         *use_sanitized = false;
@@ -8366,6 +8634,16 @@ static bool wdgwars_sanitize_wigle_file(const char *filepath, wdgwars_wigle_stat
     return true;
 }
 
+#define WARDRIVE_FIXED_DIR "/sdcard/lab/wardrives/fixed"
+
+// Repaired copies go to a sibling directory, not back into the working directory.
+// Writing "<base>.fixed.log" next to its original made it a second upload candidate
+// for the very same data, and both got uploaded.
+//
+// The alternative — replacing the original in place — was rejected: it changes the
+// file's size and hash, and upload_state.csv keys its rows on exactly that pair. Every
+// journal row for that file would stop resolving and an already-uploaded wardrive would
+// come back as "pending", which is the failure the journal exists to prevent.
 static void wardrive_build_fixed_path(const char *filename, char *out, size_t out_sz) {
     char base[128];
     snprintf(base, sizeof(base), "%s", filename ? filename : "wardrive.log");
@@ -8373,7 +8651,7 @@ static void wardrive_build_fixed_path(const char *filename, char *out, size_t ou
     if (dot && dot != base) {
         *dot = '\0';
     }
-    snprintf(out, out_sz, "/sdcard/lab/wardrives/%s.fixed.log", base);
+    snprintf(out, out_sz, WARDRIVE_FIXED_DIR "/%s.fixed.log", base);
 }
 
 static bool wardrive_fix_file_soft(const char *filepath, const char *filename,
@@ -8397,6 +8675,7 @@ static bool wardrive_fix_file_soft(const char *filepath, const char *filename,
     }
 
     wardrive_build_fixed_path(filename, out_path, out_path_sz);
+    sd_mkdir_recursive(WARDRIVE_FIXED_DIR);
     FILE *out = fopen(out_path, "w");
     if (!out) {
         fclose(in);
@@ -8631,6 +8910,255 @@ static bool wardrive_collect_file_id(const char *filepath, long *out_size, uint3
     return true;
 }
 
+/* ---------------------------------------------------------------------------
+ * Wardrive scan cache
+ *
+ * Listing and cleanup used to cost O(all bytes in /sdcard/lab/wardrives): every
+ * candidate was hashed in full and then run through the sanitizer, which read it
+ * again and wrote a complete copy that was immediately unlinked. For a real card
+ * with 63 files and 25.7 MB that is ~52 MB read and ~26 MB written per command,
+ * which is why `wardrive_files` produced 48 of 63 entries in 131 s and never
+ * reached its END marker before the host gave up at 120 s.
+ *
+ * A row here records what a full scan of one file produced, keyed on the triple
+ * (filename, size, mtime). All three must match for a hit; anything else falls
+ * through to the original full-scan path, so a missing or unparsable cache simply
+ * costs what the command cost before.
+ *
+ * This is deliberately a separate file from upload_state.csv. That one is the
+ * durable upload journal whose rows must keep resolving for files that no longer
+ * exist; this one is a disposable accelerator that may be deleted at any moment.
+ * ------------------------------------------------------------------------- */
+#define WARDRIVE_SCAN_CACHE_PATH   "/sdcard/lab/wardrives/.scan_cache.csv"
+#define WARDRIVE_SCAN_CACHE_TMP    "/sdcard/lab/wardrives/.scan_cache.tmp"
+#define WARDRIVE_SCAN_CACHE_HEADER "filename,size,mtime,hash,rows,wifi,ble,bt,bad"
+#define WARDRIVE_SCAN_CACHE_MAX_ROWS 512
+#define WARDRIVE_SCAN_CACHE_NAME_MAX 128
+/* FAT timestamps advance in 2 s steps, so a file written "now" can carry a stamp a
+ * couple of seconds stale, and a clock stepped by a GPS fix can briefly put it in the
+ * future. Anything inside this window is treated as still moving. */
+#define WARDRIVE_SCAN_CACHE_FRESH_S  5
+/* 1980-01-01, the FAT epoch. A system clock below this has not been seeded yet, so
+ * "now" carries no information and no freshness test based on it can be trusted. */
+#define WARDRIVE_CLOCK_VALID_EPOCH   315532800L
+
+typedef struct {
+    char name[WARDRIVE_SCAN_CACHE_NAME_MAX];
+    long size;
+    long mtime;
+    uint32_t hash;
+    int rows;
+    int wifi;
+    int ble;
+    int bt;
+    int bad;
+} wardrive_scan_cache_row_t;
+
+typedef struct {
+    wardrive_scan_cache_row_t *rows;
+    int count;
+    int capacity;
+    bool dirty;
+} wardrive_scan_cache_t;
+
+static bool wardrive_scan_cache_init(wardrive_scan_cache_t *cache) {
+    if (!cache) {
+        return false;
+    }
+    memset(cache, 0, sizeof(*cache));
+
+    size_t bytes = (size_t)WARDRIVE_SCAN_CACHE_MAX_ROWS * sizeof(wardrive_scan_cache_row_t);
+    cache->rows = (wardrive_scan_cache_row_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!cache->rows) {
+        cache->rows = (wardrive_scan_cache_row_t *)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+    }
+    if (!cache->rows) {
+        return false;
+    }
+    cache->capacity = WARDRIVE_SCAN_CACHE_MAX_ROWS;
+    return true;
+}
+
+static void wardrive_scan_cache_free(wardrive_scan_cache_t *cache) {
+    if (!cache) {
+        return;
+    }
+    free(cache->rows);
+    cache->rows = NULL;
+    cache->count = 0;
+    cache->capacity = 0;
+}
+
+/* Read once per command. A malformed row is skipped rather than invalidating the
+ * whole file: it simply becomes a miss and gets recomputed and rewritten. */
+static void wardrive_scan_cache_load(wardrive_scan_cache_t *cache) {
+    if (!cache || !cache->rows) {
+        return;
+    }
+
+    FILE *f = fopen(WARDRIVE_SCAN_CACHE_PATH, "r");
+    if (!f) {
+        return;
+    }
+
+    char line[320];
+    while (cache->count < cache->capacity && fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0' || strncmp(line, "filename,", 9) == 0) {
+            continue;
+        }
+
+        char *fields[9] = {0};
+        int n = 0;
+        char *save = NULL;
+        char *tok = strtok_r(line, ",", &save);
+        while (tok && n < 9) {
+            fields[n++] = tok;
+            tok = strtok_r(NULL, ",", &save);
+        }
+        if (n < 9) {
+            continue;
+        }
+
+        wardrive_scan_cache_row_t *row = &cache->rows[cache->count];
+        snprintf(row->name, sizeof(row->name), "%s", fields[0]);
+        row->size  = strtol(fields[1], NULL, 10);
+        row->mtime = strtol(fields[2], NULL, 10);
+        row->hash  = (uint32_t)strtoul(fields[3], NULL, 16);
+        row->rows  = atoi(fields[4]);
+        row->wifi  = atoi(fields[5]);
+        row->ble   = atoi(fields[6]);
+        row->bt    = atoi(fields[7]);
+        row->bad   = atoi(fields[8]);
+        cache->count++;
+    }
+    fclose(f);
+}
+
+/* One gate, consulted both before trusting a row and before storing one. Splitting
+ * the two checks would let a file that must never be cached still be served from a
+ * row written earlier under different conditions — after a GPS fix seeds the clock,
+ * for instance. */
+static bool wardrive_scan_cache_is_cacheable(const char *name, const struct stat *st, time_t now) {
+    if (!name || !st) {
+        return false;
+    }
+    if ((long)now < WARDRIVE_CLOCK_VALID_EPOCH) {
+        return false;
+    }
+    if (st->st_mtime <= 0) {
+        return false;
+    }
+    /* llabs, not (now - mtime): FatFs stamps 1980 while the clock still reads 1970,
+     * which would make a plain subtraction look comfortably old. */
+    if (llabs((long long)now - (long long)st->st_mtime) < WARDRIVE_SCAN_CACHE_FRESH_S) {
+        return false;
+    }
+    if (strchr(name, ',') != NULL) {
+        return false;
+    }
+    if (strlen(name) >= WARDRIVE_SCAN_CACHE_NAME_MAX) {
+        /* Truncating the name would let two files share a cache key. */
+        return false;
+    }
+    if (wardrive_active_log_name[0] != '\0' && strcmp(name, wardrive_active_log_name) == 0) {
+        return false;
+    }
+    return true;
+}
+
+static bool wardrive_scan_cache_lookup(const wardrive_scan_cache_t *cache, const char *name,
+                                       long size, long mtime, wardrive_scan_cache_row_t *out) {
+    if (!cache || !cache->rows || !name) {
+        return false;
+    }
+    for (int i = 0; i < cache->count; i++) {
+        const wardrive_scan_cache_row_t *row = &cache->rows[i];
+        if (row->size == size && row->mtime == mtime && strcmp(row->name, name) == 0) {
+            if (out) {
+                *out = *row;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void wardrive_scan_cache_put(wardrive_scan_cache_t *cache, const char *name, long size,
+                                    long mtime, uint32_t hash, const wdgwars_wigle_stats_t *stats) {
+    if (!cache || !cache->rows || !name || !stats) {
+        return;
+    }
+
+    wardrive_scan_cache_row_t *row = NULL;
+    for (int i = 0; i < cache->count; i++) {
+        if (strcmp(cache->rows[i].name, name) == 0) {
+            /* Same file, new size or mtime: the old row is stale by definition. */
+            row = &cache->rows[i];
+            break;
+        }
+    }
+    if (!row) {
+        if (cache->count >= cache->capacity) {
+            /* Full: this file just stays uncached and is rescanned next time. */
+            return;
+        }
+        row = &cache->rows[cache->count++];
+    }
+
+    snprintf(row->name, sizeof(row->name), "%s", name);
+    row->size  = size;
+    row->mtime = mtime;
+    row->hash  = hash;
+    row->rows  = stats->data_rows;
+    row->wifi  = stats->wifi_rows;
+    row->ble   = stats->ble_rows;
+    row->bt    = stats->bt_rows;
+    row->bad   = stats->bad_rows;
+    cache->dirty = true;
+}
+
+/* Written once, at the end of a command, and only when something changed. Rows whose
+ * file has disappeared are dropped here — that is the whole garbage collection story,
+ * and it is why wardrive_cleanup (which renames files out of the directory) has to
+ * call this too rather than leaving dozens of dead rows behind. */
+static void wardrive_scan_cache_writeback(wardrive_scan_cache_t *cache) {
+    if (!cache || !cache->rows || !cache->dirty) {
+        return;
+    }
+
+    FILE *f = fopen(WARDRIVE_SCAN_CACHE_TMP, "w");
+    if (!f) {
+        return;
+    }
+
+    fprintf(f, "%s\n", WARDRIVE_SCAN_CACHE_HEADER);
+    for (int i = 0; i < cache->count; i++) {
+        const wardrive_scan_cache_row_t *row = &cache->rows[i];
+        char path[300];
+        struct stat st;
+        snprintf(path, sizeof(path), "/sdcard/lab/wardrives/%s", row->name);
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+        fprintf(f, "%s,%ld,%ld,%08lX,%d,%d,%d,%d,%d\n",
+                row->name, row->size, row->mtime, (unsigned long)row->hash,
+                row->rows, row->wifi, row->ble, row->bt, row->bad);
+    }
+    fclose(f);
+
+    /* FatFs f_rename refuses an existing target, so the old file has to go first.
+     * That leaves a brief window with no cache at all; the worst outcome of losing
+     * the race is a cold rebuild on the next command, never a half-written cache
+     * being trusted. */
+    unlink(WARDRIVE_SCAN_CACHE_PATH);
+    if (rename(WARDRIVE_SCAN_CACHE_TMP, WARDRIVE_SCAN_CACHE_PATH) != 0) {
+        unlink(WARDRIVE_SCAN_CACHE_TMP);
+        return;
+    }
+    cache->dirty = false;
+}
+
 static bool upload_state_ensure_file(void) {
     struct stat st;
     if (stat(UPLOAD_STATE_PATH, &st) == 0) {
@@ -8771,6 +9299,219 @@ static void upload_state_get_status(const char *service, const char *filename, l
     fclose(f);
 }
 
+/* ---------------------------------------------------------------------------
+ * upload_state.csv, resolved once into RAM
+ *
+ * upload_state_get_status() reopens and rescans the whole journal for every file and
+ * every service — 126 opens and full scans for a 63-file listing. Loading it once and
+ * answering from memory removes that entirely.
+ *
+ * The two lookups below are NOT interchangeable and must stay separate. Cleanup
+ * decides what to archive with get_status, the upload loops decide what to skip with
+ * is_done; collapsing them into one rule would make the "Archive done" button move a
+ * different set of files than the listing had just shown as done.
+ * ------------------------------------------------------------------------- */
+#define UPLOAD_STATE_TBL_MAX_ROWS 1024
+
+typedef struct {
+    char service[16];
+    char filename[128];
+    long size;
+    uint32_t hash;
+    char status[16];
+} upload_state_row_t;
+
+typedef struct {
+    upload_state_row_t *rows;
+    int count;
+    /* The journal is append-only and grows with every upload attempt, so it can
+     * eventually outgrow the table. Rather than silently answering from a partial
+     * copy, an overflowed table defers to the original file-scanning functions:
+     * slow, but it cannot report a file as pending that the journal says is done. */
+    bool overflow;
+} upload_state_table_t;
+
+static bool upload_state_table_load(upload_state_table_t *tbl) {
+    if (!tbl) {
+        return false;
+    }
+    memset(tbl, 0, sizeof(*tbl));
+
+    size_t bytes = (size_t)UPLOAD_STATE_TBL_MAX_ROWS * sizeof(upload_state_row_t);
+    tbl->rows = (upload_state_row_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!tbl->rows) {
+        tbl->rows = (upload_state_row_t *)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+    }
+    if (!tbl->rows) {
+        return false;
+    }
+
+    FILE *f = fopen(UPLOAD_STATE_PATH, "r");
+    if (!f) {
+        /* No journal yet: every lookup resolves to "pending", as before. */
+        return true;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (tbl->count >= UPLOAD_STATE_TBL_MAX_ROWS) {
+            tbl->overflow = true;
+            break;
+        }
+        line[strcspn(line, "\r\n")] = '\0';
+        upload_state_row_t *row = &tbl->rows[tbl->count];
+        if (!upload_state_parse_line(line, row->service, sizeof(row->service),
+                                     row->filename, sizeof(row->filename),
+                                     &row->size, &row->hash,
+                                     row->status, sizeof(row->status),
+                                     NULL, NULL, NULL, NULL)) {
+            continue;
+        }
+        tbl->count++;
+    }
+    fclose(f);
+    return true;
+}
+
+static void upload_state_table_free(upload_state_table_t *tbl) {
+    if (!tbl) {
+        return;
+    }
+    free(tbl->rows);
+    tbl->rows = NULL;
+    tbl->count = 0;
+}
+
+/* Mirrors upload_state_get_status(): the last matching row wins, except that "done"
+ * latches — once seen it cannot be downgraded by a later row. */
+static void upload_tbl_get_status(const upload_state_table_t *tbl, const char *service,
+                                  const char *filename, long size, uint32_t hash,
+                                  char *out, size_t out_sz) {
+    if (!tbl || !tbl->rows || tbl->overflow) {
+        upload_state_get_status(service, filename, size, hash, out, out_sz);
+        return;
+    }
+
+    snprintf(out, out_sz, "pending");
+    for (int i = 0; i < tbl->count; i++) {
+        const upload_state_row_t *row = &tbl->rows[i];
+        if (row->size != size || row->hash != hash) {
+            continue;
+        }
+        if (strcmp(row->service, service) != 0 || strcmp(row->filename, filename) != 0) {
+            continue;
+        }
+        if (strcmp(out, "done") == 0) {
+            continue;
+        }
+        snprintf(out, out_sz, "%s", row->status);
+    }
+}
+
+/* Mirrors upload_state_is_done(): order-independent, any matching row marked done. */
+static bool upload_tbl_is_done(const upload_state_table_t *tbl, const char *service,
+                               const char *filename, long size, uint32_t hash) {
+    if (!tbl || !tbl->rows || tbl->overflow) {
+        return upload_state_is_done(service, filename, size, hash);
+    }
+
+    for (int i = 0; i < tbl->count; i++) {
+        const upload_state_row_t *row = &tbl->rows[i];
+        if (row->size != size || row->hash != hash) {
+            continue;
+        }
+        if (strcmp(row->service, service) != 0 || strcmp(row->filename, filename) != 0) {
+            continue;
+        }
+        if (strcmp(row->status, "done") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The single place a wardrive file's identity (size + FNV-1a hash) and its row
+ * statistics come from, cached or freshly computed. Six call sites used to derive this
+ * inline, each with its own error handling; wiring a cache into all six separately
+ * would have turned one behaviour into six subtly different ones. Callers keep their
+ * own reporting — only the work is shared.
+ *
+ * The three outcomes are distinct because the listing has to account for every file it
+ * announced. WARDRIVE_ID_ABSENT means the name is no longer a regular file and no row
+ * should exist for it at all; WARDRIVE_ID_READ_FAILED means the file is there but could
+ * not be read, and `*out_size` still carries the size stat() reported so the caller can
+ * emit an honest row instead of dropping the file silently. */
+typedef enum {
+    WARDRIVE_ID_OK = 0,       /* size, hash and stats are all real */
+    WARDRIVE_ID_READ_FAILED,  /* exists but unreadable; size from stat(), hash 0, stats zeroed */
+    WARDRIVE_ID_ABSENT,       /* not a regular file any more: emit nothing */
+} wardrive_identity_t;
+
+static wardrive_identity_t wardrive_file_identity(const char *filepath, const char *name,
+                                                  wardrive_scan_cache_t *cache,
+                                                  long *out_size, uint32_t *out_hash,
+                                                  wdgwars_wigle_stats_t *out_stats) {
+    if (out_size) *out_size = 0;
+    if (out_hash) *out_hash = 0;
+    if (out_stats) memset(out_stats, 0, sizeof(*out_stats));
+
+    if (!filepath || !name) {
+        return WARDRIVE_ID_ABSENT;
+    }
+
+    struct stat st;
+    if (stat(filepath, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return WARDRIVE_ID_ABSENT;
+    }
+    bool cacheable = cache && cache->rows &&
+                     wardrive_scan_cache_is_cacheable(name, &st, time(NULL));
+
+    if (cacheable) {
+        wardrive_scan_cache_row_t row;
+        if (wardrive_scan_cache_lookup(cache, name, (long)st.st_size, (long)st.st_mtime, &row)) {
+            if (out_size) *out_size = row.size;
+            if (out_hash) *out_hash = row.hash;
+            if (out_stats) {
+                out_stats->data_rows = row.rows;
+                out_stats->wifi_rows = row.wifi;
+                out_stats->ble_rows  = row.ble;
+                out_stats->bt_rows   = row.bt;
+                out_stats->bad_rows  = row.bad;
+            }
+            return WARDRIVE_ID_OK;
+        }
+    }
+
+    long size = 0;
+    uint32_t hash = 0;
+    if (!wardrive_collect_file_id(filepath, &size, &hash)) {
+        /* Hand back what stat() knows. The listing announced this file in its count
+         * and has to print a row for it; a silent skip is what made the host's
+         * completeness check fire on listings that were in fact complete. */
+        if (out_size) *out_size = (long)st.st_size;
+        return WARDRIVE_ID_READ_FAILED;
+    }
+
+    /* Return value deliberately ignored, matching what the listing has always done:
+     * a file that cannot be reopened for the stats pass reports zero rows rather than
+     * disappearing from the listing. The scanner zeroes the struct on entry. */
+    wdgwars_wigle_stats_t stats;
+    (void)wdgwars_scan_wigle_stats(filepath, &stats);
+
+    if (out_size) *out_size = size;
+    if (out_hash) *out_hash = hash;
+    if (out_stats) *out_stats = stats;
+
+    /* Only cache what this pass actually measured. wardrive_collect_file_id() reports
+     * the number of bytes it read, which is what every marker line prints as `size=`;
+     * storing that while keying on st_size would let a hit print a different size than
+     * the cold run did for a file that grew between the two syscalls. */
+    if (cacheable && size == (long)st.st_size) {
+        wardrive_scan_cache_put(cache, name, size, (long)st.st_mtime, hash, &stats);
+    }
+    return WARDRIVE_ID_OK;
+}
+
 static int cmd_upload_state(int argc, char **argv) {
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
@@ -8817,20 +9558,11 @@ static int cmd_wardrive_files(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
-    esp_err_t ret = init_sd_card();
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
-        return 1;
-    }
-    upload_state_ensure_file();
-
-    DIR *dir = opendir("/sdcard/lab/wardrives");
-    if (!dir) {
-        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
-        return 1;
-    }
-
-    printf("[WARD_FILE] BEGIN\n");
+    /* Every exit runs through `out:` so the host always receives BEGIN, a SUMMARY and
+     * END. This used to return early when the SD card or the directory could not be
+     * opened, leaving the Tab5 blocked until its own 120 s timeout waiting for a
+     * terminator that was never going to arrive. */
+    int rc = 0;
     int total_files = 0;
     long total_bytes = 0;
     int total_rows = 0;
@@ -8847,9 +9579,79 @@ static int cmd_wardrive_files(int argc, char **argv) {
     int wdgwars_failed = 0;
     int wdgwars_rate_limited = 0;
 
-    struct dirent *entry;
+    DIR *dir = NULL;
+    struct dirent *entry = NULL;
+    wardrive_scan_cache_t cache;
+    upload_state_table_t upload_tbl;
+    bool cache_ready = false;
+    bool tbl_ready = false;
+    int candidates = 0;
+    int scanning_idx = 0;
+    esp_err_t ret = init_sd_card();
+
+    if (ret != ESP_OK) {
+        printf("[WARD_FILE] BEGIN count=0\n");
+        printf("[WARD_FILE] ERROR reason=sd_init detail=%s\n", esp_err_to_name(ret));
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        rc = 1;
+        goto out;
+    }
+    upload_state_ensure_file();
+
+    dir = opendir("/sdcard/lab/wardrives");
+    if (!dir) {
+        printf("[WARD_FILE] BEGIN count=0\n");
+        printf("[WARD_FILE] ERROR reason=opendir path=/sdcard/lab/wardrives errno=%d\n", errno);
+        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
+        rc = 1;
+        goto out;
+    }
+
+    /* One stat() per name and nothing else. This number is the host's completeness
+     * check — it compares the filename= lines it parsed against it and shows a
+     * "listing truncated" banner when they differ — so it has to be the count *after*
+     * every filter and skip, not the raw directory enumeration. That holds only
+     * because the loop below emits a row for every file counted here, including one
+     * that turns out to be unreadable. Counting before the per-file work and then
+     * dropping a failed file would put the host in a permanent false alarm on a
+     * listing that was in fact complete.
+     *
+     * Nothing is opened here, and nothing may be slow: the host aborts the read if it
+     * sees 1.5 s of silence before BEGIN arrives. */
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
+            continue;
+        }
+        if (!wigle_is_upload_candidate(entry->d_name) && !wdgwars_is_upload_candidate(entry->d_name)) {
+            continue;
+        }
+
+        char probe_path[280];
+        struct stat probe_st;
+        snprintf(probe_path, sizeof(probe_path), "/sdcard/lab/wardrives/%s", entry->d_name);
+        if (stat(probe_path, &probe_st) != 0 || !S_ISREG(probe_st.st_mode)) {
+            continue;
+        }
+        candidates++;
+    }
+    rewinddir(dir);
+
+    printf("[WARD_FILE] BEGIN count=%d\n", candidates);
+
+    cache_ready = wardrive_scan_cache_init(&cache);
+    if (cache_ready) {
+        wardrive_scan_cache_load(&cache);
+    }
+    tbl_ready = upload_state_table_load(&upload_tbl);
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
             continue;
         }
         if (!wigle_is_upload_candidate(entry->d_name) && !wdgwars_is_upload_candidate(entry->d_name)) {
@@ -8858,22 +9660,32 @@ static int cmd_wardrive_files(int argc, char **argv) {
 
         char filepath[280];
         snprintf(filepath, sizeof(filepath), "/sdcard/lab/wardrives/%s", entry->d_name);
+
+        /* Emitted before the work, not after: on a cold cache hashing and scanning a
+         * 3 MB log takes tens of seconds, and silence is indistinguishable from a dead
+         * module. The key is `name=`, deliberately not `filename=`, because the host
+         * counts "[WARD_FILE] filename=" occurrences to drive its progress display and
+         * reusing that key would count every file twice. */
+        scanning_idx++;
+        printf("[WARD_FILE] SCANNING %d/%d name=%s\n", scanning_idx, candidates, entry->d_name);
+
         long size = 0;
         uint32_t hash = 0;
-        if (!wardrive_collect_file_id(filepath, &size, &hash)) {
+        wdgwars_wigle_stats_t stats;
+        wardrive_identity_t id = wardrive_file_identity(filepath, entry->d_name,
+                                                        cache_ready ? &cache : NULL,
+                                                        &size, &hash, &stats);
+        if (id == WARDRIVE_ID_ABSENT) {
+            /* No longer a regular file. The counting pass applied the same stat()
+             * predicate, so it was not counted either and the total stays exact. */
             continue;
         }
 
-        wdgwars_wigle_stats_t stats = {0};
-        bool use_sanitized = false;
-        wdgwars_sanitize_wigle_file(filepath, &stats, &use_sanitized);
-        if (use_sanitized) {
-            unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
-        }
-
         char wigle_status[16], wdgwars_status[16];
-        upload_state_get_status("wigle", entry->d_name, size, hash, wigle_status, sizeof(wigle_status));
-        upload_state_get_status("wdgwars", entry->d_name, size, hash, wdgwars_status, sizeof(wdgwars_status));
+        upload_tbl_get_status(tbl_ready ? &upload_tbl : NULL, "wigle", entry->d_name, size, hash,
+                              wigle_status, sizeof(wigle_status));
+        upload_tbl_get_status(tbl_ready ? &upload_tbl : NULL, "wdgwars", entry->d_name, size, hash,
+                              wdgwars_status, sizeof(wdgwars_status));
 
         total_files++;
         total_bytes += size;
@@ -8903,18 +9715,35 @@ static int cmd_wardrive_files(int argc, char **argv) {
             wdgwars_pending++;
         }
 
-        printf("[WARD_FILE] filename=%s size=%ld hash=%08lX wifi=%d ble=%d bt=%d bad=%d wigle=%s wdgwars=%s\n",
+        /* An unreadable file still gets a row, with the size stat() reported, a zero
+         * hash, zeroed counts and a trailing error=read. The field is appended, so a
+         * host that does not know it ignores it and simply shows the file with empty
+         * counts — which beats the file disappearing from a listing that announced it. */
+        printf("[WARD_FILE] filename=%s size=%ld hash=%08lX wifi=%d ble=%d bt=%d bad=%d wigle=%s wdgwars=%s%s\n",
                entry->d_name, size, (unsigned long)hash,
                stats.wifi_rows, stats.ble_rows, stats.bt_rows, stats.bad_rows,
-               wigle_status, wdgwars_status);
+               wigle_status, wdgwars_status,
+               (id == WARDRIVE_ID_READ_FAILED) ? " error=read" : "");
     }
-    closedir(dir);
+
+out:
+    if (dir) {
+        closedir(dir);
+    }
+    if (cache_ready) {
+        wardrive_scan_cache_writeback(&cache);
+        wardrive_scan_cache_free(&cache);
+    }
+    if (tbl_ready) {
+        upload_state_table_free(&upload_tbl);
+    }
+
     printf("[WARD_FILE] SUMMARY files=%d bytes=%ld rows=%d devices=%d wifi=%d ble=%d bt=%d bad=%d wigle_ok=%d wigle_pending=%d wigle_failed=%d wigle_rate_limited=%d wdgwars_ok=%d wdgwars_pending=%d wdgwars_failed=%d wdgwars_rate_limited=%d\n",
            total_files, total_bytes, total_rows, total_rows, total_wifi, total_ble, total_bt, total_bad,
            wigle_ok, wigle_pending, wigle_failed, wigle_rate_limited,
            wdgwars_ok, wdgwars_pending, wdgwars_failed, wdgwars_rate_limited);
     printf("[WARD_FILE] END\n");
-    return 0;
+    return rc;
 }
 
 static bool wardrive_cleanup_valid_service(const char *service) {
@@ -9046,42 +9875,105 @@ static int cmd_wardrive_cleanup(int argc, char **argv) {
     const char *dest_subdir = (argc >= 5) ? argv[4] : NULL;
 
     if (dest_subdir && !wardrive_cleanup_valid_subdir(dest_subdir)) {
-        printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=move target=\n", service, status);
+        printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=move target= count=0\n", service, status);
         printf("[WARD_CLEANUP] filename=destination action=failed reason=invalid_destination destination=%s\n", dest_subdir ? dest_subdir : "");
         printf("[WARD_CLEANUP] SUMMARY scanned=0 matched=0 moved=0 failed=1 dry_run=0\n");
         printf("[WARD_CLEANUP] END\n");
         return 1;
     }
 
-    esp_err_t ret = init_sd_card();
-    if (ret != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
-        return 1;
-    }
-    upload_state_ensure_file();
-
-    char target_dir[384];
-    if (!wardrive_cleanup_ensure_dir(service, status, dest_subdir, target_dir, sizeof(target_dir))) {
-        MY_LOG_INFO(TAG, "wardrive_cleanup: failed to prepare target directory");
-        return 1;
-    }
-
-    DIR *dir = opendir("/sdcard/lab/wardrives");
-    if (!dir) {
-        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
-        return 1;
-    }
-
-    printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=%s target=%s\n",
-           service, status, do_move ? "move" : "dry-run", target_dir);
-
+    /* Like the listing, this backs a button on the host ("Archive done") and so has to
+     * terminate its own output on every path, including the failures that used to
+     * return silently. */
     int scanned = 0;
     int matched = 0;
     int moved = 0;
     int failed = 0;
-    struct dirent *entry;
+    int candidates = 0;
+    int scanning_idx = 0;
+    DIR *dir = NULL;
+    struct dirent *entry = NULL;
+    wardrive_scan_cache_t cache;
+    upload_state_table_t upload_tbl;
+    bool cache_ready = false;
+    bool tbl_ready = false;
+    char target_dir[384];
+    esp_err_t ret;
+
+    target_dir[0] = '\0';
+
+    ret = init_sd_card();
+    if (ret != ESP_OK) {
+        printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=%s target= count=0\n",
+               service, status, do_move ? "move" : "dry-run");
+        printf("[WARD_CLEANUP] ERROR reason=sd_init detail=%s\n", esp_err_to_name(ret));
+        MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        failed++;
+        goto out;
+    }
+    upload_state_ensure_file();
+
+    if (!wardrive_cleanup_ensure_dir(service, status, dest_subdir, target_dir, sizeof(target_dir))) {
+        printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=%s target= count=0\n",
+               service, status, do_move ? "move" : "dry-run");
+        printf("[WARD_CLEANUP] ERROR reason=target_dir\n");
+        MY_LOG_INFO(TAG, "wardrive_cleanup: failed to prepare target directory");
+        failed++;
+        goto out;
+    }
+
+    dir = opendir("/sdcard/lab/wardrives");
+    if (!dir) {
+        printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=%s target=%s count=0\n",
+               service, status, do_move ? "move" : "dry-run", target_dir);
+        printf("[WARD_CLEANUP] ERROR reason=opendir path=/sdcard/lab/wardrives errno=%d\n", errno);
+        MY_LOG_INFO(TAG, "Failed to open /sdcard/lab/wardrives directory");
+        failed++;
+        goto out;
+    }
+
+    /* Must end up equal to the `scanned` the SUMMARY reports, so it applies exactly the
+     * predicate the loop below uses before it increments `scanned`: the name filters,
+     * a stat() that says regular file, and the same path-length limit. One stat() per
+     * name, nothing opened — the host aborts on 1.5 s of silence before BEGIN. */
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
+            continue;
+        }
+        if (!wigle_is_upload_candidate(entry->d_name) && !wdgwars_is_upload_candidate(entry->d_name)) {
+            continue;
+        }
+
+        char probe_path[384];
+        struct stat probe_st;
+        int probe_len = snprintf(probe_path, sizeof(probe_path), "/sdcard/lab/wardrives/%s", entry->d_name);
+        if (probe_len <= 0 || probe_len >= (int)sizeof(probe_path)) {
+            continue;
+        }
+        if (stat(probe_path, &probe_st) != 0 || !S_ISREG(probe_st.st_mode)) {
+            continue;
+        }
+        candidates++;
+    }
+    rewinddir(dir);
+
+    printf("[WARD_CLEANUP] BEGIN service=%s status=%s mode=%s target=%s count=%d\n",
+           service, status, do_move ? "move" : "dry-run", target_dir, candidates);
+
+    cache_ready = wardrive_scan_cache_init(&cache);
+    if (cache_ready) {
+        wardrive_scan_cache_load(&cache);
+    }
+    tbl_ready = upload_state_table_load(&upload_tbl);
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
             continue;
         }
         if (!wigle_is_upload_candidate(entry->d_name) && !wdgwars_is_upload_candidate(entry->d_name)) {
@@ -9095,16 +9987,39 @@ static int cmd_wardrive_cleanup(int argc, char **argv) {
             printf("[WARD_CLEANUP] filename=%s action=failed reason=path_too_long\n", entry->d_name);
             continue;
         }
+        /* Heartbeat before the work, same reason and same `name=` key as the listing:
+         * the cleanup popup on the host has a live log panel, and on a cold cache this
+         * loop is silent for tens of seconds per file. */
+        scanning_idx++;
+        printf("[WARD_CLEANUP] SCANNING %d/%d name=%s\n", scanning_idx, candidates, entry->d_name);
+
         long size = 0;
         uint32_t hash = 0;
-        if (!wardrive_collect_file_id(filepath, &size, &hash)) {
+        wardrive_identity_t id = wardrive_file_identity(filepath, entry->d_name,
+                                                        cache_ready ? &cache : NULL,
+                                                        &size, &hash, NULL);
+        if (id == WARDRIVE_ID_ABSENT) {
+            /* The counting pass applied the same stat() predicate and skipped it too,
+             * so `scanned` still matches the count announced on BEGIN. */
             continue;
         }
         scanned++;
 
+        if (id == WARDRIVE_ID_READ_FAILED) {
+            /* Counted, reported, but never matched or moved. The status lookup would
+             * be keyed on a zero hash and could match the wanted status by accident —
+             * archiving a file whose contents could not be read is not a risk worth
+             * taking to save one line of output. */
+            printf("[WARD_CLEANUP] filename=%s size=%ld action=skipped reason=read_error\n",
+                   entry->d_name, size);
+            continue;
+        }
+
         char wigle_status[16], wdgwars_status[16];
-        upload_state_get_status("wigle", entry->d_name, size, hash, wigle_status, sizeof(wigle_status));
-        upload_state_get_status("wdgwars", entry->d_name, size, hash, wdgwars_status, sizeof(wdgwars_status));
+        upload_tbl_get_status(tbl_ready ? &upload_tbl : NULL, "wigle", entry->d_name, size, hash,
+                              wigle_status, sizeof(wigle_status));
+        upload_tbl_get_status(tbl_ready ? &upload_tbl : NULL, "wdgwars", entry->d_name, size, hash,
+                              wdgwars_status, sizeof(wdgwars_status));
 
         if (!wardrive_cleanup_status_matches(service, status, wigle_status, wdgwars_status)) {
             continue;
@@ -9172,7 +10087,20 @@ static int cmd_wardrive_cleanup(int argc, char **argv) {
         }
     }
 
-    closedir(dir);
+out:
+    if (dir) {
+        closedir(dir);
+    }
+    /* Runs after the renames, so the garbage collection pass inside sees the moved
+     * files as gone and drops their rows. Without it an "Archive done" of sixty files
+     * would leave sixty dead entries behind for the next command to walk. */
+    if (cache_ready) {
+        wardrive_scan_cache_writeback(&cache);
+        wardrive_scan_cache_free(&cache);
+    }
+    if (tbl_ready) {
+        upload_state_table_free(&upload_tbl);
+    }
     if (do_move && moved > 0) {
         sd_sync();
     }
@@ -9217,11 +10145,16 @@ static int cmd_wardrive_fix(int argc, char **argv) {
     uint32_t fixed_hash = 0;
     wardrive_collect_file_id(fixed_path, &fixed_size, &fixed_hash);
 
-    printf("[WARD_FIX] filename=%s output=%s size=%ld hash=%08lX kept=%d dropped=%d wifi=%d ble=%d bt=%d bad=%d status=ok\n",
+    // The repaired copy is reported with its directory, because it no longer sits next
+    // to the original: it goes to /sdcard/lab/wardrives/fixed/ and the upload scans skip
+    // "*.fixed.log", so it cannot become a second upload candidate for the same data.
+    printf("[WARD_FIX] filename=%s output=fixed/%s size=%ld hash=%08lX kept=%d dropped=%d wifi=%d ble=%d bt=%d bad=%d status=ok\n",
            upload_name, fixed_name ? fixed_name : fixed_path,
            fixed_size, (unsigned long)fixed_hash,
            stats.data_rows, stats.bad_rows,
            stats.wifi_rows, stats.ble_rows, stats.bt_rows, stats.bad_rows);
+    printf("[WARD_FIX] note=output_dir=%s excluded_from_uploads=yes\n", WARDRIVE_FIXED_DIR);
+    MY_LOG_INFO(TAG, "wardrive_fix: repaired copy written to %s (excluded from upload scans)", fixed_path);
     printf("[WARD_FIX] END\n");
     return 0;
 }
@@ -9856,6 +10789,14 @@ static int cmd_wigle_upload(int argc, char **argv) {
         int total_files = argc - 1;
         MY_LOG_INFO(TAG, "Uploading %d selected Wardrive file(s) to api.wigle.net...", total_files);
 
+        wardrive_scan_cache_t cache;
+        upload_state_table_t upload_tbl;
+        bool cache_ready = wardrive_scan_cache_init(&cache);
+        if (cache_ready) {
+            wardrive_scan_cache_load(&cache);
+        }
+        bool tbl_ready = upload_state_table_load(&upload_tbl);
+
         for (int i = 1; i < argc; i++) {
             const char *arg = argv[i];
             char filepath[280];
@@ -9867,31 +10808,33 @@ static int cmd_wigle_upload(int argc, char **argv) {
                 continue;
             }
 
-            struct stat st;
             long fsize = 0;
-            if (stat(filepath, &st) == 0) {
-                fsize = (long)st.st_size;
-            }
-
             uint32_t hash = 0;
-            if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+            wdgwars_wigle_stats_t wigle_stats;
+            if (wardrive_file_identity(filepath, upload_name, cache_ready ? &cache : NULL,
+                                       &fsize, &hash, &wigle_stats) != WARDRIVE_ID_OK) {
                 MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", i, total_files, upload_name);
                 failed++;
                 continue;
             }
 
-            wdgwars_wigle_stats_t wigle_stats;
+            /* Settled before any sanitizing. Building the tmp copy costs a full read
+             * plus a full write of the file, and on a real card nearly every candidate
+             * turns out to be uploaded already — 62 of 63 files each paying for a
+             * sanitized copy that was unlinked seconds later without being sent. */
+            if (upload_tbl_is_done(tbl_ready ? &upload_tbl : NULL, "wigle", upload_name, fsize, hash)) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", i, total_files, upload_name, fsize);
+                skipped++;
+                continue;
+            }
+
+            /* Only files that are really going to be sent get a sanitized copy. The
+             * stats it recomputes match what the identity pass already produced; what
+             * is wanted here is the tmp file itself. */
             bool use_sanitized = false;
             if (!wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
                 MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED (preflight)", i, total_files, upload_name, fsize);
                 failed++;
-                continue;
-            }
-
-            if (upload_state_is_done("wigle", upload_name, fsize, hash)) {
-                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", i, total_files, upload_name, fsize);
-                skipped++;
-                if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
                 continue;
             }
 
@@ -9923,6 +10866,14 @@ static int cmd_wigle_upload(int argc, char **argv) {
             vTaskDelay(pdMS_TO_TICKS(250));
         }
 
+        if (cache_ready) {
+            wardrive_scan_cache_writeback(&cache);
+            wardrive_scan_cache_free(&cache);
+        }
+        if (tbl_ready) {
+            upload_state_table_free(&upload_tbl);
+        }
+
         MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
         if (auth_failed) {
             return 1;
@@ -9940,6 +10891,9 @@ static int cmd_wigle_upload(int argc, char **argv) {
     int total_files = 0;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
             continue;
         }
         if (wigle_is_upload_candidate(entry->d_name)) {
@@ -9960,8 +10914,19 @@ static int cmd_wigle_upload(int argc, char **argv) {
     rewinddir(dir);
     int current = 0;
 
+    wardrive_scan_cache_t cache;
+    upload_state_table_t upload_tbl;
+    bool cache_ready = wardrive_scan_cache_init(&cache);
+    if (cache_ready) {
+        wardrive_scan_cache_load(&cache);
+    }
+    bool tbl_ready = upload_state_table_load(&upload_tbl);
+
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
             continue;
         }
         if (!wigle_is_upload_candidate(entry->d_name)) {
@@ -9972,31 +10937,27 @@ static int cmd_wigle_upload(int argc, char **argv) {
         char filepath[280];
         snprintf(filepath, sizeof(filepath), "/sdcard/lab/wardrives/%s", entry->d_name);
 
-        struct stat st;
         long fsize = 0;
-        if (stat(filepath, &st) == 0) {
-            fsize = (long)st.st_size;
-        }
-
         uint32_t hash = 0;
-        if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+        wdgwars_wigle_stats_t wigle_stats;
+        if (wardrive_file_identity(filepath, entry->d_name, cache_ready ? &cache : NULL,
+                                   &fsize, &hash, &wigle_stats) != WARDRIVE_ID_OK) {
             MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", current, total_files, entry->d_name);
             failed++;
             continue;
         }
 
-        wdgwars_wigle_stats_t wigle_stats;
+        /* Settled before any sanitizing: see the selected-files branch above. */
+        if (!force_all && upload_tbl_is_done(tbl_ready ? &upload_tbl : NULL, "wigle", entry->d_name, fsize, hash)) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", current, total_files, entry->d_name, fsize);
+            skipped++;
+            continue;
+        }
+
         bool use_sanitized = false;
         if (!wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
             MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> FAILED (preflight)", current, total_files, entry->d_name, fsize);
             failed++;
-            continue;
-        }
-
-        if (!force_all && upload_state_is_done("wigle", entry->d_name, fsize, hash)) {
-            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", current, total_files, entry->d_name, fsize);
-            skipped++;
-            if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
             continue;
         }
 
@@ -10029,6 +10990,13 @@ static int cmd_wigle_upload(int argc, char **argv) {
     }
 
     closedir(dir);
+    if (cache_ready) {
+        wardrive_scan_cache_writeback(&cache);
+        wardrive_scan_cache_free(&cache);
+    }
+    if (tbl_ready) {
+        upload_state_table_free(&upload_tbl);
+    }
 
     MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
     if (auth_failed) {
@@ -10714,6 +11682,14 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
         int total_files = argc - 1;
         MY_LOG_INFO(TAG, "Uploading %d selected Wardrive file(s) to wdgwars.pl...", total_files);
 
+        wardrive_scan_cache_t cache;
+        upload_state_table_t upload_tbl;
+        bool cache_ready = wardrive_scan_cache_init(&cache);
+        if (cache_ready) {
+            wardrive_scan_cache_load(&cache);
+        }
+        bool tbl_ready = upload_state_table_load(&upload_tbl);
+
         for (int i = 1; i < argc; i++) {
             const char *arg = argv[i];
             char filepath[280];
@@ -10727,27 +11703,28 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
 
             struct stat st;
             long fsize = 0;
-            if (stat(filepath, &st) == 0) {
-                fsize = (long)st.st_size;
-            }
-
             wdgwars_wigle_stats_t wigle_stats;
             bool use_sanitized = false;
             uint32_t hash = 0;
-            if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+            if (wardrive_file_identity(filepath, upload_name, cache_ready ? &cache : NULL,
+                                       &fsize, &hash, &wigle_stats) != WARDRIVE_ID_OK) {
                 MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", i, total_files, upload_name);
                 failed++;
                 continue;
             }
 
-            if (wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
-                if (upload_state_is_done("wdgwars", upload_name, fsize, hash)) {
-                    MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", i, total_files, upload_name, fsize);
-                    skipped++;
-                    if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
-                    continue;
-                }
+            /* Settled before any sanitizing. Building the tmp copy reads and rewrites
+             * the whole file, and on a real card nearly every candidate turns out to be
+             * uploaded already — that is where the 200 s to send one file and skip 62
+             * was going. */
+            if (upload_tbl_is_done(tbl_ready ? &upload_tbl : NULL, "wdgwars", upload_name, fsize, hash)) {
+                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", i, total_files, upload_name, fsize);
+                skipped++;
+                continue;
+            }
 
+            /* Only files that are really going to be sent get a sanitized copy. */
+            if (wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
                 const char *upload_path = use_sanitized ? WDGWARS_SANITIZED_UPLOAD_PATH : filepath;
                 if (use_sanitized && stat(upload_path, &st) == 0) {
                     /* Keep fsize/hash from the original file for upload_state identity. */
@@ -10789,6 +11766,14 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
             vTaskDelay(pdMS_TO_TICKS(250));
         }
 
+        if (cache_ready) {
+            wardrive_scan_cache_writeback(&cache);
+            wardrive_scan_cache_free(&cache);
+        }
+        if (tbl_ready) {
+            upload_state_table_free(&upload_tbl);
+        }
+
         MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed, %d rate_limited", uploaded, skipped, failed, rate_limited);
         if (auth_failed) {
             return 1;
@@ -10806,6 +11791,9 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
     int total_files = 0;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
             continue;
         }
         if (wdgwars_is_upload_candidate(entry->d_name)) {
@@ -10826,8 +11814,19 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
     rewinddir(dir);
     int current = 0;
 
+    wardrive_scan_cache_t cache;
+    upload_state_table_t upload_tbl;
+    bool cache_ready = wardrive_scan_cache_init(&cache);
+    if (cache_ready) {
+        wardrive_scan_cache_load(&cache);
+    }
+    bool tbl_ready = upload_state_table_load(&upload_tbl);
+
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
+            continue;
+        }
+        if (wardrive_is_fixed_output(entry->d_name)) {
             continue;
         }
         if (!wdgwars_is_upload_candidate(entry->d_name)) {
@@ -10840,27 +11839,25 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
 
         struct stat st;
         long fsize = 0;
-        if (stat(filepath, &st) == 0) {
-            fsize = (long)st.st_size;
-        }
-
         wdgwars_wigle_stats_t wigle_stats;
         bool use_sanitized = false;
         uint32_t hash = 0;
-        if (!wardrive_collect_file_id(filepath, &fsize, &hash)) {
+        if (wardrive_file_identity(filepath, entry->d_name, cache_ready ? &cache : NULL,
+                                   &fsize, &hash, &wigle_stats) != WARDRIVE_ID_OK) {
             MY_LOG_INFO(TAG, "[%d/%d] %s -> FAILED (hash/read)", current, total_files, entry->d_name);
             failed++;
             continue;
         }
 
-        if (wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
-            if (!force_all && upload_state_is_done("wdgwars", entry->d_name, fsize, hash)) {
-                MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", current, total_files, entry->d_name, fsize);
-                skipped++;
-                if (use_sanitized) unlink(WDGWARS_SANITIZED_UPLOAD_PATH);
-                continue;
-            }
+        /* Settled before any sanitizing: see the selected-files branch above. */
+        if (!force_all && upload_tbl_is_done(tbl_ready ? &upload_tbl : NULL, "wdgwars", entry->d_name, fsize, hash)) {
+            MY_LOG_INFO(TAG, "[%d/%d] %s (%ld bytes) -> skipped (already uploaded)", current, total_files, entry->d_name, fsize);
+            skipped++;
+            continue;
+        }
 
+        /* Only files that are really going to be sent get a sanitized copy. */
+        if (wdgwars_sanitize_wigle_file(filepath, &wigle_stats, &use_sanitized)) {
             const char *upload_path = use_sanitized ? WDGWARS_SANITIZED_UPLOAD_PATH : filepath;
             if (use_sanitized && stat(upload_path, &st) == 0) {
                 /* Keep fsize/hash from the original file for upload_state identity. */
@@ -10903,6 +11900,13 @@ static int cmd_wdgwars_upload(int argc, char **argv) {
     }
 
     closedir(dir);
+    if (cache_ready) {
+        wardrive_scan_cache_writeback(&cache);
+        wardrive_scan_cache_free(&cache);
+    }
+    if (tbl_ready) {
+        upload_state_table_free(&upload_tbl);
+    }
 
     MY_LOG_INFO(TAG, "Done: %d uploaded, %d skipped, %d failed, %d rate_limited", uploaded, skipped, failed, rate_limited);
     if (auth_failed) {
@@ -11530,7 +12534,15 @@ static int cmd_stop(int argc, char **argv) {
     (void)argc; (void)argv;
     oled_display_update_full("> STOPPED", "  All ops halted", "", "  > Idle");
     MY_LOG_INFO(TAG, "Stop command received - stopping all operations...");
-    
+
+    // Sampled before any flag is cleared, so the acknowledgement at the end can tell
+    // the host whether this stop actually stopped a wardrive or found nothing running.
+    // The host stops and restarts scans back to back and had no way to confirm the
+    // module went idle, so it needed a run generation counter to keep an old reader
+    // task from being revived by the next start.
+    bool wardrive_was_running = (wardrive_active || wardrive_task_handle != NULL ||
+                                 wardrive_promisc_active || wardrive_promisc_task_handle != NULL);
+
     // Set global stop flags
     operation_stop_requested = true;
     wardrive_active = false;
@@ -11553,12 +12565,27 @@ static int cmd_stop(int argc, char **argv) {
 
     // Stop PCAP capture if running
     if (pcap_capture_active) {
+        if (pcap_capture_mode == PCAP_MODE_GATEWAY) {
+            // Stop admitting new packets before draining the limiter. The saved
+            // callbacks stay available to forward packets already accepted by
+            // the limiter task.
+            if (pcap_hooked_netif != NULL) {
+                if (pcap_original_input != NULL) {
+                    pcap_hooked_netif->input = pcap_original_input;
+                }
+                if (pcap_original_linkoutput != NULL) {
+                    pcap_hooked_netif->linkoutput = pcap_original_linkoutput;
+                }
+            }
+            pcap_rate_limiter_stop();
+        }
         pcap_capture_active = false;
 
         if (pcap_capture_mode == PCAP_MODE_RADIO) {
             esp_wifi_set_promiscuous(false);
-        } else if (pcap_capture_mode == PCAP_MODE_NET) {
-            if (pcap_arp_active) {
+        } else if (pcap_capture_mode == PCAP_MODE_NET ||
+                   pcap_capture_mode == PCAP_MODE_GATEWAY) {
+            if (pcap_capture_mode == PCAP_MODE_NET && pcap_arp_active) {
                 pcap_arp_active = false;
                 for (int i = 0; i < 60 && pcap_arp_task_handle != NULL; i++) {
                     vTaskDelay(pdMS_TO_TICKS(100));
@@ -11571,19 +12598,19 @@ static int cmd_stop(int argc, char **argv) {
                 pcap_arp_host_count = 0;
             }
 
-            esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-            if (sta) {
-                struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(sta);
-                if (lwip_nif) {
-                    if (pcap_original_input) lwip_nif->input = pcap_original_input;
-                    if (pcap_original_linkoutput) lwip_nif->linkoutput = pcap_original_linkoutput;
-                }
+            // Idempotent for non-gateway capture and already-drained gateway.
+            pcap_rate_limiter_stop();
+
+            if (pcap_hooked_netif) {
+                if (pcap_original_input) pcap_hooked_netif->input = pcap_original_input;
+                if (pcap_original_linkoutput) pcap_hooked_netif->linkoutput = pcap_original_linkoutput;
             }
             pcap_original_input = NULL;
             pcap_original_linkoutput = NULL;
+            pcap_hooked_netif = NULL;
         }
 
-        for (int i = 0; i < 40 && pcap_writer_task_handle != NULL; i++) {
+        for (int i = 0; i < 200 && pcap_writer_task_handle != NULL; i++) {
             vTaskDelay(pdMS_TO_TICKS(50));
         }
         if (pcap_writer_task_handle != NULL) {
@@ -11594,7 +12621,11 @@ static int cmd_stop(int argc, char **argv) {
         if (pcap_packet_queue) {
             pcap_queued_frame_t *leftover = NULL;
             while (xQueueReceive(pcap_packet_queue, &leftover, 0) == pdTRUE) {
-                free(leftover);
+                heap_caps_free(leftover);
+                portENTER_CRITICAL(&pcap_stats_lock);
+                pcap_capture_drop_count++;
+                pcap_capture_drop_queue_count++;
+                portEXIT_CRITICAL(&pcap_stats_lock);
             }
             vQueueDelete(pcap_packet_queue);
             pcap_packet_queue = NULL;
@@ -11605,13 +12636,39 @@ static int cmd_stop(int argc, char **argv) {
             pcap_capture_file = NULL;
             sd_sync();
         }
+        if (pcap_stdio_buffer != NULL) {
+            heap_caps_free(pcap_stdio_buffer);
+            pcap_stdio_buffer = NULL;
+        }
 
         MY_LOG_INFO(TAG, "PCAP saved: %s (%lu frames, %lu drops)",
                     pcap_capture_filepath,
                     (unsigned long)pcap_capture_frame_count,
                     (unsigned long)pcap_capture_drop_count);
+        printf("[PCAP_FINAL] file=%s frames=%lu drops=%lu drop_alloc=%lu drop_queue=%lu drop_write=%lu rate_queue_drops=%lu throttle_events=%lu pause_events=%lu filter_drops=%lu\n",
+               pcap_capture_filepath,
+               (unsigned long)pcap_capture_frame_count,
+               (unsigned long)pcap_capture_drop_count,
+               (unsigned long)pcap_capture_drop_alloc_count,
+               (unsigned long)pcap_capture_drop_queue_count,
+               (unsigned long)pcap_capture_drop_write_count,
+               (unsigned long)pcap_rate_queue_drop_count,
+               (unsigned long)pcap_rate_throttle_event_count,
+               (unsigned long)pcap_rate_pause_event_count,
+               (unsigned long)pcap_gateway_filtered_frame_count);
         pcap_capture_mode = PCAP_MODE_NONE;
     }
+
+    // Disable routed gateway only after any gateway PCAP hook has been restored.
+    if (capture_gateway_is_active()) {
+        esp_err_t gateway_err = capture_gateway_stop();
+        if (gateway_err == ESP_OK) {
+            MY_LOG_INFO(TAG, "Capture Gateway stopped");
+        } else {
+            MY_LOG_INFO(TAG, "Capture Gateway stop warning: %s", esp_err_to_name(gateway_err));
+        }
+    }
+    rogue_gitm_mode_active = false;
 
     // Stop handshake attack task if running
     if (handshake_attack_active || handshake_attack_task_handle != NULL) {
@@ -11896,6 +12953,11 @@ static int cmd_stop(int argc, char **argv) {
         }
     }
 
+    // Both wardrive tasks clear this on their own way out, but a vTaskDelete above skips
+    // their cleanup entirely. Left set, the name would keep the scan cache refusing to
+    // store that log for the rest of the boot, so every listing would rehash it.
+    wardrive_set_active_log(NULL);
+
     // Stop anti-surveillance task if running
     if (antisurv_active || antisurv_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Stopping anti-surveillance task...");
@@ -11949,7 +13011,7 @@ static int cmd_stop(int argc, char **argv) {
         portal_active = false;
         karma_mode_active = false;
         rogueap_mode_active = false;
-        
+
         // Stop DNS server task
         if (dns_server_task_handle != NULL) {
             // Wait for DNS task to finish (it checks portal_active flag)
@@ -12064,6 +13126,11 @@ static int cmd_stop(int argc, char **argv) {
     }
     
     MY_LOG_INFO(TAG, "All operations stopped.");
+    // Deterministic and idempotent: printed on every stop, including one that found
+    // nothing running, so the host can wait for a known state instead of flushing the
+    // UART and assuming. The human-readable "Wardrive promisc stopped ..." line the
+    // monitor task greps is emitted by the task itself and is untouched.
+    printf("[WARDRIVE] STOPPED running=%d\n", wardrive_was_running ? 1 : 0);
     return 0;
 }
 
@@ -12076,6 +13143,7 @@ static bool zig_recon_radio_busy(char *reason, size_t reason_len)
     else if (ap_locator_active || ap_locator_task_handle != NULL) why = "ap_locator";
     else if (channel_view_active || channel_view_task_handle != NULL) why = "channel_view";
     else if (pcap_capture_active || pcap_writer_task_handle != NULL) why = "pcap";
+    else if (capture_gateway_is_active()) why = "capture_gateway";
     else if (deauth_attack_active || deauth_attack_task_handle != NULL) why = "deauth";
     else if (blackout_attack_active || blackout_attack_task_handle != NULL) why = "blackout";
     else if (sae_attack_active || sae_attack_task_handle != NULL) why = "sae_overflow";
@@ -12526,12 +13594,20 @@ static const cli_hint_t k_cli_hints[] = {
     { "led", " set <on|off> | level <1-100> | read" },
     { "channel_time", " set <min|max> <ms> | read <min|max>" },
     { "wifi_connect", " <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]" },
+    { "capture_gateway", " start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop" },
+    { "start_rogue_gitm", " <SSID> <password> [--pcap-name <name>]" },
+    { "sd_benchmark", " [size_mb]" },
+    { "start_pcap", " radio|net|gateway" },
     { "ota_channel", " [main|dev]" },
     { "ota_boot", " <ota_0|ota_1>" },
     { "arp_ban", " <MAC> [IP]" },
     { "show_pass", " [portal|evil]" },
-    { "list_dir", " [path]" },
-    { "file_delete", " <path>" },
+    { "list_dir", " [path] [-s]" },
+    { "send_file", " <path> [offset]" },
+    { "uart_baud", " <115200|230400|460800|921600|2000000>" },
+    { "uart_baud_confirm", "" },
+    { "uart_baud_status", "" },
+    { "file_delete", " <path> [path2 ...]" },
     { "select_html", " <index>" },
     { "set_html", " <html>" },
     { "wpasec_key", " set <key> | read" },
@@ -12716,6 +13792,11 @@ static int cmd_wifi_disconnect(int argc, char **argv) {
     if (argc != 1) {
         MY_LOG_INFO(TAG, "Usage: wifi_disconnect");
         return 0;
+    }
+
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway is active. Use 'capture_gateway stop' or 'stop' first.");
+        return 1;
     }
 
     if (current_radio_mode != RADIO_MODE_WIFI || !wifi_initialized) {
@@ -12921,6 +14002,11 @@ static int cmd_wifi_connect(int argc, char **argv) {
     if (argc < 2 || argc > 9) {
         MY_LOG_INFO(TAG, "Usage: wifi_connect <SSID> [Password|--saved] [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]");
         return 0;
+    }
+
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway is active. Use 'capture_gateway stop' or 'stop' first.");
+        return 1;
     }
     
     const char *ssid = argv[1];
@@ -13135,6 +14221,515 @@ static int cmd_wifi_connect(int argc, char **argv) {
         MY_LOG_INFO(TAG, "TIMEOUT: Connection to '%s' timed out", ssid);
         return 0;
     }
+}
+
+static bool capture_gateway_wait_for_upstream(int timeout_ms,
+                                              wifi_ap_record_t *ap_info,
+                                              esp_netif_ip_info_t *ip_info)
+{
+    int loops = timeout_ms / 100;
+    for (int i = 0; i <= loops; i++) {
+        wifi_ap_record_t current_ap = {0};
+        esp_netif_ip_info_t current_ip = {0};
+        esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (sta != NULL &&
+            esp_wifi_sta_get_ap_info(&current_ap) == ESP_OK &&
+            esp_netif_get_ip_info(sta, &current_ip) == ESP_OK &&
+            current_ip.ip.addr != 0) {
+            if (ap_info != NULL) {
+                *ap_info = current_ap;
+            }
+            if (ip_info != NULL) {
+                *ip_info = current_ip;
+            }
+            return true;
+        }
+        if (i < loops) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+    return false;
+}
+
+static void capture_gateway_print_status(void)
+{
+    capture_gateway_status_t status;
+    capture_gateway_get_status(&status);
+    if (!status.active) {
+        MY_LOG_INFO(TAG, "Capture Gateway: idle");
+        printf("[CGW] status active=0\n");
+        printf("[CGW] END\n");
+        return;
+    }
+
+    MY_LOG_INFO(TAG, "Capture Gateway: active SSID='%s' security=%s clients=%u channel=%u upstream=%s NAPT=%s",
+                status.ssid,
+                status.open_network ? "open" : "wpa2",
+                status.connected_clients,
+                status.channel,
+                status.upstream_ready ? "up" : "down",
+                status.napt_enabled ? "on" : "off");
+    MY_LOG_INFO(TAG, "Capture Gateway: AP=" IPSTR " STA=" IPSTR " DNS=" IPSTR
+                " (proxy=%s upstream_dns=" IPSTR ")",
+                IP2STR(&status.downstream_ip.ip),
+                IP2STR(&status.upstream_ip.ip),
+                IP2STR(&status.advertised_dns.ip.u_addr.ip4),
+                status.dns_proxy ? "on" : "off",
+                IP2STR(&status.upstream_dns.ip.u_addr.ip4));
+    printf("[CGW] status active=1 upstream=%d napt=%d clients=%u channel=%u\n",
+           status.upstream_ready ? 1 : 0,
+           status.napt_enabled ? 1 : 0,
+           status.connected_clients,
+           status.channel);
+    printf("[CGW] ssid=%s security=%s upstream_ssid=%s\n",
+           status.ssid, status.open_network ? "open" : "wpa2",
+           status.upstream_ssid);
+    printf("[CGW] ap_ip=" IPSTR " sta_ip=" IPSTR " dns=" IPSTR
+           " dns_proxy=%s upstream_dns=" IPSTR "\n",
+           IP2STR(&status.downstream_ip.ip),
+           IP2STR(&status.upstream_ip.ip),
+           IP2STR(&status.advertised_dns.ip.u_addr.ip4),
+           status.dns_proxy ? "on" : "off",
+           IP2STR(&status.upstream_dns.ip.u_addr.ip4));
+
+    bool gateway_capture_active = pcap_capture_active &&
+                                  pcap_capture_mode == PCAP_MODE_GATEWAY;
+    pcap_stats_snapshot_t capture_stats = {0};
+    pcap_stats_snapshot(&capture_stats);
+    UBaseType_t rate_queue_depth = pcap_rate_packet_queue != NULL
+                                      ? uxQueueMessagesWaiting(pcap_rate_packet_queue)
+                                      : 0;
+    MY_LOG_INFO(TAG, "Capture Gateway PCAP: packets=%lu drops=%lu size=%" PRIu64 " bytes queue=%lu/%d",
+                (unsigned long)capture_stats.packets,
+                (unsigned long)capture_stats.drops,
+                capture_stats.file_bytes,
+                (unsigned long)capture_stats.queue_depth,
+                PCAP_PACKET_QUEUE_LENGTH);
+    printf("[CGW] capture=%s file=%s packets=%lu frames=%lu drops=%lu file_bytes=%" PRIu64 "\n",
+           gateway_capture_active ? "active" : "inactive",
+           gateway_capture_active ? pcap_capture_filepath : "-",
+           (unsigned long)capture_stats.packets,
+           (unsigned long)capture_stats.packets,
+           (unsigned long)capture_stats.drops,
+           capture_stats.file_bytes);
+    printf("[CGW] recorder drop_alloc=%lu drop_queue=%lu drop_write=%lu queue_depth=%lu queue_capacity=%d queue_high_water=%lu\n",
+           (unsigned long)capture_stats.drop_alloc,
+           (unsigned long)capture_stats.drop_queue,
+           (unsigned long)capture_stats.drop_write,
+           (unsigned long)capture_stats.queue_depth,
+           PCAP_PACKET_QUEUE_LENGTH,
+           (unsigned long)capture_stats.queue_high_water);
+    printf("[CGW] rate_limit_kbps=%lu rate_effective_kbps=%lu adaptive=%s throttle_events=%lu pause_events=%lu rate_queue_depth=%lu rate_queue_capacity=%d rate_queue_drops=%lu rate_queue_high_water=%lu\n",
+           (unsigned long)PCAP_GATEWAY_RATE_LIMIT_KBPS,
+           (unsigned long)capture_stats.rate_effective_kbps,
+           "on",
+           (unsigned long)capture_stats.rate_throttle_events,
+           (unsigned long)capture_stats.rate_pause_events,
+           (unsigned long)rate_queue_depth,
+           PCAP_RATE_QUEUE_LENGTH,
+           (unsigned long)capture_stats.rate_queue_drops,
+           (unsigned long)capture_stats.rate_queue_high_water);
+    printf("[CGW] pcap_scope=softap_10_42 filter_drops=%lu\n",
+           (unsigned long)capture_stats.gateway_filtered);
+    printf("[CGW] client_isolation=off\n");
+
+    wifi_sta_list_t wifi_clients = {0};
+    wifi_sta_mac_ip_list_t ip_clients = {0};
+    esp_err_t clients_err = esp_wifi_ap_get_sta_list(&wifi_clients);
+    if (clients_err == ESP_OK) {
+        clients_err = esp_wifi_ap_get_sta_list_with_ip(&wifi_clients, &ip_clients);
+    }
+    if (clients_err == ESP_OK) {
+        for (int i = 0; i < ip_clients.num; i++) {
+            printf("[CGW_CLIENT] mac=%02X:%02X:%02X:%02X:%02X:%02X ip=" IPSTR "\n",
+                   ip_clients.sta[i].mac[0], ip_clients.sta[i].mac[1],
+                   ip_clients.sta[i].mac[2], ip_clients.sta[i].mac[3],
+                   ip_clients.sta[i].mac[4], ip_clients.sta[i].mac[5],
+                   IP2STR(&ip_clients.sta[i].ip));
+        }
+    } else {
+        printf("[CGW] client_inventory_error=%s\n", esp_err_to_name(clients_err));
+    }
+    printf("[CGW] END\n");
+}
+
+/**
+ * Start Capture Gateway SoftAP/NAPT and arm gateway PCAP.
+ * @param password empty string creates an open SoftAP; otherwise WPA2-PSK.
+ * @param normalized_pcap_name empty for automatic sniff_N.pcap naming.
+ * @param oled_title short OLED header (e.g. "> Capture GW").
+ * @return 0 on success.
+ */
+static int capture_gateway_start_session(const char *ssid,
+                                         const char *password,
+                                         const char *normalized_pcap_name,
+                                         const char *oled_title)
+{
+    if (ssid == NULL || password == NULL) {
+        return 1;
+    }
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway is already active");
+        capture_gateway_print_status();
+        return 1;
+    }
+
+    size_t ssid_len = strlen(ssid);
+    size_t password_len = strlen(password);
+    if (ssid_len == 0 || ssid_len > CAPTURE_GATEWAY_SSID_MAX_LEN ||
+        (password_len > 0 &&
+         (password_len < CAPTURE_GATEWAY_PASSWORD_MIN_LEN ||
+          password_len > CAPTURE_GATEWAY_PASSWORD_MAX_LEN))) {
+        MY_LOG_INFO(TAG, "Capture SSID must be 1-32 bytes; optional password must be 8-63 bytes");
+        return 1;
+    }
+
+    char busy[32] = {0};
+    if (zig_recon_radio_busy(busy, sizeof(busy))) {
+        MY_LOG_INFO(TAG, "Cannot start Capture Gateway: radio busy (%s). Use 'stop' first.", busy);
+        return 1;
+    }
+    if (current_radio_mode != RADIO_MODE_WIFI || !wifi_initialized) {
+        MY_LOG_INFO(TAG, "WiFi is not initialized. Use 'wifi_connect' first.");
+        return 1;
+    }
+
+    wifi_ap_record_t upstream_ap = {0};
+    esp_netif_ip_info_t upstream_ip = {0};
+    if (!capture_gateway_wait_for_upstream(0, &upstream_ap, &upstream_ip)) {
+        MY_LOG_INFO(TAG, "No upstream IPv4 connection. Use 'wifi_connect' first.");
+        return 1;
+    }
+
+    esp_netif_t *ap_netif = ensure_ap_mode();
+    if (ap_netif == NULL) {
+        MY_LOG_INFO(TAG, "Failed to enable APSTA mode");
+        return 1;
+    }
+
+    if (!capture_gateway_wait_for_upstream(500, &upstream_ap, &upstream_ip)) {
+        esp_err_t connect_err = esp_wifi_connect();
+        if (connect_err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Capture Gateway: STA reconnect request: %s",
+                        esp_err_to_name(connect_err));
+        }
+        if (!capture_gateway_wait_for_upstream(15000, &upstream_ap, &upstream_ip)) {
+            esp_wifi_set_mode(WIFI_MODE_STA);
+            MY_LOG_INFO(TAG, "Capture Gateway: upstream did not recover after APSTA switch");
+            return 1;
+        }
+    }
+
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta_netif == NULL) {
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        MY_LOG_INFO(TAG, "Capture Gateway: STA netif not found");
+        return 1;
+    }
+
+    capture_gateway_config_t config = {
+        .ssid = ssid,
+        .password = password,
+        .channel = upstream_ap.primary,
+        .max_clients = CAPTURE_GATEWAY_DEFAULT_MAX_CLIENTS,
+    };
+    esp_err_t err = capture_gateway_start(ap_netif, sta_netif, &config);
+    if (err != ESP_OK) {
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        MY_LOG_INFO(TAG, "Capture Gateway start failed: %s", esp_err_to_name(err));
+        return 1;
+    }
+
+    operation_stop_requested = false;
+    if (normalized_pcap_name != NULL && normalized_pcap_name[0] != '\0') {
+        strlcpy(pcap_next_basename, normalized_pcap_name, sizeof(pcap_next_basename));
+    } else {
+        pcap_next_basename[0] = '\0';
+    }
+    char *pcap_argv[] = {"start_pcap", "gateway"};
+    if (cmd_start_pcap(2, pcap_argv) != 0) {
+        esp_err_t rollback_err = capture_gateway_stop();
+        esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_STA);
+        MY_LOG_INFO(TAG, "Capture Gateway: recorder failed to arm; gateway rolled back");
+        if (rollback_err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Capture Gateway rollback warning: %s",
+                        esp_err_to_name(rollback_err));
+        }
+        if (mode_err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Capture Gateway STA mode rollback warning: %s",
+                        esp_err_to_name(mode_err));
+        }
+        return 1;
+    }
+
+    oled_display_update_full(oled_title != NULL ? oled_title : "> Capture GW",
+                             ssid, "  APSTA + NAPT", "  PCAP armed");
+    MY_LOG_INFO(TAG,
+                "Capture Gateway ready and recording. Any authorized client joining '%s' is captured.",
+                ssid);
+    capture_gateway_print_status();
+    return 0;
+}
+
+static int cmd_capture_gateway(int argc, char **argv)
+{
+    if (argc < 2) {
+        MY_LOG_INFO(TAG, "Usage: capture_gateway start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop");
+        return 1;
+    }
+
+    if (strcasecmp(argv[1], "status") == 0) {
+        if (argc != 2) {
+            MY_LOG_INFO(TAG, "Usage: capture_gateway status");
+            return 1;
+        }
+        capture_gateway_print_status();
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "stop") == 0) {
+        if (argc != 2) {
+            MY_LOG_INFO(TAG, "Usage: capture_gateway stop");
+            return 1;
+        }
+        if (!capture_gateway_is_active()) {
+            MY_LOG_INFO(TAG, "Capture Gateway is not active");
+            return 0;
+        }
+        if (pcap_capture_active && pcap_capture_mode == PCAP_MODE_GATEWAY) {
+            MY_LOG_INFO(TAG, "Gateway PCAP is active. Use 'stop' so the writer and hooks are finalized first.");
+            return 1;
+        }
+
+        esp_err_t err = capture_gateway_stop();
+        esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Capture Gateway stop warning: %s", esp_err_to_name(err));
+        }
+        if (mode_err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to return WiFi to STA mode: %s", esp_err_to_name(mode_err));
+            return 1;
+        }
+        rogue_gitm_mode_active = false;
+        oled_display_update_full("> Capture GW", "  Gateway stopped", "  STA remains up", "  > Idle");
+        MY_LOG_INFO(TAG, "Capture Gateway stopped; STA connection preserved");
+        printf("[CGW] stopped\n[CGW] END\n");
+        return err == ESP_OK ? 0 : 1;
+    }
+
+    if (strcasecmp(argv[1], "start") != 0 || argc < 3) {
+        MY_LOG_INFO(TAG, "Usage: capture_gateway start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop");
+        return 1;
+    }
+
+    const char *capture_password = "";
+    const char *requested_pcap_name = NULL;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--pcap-name") == 0) {
+            if (requested_pcap_name != NULL || i + 1 >= argc) {
+                MY_LOG_INFO(TAG, "--pcap-name requires exactly one filename");
+                return 1;
+            }
+            requested_pcap_name = argv[++i];
+        } else if (strncmp(argv[i], "--", 2) == 0) {
+            MY_LOG_INFO(TAG, "Unexpected option: %s", argv[i]);
+            return 1;
+        } else if (capture_password[0] == '\0') {
+            capture_password = argv[i];
+        } else {
+            MY_LOG_INFO(TAG, "Unexpected argument: %s", argv[i]);
+            return 1;
+        }
+    }
+
+    char normalized_pcap_name[PCAP_BASENAME_MAX_LEN + 1] = {0};
+    if (requested_pcap_name != NULL &&
+        !pcap_normalize_basename(requested_pcap_name, normalized_pcap_name,
+                                 sizeof(normalized_pcap_name))) {
+        MY_LOG_INFO(TAG,
+                    "PCAP name must fit in %d characters including optional .pcap and use only letters, digits, '.', '_' or '-'; paths are not allowed",
+                    PCAP_BASENAME_MAX_LEN);
+        return 1;
+    }
+
+    return capture_gateway_start_session(argv[2], capture_password,
+                                         normalized_pcap_name, "> Capture GW");
+}
+
+static int cmd_start_rogue_gitm(int argc, char **argv)
+{
+    if (argc < 3) {
+        MY_LOG_INFO(TAG, "Usage: start_rogue_gitm <SSID> <password> [--pcap-name <name>]");
+        MY_LOG_INFO(TAG, "Requires wifi_connect first. Optional select_networks for same-channel deauth.");
+        return 1;
+    }
+
+    const char *ssid = argv[1];
+    const char *password = argv[2];
+    const char *requested_pcap_name = NULL;
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--pcap-name") == 0) {
+            if (requested_pcap_name != NULL || i + 1 >= argc) {
+                MY_LOG_INFO(TAG, "--pcap-name requires exactly one filename");
+                return 1;
+            }
+            requested_pcap_name = argv[++i];
+        } else if (strncmp(argv[i], "--", 2) == 0) {
+            MY_LOG_INFO(TAG, "Unexpected option: %s", argv[i]);
+            return 1;
+        } else {
+            MY_LOG_INFO(TAG, "Unexpected argument: %s", argv[i]);
+            return 1;
+        }
+    }
+
+    size_t ssid_len = strlen(ssid);
+    size_t password_len = strlen(password);
+    if (ssid_len == 0 || ssid_len > CAPTURE_GATEWAY_SSID_MAX_LEN) {
+        MY_LOG_INFO(TAG, "SSID length must be between 1 and 32 characters");
+        return 1;
+    }
+    if (password_len < CAPTURE_GATEWAY_PASSWORD_MIN_LEN ||
+        password_len > CAPTURE_GATEWAY_PASSWORD_MAX_LEN) {
+        MY_LOG_INFO(TAG, "Password length must be between 8 and 63 characters for WPA2");
+        return 1;
+    }
+
+    char normalized_pcap_name[PCAP_BASENAME_MAX_LEN + 1] = {0};
+    if (requested_pcap_name != NULL &&
+        !pcap_normalize_basename(requested_pcap_name, normalized_pcap_name,
+                                 sizeof(normalized_pcap_name))) {
+        MY_LOG_INFO(TAG,
+                    "PCAP name must fit in %d characters including optional .pcap and use only letters, digits, '.', '_' or '-'; paths are not allowed",
+                    PCAP_BASENAME_MAX_LEN);
+        return 1;
+    }
+
+    if (portal_active) {
+        MY_LOG_INFO(TAG, "Portal already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+    if (deauth_attack_active || deauth_attack_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Deauth attack already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+    if (pcap_capture_active) {
+        MY_LOG_INFO(TAG, "PCAP capture already active. Use 'stop' first.");
+        return 1;
+    }
+    if (capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway is already active. Use 'stop' first.");
+        capture_gateway_print_status();
+        return 1;
+    }
+
+    wifi_ap_record_t upstream_ap = {0};
+    esp_netif_ip_info_t upstream_ip = {0};
+    if (current_radio_mode != RADIO_MODE_WIFI || !wifi_initialized ||
+        !capture_gateway_wait_for_upstream(0, &upstream_ap, &upstream_ip)) {
+        MY_LOG_INFO(TAG, "No upstream IPv4 connection. Use 'wifi_connect' first.");
+        return 1;
+    }
+
+    bool deauth_enabled = (g_selected_count > 0);
+    if (deauth_enabled) {
+        if (!g_scan_done) {
+            MY_LOG_INFO(TAG, "No scan results for selected networks. Run scan_networks first.");
+            return 1;
+        }
+        uint8_t upstream_channel = upstream_ap.primary;
+        bool channel_ok = true;
+        bool uplink_collision = false;
+        for (int i = 0; i < g_selected_count; i++) {
+            int idx = g_selected_indices[i];
+            if (idx < 0 || idx >= (int)g_scan_count) {
+                MY_LOG_INFO(TAG, "Invalid selected network index %d", idx);
+                return 1;
+            }
+            const wifi_ap_record_t *ap = &g_scan_results[idx];
+            if (memcmp(ap->bssid, upstream_ap.bssid, 6) == 0) {
+                MY_LOG_INFO(TAG,
+                           "Rogue GITM: selected '%s' (%02X:%02X:%02X:%02X:%02X:%02X) is the STA uplink BSSID — deauth would kill Internet",
+                           ap->ssid,
+                           ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                           ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+                uplink_collision = true;
+            }
+            if (ap->primary != upstream_channel) {
+                MY_LOG_INFO(TAG,
+                           "Rogue GITM: selected '%s' (%02X:%02X:%02X:%02X:%02X:%02X) is on channel %u, upstream is channel %u",
+                           ap->ssid,
+                           ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                           ap->bssid[3], ap->bssid[4], ap->bssid[5],
+                           ap->primary, upstream_channel);
+                channel_ok = false;
+            }
+        }
+        if (uplink_collision) {
+            MY_LOG_INFO(TAG,
+                        "Rogue GITM refused: do not select the upstream STA BSSID for deauth. Use a different uplink (wifi_connect) than the mirror/deauth target.");
+            return 1;
+        }
+        if (!channel_ok) {
+            MY_LOG_INFO(TAG,
+                        "Rogue GITM refused: all selected deauth targets must share the upstream STA channel (%u)",
+                        upstream_channel);
+            return 1;
+        }
+        MY_LOG_INFO(TAG, "Networks selected: %d - deauth will run alongside Rogue GITM on channel %u",
+                    g_selected_count, upstream_channel);
+    } else {
+        MY_LOG_INFO(TAG, "No networks selected - Rogue GITM SoftAP only (no deauth)");
+    }
+
+    int start_err = capture_gateway_start_session(ssid, password, normalized_pcap_name,
+                                                  "> Rogue GITM");
+    if (start_err != 0) {
+        return start_err;
+    }
+
+    rogue_gitm_mode_active = true;
+
+    if (deauth_enabled) {
+        applicationState = DEAUTH_EVIL_TWIN;
+        save_target_bssids();
+        last_channel_check_time = esp_timer_get_time() / 1000;
+
+        MY_LOG_INFO(TAG, "Starting deauth attack on %d network(s):", g_selected_count);
+        for (int i = 0; i < target_bssid_count; i++) {
+            MY_LOG_INFO(TAG, "  [%d] %02X:%02X:%02X:%02X:%02X:%02X (CH %d)",
+                        i + 1,
+                        target_bssids[i].bssid[0], target_bssids[i].bssid[1],
+                        target_bssids[i].bssid[2], target_bssids[i].bssid[3],
+                        target_bssids[i].bssid[4], target_bssids[i].bssid[5],
+                        target_bssids[i].channel);
+        }
+
+        deauth_attack_active = true;
+        BaseType_t result = xTaskCreate(
+            deauth_attack_task,
+            "deauth_task",
+            4096,
+            NULL,
+            5,
+            &deauth_attack_task_handle
+        );
+        if (result != pdPASS) {
+            MY_LOG_INFO(TAG, "Failed to create deauth attack task!");
+            deauth_attack_active = false;
+            applicationState = IDLE;
+            MY_LOG_INFO(TAG, "WARNING: Rogue GITM running but deauth attack failed to start");
+        }
+    }
+
+    MY_LOG_INFO(TAG, "Rogue GITM started successfully!");
+    MY_LOG_INFO(TAG, "Mirror SoftAP: %s (WPA2) via Capture Gateway; use 'capture_gateway status' / 'stop'",
+                ssid);
+    esp_err_t led_err = led_set_color(255, 165, 0);
+    if (led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set LED for Rogue GITM: %s", esp_err_to_name(led_err));
+    }
+    return 0;
 }
 
 static int cmd_ota_check(int argc, char **argv) {
@@ -15045,7 +16640,71 @@ static int cmd_start_sniffer(int argc, char **argv) {
     return 0;
 }
 
+static void pcap_abort_start(void)
+{
+    pcap_capture_active = false;
+    pcap_rate_limiter_stop();
+    for (int i = 0; i < 40 && pcap_writer_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (pcap_writer_task_handle != NULL) {
+        vTaskDelete(pcap_writer_task_handle);
+        pcap_writer_task_handle = NULL;
+    }
+    if (pcap_packet_queue != NULL) {
+        pcap_queued_frame_t *leftover = NULL;
+        while (xQueueReceive(pcap_packet_queue, &leftover, 0) == pdTRUE) {
+            heap_caps_free(leftover);
+        }
+        vQueueDelete(pcap_packet_queue);
+        pcap_packet_queue = NULL;
+    }
+    if (pcap_capture_file != NULL) {
+        fclose(pcap_capture_file);
+        pcap_capture_file = NULL;
+        sd_sync();
+    }
+    if (pcap_stdio_buffer != NULL) {
+        heap_caps_free(pcap_stdio_buffer);
+        pcap_stdio_buffer = NULL;
+    }
+    pcap_capture_mode = PCAP_MODE_NONE;
+}
+
+static bool pcap_normalize_basename(const char *requested, char *normalized,
+                                    size_t normalized_size)
+{
+    if (requested == NULL || normalized == NULL || normalized_size < 6) {
+        return false;
+    }
+    size_t length = strlen(requested);
+    if (length == 0 || requested[0] == '.' || length > PCAP_BASENAME_MAX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)requested[i];
+        if (!isalnum(c) && c != '.' && c != '_' && c != '-') {
+            return false;
+        }
+    }
+
+    bool has_extension = length >= 5 &&
+                         strcasecmp(requested + length - 5, ".pcap") == 0;
+    size_t final_length = length + (has_extension ? 0 : 5);
+    if (final_length > PCAP_BASENAME_MAX_LEN || final_length >= normalized_size) {
+        return false;
+    }
+    strlcpy(normalized, requested, normalized_size);
+    if (!has_extension) {
+        strlcat(normalized, ".pcap", normalized_size);
+    }
+    return true;
+}
+
 static int cmd_start_pcap(int argc, char **argv) {
+    char requested_basename[PCAP_BASENAME_MAX_LEN + 1] = {0};
+    strlcpy(requested_basename, pcap_next_basename, sizeof(requested_basename));
+    pcap_next_basename[0] = '\0';
     pcap_capture_mode_t mode = PCAP_MODE_RADIO;
 
     if (argc >= 2) {
@@ -15053,14 +16712,31 @@ static int cmd_start_pcap(int argc, char **argv) {
             mode = PCAP_MODE_NET;
         } else if (strcasecmp(argv[1], "radio") == 0) {
             mode = PCAP_MODE_RADIO;
+        } else if (strcasecmp(argv[1], "gateway") == 0) {
+            mode = PCAP_MODE_GATEWAY;
         } else {
-            MY_LOG_INFO(TAG, "Usage: start_pcap radio|net");
+            MY_LOG_INFO(TAG, "Usage: start_pcap radio|net|gateway");
             return 1;
         }
     }
 
     if (pcap_capture_active) {
+        if (mode == PCAP_MODE_GATEWAY && pcap_capture_mode == PCAP_MODE_GATEWAY &&
+            capture_gateway_is_active()) {
+            MY_LOG_INFO(TAG, "Gateway PCAP is already armed -> %s",
+                        pcap_capture_filepath);
+            return 0;
+        }
         MY_LOG_INFO(TAG, "PCAP capture already active. Use 'stop' first.");
+        return 1;
+    }
+
+    if (mode == PCAP_MODE_GATEWAY && !capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway is not active. Start it before 'start_pcap gateway'.");
+        return 1;
+    }
+    if (mode != PCAP_MODE_GATEWAY && capture_gateway_is_active()) {
+        MY_LOG_INFO(TAG, "Capture Gateway is active; only 'start_pcap gateway' is allowed.");
         return 1;
     }
 
@@ -15088,21 +16764,50 @@ static int cmd_start_pcap(int argc, char **argv) {
     }
 
     struct stat st;
-    if (stat("/sdcard/lab/pcaps", &st) != 0) {
-        if (mkdir("/sdcard/lab/pcaps", 0755) != 0) {
-            MY_LOG_INFO(TAG, "Failed to create /sdcard/lab/pcaps directory");
+    if (stat(PCAP_CAPTURE_DIR, &st) != 0) {
+        if (mkdir(PCAP_CAPTURE_DIR, 0755) != 0) {
+            MY_LOG_INFO(TAG, "Failed to create %s directory", PCAP_CAPTURE_DIR);
             return 1;
         }
         sd_sync();
     }
 
-    int file_num = find_next_pcap_file_number();
-    snprintf(pcap_capture_filepath, sizeof(pcap_capture_filepath),
-             "/sdcard/lab/pcaps/sniff_%d.pcap", file_num);
+    if (requested_basename[0] != '\0') {
+        snprintf(pcap_capture_filepath, sizeof(pcap_capture_filepath),
+                 PCAP_CAPTURE_DIR "/%s", requested_basename);
+        if (stat(pcap_capture_filepath, &st) == 0) {
+            MY_LOG_INFO(TAG, "PCAP file already exists; refusing to overwrite: %s",
+                        pcap_capture_filepath);
+            return 1;
+        }
+    } else {
+        int file_num = find_next_pcap_file_number();
+        snprintf(pcap_capture_filepath, sizeof(pcap_capture_filepath),
+                 PCAP_CAPTURE_DIR "/sniff_%d.pcap", file_num);
+    }
 
     pcap_capture_file = fopen(pcap_capture_filepath, "wb");
     if (!pcap_capture_file) {
         MY_LOG_INFO(TAG, "Failed to open %s for writing", pcap_capture_filepath);
+        return 1;
+    }
+
+    pcap_stdio_buffer = heap_caps_malloc(PCAP_WRITE_BATCH_SIZE,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (pcap_stdio_buffer == NULL) {
+        pcap_stdio_buffer = heap_caps_malloc(PCAP_WRITE_BATCH_SIZE,
+                                             MALLOC_CAP_8BIT);
+    }
+    if (pcap_stdio_buffer == NULL ||
+        setvbuf(pcap_capture_file, (char *)pcap_stdio_buffer, _IOFBF,
+                PCAP_WRITE_BATCH_SIZE) != 0) {
+        MY_LOG_INFO(TAG, "Failed to allocate/configure PCAP write buffer");
+        if (pcap_stdio_buffer != NULL) {
+            heap_caps_free(pcap_stdio_buffer);
+            pcap_stdio_buffer = NULL;
+        }
+        fclose(pcap_capture_file);
+        pcap_capture_file = NULL;
         return 1;
     }
 
@@ -15116,24 +16821,55 @@ static int cmd_start_pcap(int argc, char **argv) {
         .snaplen = 65535,
         .network = linktype
     };
-    fwrite(&ghdr, 1, sizeof(ghdr), pcap_capture_file);
+    size_t header_written = fwrite(&ghdr, 1, sizeof(ghdr), pcap_capture_file);
+    if (header_written != sizeof(ghdr)) {
+        MY_LOG_INFO(TAG, "Failed to write PCAP header to %s", pcap_capture_filepath);
+        fclose(pcap_capture_file);
+        pcap_capture_file = NULL;
+        heap_caps_free(pcap_stdio_buffer);
+        pcap_stdio_buffer = NULL;
+        return 1;
+    }
     fflush(pcap_capture_file);
 
+    portENTER_CRITICAL(&pcap_stats_lock);
     pcap_capture_frame_count = 0;
     pcap_capture_drop_count = 0;
+    pcap_capture_drop_alloc_count = 0;
+    pcap_capture_drop_queue_count = 0;
+    pcap_capture_drop_write_count = 0;
+    pcap_capture_queue_high_water = 0;
+    pcap_capture_file_byte_count = header_written;
+    pcap_rate_queue_drop_count = 0;
+    pcap_rate_queue_high_water = 0;
+    pcap_rate_effective_kbps = mode == PCAP_MODE_GATEWAY
+                                   ? PCAP_GATEWAY_RATE_LIMIT_KBPS
+                                   : 0;
+    pcap_rate_throttle_event_count = 0;
+    pcap_rate_pause_event_count = 0;
+    pcap_gateway_filtered_frame_count = 0;
+    portEXIT_CRITICAL(&pcap_stats_lock);
 
-    pcap_packet_queue = xQueueCreate(256, sizeof(pcap_queued_frame_t *));
+    pcap_packet_queue = xQueueCreate(PCAP_PACKET_QUEUE_LENGTH,
+                                     sizeof(pcap_queued_frame_t *));
     if (!pcap_packet_queue) {
         MY_LOG_INFO(TAG, "Failed to create PCAP packet queue");
         fclose(pcap_capture_file);
         pcap_capture_file = NULL;
+        heap_caps_free(pcap_stdio_buffer);
+        pcap_stdio_buffer = NULL;
         return 1;
     }
 
     pcap_capture_mode = mode;
     pcap_capture_active = true;
 
-    xTaskCreate(pcap_writer_task, "pcap_writer", 4096, NULL, 5, &pcap_writer_task_handle);
+    if (xTaskCreate(pcap_writer_task, "pcap_writer", 4096, NULL, 17,
+                    &pcap_writer_task_handle) != pdPASS) {
+        MY_LOG_INFO(TAG, "Failed to create PCAP writer task");
+        pcap_abort_start();
+        return 1;
+    }
 
     if (mode == PCAP_MODE_RADIO) {
         wifi_promiscuous_filter_t filter = {
@@ -15148,34 +16884,30 @@ static int cmd_start_pcap(int argc, char **argv) {
         oled_display_update_full("> PCAP Radio", "  Promiscuous", "  Capturing...", pcap_capture_filepath + 18);
         MY_LOG_INFO(TAG, "PCAP radio capture started -> %s", pcap_capture_filepath);
     } else {
-        esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-        if (!sta_netif) {
-            MY_LOG_INFO(TAG, "Failed to get STA netif");
-            pcap_capture_active = false;
-            fclose(pcap_capture_file);
-            pcap_capture_file = NULL;
-            vQueueDelete(pcap_packet_queue);
-            pcap_packet_queue = NULL;
+        esp_netif_t *capture_netif = mode == PCAP_MODE_GATEWAY
+                                         ? capture_gateway_get_ap_netif()
+                                         : esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (!capture_netif) {
+            MY_LOG_INFO(TAG, "Failed to get %s netif",
+                        mode == PCAP_MODE_GATEWAY ? "Capture Gateway AP" : "STA");
+            pcap_abort_start();
             return 1;
         }
 
-        struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(sta_netif);
+        struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(capture_netif);
         if (!lwip_nif) {
             MY_LOG_INFO(TAG, "Failed to get lwIP netif");
-            pcap_capture_active = false;
-            fclose(pcap_capture_file);
-            pcap_capture_file = NULL;
-            vQueueDelete(pcap_packet_queue);
-            pcap_packet_queue = NULL;
+            pcap_abort_start();
             return 1;
         }
 
-        // --- ARP spoof MITM setup ---
-        esp_wifi_get_mac(WIFI_IF_STA, pcap_arp_own_mac);
+        if (mode == PCAP_MODE_NET) {
+            // --- Legacy ARP spoof MITM setup ---
+            esp_wifi_get_mac(WIFI_IF_STA, pcap_arp_own_mac);
 
-        esp_netif_ip_info_t ip_info;
-        esp_netif_get_ip_info(sta_netif, &ip_info);
-        pcap_arp_gateway_ip = ip_info.gw.addr;
+            esp_netif_ip_info_t ip_info;
+            esp_netif_get_ip_info(capture_netif, &ip_info);
+            pcap_arp_gateway_ip = ip_info.gw.addr;
 
         bool gw_found = false;
         for (int i = 0; i < ARP_TABLE_SIZE; i++) {
@@ -15257,19 +16989,51 @@ static int cmd_start_pcap(int argc, char **argv) {
                 MY_LOG_INFO(TAG, "PCAP net: ARP spoof MITM started (IP forwarding enabled)");
             }
         }
-        // --- End ARP spoof setup ---
+            // --- End legacy ARP spoof setup ---
+        }
 
         pcap_original_input = lwip_nif->input;
         pcap_original_linkoutput = lwip_nif->linkoutput;
+        pcap_hooked_netif = lwip_nif;
         lwip_nif->input = pcap_netif_input_hook;
         lwip_nif->linkoutput = pcap_netif_linkoutput_hook;
 
-        {
+        if (mode == PCAP_MODE_GATEWAY && !pcap_rate_limiter_start()) {
+            lwip_nif->input = pcap_original_input;
+            lwip_nif->linkoutput = pcap_original_linkoutput;
+            pcap_original_input = NULL;
+            pcap_original_linkoutput = NULL;
+            pcap_hooked_netif = NULL;
+            MY_LOG_INFO(TAG, "Capture Gateway rate limiter failed to start");
+            pcap_abort_start();
+            return 1;
+        }
+
+        if (mode == PCAP_MODE_GATEWAY) {
+            esp_netif_ip_info_t ap_ip = {0};
+            esp_netif_get_ip_info(capture_netif, &ap_ip);
+            capture_gateway_status_t cgw = {0};
+            capture_gateway_get_status(&cgw);
+            oled_display_update_full("> PCAP Gateway", "  AP pre-NAT", "  Ethernet RX/TX",
+                                     pcap_capture_filepath + 18);
+            MY_LOG_INFO(TAG, "PCAP gateway capture started on downstream AP -> %s",
+                        pcap_capture_filepath);
+            MY_LOG_INFO(TAG,
+                        "PCAP gateway hooked netif AP IP=" IPSTR " (pre-NAT SoftAP only; no STA ARP-spoof)",
+                        IP2STR(&ap_ip.ip));
+            MY_LOG_INFO(TAG,
+                        "PCAP gateway DNS: downstream_dns=" IPSTR " upstream_dns=" IPSTR " dns_proxy=%s",
+                        IP2STR(&cgw.advertised_dns.ip.u_addr.ip4),
+                        IP2STR(&cgw.upstream_dns.ip.u_addr.ip4),
+                        cgw.dns_proxy ? "on" : "off");
+            MY_LOG_INFO(TAG, "Capture Gateway adaptive traffic ceiling: %lu kbps",
+                        (unsigned long)PCAP_GATEWAY_RATE_LIMIT_KBPS);
+        } else {
             char oled_l3[32];
             snprintf(oled_l3, sizeof(oled_l3), "  MITM %d hosts", pcap_arp_host_count);
             oled_display_update_full("> PCAP Net", "  Ethernet RX/TX", oled_l3, pcap_capture_filepath + 18);
+            MY_LOG_INFO(TAG, "PCAP net capture started -> %s", pcap_capture_filepath);
         }
-        MY_LOG_INFO(TAG, "PCAP net capture started -> %s", pcap_capture_filepath);
     }
 
     MY_LOG_INFO(TAG, "Use 'stop' to stop capture and save file.");
@@ -16884,6 +18648,201 @@ static int cmd_sd_status(int argc, char **argv)
     return 0;
 }
 
+#define SD_BENCH_DEFAULT_MB 32U
+#define SD_BENCH_MIN_MB 1U
+#define SD_BENCH_MAX_MB 256U
+#define SD_BENCH_CHUNK_SIZE (64U * 1024U)
+#define SD_BENCH_PATH "/sdcard/lab/.janos_sd_benchmark.tmp"
+
+static int sd_benchmark_compare_u32(const void *left, const void *right)
+{
+    uint32_t a = *(const uint32_t *)left;
+    uint32_t b = *(const uint32_t *)right;
+    return (a > b) - (a < b);
+}
+
+// Sequential write benchmark shaped like the PCAP writer: 64 KiB chunks and a
+// 64 KiB stdio buffer. The temporary file is always removed after the test.
+static int cmd_sd_benchmark(int argc, char **argv)
+{
+    if (argc > 2) {
+        MY_LOG_INFO(TAG, "Usage: sd_benchmark [size_mb]");
+        return 1;
+    }
+    if (pcap_capture_active || capture_gateway_is_active() || wardrive_active) {
+        MY_LOG_INFO(TAG, "SD benchmark requires idle capture/wardrive state. Use 'stop' first.");
+        return 1;
+    }
+
+    uint32_t size_mb = SD_BENCH_DEFAULT_MB;
+    if (argc == 2) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long parsed = strtoul(argv[1], &end, 10);
+        if (errno != 0 || end == argv[1] || *end != '\0' ||
+            parsed < SD_BENCH_MIN_MB || parsed > SD_BENCH_MAX_MB) {
+            MY_LOG_INFO(TAG, "size_mb must be an integer from %u to %u",
+                        SD_BENCH_MIN_MB, SD_BENCH_MAX_MB);
+            return 1;
+        }
+        size_mb = (uint32_t)parsed;
+    }
+
+    esp_err_t mount_err = init_sd_card();
+    if (mount_err != ESP_OK) {
+        MY_LOG_INFO(TAG, "SD benchmark mount failed: %s", esp_err_to_name(mount_err));
+        printf("[SD_BENCH] result=error stage=mount error=%s\n",
+               esp_err_to_name(mount_err));
+        return 1;
+    }
+    if (!sd_mkdir_recursive("/sdcard/lab")) {
+        MY_LOG_INFO(TAG, "SD benchmark could not create /sdcard/lab");
+        printf("[SD_BENCH] result=error stage=directory\n");
+        return 1;
+    }
+
+    const uint64_t total_bytes = (uint64_t)size_mb * 1024ULL * 1024ULL;
+    const uint32_t sample_capacity = (uint32_t)(total_bytes / SD_BENCH_CHUNK_SIZE);
+    uint8_t *write_buffer = heap_caps_malloc(SD_BENCH_CHUNK_SIZE,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *stdio_buffer = heap_caps_malloc(SD_BENCH_CHUNK_SIZE,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint32_t *latency_us = heap_caps_malloc(sample_capacity * sizeof(uint32_t),
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (write_buffer == NULL) {
+        write_buffer = heap_caps_malloc(SD_BENCH_CHUNK_SIZE, MALLOC_CAP_8BIT);
+    }
+    if (stdio_buffer == NULL) {
+        stdio_buffer = heap_caps_malloc(SD_BENCH_CHUNK_SIZE, MALLOC_CAP_8BIT);
+    }
+    if (latency_us == NULL) {
+        latency_us = heap_caps_malloc(sample_capacity * sizeof(uint32_t),
+                                      MALLOC_CAP_8BIT);
+    }
+    if (write_buffer == NULL || stdio_buffer == NULL || latency_us == NULL) {
+        MY_LOG_INFO(TAG, "SD benchmark buffer allocation failed");
+        printf("[SD_BENCH] result=error stage=allocate\n");
+        heap_caps_free(write_buffer);
+        heap_caps_free(stdio_buffer);
+        heap_caps_free(latency_us);
+        return 1;
+    }
+
+    for (size_t i = 0; i < SD_BENCH_CHUNK_SIZE; i++) {
+        write_buffer[i] = (uint8_t)((i * 31U + 17U) & 0xffU);
+    }
+
+    unlink(SD_BENCH_PATH); // remove only the benchmark's own stale temp file
+    FILE *file = fopen(SD_BENCH_PATH, "wb");
+    if (file == NULL) {
+        MY_LOG_INFO(TAG, "SD benchmark open failed: %s", strerror(errno));
+        printf("[SD_BENCH] result=error stage=open errno=%d\n", errno);
+        heap_caps_free(write_buffer);
+        heap_caps_free(stdio_buffer);
+        heap_caps_free(latency_us);
+        return 1;
+    }
+    if (setvbuf(file, (char *)stdio_buffer, _IOFBF, SD_BENCH_CHUNK_SIZE) != 0) {
+        MY_LOG_INFO(TAG, "SD benchmark setvbuf failed");
+        printf("[SD_BENCH] result=error stage=setvbuf\n");
+        fclose(file);
+        unlink(SD_BENCH_PATH);
+        heap_caps_free(write_buffer);
+        heap_caps_free(stdio_buffer);
+        heap_caps_free(latency_us);
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "SD benchmark: writing %lu MiB in 64 KiB chunks...",
+                (unsigned long)size_mb);
+    printf("[SD_BENCH] start size_mb=%lu chunk_bytes=%u bus_khz=%d path=%s\n",
+           (unsigned long)size_mb, SD_BENCH_CHUNK_SIZE, sd_mount_freq_khz,
+           SD_BENCH_PATH);
+
+    uint64_t bytes_written = 0;
+    uint32_t sample_count = 0;
+    int saved_errno = 0;
+    int64_t start_us = esp_timer_get_time();
+    uint64_t next_progress = 4ULL * 1024ULL * 1024ULL;
+    while (bytes_written < total_bytes) {
+        int64_t write_start_us = esp_timer_get_time();
+        size_t written = fwrite(write_buffer, 1, SD_BENCH_CHUNK_SIZE, file);
+        int64_t write_elapsed_us = esp_timer_get_time() - write_start_us;
+        latency_us[sample_count++] = write_elapsed_us > UINT32_MAX
+                                         ? UINT32_MAX
+                                         : (uint32_t)write_elapsed_us;
+        bytes_written += written;
+        if (written != SD_BENCH_CHUNK_SIZE) {
+            saved_errno = errno;
+            break;
+        }
+        if (bytes_written >= next_progress) {
+            int64_t elapsed_us = esp_timer_get_time() - start_us;
+            uint64_t avg_kib_s = elapsed_us > 0
+                                     ? (bytes_written * 1000000ULL) /
+                                           ((uint64_t)elapsed_us * 1024ULL)
+                                     : 0;
+            printf("[SD_BENCH] progress bytes=%" PRIu64 " avg_kib_s=%" PRIu64 "\n",
+                   bytes_written, avg_kib_s);
+            next_progress += 4ULL * 1024ULL * 1024ULL;
+        }
+    }
+
+    int64_t flush_start_us = esp_timer_get_time();
+    int flush_result = fflush(file);
+    uint64_t flush_us = (uint64_t)(esp_timer_get_time() - flush_start_us);
+    int descriptor = fileno(file);
+    int64_t sync_start_us = esp_timer_get_time();
+    int sync_result = descriptor >= 0 ? fsync(descriptor) : -1;
+    uint64_t sync_us = (uint64_t)(esp_timer_get_time() - sync_start_us);
+    int64_t end_us = esp_timer_get_time();
+    int close_result = fclose(file);
+    file = NULL;
+
+    bool write_ok = bytes_written == total_bytes && flush_result == 0 &&
+                    sync_result == 0 && close_result == 0;
+    if (!write_ok && saved_errno == 0) {
+        saved_errno = errno;
+    }
+
+    qsort(latency_us, sample_count, sizeof(uint32_t), sd_benchmark_compare_u32);
+    uint32_t p50_us = sample_count > 0 ? latency_us[(sample_count - 1U) * 50U / 100U] : 0;
+    uint32_t p95_us = sample_count > 0 ? latency_us[(sample_count - 1U) * 95U / 100U] : 0;
+    uint32_t p99_us = sample_count > 0 ? latency_us[(sample_count - 1U) * 99U / 100U] : 0;
+    uint32_t max_us = sample_count > 0 ? latency_us[sample_count - 1U] : 0;
+    uint64_t elapsed_us = end_us > start_us ? (uint64_t)(end_us - start_us) : 1ULL;
+    uint64_t avg_kib_s = (bytes_written * 1000000ULL) / (elapsed_us * 1024ULL);
+    uint64_t avg_kbps = (bytes_written * 8000ULL) / elapsed_us;
+    uint64_t conservative_kbps = avg_kbps / 2ULL;
+    if (conservative_kbps > SD_BENCH_CONSERVATIVE_MAX_KBPS) {
+        conservative_kbps = SD_BENCH_CONSERVATIVE_MAX_KBPS;
+    }
+
+    printf("[SD_BENCH] result=%s bytes=%" PRIu64 " elapsed_ms=%" PRIu64
+           " avg_kib_s=%" PRIu64 " avg_kbps=%" PRIu64
+           " p50_write_us=%lu p95_write_us=%lu p99_write_us=%lu max_write_us=%lu"
+           " flush_ms=%" PRIu64 " sync_ms=%" PRIu64
+           " conservative_50pct_kbps=%" PRIu64 " bus_khz=%d errno=%d\n",
+           write_ok ? "ok" : "error", bytes_written, elapsed_us / 1000ULL,
+           avg_kib_s, avg_kbps,
+           (unsigned long)p50_us, (unsigned long)p95_us,
+           (unsigned long)p99_us, (unsigned long)max_us,
+           flush_us / 1000ULL, sync_us / 1000ULL,
+           conservative_kbps, sd_mount_freq_khz, saved_errno);
+    MY_LOG_INFO(TAG,
+                "SD benchmark %s: %" PRIu64 " KiB/s, p99=%lu us, max=%lu us, flush=%" PRIu64 " ms, sync=%" PRIu64 " ms",
+                write_ok ? "passed" : "failed", avg_kib_s,
+                (unsigned long)p99_us, (unsigned long)max_us,
+                flush_us / 1000ULL, sync_us / 1000ULL);
+
+    unlink(SD_BENCH_PATH);
+    sd_sync();
+    heap_caps_free(write_buffer);
+    heap_caps_free(stdio_buffer);
+    heap_caps_free(latency_us);
+    return write_ok ? 0 : 1;
+}
+
 // Command: list_sd - Lists HTML files on SD card
 static int cmd_list_sd(int argc, char **argv)
 {
@@ -17005,8 +18964,18 @@ static bool build_sd_path(char *dest, size_t dest_size, const char *input_path)
     }
 
     if (input_path[0] == '/') {
-        strncpy(dest, input_path, dest_size - 1);
-        dest[dest_size - 1] = '\0';
+        // An absolute path used to be taken verbatim, so "list_dir /lab/handshakes"
+        // tried to open "/lab/handshakes" and failed while "/sdcard/lab/handshakes"
+        // worked — the same directory named two ways, one of which silently did not
+        // exist. Anything not already under the mount point is rebased onto it.
+        bool already_rooted = (strncmp(input_path, "/sdcard", 7) == 0) &&
+                              (input_path[7] == '\0' || input_path[7] == '/');
+        if (already_rooted) {
+            strncpy(dest, input_path, dest_size - 1);
+            dest[dest_size - 1] = '\0';
+        } else {
+            snprintf(dest, dest_size, "/sdcard%s", input_path);
+        }
     } else {
         snprintf(dest, dest_size, "/sdcard/%s", input_path);
     }
@@ -17019,10 +18988,543 @@ static bool build_sd_path(char *dest, size_t dest_size, const char *input_path)
     return dest[0] != '\0';
 }
 
-// Command: list_dir [path] - Lists files inside a directory on SD card
+#define JANOS_UART_NUM              UART_NUM_0
+#define JANOS_UART_DEFAULT_BAUD     115200U
+#define UART_BAUD_CONFIRM_US        (10ULL * 1000ULL * 1000ULL)
+#define UART_BAUD_IDLE_REVERT_US    (60ULL * 1000ULL * 1000ULL)
+#define UART_BAUD_IDLE_CHECK_US     (1ULL * 1000ULL * 1000ULL)
+#define JANOS_CONSOLE_MAX_COMMANDS  128U
+
+#define FT_BLOCK_SIZE               4096U
+#define FT_ACK_TIMEOUT_MS           5000U
+#define FT_MAX_BLOCK_ATTEMPTS       3U
+#define FT_ACK                      0x06U
+#define FT_NAK                      0x15U
+#define FT_CAN                      0x18U
+
+static SemaphoreHandle_t uart_baud_mutex;
+static esp_timer_handle_t uart_baud_confirm_timer;
+static esp_timer_handle_t uart_baud_idle_timer;
+static uint32_t uart_current_baud = JANOS_UART_DEFAULT_BAUD;
+static bool uart_baud_confirmation_pending;
+static bool uart_file_transfer_active;
+static int64_t uart_last_command_us;
+
+typedef struct {
+    esp_console_cmd_func_t func;
+    esp_console_cmd_func_with_context_t func_w_context;
+    void *context;
+} janos_console_cmd_context_t;
+
+static janos_console_cmd_context_t janos_console_cmd_contexts[JANOS_CONSOLE_MAX_COMMANDS];
+static size_t janos_console_cmd_context_count;
+
+static void uart_baud_note_activity(void)
+{
+    if (uart_baud_mutex == NULL) {
+        return;
+    }
+
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+    uart_last_command_us = esp_timer_get_time();
+    xSemaphoreGive(uart_baud_mutex);
+}
+
+static void uart_baud_set_file_transfer_active(bool active)
+{
+    if (uart_baud_mutex == NULL) {
+        return;
+    }
+
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+    uart_file_transfer_active = active;
+    if (!active) {
+        uart_last_command_us = esp_timer_get_time();
+    }
+    xSemaphoreGive(uart_baud_mutex);
+}
+
+static void uart_baud_timeout_cb(void *arg)
+{
+    (void)arg;
+
+    if (uart_baud_mutex == NULL) {
+        return;
+    }
+
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+    if (uart_baud_confirmation_pending) {
+        uart_baud_confirmation_pending = false;
+        if (uart_set_baudrate(JANOS_UART_NUM, JANOS_UART_DEFAULT_BAUD) == ESP_OK) {
+            uart_current_baud = JANOS_UART_DEFAULT_BAUD;
+        }
+    }
+    xSemaphoreGive(uart_baud_mutex);
+}
+
+static void uart_baud_idle_cb(void *arg)
+{
+    (void)arg;
+
+    if (uart_baud_mutex == NULL) {
+        return;
+    }
+
+    bool reverted = false;
+    int64_t now_us = esp_timer_get_time();
+
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+    if (!uart_file_transfer_active &&
+        !uart_baud_confirmation_pending &&
+        uart_current_baud != JANOS_UART_DEFAULT_BAUD &&
+        now_us - uart_last_command_us >= (int64_t)UART_BAUD_IDLE_REVERT_US) {
+        if (uart_set_baudrate(JANOS_UART_NUM, JANOS_UART_DEFAULT_BAUD) == ESP_OK) {
+            uart_current_baud = JANOS_UART_DEFAULT_BAUD;
+            uart_last_command_us = now_us;
+            reverted = true;
+        }
+    }
+    xSemaphoreGive(uart_baud_mutex);
+
+    if (reverted) {
+        printf("[UARTB] idle revert rate=115200\n");
+        fflush(stdout);
+    }
+}
+
+static esp_err_t uart_baud_control_init(void)
+{
+    uart_baud_mutex = xSemaphoreCreateMutex();
+    if (uart_baud_mutex == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    const esp_timer_create_args_t timer_args = {
+        .callback = uart_baud_timeout_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "uart_baud_confirm",
+        .skip_unhandled_events = true,
+    };
+    esp_err_t err = esp_timer_create(&timer_args, &uart_baud_confirm_timer);
+    if (err != ESP_OK) {
+        vSemaphoreDelete(uart_baud_mutex);
+        uart_baud_mutex = NULL;
+        return err;
+    }
+
+    const esp_timer_create_args_t idle_timer_args = {
+        .callback = uart_baud_idle_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "uart_baud_idle",
+        .skip_unhandled_events = true,
+    };
+    err = esp_timer_create(&idle_timer_args, &uart_baud_idle_timer);
+    if (err != ESP_OK) {
+        (void)esp_timer_delete(uart_baud_confirm_timer);
+        uart_baud_confirm_timer = NULL;
+        vSemaphoreDelete(uart_baud_mutex);
+        uart_baud_mutex = NULL;
+        return err;
+    }
+
+    uart_last_command_us = esp_timer_get_time();
+    err = esp_timer_start_periodic(uart_baud_idle_timer, UART_BAUD_IDLE_CHECK_US);
+    if (err != ESP_OK) {
+        (void)esp_timer_delete(uart_baud_idle_timer);
+        uart_baud_idle_timer = NULL;
+        (void)esp_timer_delete(uart_baud_confirm_timer);
+        uart_baud_confirm_timer = NULL;
+        vSemaphoreDelete(uart_baud_mutex);
+        uart_baud_mutex = NULL;
+    }
+    return err;
+}
+
+static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
+{
+    janos_console_cmd_context_t *cmd_context =
+        (janos_console_cmd_context_t *)context;
+
+    uart_baud_note_activity();
+    if (cmd_context->func != NULL) {
+        return cmd_context->func(argc, argv);
+    }
+    return cmd_context->func_w_context(cmd_context->context, argc, argv);
+}
+
+static esp_err_t janos_console_cmd_register(const esp_console_cmd_t *cmd)
+{
+    if (cmd == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if ((cmd->func == NULL) == (cmd->func_w_context == NULL)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (janos_console_cmd_context_count >= JANOS_CONSOLE_MAX_COMMANDS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    janos_console_cmd_context_t *context =
+        &janos_console_cmd_contexts[janos_console_cmd_context_count];
+    context->func = cmd->func;
+    context->func_w_context = cmd->func_w_context;
+    context->context = cmd->context;
+
+    esp_console_cmd_t wrapped_cmd = *cmd;
+    wrapped_cmd.func = NULL;
+    wrapped_cmd.func_w_context = janos_console_cmd_dispatch;
+    wrapped_cmd.context = context;
+
+    esp_err_t err = esp_console_cmd_register(&wrapped_cmd);
+    if (err == ESP_OK) {
+        janos_console_cmd_context_count++;
+    }
+    return err;
+}
+
+static bool uart_baud_is_allowed(uint32_t rate)
+{
+    return rate == 115200U || rate == 230400U || rate == 460800U ||
+           rate == 921600U || rate == 2000000U;
+}
+
+static int cmd_uart_baud(int argc, char **argv)
+{
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = (argc == 2) ? strtoull(argv[1], &end, 10) : 0;
+    if (argc != 2 || errno == ERANGE || end == argv[1] || *end != '\0' ||
+        parsed > UINT32_MAX || !uart_baud_is_allowed((uint32_t)parsed)) {
+        printf("[UARTB] error allowed=115200,230400,460800,921600,2000000\n");
+        printf("[UARTB] END\n");
+        return 0;
+    }
+
+    uint32_t rate = (uint32_t)parsed;
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+
+    uart_baud_confirmation_pending = false;
+    (void)esp_timer_stop(uart_baud_confirm_timer);
+
+    printf("[UARTB] switching rate=%" PRIu32 " confirm_within=10s\n", rate);
+    printf("[UARTB] END\n");
+    fflush(stdout);
+
+    esp_err_t err = uart_wait_tx_done(JANOS_UART_NUM, pdMS_TO_TICKS(2000));
+    if (err == ESP_OK) {
+        err = uart_set_baudrate(JANOS_UART_NUM, rate);
+    }
+
+    if (err == ESP_OK) {
+        uart_current_baud = rate;
+        uart_baud_confirmation_pending = true;
+        err = esp_timer_start_once(uart_baud_confirm_timer, UART_BAUD_CONFIRM_US);
+    }
+
+    if (err != ESP_OK) {
+        uart_baud_confirmation_pending = false;
+        (void)uart_set_baudrate(JANOS_UART_NUM, JANOS_UART_DEFAULT_BAUD);
+        uart_current_baud = JANOS_UART_DEFAULT_BAUD;
+    }
+
+    xSemaphoreGive(uart_baud_mutex);
+    return 0;
+}
+
+static int cmd_uart_baud_confirm(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+    uart_baud_confirmation_pending = false;
+    (void)esp_timer_stop(uart_baud_confirm_timer);
+    uint32_t rate = uart_current_baud;
+    xSemaphoreGive(uart_baud_mutex);
+
+    printf("[UARTB] confirmed rate=%" PRIu32 "\n", rate);
+    printf("[UARTB] END\n");
+    return 0;
+}
+
+static int cmd_uart_baud_status(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+    uint32_t rate = uart_current_baud;
+    bool pending = uart_baud_confirmation_pending;
+    xSemaphoreGive(uart_baud_mutex);
+
+    printf("[UARTB] status rate=%" PRIu32 " pending=%s\n",
+           rate, pending ? "yes" : "no");
+    printf("[UARTB] END\n");
+    return 0;
+}
+
+static bool ft_uart_write_all(const void *data, size_t length)
+{
+    const uint8_t *bytes = (const uint8_t *)data;
+    while (length > 0) {
+        int written = uart_write_bytes(JANOS_UART_NUM, bytes, length);
+        if (written <= 0) {
+            return false;
+        }
+        bytes += written;
+        length -= (size_t)written;
+    }
+    return true;
+}
+
+static void ft_send_error(const char *reason)
+{
+    char response[256];
+    int len = snprintf(response, sizeof(response),
+                       "[FT] error %s\r\n[FT] END\r\n", reason);
+    if (len > 0) {
+        size_t send_len = (size_t)len < sizeof(response) ? (size_t)len : sizeof(response) - 1;
+        (void)ft_uart_write_all(response, send_len);
+        (void)uart_wait_tx_done(JANOS_UART_NUM, pdMS_TO_TICKS(2000));
+    }
+}
+
+static void ft_put_le32(uint8_t *dest, uint32_t value)
+{
+    dest[0] = (uint8_t)value;
+    dest[1] = (uint8_t)(value >> 8);
+    dest[2] = (uint8_t)(value >> 16);
+    dest[3] = (uint8_t)(value >> 24);
+}
+
+static int ft_wait_for_response(uint8_t *response)
+{
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)FT_ACK_TIMEOUT_MS * 1000;
+    while (esp_timer_get_time() < deadline_us) {
+        int64_t remaining_ms = (deadline_us - esp_timer_get_time() + 999) / 1000;
+        TickType_t wait_ticks = pdMS_TO_TICKS((uint32_t)remaining_ms);
+        if (wait_ticks == 0) {
+            wait_ticks = 1;
+        }
+        int read = uart_read_bytes(JANOS_UART_NUM, response, 1, wait_ticks);
+        if (read == 1) {
+            return 1;
+        }
+        if (read < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int cmd_send_file(int argc, char **argv)
+{
+    FILE *file = NULL;
+    uint8_t *buffer = NULL;
+    char full_path[SD_PATH_MAX];
+    char reason[160];
+    uint64_t offset = 0;
+    uint64_t total_size = 0;
+    uint64_t remaining = 0;
+    uint64_t sent = 0;
+    uint32_t sent_crc = 0;
+    uint32_t block_index = 0;
+    bool cancelled = false;
+
+    uart_baud_set_file_transfer_active(true);
+    flockfile(stdout);
+    fflush(stdout);
+
+    if (argc < 2 || argc > 3) {
+        ft_send_error("usage: send_file <path> [offset]");
+        goto cleanup;
+    }
+
+    if (!build_sd_path(full_path, sizeof(full_path), argv[1])) {
+        ft_send_error("invalid path");
+        goto cleanup;
+    }
+
+    if (argc == 3) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(argv[2], &end, 10);
+        if (errno == ERANGE || end == argv[2] || *end != '\0' || argv[2][0] == '-') {
+            ft_send_error("invalid offset");
+            goto cleanup;
+        }
+        offset = (uint64_t)parsed;
+    }
+
+    esp_err_t sd_err = init_sd_card();
+    if (sd_err != ESP_OK) {
+        snprintf(reason, sizeof(reason), "SD unavailable: %s", esp_err_to_name(sd_err));
+        ft_send_error(reason);
+        goto cleanup;
+    }
+
+    struct stat st;
+    if (stat(full_path, &st) != 0) {
+        snprintf(reason, sizeof(reason), "open failed: %s", strerror(errno));
+        ft_send_error(reason);
+        goto cleanup;
+    }
+    if (!S_ISREG(st.st_mode) || st.st_size < 0) {
+        ft_send_error("path is not a regular file");
+        goto cleanup;
+    }
+
+    total_size = (uint64_t)st.st_size;
+    if (offset > total_size || offset > (uint64_t)INT64_MAX) {
+        ft_send_error("offset exceeds file size");
+        goto cleanup;
+    }
+
+    file = fopen(full_path, "rb");
+    if (file == NULL) {
+        snprintf(reason, sizeof(reason), "open failed: %s", strerror(errno));
+        ft_send_error(reason);
+        goto cleanup;
+    }
+
+    buffer = malloc(FT_BLOCK_SIZE);
+    if (buffer == NULL) {
+        ft_send_error("out of memory");
+        goto cleanup;
+    }
+
+    if (fseeko(file, (off_t)offset, SEEK_SET) != 0) {
+        snprintf(reason, sizeof(reason), "seek failed: %s", strerror(errno));
+        ft_send_error(reason);
+        goto cleanup;
+    }
+
+    remaining = total_size - offset;
+
+    /* linenoise consumes CR but a terminal sending CRLF may leave LF in the UART ring. */
+    if (uart_flush_input(JANOS_UART_NUM) != ESP_OK) {
+        ft_send_error("could not clear UART input");
+        goto cleanup;
+    }
+
+    char header[192];
+    int header_len = snprintf(header, sizeof(header),
+                              "[FT] begin size=%" PRIu64 " offset=%" PRIu64
+                              " bsize=%u crc32=00000000\r\n"
+                              "[FT] END\r\n\r\n",
+                              total_size, offset, FT_BLOCK_SIZE);
+    if (header_len <= 0 || (size_t)header_len >= sizeof(header) ||
+        !ft_uart_write_all(header, (size_t)header_len) ||
+        uart_wait_tx_done(JANOS_UART_NUM, pdMS_TO_TICKS(2000)) != ESP_OK) {
+        goto cleanup;
+    }
+
+    while (remaining > 0) {
+        size_t wanted = remaining > FT_BLOCK_SIZE ? FT_BLOCK_SIZE : (size_t)remaining;
+        size_t payload_len = fread(buffer, 1, wanted, file);
+        if (payload_len != wanted) {
+            ft_send_error(ferror(file) ? "read failed" : "file changed during transfer");
+            goto cleanup;
+        }
+
+        uint8_t block_header[16] = { 'F', 'T', 'B', 0x01 };
+        ft_put_le32(block_header + 4, block_index);
+        ft_put_le32(block_header + 8, (uint32_t)payload_len);
+        ft_put_le32(block_header + 12,
+                    esp_rom_crc32_le(0, buffer, (uint32_t)payload_len));
+
+        bool acknowledged = false;
+        for (uint32_t attempt = 0; attempt < FT_MAX_BLOCK_ATTEMPTS; attempt++) {
+            if (!ft_uart_write_all(block_header, sizeof(block_header)) ||
+                !ft_uart_write_all(buffer, payload_len) ||
+                uart_wait_tx_done(JANOS_UART_NUM, pdMS_TO_TICKS(FT_ACK_TIMEOUT_MS)) != ESP_OK) {
+                ft_send_error("UART write failed");
+                goto cleanup;
+            }
+            uart_baud_note_activity();
+
+            uint8_t response = 0;
+            int response_status = ft_wait_for_response(&response);
+            if (response_status == 0) {
+                ft_send_error("ACK timeout");
+                goto cleanup;
+            }
+            if (response == FT_CAN) {
+                cancelled = true;
+                goto transfer_end;
+            }
+            if (response_status < 0) {
+                ft_send_error("UART read failed");
+                goto cleanup;
+            }
+            if (response == FT_ACK) {
+                acknowledged = true;
+                break;
+            }
+            if (response != FT_NAK) {
+                snprintf(reason, sizeof(reason), "invalid response 0x%02x", response);
+                ft_send_error(reason);
+                goto cleanup;
+            }
+        }
+
+        if (!acknowledged) {
+            snprintf(reason, sizeof(reason), "retry limit index=%" PRIu32, block_index);
+            ft_send_error(reason);
+            goto cleanup;
+        }
+
+        sent_crc = esp_rom_crc32_le(sent_crc, buffer, (uint32_t)payload_len);
+        sent += payload_len;
+        remaining -= payload_len;
+        block_index++;
+        vTaskDelay(1);
+    }
+
+transfer_end:
+    if (cancelled) {
+        static const char cancelled_response[] = "[FT] cancelled\r\n[FT] END\r\n";
+        (void)ft_uart_write_all(cancelled_response, sizeof(cancelled_response) - 1);
+    } else {
+        char done[128];
+        int done_len = snprintf(done, sizeof(done),
+                                "[FT] done sent=%" PRIu64 " crc32=%08" PRIx32
+                                "\r\n[FT] END\r\n",
+                                sent, sent_crc);
+        if (done_len > 0 && (size_t)done_len < sizeof(done)) {
+            (void)ft_uart_write_all(done, (size_t)done_len);
+        }
+    }
+    (void)uart_wait_tx_done(JANOS_UART_NUM, pdMS_TO_TICKS(2000));
+
+cleanup:
+    if (file != NULL) {
+        fclose(file);
+    }
+    free(buffer);
+    uart_baud_set_file_transfer_active(false);
+    funlockfile(stdout);
+    return 0;
+}
+
+// Command: list_dir [path] [-s] - Lists files inside a directory on SD card
 static int cmd_list_dir(int argc, char **argv)
 {
-    const char *input_path = (argc >= 2) ? argv[1] : "lab/handshakes";
+    const char *input_path = NULL;
+    bool with_size = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-s") == 0) {
+            with_size = true;
+        } else if (input_path == NULL) {
+            input_path = argv[i];
+        }
+    }
+    if (input_path == NULL) {
+        input_path = "lab/handshakes";
+    }
+
     char full_path[SD_PATH_MAX];
 
     if (!build_sd_path(full_path, sizeof(full_path), input_path)) {
@@ -17054,7 +19556,18 @@ static int cmd_list_dir(int argc, char **argv)
             continue;
         }
         file_count++;
-        printf("%d %s\n", file_count, entry->d_name);
+        if (with_size) {
+            char item[SD_PATH_MAX];
+            struct stat st;
+            unsigned long long size = 0;
+            int item_len = snprintf(item, sizeof(item), "%s/%s", full_path, entry->d_name);
+            if (item_len >= 0 && item_len < (int)sizeof(item) && stat(item, &st) == 0) {
+                size = (unsigned long long)st.st_size;
+            }
+            printf("%d %llu %s\n", file_count, size, entry->d_name);
+        } else {
+            printf("%d %s\n", file_count, entry->d_name);
+        }
     }
 
     closedir(dir);
@@ -17068,46 +19581,82 @@ static int cmd_list_dir(int argc, char **argv)
     return 0;
 }
 
-// Command: file_delete <path> - Deletes a file on SD card
+// Command: file_delete <path> [path2 ...] - Deletes one or more files on SD card
 static int cmd_file_delete(int argc, char **argv)
 {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: file_delete <path>");
+        MY_LOG_INFO(TAG, "Usage: file_delete <path> [path2 ...]");
         MY_LOG_INFO(TAG, "Example: file_delete lab/handshakes/sample.pcap");
-        return 1;
-    }
-
-    char full_path[SD_PATH_MAX];
-    if (!build_sd_path(full_path, sizeof(full_path), argv[1])) {
-        MY_LOG_INFO(TAG, "Invalid path provided.");
         return 1;
     }
 
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to initialize SD card: %s", esp_err_to_name(ret));
+        // Still one line per path: returning here with no markers at all would leave the
+        // host counting a short batch and retrying paths one at a time against a card
+        // that is not mounted. Nothing was deleted, and every path says so.
+        for (int i = 1; i < argc; i++) {
+            printf("[FILE_DELETE] path=%s result=failed\n", argv[i]);
+        }
         return 1;
     }
 
-    struct stat st;
-    if (stat(full_path, &st) != 0) {
-        MY_LOG_INFO(TAG, "File not found: %s (errno: %d)", full_path, errno);
-        return 1;
+    // Exactly one [FILE_DELETE] line per path, in argv order, whatever happens to any
+    // of them: the host maps results positionally, because its marker parser cuts a
+    // value at the first whitespace and handshake filenames come from SSIDs and can
+    // contain spaces. A missing or reordered marker would mark the wrong file as
+    // deleted, and a short batch makes the host discard the whole result and retry the
+    // paths one at a time. So no early return, no skipped path, and no batch-level
+    // result code. Quoting is the host's job and esp_console_split_argv already undoes
+    // it, so a path arrives whole even with spaces in it.
+    int failed = 0;
+    bool deleted_any = false;
+
+    for (int i = 1; i < argc; i++) {
+        char full_path[SD_PATH_MAX];
+        if (!build_sd_path(full_path, sizeof(full_path), argv[i])) {
+            MY_LOG_INFO(TAG, "Invalid path provided.");
+            printf("[FILE_DELETE] path=%s result=failed\n", argv[i]);
+            failed++;
+            continue;
+        }
+
+        struct stat st;
+        if (stat(full_path, &st) != 0) {
+            MY_LOG_INFO(TAG, "File not found: %s (errno: %d)", full_path, errno);
+            printf("[FILE_DELETE] path=%s result=not_found\n", full_path);
+            failed++;
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            MY_LOG_INFO(TAG, "Refusing to delete directory: %s", full_path);
+            printf("[FILE_DELETE] path=%s result=is_dir\n", full_path);
+            failed++;
+            continue;
+        }
+
+        if (unlink(full_path) != 0) {
+            MY_LOG_INFO(TAG, "Failed to delete %s: %s", full_path, strerror(errno));
+            printf("[FILE_DELETE] path=%s result=failed\n", full_path);
+            failed++;
+            continue;
+        }
+
+        // Printed before the sync, not after. The host waits about 900 ms for
+        // "Deleted "; creating, fsyncing and unlinking /sdcard/.sync can outlast that
+        // window, so the file was gone but the UI reported a failure.
+        deleted_any = true;
+        MY_LOG_INFO(TAG, "Deleted %s", full_path);
+        printf("[FILE_DELETE] path=%s result=ok\n", full_path);
     }
 
-    if (S_ISDIR(st.st_mode)) {
-        MY_LOG_INFO(TAG, "Refusing to delete directory: %s", full_path);
-        return 1;
+    // One sync for the whole batch rather than one per file.
+    if (deleted_any) {
+        sd_sync();
     }
-
-    if (unlink(full_path) != 0) {
-        MY_LOG_INFO(TAG, "Failed to delete %s: %s", full_path, strerror(errno));
-        return 1;
-    }
-    sd_sync();
-
-    MY_LOG_INFO(TAG, "Deleted %s", full_path);
-    return 0;
+    return failed > 0 ? 1 : 0;
 }
 
 // Command: select_html [index] - Loads HTML file from SD card
@@ -17483,6 +20032,14 @@ static void wardrive_task(void *pvParameters) {
     // Find the next file number by scanning existing files
     wardrive_file_counter = find_next_wardrive_file_number();
     MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", wardrive_file_counter);
+    {
+        // Claimed up front rather than inside the scan loop: the counter is fixed for
+        // the whole session, and the file has to be off-limits to the scan cache from
+        // the moment it can first be created.
+        char active_name[64];
+        snprintf(active_name, sizeof(active_name), "w%d.log", wardrive_file_counter);
+        wardrive_set_active_log(active_name);
+    }
     
     // Wait for GPS fix before starting
     MY_LOG_INFO(TAG, "Waiting for GPS fix...");
@@ -17717,6 +20274,7 @@ static void wardrive_task(void *pvParameters) {
     
     wardrive_active = false;
     wardrive_task_handle = NULL;
+    wardrive_set_active_log(NULL);
     MY_LOG_INFO(TAG, "Wardrive stopped after %d scans. Last file: w%d.log", scan_counter, wardrive_file_counter);
     
     vTaskDelete(NULL); // Delete this task
@@ -19489,6 +22047,8 @@ static esp_err_t admin_list_handler(httpd_req_t *req) {
 
 // GET /api/download?path=<rel> -> raw file (chunked)
 static esp_err_t admin_download_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
+
     char full[SD_PATH_MAX];
     if (!admin_resolve_query_path(req, full, sizeof(full))) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path");
@@ -19503,6 +22063,82 @@ static esp_err_t admin_download_handler(httpd_req_t *req) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
         return ESP_FAIL;
     }
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "File size error");
+        return ESP_FAIL;
+    }
+    long file_size_long = ftell(f);
+    if (file_size_long < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "File size error");
+        return ESP_FAIL;
+    }
+
+    uint64_t file_size = (uint64_t)file_size_long;
+    uint64_t range_start = 0;
+    uint64_t range_end = file_size > 0 ? file_size - 1 : 0;
+    bool partial = false;
+    bool range_unsatisfiable = false;
+    char range_hdr[64];
+
+    if (httpd_req_get_hdr_value_str(req, "Range", range_hdr, sizeof(range_hdr)) == ESP_OK &&
+        strncmp(range_hdr, "bytes=", 6) == 0) {
+        const char *start_text = range_hdr + 6;
+        if (isdigit((unsigned char)*start_text)) {
+            char *after_start;
+            errno = 0;
+            unsigned long long parsed_start = strtoull(start_text, &after_start, 10);
+            if (errno != ERANGE && after_start != start_text && *after_start == '-') {
+                const char *end_text = after_start + 1;
+                unsigned long long parsed_end = 0;
+                bool valid_end = (*end_text == '\0');
+                if (!valid_end && isdigit((unsigned char)*end_text)) {
+                    char *after_end;
+                    errno = 0;
+                    parsed_end = strtoull(end_text, &after_end, 10);
+                    valid_end = (errno != ERANGE && after_end != end_text && *after_end == '\0');
+                }
+
+                if (valid_end && (*end_text == '\0' || parsed_end >= parsed_start)) {
+                    range_start = (uint64_t)parsed_start;
+                    if (range_start >= file_size) {
+                        range_unsatisfiable = true;
+                    } else {
+                        range_end = *end_text == '\0' ? file_size - 1 : (uint64_t)parsed_end;
+                        if (range_end >= file_size) {
+                            range_end = file_size - 1;
+                        }
+                        partial = true;
+                    }
+                }
+            }
+        }
+    }
+
+    char content_range[80];
+    if (range_unsatisfiable) {
+        snprintf(content_range, sizeof(content_range), "bytes */%" PRIu64, file_size);
+        httpd_resp_set_status(req, "416 Range Not Satisfiable");
+        httpd_resp_set_hdr(req, "Content-Range", content_range);
+        fclose(f);
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    if (partial) {
+        if (fseek(f, (long)range_start, SEEK_SET) != 0) {
+            fclose(f);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "File seek error");
+            return ESP_FAIL;
+        }
+        snprintf(content_range, sizeof(content_range), "bytes %" PRIu64 "-%" PRIu64 "/%" PRIu64,
+                 range_start, range_end, file_size);
+        httpd_resp_set_status(req, "206 Partial Content");
+        httpd_resp_set_hdr(req, "Content-Range", content_range);
+    }
+
     const char *base = strrchr(full, '/');
     base = base ? base + 1 : full;
     char cd[SD_PATH_MAX + 32];
@@ -19515,10 +22151,20 @@ static esp_err_t admin_download_handler(httpd_req_t *req) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
         return ESP_FAIL;
     }
+    uint64_t remaining = partial ? range_end - range_start + 1 : 0;
     size_t r;
-    while ((r = fread(buf, 1, ADMIN_IO_CHUNK, f)) > 0) {
+    while (!partial || remaining > 0) {
+        size_t to_read = partial && remaining < ADMIN_IO_CHUNK ?
+                         (size_t)remaining : ADMIN_IO_CHUNK;
+        r = fread(buf, 1, to_read, f);
+        if (r == 0) {
+            break;
+        }
         if (httpd_resp_send_chunk(req, buf, r) != ESP_OK) {
             break;
+        }
+        if (partial) {
+            remaining -= r;
         }
     }
     free(buf);
@@ -21396,6 +24042,7 @@ static int cmd_start_jammer24(int argc, char **argv) {
 }
 
 // --- Command registration in esp_console ---
+#define esp_console_cmd_register(cmd) janos_console_cmd_register(cmd)
 static void register_commands(void)
 {
     const esp_console_cmd_t scan_cmd = {
@@ -21939,6 +24586,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&rogueap_cmd));
 
+    const esp_console_cmd_t rogue_gitm_cmd = {
+        .command = "start_rogue_gitm",
+        .help = "Mirror SoftAP + Capture Gateway (GITM), optional same-channel deauth: start_rogue_gitm <SSID> <password> [--pcap-name <name>]. Requires wifi_connect. No captive portal.",
+        .hint = "<SSID> <password> [--pcap-name <name>]",
+        .func = &cmd_start_rogue_gitm,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&rogue_gitm_cmd));
+
     const esp_console_cmd_t karma_cmd = {
         .command = "start_karma",
         .help = "Starts Karma attack with SSID from probe list: start_karma <index>",
@@ -22004,8 +24660,8 @@ static void register_commands(void)
 
     const esp_console_cmd_t pcap_cmd = {
         .command = "start_pcap",
-        .help = "Capture WiFi traffic to PCAP: start_pcap radio|net",
-        .hint = "radio|net",
+        .help = "Capture WiFi traffic to PCAP: start_pcap radio|net|gateway",
+        .hint = "radio|net|gateway",
         .func = &cmd_start_pcap,
         .argtable = NULL
     };
@@ -22091,6 +24747,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_connect_cmd));
+
+    const esp_console_cmd_t capture_gateway_cmd = {
+        .command = "capture_gateway",
+        .help = "Authorized APSTA/NAPT capture gateway with fixed adaptive 4096 kbps ceiling: capture_gateway start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop",
+        .hint = "start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop",
+        .func = &cmd_capture_gateway,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&capture_gateway_cmd));
 
     const esp_console_cmd_t wifi_disconnect_cmd = {
         .command = "wifi_disconnect",
@@ -22218,6 +24883,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&sd_status_cmd));
 
+    const esp_console_cmd_t sd_benchmark_cmd = {
+        .command = "sd_benchmark",
+        .help = "Sequential SD write benchmark: sd_benchmark [size_mb] (1-256, default 32)",
+        .hint = NULL,
+        .func = &cmd_sd_benchmark,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&sd_benchmark_cmd));
+
     const esp_console_cmd_t show_pass_cmd = {
         .command = "show_pass",
         .help = "Prints password log: show_pass [portal|evil]",
@@ -22229,12 +24903,48 @@ static void register_commands(void)
 
     const esp_console_cmd_t list_dir_cmd = {
         .command = "list_dir",
-        .help = "List files inside a directory on SD card: list_dir [path]",
+        .help = "List files inside a directory on SD card: list_dir [path] [-s]",
         .hint = NULL,
         .func = &cmd_list_dir,
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&list_dir_cmd));
+
+    const esp_console_cmd_t send_file_cmd = {
+        .command = "send_file",
+        .help = "Transfer an SD file over UART: send_file <path> [offset]",
+        .hint = "<path> [offset]",
+        .func = &cmd_send_file,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&send_file_cmd));
+
+    const esp_console_cmd_t uart_baud_cmd = {
+        .command = "uart_baud",
+        .help = "Change console UART rate with a 10 second confirmation window",
+        .hint = "<115200|230400|460800|921600|2000000>",
+        .func = &cmd_uart_baud,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&uart_baud_cmd));
+
+    const esp_console_cmd_t uart_baud_confirm_cmd = {
+        .command = "uart_baud_confirm",
+        .help = "Confirm the current console UART rate",
+        .hint = NULL,
+        .func = &cmd_uart_baud_confirm,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&uart_baud_confirm_cmd));
+
+    const esp_console_cmd_t uart_baud_status_cmd = {
+        .command = "uart_baud_status",
+        .help = "Show console UART rate and confirmation state",
+        .hint = NULL,
+        .func = &cmd_uart_baud_status,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&uart_baud_status_cmd));
 
     const esp_console_cmd_t list_ssid_cmd = {
         .command = "list_ssid",
@@ -22301,7 +25011,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t file_delete_cmd = {
         .command = "file_delete",
-        .help = "Delete a file on SD card: file_delete <path>",
+        .help = "Delete files on SD card: file_delete <path> [path2 ...]",
         .hint = NULL,
         .func = &cmd_file_delete,
         .argtable = NULL
@@ -22354,6 +25064,7 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&version_cmd));
 }
+#undef esp_console_cmd_register
 
 void app_main(void) {
 
@@ -22529,10 +25240,12 @@ void app_main(void) {
     repl_config.prompt = ">";
     repl_config.max_cmdline_length = 256;
 
+    ESP_ERROR_CHECK(uart_baud_control_init());
     esp_console_register_help_command();
     register_commands();
 
     esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    hw_config.baud_rate = JANOS_UART_DEFAULT_BAUD;
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
 
     linenoiseSetHintsCallback((linenoiseHintsCallback *)&janos_console_hint);
@@ -22645,6 +25358,17 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
         return;
     }
 
+    // Capture Gateway / Rogue GITM owns the radio channel (STA+SoftAP). Never hop.
+    const bool gateway_radio_locked =
+        capture_gateway_is_active() || rogue_gitm_mode_active;
+
+    int softap_clients = portal_connected_clients;
+    if (capture_gateway_is_active()) {
+        capture_gateway_status_t cgw_st = {0};
+        capture_gateway_get_status(&cgw_st);
+        softap_clients = cgw_st.connected_clients;
+    }
+
     //proceed with deauth frames on channels of the APs:
     // Use target_bssids[] directly to avoid index confusion after periodic re-scan
     for (int i = 0; i < target_bssid_count; ++i) {
@@ -22663,33 +25387,23 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
         
         // Check if BSSID is whitelisted - but ONLY during blackout attack, not during regular deauth
         if (blackout_attack_active && is_bssid_whitelisted(target_bssids[i].bssid)) {
-            // MY_LOG_INFO(TAG, "Skipping whitelisted BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
-            //            target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
-            //            target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5]);
             continue;
         }
         
-        // During evil twin with connected clients, only attack networks on same channel as first selected network
-        if ((applicationState == DEAUTH_EVIL_TWIN) && portal_connected_clients > 0 && target_bssid_count > 0) {
-            uint8_t first_network_channel = target_bssids[0].channel; // First selected network's channel
+        // During evil twin / Rogue GITM with SoftAP clients, only attack same channel as SoftAP
+        if ((applicationState == DEAUTH_EVIL_TWIN) && softap_clients > 0 && target_bssid_count > 0) {
+            uint8_t first_network_channel = target_bssids[0].channel;
             if (target_bssids[i].channel != first_network_channel) {
-                // Skip networks on different channels when clients are connected
                 continue;
             }
-            // Only send deauth on same channel - no channel switch needed since we're already on this channel
         }
         
-        // Enhanced logging to debug BSSID mismatch issue
-        // MY_LOG_INFO(TAG, "DEAUTH: Sending to SSID: %s, CH: %d, BSSID: %02X:%02X:%02X:%02X:%02X:%02X (target_bssids[%d])",
-        //         target_bssids[i].ssid, target_bssids[i].channel,
-        //         target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
-        //         target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5], i);
-        
-        // If no clients connected or not evil twin mode, do normal channel hopping
-        if (portal_connected_clients == 0 || applicationState != DEAUTH_EVIL_TWIN) {
-            vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
-            esp_wifi_set_channel(target_bssids[i].channel, WIFI_SECOND_CHAN_NONE );
-            vTaskDelay(pdMS_TO_TICKS(50)); // Short delay to ensure channel switch
+        // Channel hop only when SoftAP is not serving clients and GITM is not locking the radio
+        if (!gateway_radio_locked &&
+            (softap_clients == 0 || applicationState != DEAUTH_EVIL_TWIN)) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            esp_wifi_set_channel(target_bssids[i].channel, WIFI_SECOND_CHAN_NONE);
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
 
         // If stations are selected AND we're in regular DEAUTH mode (not evil_twin/blackout), send targeted deauth
@@ -22714,17 +25428,17 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
             wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
         }
         
-        // If clients are connected during evil twin, immediately return to first network's channel
-        // This ensures we're on the correct channel when clients try to connect to the portal
-        if ((applicationState == DEAUTH_EVIL_TWIN) && portal_connected_clients > 0 && target_bssid_count > 0) {
+        // If clients are connected during classic evil twin, return to SoftAP channel
+        if (!gateway_radio_locked &&
+            (applicationState == DEAUTH_EVIL_TWIN) && softap_clients > 0 && target_bssid_count > 0) {
             uint8_t first_network_channel = target_bssids[0].channel;
             esp_wifi_set_channel(first_network_channel, WIFI_SECOND_CHAN_NONE);
         }
     }
     
-    // After sending all deauth frames, always return to first network's channel during evil twin
-    // This maximizes probability of being on correct channel when clients try to connect
-    if ((applicationState == DEAUTH_EVIL_TWIN) && target_bssid_count > 0) {
+    // After sending all deauth frames, return to SoftAP channel during classic evil twin only
+    if (!gateway_radio_locked &&
+        (applicationState == DEAUTH_EVIL_TWIN) && target_bssid_count > 0) {
         uint8_t first_network_channel = target_bssids[0].channel;
         esp_wifi_set_channel(first_network_channel, WIFI_SECOND_CHAN_NONE);
     }
@@ -23398,20 +26112,120 @@ static void sniffer_channel_task(void *pvParameters) {
 // PCAP capture functions
 // ============================================================================
 
-static void pcap_enqueue_frame(const uint8_t *data, uint16_t len) {
-    if (!pcap_capture_active || !pcap_packet_queue || len == 0) return;
+static void pcap_stats_snapshot(pcap_stats_snapshot_t *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
+    portENTER_CRITICAL(&pcap_stats_lock);
+    snapshot->packets = pcap_capture_frame_count;
+    snapshot->drops = pcap_capture_drop_count;
+    snapshot->drop_alloc = pcap_capture_drop_alloc_count;
+    snapshot->drop_queue = pcap_capture_drop_queue_count;
+    snapshot->drop_write = pcap_capture_drop_write_count;
+    snapshot->queue_high_water = pcap_capture_queue_high_water;
+    snapshot->rate_queue_drops = pcap_rate_queue_drop_count;
+    snapshot->rate_queue_high_water = pcap_rate_queue_high_water;
+    snapshot->rate_effective_kbps = pcap_rate_effective_kbps;
+    snapshot->rate_throttle_events = pcap_rate_throttle_event_count;
+    snapshot->rate_pause_events = pcap_rate_pause_event_count;
+    snapshot->gateway_filtered = pcap_gateway_filtered_frame_count;
+    snapshot->file_bytes = pcap_capture_file_byte_count;
+    portEXIT_CRITICAL(&pcap_stats_lock);
+    snapshot->queue_depth = pcap_packet_queue != NULL
+                                ? (uint32_t)uxQueueMessagesWaiting(pcap_packet_queue)
+                                : 0;
+}
 
-    pcap_queued_frame_t *frame = malloc(sizeof(pcap_queued_frame_t) + len);
-    if (!frame) return;
+/** Gateway PCAP: keep only IPv4 frames that involve SoftAP subnet 10.42.0.0/24. */
+static bool pcap_gateway_should_record(const uint8_t *data, uint16_t len)
+{
+    if (pcap_capture_mode != PCAP_MODE_GATEWAY) {
+        return true;
+    }
+    if (data == NULL || len < 14) {
+        return false;
+    }
+
+    size_t ip_off = 14;
+    uint16_t ethertype = ((uint16_t)data[12] << 8) | data[13];
+    if (ethertype == 0x8100) {
+        if (len < 18) {
+            return false;
+        }
+        ethertype = ((uint16_t)data[16] << 8) | data[17];
+        ip_off = 18;
+    }
+    if (ethertype != 0x0800) {
+        return false;
+    }
+    if (len < ip_off + 20) {
+        return false;
+    }
+
+    uint32_t src_n;
+    uint32_t dst_n;
+    memcpy(&src_n, data + ip_off + 12, 4);
+    memcpy(&dst_n, data + ip_off + 16, 4);
+    uint32_t src_h = ntohl(src_n);
+    uint32_t dst_h = ntohl(dst_n);
+    const uint32_t softap_net = 0x0A2A0000U; /* 10.42.0.0 */
+    const uint32_t softap_mask = 0xFFFFFF00U;
+    bool src_softap = (src_h & softap_mask) == softap_net;
+    bool dst_softap = (dst_h & softap_mask) == softap_net;
+    return src_softap || dst_softap;
+}
+
+static void pcap_enqueue_frame_at(const uint8_t *data, uint16_t len,
+                                  int64_t timestamp_us) {
+    if (!pcap_capture_active || !pcap_packet_queue || len == 0 || data == NULL) {
+        return;
+    }
+
+    if (!pcap_gateway_should_record(data, len)) {
+        portENTER_CRITICAL(&pcap_stats_lock);
+        pcap_gateway_filtered_frame_count++;
+        portEXIT_CRITICAL(&pcap_stats_lock);
+        return;
+    }
+
+    pcap_queued_frame_t *frame = heap_caps_malloc(sizeof(pcap_queued_frame_t) + len,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!frame) {
+        frame = heap_caps_malloc(sizeof(pcap_queued_frame_t) + len,
+                                 MALLOC_CAP_8BIT);
+    }
+    if (!frame) {
+        portENTER_CRITICAL(&pcap_stats_lock);
+        pcap_capture_drop_count++;
+        pcap_capture_drop_alloc_count++;
+        portEXIT_CRITICAL(&pcap_stats_lock);
+        return;
+    }
 
     frame->len = len;
-    frame->timestamp_us = esp_timer_get_time();
+    frame->timestamp_us = timestamp_us;
     memcpy(frame->data, data, len);
 
     if (xQueueSend(pcap_packet_queue, &frame, 0) != pdTRUE) {
-        free(frame);
+        heap_caps_free(frame);
+        portENTER_CRITICAL(&pcap_stats_lock);
         pcap_capture_drop_count++;
+        pcap_capture_drop_queue_count++;
+        portEXIT_CRITICAL(&pcap_stats_lock);
+    } else {
+        uint32_t depth = (uint32_t)uxQueueMessagesWaiting(pcap_packet_queue);
+        portENTER_CRITICAL(&pcap_stats_lock);
+        if (depth > pcap_capture_queue_high_water) {
+            pcap_capture_queue_high_water = depth;
+        }
+        portEXIT_CRITICAL(&pcap_stats_lock);
     }
+}
+
+static void pcap_enqueue_frame(const uint8_t *data, uint16_t len) {
+    pcap_enqueue_frame_at(data, len, esp_timer_get_time());
 }
 
 static void pcap_radio_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
@@ -23422,7 +26236,8 @@ static void pcap_radio_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
     pcap_enqueue_frame(pkt->payload, len);
 }
 
-static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp) {
+static void pcap_capture_pbuf(struct pbuf *p)
+{
     if (pcap_capture_active && p && p->tot_len > 0 && p->tot_len <= 1600) {
         uint8_t tmp[1600];
         uint16_t copied = pbuf_copy_partial(p, tmp, p->tot_len, 0);
@@ -23430,18 +26245,294 @@ static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp) {
             pcap_enqueue_frame(tmp, copied);
         }
     }
+}
+
+static void pcap_rate_note_queued(void)
+{
+    uint32_t depth = pcap_rate_packet_queue != NULL
+                         ? (uint32_t)uxQueueMessagesWaiting(pcap_rate_packet_queue)
+                         : 0;
+    portENTER_CRITICAL(&pcap_stats_lock);
+    if (depth > pcap_rate_queue_high_water) {
+        pcap_rate_queue_high_water = depth;
+    }
+    portEXIT_CRITICAL(&pcap_stats_lock);
+}
+
+static void pcap_rate_note_drop(void)
+{
+    portENTER_CRITICAL(&pcap_stats_lock);
+    pcap_rate_queue_drop_count++;
+    portEXIT_CRITICAL(&pcap_stats_lock);
+}
+
+static bool pcap_rate_enqueue(struct pbuf *p, struct netif *netif,
+                              pcap_rate_packet_direction_t direction)
+{
+    if (!pcap_rate_active || pcap_rate_packet_queue == NULL || p == NULL ||
+        p->tot_len == 0 || p->tot_len > 1600) {
+        return false;
+    }
+    pcap_rate_queued_packet_t *packet = heap_caps_malloc(sizeof(*packet) + p->tot_len,
+                                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (packet == NULL) {
+        packet = heap_caps_malloc(sizeof(*packet) + p->tot_len,
+                                  MALLOC_CAP_8BIT);
+    }
+    if (packet == NULL) {
+        pcap_rate_note_drop();
+        return false;
+    }
+    packet->netif = netif;
+    packet->direction = direction;
+    packet->len = p->tot_len;
+    packet->timestamp_us = esp_timer_get_time();
+    if (pbuf_copy_partial(p, packet->data, packet->len, 0) != packet->len) {
+        heap_caps_free(packet);
+        pcap_rate_note_drop();
+        return false;
+    }
+    if (xQueueSend(pcap_rate_packet_queue, &packet, 0) != pdTRUE) {
+        heap_caps_free(packet);
+        pcap_rate_note_drop();
+        return false;
+    }
+    pcap_rate_note_queued();
+    return true;
+}
+
+static err_t pcap_netif_input_hook(struct pbuf *p, struct netif *inp) {
+    if (pcap_capture_mode == PCAP_MODE_GATEWAY && pcap_rate_active) {
+        // Copy out of the driver-owned RX buffer; holding that pbuf in a slow
+        // queue could exhaust the Wi-Fi driver's finite RX buffer pool.
+        pcap_rate_enqueue(p, inp, PCAP_RATE_PACKET_INPUT);
+        if (p != NULL) {
+            pbuf_free(p);
+        }
+        return ERR_OK;
+    }
+    pcap_capture_pbuf(p);
     return pcap_original_input(p, inp);
 }
 
 static err_t pcap_netif_linkoutput_hook(struct netif *netif, struct pbuf *p) {
-    if (pcap_capture_active && p && p->tot_len > 0 && p->tot_len <= 1600) {
-        uint8_t tmp[1600];
-        uint16_t copied = pbuf_copy_partial(p, tmp, p->tot_len, 0);
-        if (copied > 0) {
-            pcap_enqueue_frame(tmp, copied);
+    if (pcap_capture_mode == PCAP_MODE_GATEWAY && pcap_rate_active) {
+        if (pcap_rate_enqueue(p, netif, PCAP_RATE_PACKET_LINKOUTPUT)) {
+            return ERR_OK;
         }
+        // The caller still owns its reference. Returning ERR_MEM lets TCP/lwIP
+        // retry instead of pretending that the frame was transmitted.
+        return ERR_MEM;
     }
+    pcap_capture_pbuf(p);
     return pcap_original_linkoutput(netif, p);
+}
+
+static bool pcap_rate_limiter_start(void)
+{
+    pcap_rate_packet_queue = xQueueCreate(PCAP_RATE_QUEUE_LENGTH,
+                                          sizeof(pcap_rate_queued_packet_t *));
+    if (pcap_rate_packet_queue == NULL) {
+        return false;
+    }
+    pcap_rate_active = true;
+    if (xTaskCreate(pcap_rate_limiter_task, "pcap_rate", 4096, NULL, 16,
+                    &pcap_rate_task_handle) != pdPASS) {
+        pcap_rate_active = false;
+        vQueueDelete(pcap_rate_packet_queue);
+        pcap_rate_packet_queue = NULL;
+        return false;
+    }
+    return true;
+}
+
+static void pcap_rate_limiter_stop(void)
+{
+    pcap_rate_active = false;
+    for (int i = 0; i < 500 && pcap_rate_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (pcap_rate_task_handle != NULL) {
+        vTaskDelete(pcap_rate_task_handle);
+        pcap_rate_task_handle = NULL;
+    }
+    if (pcap_rate_packet_queue != NULL) {
+        pcap_rate_queued_packet_t *packet = NULL;
+        while (xQueueReceive(pcap_rate_packet_queue, &packet, 0) == pdTRUE) {
+            if (packet != NULL) {
+                heap_caps_free(packet);
+                pcap_rate_note_drop();
+            }
+        }
+        vQueueDelete(pcap_rate_packet_queue);
+        pcap_rate_packet_queue = NULL;
+    }
+    portENTER_CRITICAL(&pcap_stats_lock);
+    pcap_rate_effective_kbps = 0;
+    portEXIT_CRITICAL(&pcap_stats_lock);
+}
+
+static uint32_t pcap_rate_for_recorder_depth(uint32_t max_kbps,
+                                             uint32_t recorder_depth)
+{
+    uint32_t effective_kbps = max_kbps;
+    if (recorder_depth >= PCAP_ADAPTIVE_PAUSE_DEPTH) {
+        return 0;
+    }
+    if (recorder_depth >= PCAP_ADAPTIVE_THREE_QUARTER_DEPTH) {
+        effective_kbps = max_kbps / 4U;
+    } else if (recorder_depth >= PCAP_ADAPTIVE_HALF_DEPTH) {
+        effective_kbps = max_kbps / 2U;
+    }
+    if (effective_kbps > 0 && effective_kbps < PCAP_RATE_LIMIT_MIN_KBPS) {
+        effective_kbps = PCAP_RATE_LIMIT_MIN_KBPS;
+    }
+    return effective_kbps;
+}
+
+static void pcap_rate_publish_effective(uint32_t effective_kbps,
+                                        bool throttle_transition,
+                                        bool pause_transition)
+{
+    portENTER_CRITICAL(&pcap_stats_lock);
+    pcap_rate_effective_kbps = effective_kbps;
+    if (throttle_transition) {
+        pcap_rate_throttle_event_count++;
+    }
+    if (pause_transition) {
+        pcap_rate_pause_event_count++;
+    }
+    portEXIT_CRITICAL(&pcap_stats_lock);
+}
+
+static void pcap_rate_limiter_task(void *param)
+{
+    (void)param;
+    const uint32_t max_kbps = PCAP_GATEWAY_RATE_LIMIT_KBPS;
+    const uint64_t max_bytes_per_second =
+        ((uint64_t)max_kbps * 1000ULL) / 8ULL;
+    uint64_t burst_bytes = max_bytes_per_second / 4ULL;
+    if (burst_bytes < PCAP_RATE_BURST_MIN_BYTES) {
+        burst_bytes = PCAP_RATE_BURST_MIN_BYTES;
+    }
+    if (burst_bytes > PCAP_WRITE_BATCH_SIZE) {
+        burst_bytes = PCAP_WRITE_BATCH_SIZE;
+    }
+    uint64_t tokens = burst_bytes;
+    int64_t last_refill_us = esp_timer_get_time();
+    pcap_rate_queued_packet_t *packet = NULL;
+    uint32_t last_effective_kbps = max_kbps;
+    bool recorder_paused = false;
+
+    pcap_rate_publish_effective(max_kbps, false, false);
+
+    while (pcap_rate_active ||
+           (pcap_rate_packet_queue != NULL &&
+            uxQueueMessagesWaiting(pcap_rate_packet_queue) > 0)) {
+        if (xQueueReceive(pcap_rate_packet_queue, &packet,
+                          pdMS_TO_TICKS(100)) != pdTRUE) {
+            continue;
+        }
+
+        while (pcap_rate_active && max_bytes_per_second > 0) {
+            int64_t now_us = esp_timer_get_time();
+            uint32_t recorder_depth = pcap_packet_queue != NULL
+                                          ? (uint32_t)uxQueueMessagesWaiting(pcap_packet_queue)
+                                          : 0;
+            bool pause_transition = false;
+            if (recorder_paused) {
+                if (recorder_depth <= PCAP_ADAPTIVE_HALF_DEPTH) {
+                    recorder_paused = false;
+                }
+            } else if (recorder_depth >= PCAP_ADAPTIVE_PAUSE_DEPTH) {
+                recorder_paused = true;
+                pause_transition = true;
+            }
+
+            uint32_t effective_kbps = recorder_paused
+                                          ? 0
+                                          : pcap_rate_for_recorder_depth(max_kbps,
+                                                                         recorder_depth);
+            if (effective_kbps != last_effective_kbps || pause_transition) {
+                bool throttle_transition = effective_kbps > 0 &&
+                                           effective_kbps < last_effective_kbps;
+                if (effective_kbps < last_effective_kbps) {
+                    // Do not spend tokens accumulated at the faster rate after
+                    // the recorder has requested backpressure.
+                    tokens = 0;
+                }
+                last_effective_kbps = effective_kbps;
+                last_refill_us = now_us;
+                pcap_rate_publish_effective(effective_kbps,
+                                            throttle_transition,
+                                            pause_transition);
+            }
+            if (effective_kbps == 0) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+
+            uint64_t bytes_per_second =
+                ((uint64_t)effective_kbps * 1000ULL) / 8ULL;
+            int64_t elapsed_us = now_us - last_refill_us;
+            if (elapsed_us > 0) {
+                uint64_t added = ((uint64_t)elapsed_us * bytes_per_second) /
+                                 1000000ULL;
+                tokens = tokens + added > burst_bytes ? burst_bytes : tokens + added;
+                last_refill_us = now_us;
+            }
+            uint64_t packet_bytes = packet != NULL ? packet->len : 0;
+            if (tokens >= packet_bytes) {
+                tokens -= packet_bytes;
+                break;
+            }
+            uint64_t missing = packet_bytes - tokens;
+            uint64_t wait_us = (missing * 1000000ULL + bytes_per_second - 1ULL) /
+                               bytes_per_second;
+            TickType_t wait_ticks = pdMS_TO_TICKS((wait_us + 999ULL) / 1000ULL);
+            vTaskDelay(wait_ticks > 0 ? wait_ticks : 1);
+        }
+
+        if (packet == NULL) {
+            continue;
+        }
+        // During stop the hooks have already been restored, so no new packets
+        // enter the limiter. Drain accepted packets without overflowing PCAP.
+        while (!pcap_rate_active && pcap_capture_active &&
+               pcap_packet_queue != NULL &&
+               uxQueueMessagesWaiting(pcap_packet_queue) >=
+                   PCAP_ADAPTIVE_THREE_QUARTER_DEPTH) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        pcap_enqueue_frame_at(packet->data, packet->len, packet->timestamp_us);
+        struct pbuf *forward = pbuf_alloc(PBUF_RAW, packet->len, PBUF_RAM);
+        if (forward == NULL || pbuf_take(forward, packet->data, packet->len) != ERR_OK) {
+            if (forward != NULL) {
+                pbuf_free(forward);
+            }
+            heap_caps_free(packet);
+            packet = NULL;
+            pcap_rate_note_drop();
+            continue;
+        }
+        if (packet->direction == PCAP_RATE_PACKET_INPUT) {
+            if (pcap_original_input == NULL ||
+                pcap_original_input(forward, packet->netif) != ERR_OK) {
+                pbuf_free(forward);
+            }
+        } else {
+            if (pcap_original_linkoutput != NULL) {
+                pcap_original_linkoutput(packet->netif, forward);
+            }
+            pbuf_free(forward);
+        }
+        heap_caps_free(packet);
+        packet = NULL;
+    }
+
+    pcap_rate_publish_effective(0, false, false);
+    pcap_rate_task_handle = NULL;
+    vTaskDelete(NULL);
 }
 
 static void pcap_writer_task(void *param) {
@@ -23459,12 +26550,20 @@ static void pcap_writer_task(void *param) {
                 .incl_len = frame->len,
                 .orig_len = frame->len
             };
-            fwrite(&rec, 1, sizeof(rec), pcap_capture_file);
-            fwrite(frame->data, 1, frame->len, pcap_capture_file);
-            free(frame);
-            pcap_capture_frame_count++;
+            size_t record_bytes = fwrite(&rec, 1, sizeof(rec), pcap_capture_file);
+            size_t payload_bytes = fwrite(frame->data, 1, frame->len, pcap_capture_file);
+            heap_caps_free(frame);
+            portENTER_CRITICAL(&pcap_stats_lock);
+            pcap_capture_file_byte_count += record_bytes + payload_bytes;
+            if (record_bytes == sizeof(rec) && payload_bytes == rec.incl_len) {
+                pcap_capture_frame_count++;
+            } else {
+                pcap_capture_drop_count++;
+                pcap_capture_drop_write_count++;
+            }
+            portEXIT_CRITICAL(&pcap_stats_lock);
             flush_counter++;
-            if (flush_counter >= 50) {
+            if (flush_counter >= 512) {
                 fflush(pcap_capture_file);
                 flush_counter = 0;
             }
@@ -23478,15 +26577,27 @@ static void pcap_writer_task(void *param) {
             .incl_len = frame->len,
             .orig_len = frame->len
         };
-        fwrite(&rec, 1, sizeof(rec), pcap_capture_file);
-        fwrite(frame->data, 1, frame->len, pcap_capture_file);
-        free(frame);
-        pcap_capture_frame_count++;
+        size_t record_bytes = fwrite(&rec, 1, sizeof(rec), pcap_capture_file);
+        size_t payload_bytes = fwrite(frame->data, 1, frame->len, pcap_capture_file);
+        heap_caps_free(frame);
+        portENTER_CRITICAL(&pcap_stats_lock);
+        pcap_capture_file_byte_count += record_bytes + payload_bytes;
+        if (record_bytes == sizeof(rec) && payload_bytes == rec.incl_len) {
+            pcap_capture_frame_count++;
+        } else {
+            pcap_capture_drop_count++;
+            pcap_capture_drop_write_count++;
+        }
+        portEXIT_CRITICAL(&pcap_stats_lock);
     }
 
     fflush(pcap_capture_file);
     fclose(pcap_capture_file);
     pcap_capture_file = NULL;
+    if (pcap_stdio_buffer != NULL) {
+        heap_caps_free(pcap_stdio_buffer);
+        pcap_stdio_buffer = NULL;
+    }
     sd_sync();
 
     MY_LOG_INFO(TAG, "PCAP writer done: %s (%lu frames, %lu drops)",
@@ -24478,6 +27589,7 @@ static void safe_restart(void) {
         esp_vfs_fat_sdcard_unmount("/sdcard", sd_card_handle);
         sd_card_mounted = false;
         sd_card_handle = NULL;
+        sd_mount_freq_khz = 0;
     }
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
@@ -24537,12 +27649,14 @@ static esp_err_t init_sd_card(void) {
         attempted_freqs[i] = host.max_freq_khz;
         ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &sd_card_handle);
         if (ret == ESP_OK) {
+            sd_mount_freq_khz = host.max_freq_khz;
             break;
         }
         vTaskDelay(pdMS_TO_TICKS(60));
     }
     
     if (ret != ESP_OK) {
+        sd_mount_freq_khz = 0;
         sd_last_init_error = ret;
         if (ret == ESP_FAIL) {
             MY_LOG_INFO(TAG, "SD: not mounted (filesystem unsupported/corrupted). File-backed features disabled.");
