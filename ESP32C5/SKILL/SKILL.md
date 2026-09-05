@@ -119,7 +119,9 @@ Every command response has a known end marker. Wait for it before proceeding:
 | `show_pass` | Timeout (no explicit end marker) |
 | `list_probes` | Timeout (no explicit end marker) |
 | `wpasec_upload` | `"Done:"` |
-| `start_pcap` | `"PCAP radio capture started"` or `"PCAP net capture started"` (initial); on stop: `"PCAP saved:"` |
+| `start_pcap` | `"PCAP radio capture started"` / `"PCAP net capture started"` / (gateway usually via `capture_gateway`); on stop: `"PCAP saved:"` / `"[PCAP_FINAL]"` |
+| `capture_gateway` | `"[CGW] END"` (after start/status/`capture_gateway stop`); while recording use universal `stop` |
+| `start_rogue_gitm` | `"[CGW] END"` (same status block as `capture_gateway start`) |
 | `zig_recon_status` | `"[ZIG] END"` |
 | `zig_recon_list` | `"[ZIG] END"` |
 | `zig_recon_nodes` | `"[ZIG] END"` |
@@ -556,6 +558,19 @@ wifi_connect <SSID> [password|--saved]
 start_pcap net
   → wait for "PCAP net capture started -> ..."
   → stop → "PCAP saved: ... (N frames, M drops)"
+```
+
+### 7b. Capture Gateway (GITM)
+
+```
+wifi_connect <upstream_ssid> [password|--saved]
+  → wait for "SUCCESS" (STA IPv4 required)
+capture_gateway start <capture_ssid> [capture_password] [--pcap-name <basename>]
+  → wait for "[CGW] END" with active=1 and capture=active
+  → optional: poll capture_gateway status (same [CGW] ... [CGW] END contract)
+  → clients may join SoftAP 10.42.0.0/24 at any time
+stop
+  → "[PCAP_FINAL] ..." then gateway teardown; do not use capture_gateway stop while PCAP is armed
 ```
 
 ### 8. Bluetooth Locate

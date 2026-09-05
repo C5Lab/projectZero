@@ -141,11 +141,12 @@ TP-Link_F5F8 (64:57:25:BB:90:6A)
 - **Stop**: Send `stop`.
 
 ### `start_pcap`
-- **Syntax**: `start_pcap [radio|net]`
+- **Syntax**: `start_pcap [radio|net|gateway]`
 - **Description**: Captures WiFi traffic to PCAP file on SD card. Default mode: `radio`.
   - **Radio mode** (linktype 105): Promiscuous mode capturing all management/data/control frames on all channels.
   - **Net mode** (linktype 1): Requires WiFi STA connection. Captures outbound packets and performs ARP spoofing MITM on detected hosts.
-- **Example**: `start_pcap radio` or `start_pcap net`
+  - **Gateway mode** (linktype 1): Compatibility/idempotency helper for Capture Gateway. Prefer `capture_gateway start`, which arms gateway PCAP automatically. `start_pcap gateway` requires an already-active Capture Gateway and is a no-op if that recorder is already armed.
+- **Example**: `start_pcap radio`, `start_pcap net`, or `start_pcap gateway`
 - **Output**:
 ```
 PCAP radio capture started -> /sdcard/lab/pcaps/sniff_1.pcap
@@ -153,16 +154,18 @@ PCAP radio capture started -> /sdcard/lab/pcaps/sniff_1.pcap
 - **On stop**:
 ```
 PCAP saved: /sdcard/lab/pcaps/sniff_1.pcap (1530 frames, 2 drops)
+[PCAP_FINAL] file=... frames=... drops=... drop_alloc=... drop_queue=... drop_write=... rate_queue_drops=... throttle_events=... pause_events=... filter_drops=...
 ```
 - **Error outputs**:
-  - `"Usage: start_pcap radio|net"` (invalid argument)
+  - `"Usage: start_pcap radio|net|gateway"` (invalid argument)
   - `"Not connected to WiFi. Use 'wifi_connect' first."` (net mode, not connected)
+  - `"Capture Gateway is not active. Start it before 'start_pcap gateway'."`
   - `"Failed to initialize SD card: <error>"` (SD init fail)
   - `"Failed to create /sdcard/lab/pcaps directory"` (directory fail)
   - `"Failed to open <filepath> for writing"` (file fail)
-- **Prerequisites**: SD card. For net mode: WiFi connected via `wifi_connect`.
+- **Prerequisites**: SD card. For net mode: WiFi connected via `wifi_connect`. For gateway mode: active Capture Gateway (`capture_gateway start` or `start_rogue_gitm`).
 - **Stop**: Send `stop`.
-- **Notes**: Files are saved at `/sdcard/lab/pcaps/sniff_N.pcap` (N auto-increments).
+- **Notes**: Files are saved at `/sdcard/lab/pcaps/sniff_N.pcap` (N auto-increments) unless `--pcap-name` was set by Capture Gateway / Rogue GITM.
 
 ---
 
@@ -374,6 +377,66 @@ DHCP IP: 192.168.0.5, Netmask: 255.255.255.0, GW: 192.168.0.1
 ### `wifi_disconnect`
 - **Syntax**: `wifi_disconnect`
 - **Description**: Disconnects from current AP.
+
+---
+
+## JanOS Capture Gateway (GITM)
+
+Authorized APSTA/NAPT gateway that turns JanOS into the IPv4 default route for clients joined to a dedicated SoftAP. Downstream SoftAP traffic is recorded to PCAP before NAPT (client addresses preserved). Product name: **JanOS GITM** (Gate-in-the-Middle). Complements `start_pcap net` (ARP-spoof on an existing LAN); does not decrypt HTTPS/QUIC/VPN.
+
+### `capture_gateway`
+- **Syntax**:
+  - `capture_gateway start <capture_ssid> [capture_password] [--pcap-name <name>]`
+  - `capture_gateway status`
+  - `capture_gateway stop`
+- **Description**: After `wifi_connect` (STA must have IPv4), starts SoftAP on fixed `10.42.0.1/24`, DHCP, DNS proxy (`dns=10.42.0.1` advertised; queries forwarded to upstream resolver), IPv4 NAPT through STA, adaptive aggregate 4096 kbps ceiling, and automatically arms gateway PCAP before reporting ready. Does not wait for a client. Omit password for open SoftAP; supply 8-63 bytes for WPA2-PSK. Channel follows the upstream AP (single radio).
+- **Args**:
+  - `capture_ssid`: 1-32 bytes (quote if it contains spaces)
+  - `capture_password`: optional; empty/open vs 8-63 WPA2-PSK
+  - `--pcap-name <name>`: optional basename under `/sdcard/lab/pcaps`; `.pcap` appended if omitted; safe chars `[A-Za-z0-9._-]`, max 95 incl. extension; never overwrites an existing file. Without it: `sniff_N.pcap`
+- **Examples**:
+  - `capture_gateway start JanOS-Capture`
+  - `capture_gateway start JanOS-Capture correct-horse-battery-staple`
+  - `capture_gateway start "JanOS Lab" "eight char password" --pcap-name office_20260812_143000`
+  - `capture_gateway status`
+- **Prerequisite**: `wifi_connect` with usable IPv4. Upstream subnet must not contain `10.42.0.1`.
+- **Completion marker (start/status)**: exact line `"[CGW] END"` (collect all `[CGW]` / `[CGW_CLIENT]` lines until then). Successful start also prints human `"Capture Gateway ready and recording..."` and a status block with `active=1` and `capture=active`.
+- **Active status example**:
+```
+[CGW] status active=1 upstream=1 napt=1 clients=2 channel=6
+[CGW] ssid=JanOS Lab security=open upstream_ssid=Office WiFi
+[CGW] ap_ip=10.42.0.1 sta_ip=192.168.1.27 dns=10.42.0.1 dns_proxy=on upstream_dns=192.168.1.1
+[CGW] capture=active file=/sdcard/lab/pcaps/iot-lab_20260812_143000.pcap packets=18742 frames=18742 drops=0 file_bytes=9238164
+[CGW] recorder drop_alloc=0 drop_queue=0 drop_write=0 queue_depth=3 queue_capacity=1024 queue_high_water=41
+[CGW] rate_limit_kbps=4096 rate_effective_kbps=2048 adaptive=on throttle_events=3 pause_events=0 rate_queue_depth=27 rate_queue_capacity=1024 rate_queue_drops=0 rate_queue_high_water=545
+[CGW] pcap_scope=softap_10_42 filter_drops=0
+[CGW] client_isolation=off
+[CGW_CLIENT] mac=02:11:22:33:44:55 ip=10.42.0.2
+[CGW_CLIENT] mac=02:AA:BB:CC:DD:EE ip=10.42.0.3
+[CGW] END
+```
+- **Idle status**:
+```
+[CGW] status active=0
+[CGW] END
+```
+- **Parse notes**:
+  - Match prefixes `[CGW] ` and `[CGW_CLIENT] ` only; ignore ESP-IDF/human log lines between them.
+  - On the `ssid=` line, extract `ssid` between `ssid=` and ` security=`, `security` between ` security=` and ` upstream_ssid=`, remainder is `upstream_ssid` (may contain spaces).
+  - Commit the snapshot only on `[CGW] END`. Use 64-bit for `file_bytes`. `frames` is a compatibility alias of `packets`.
+  - `drops>0` = degraded PCAP; `rate_queue_drops>0` = shaping degradation (separate from recorder drops). Passwords are never returned.
+- **Stop**:
+  - While gateway PCAP is armed: send universal `stop` (finalizes writer, emits `[PCAP_FINAL]`, then tears down gateway). Do **not** use `capture_gateway stop` in that state — it refuses with `"Gateway PCAP is active. Use 'stop'..."`.
+  - `capture_gateway stop` only when gateway is up but PCAP is not armed; prints `[CGW] stopped` / `[CGW] END` and keeps STA up.
+- **Error outputs** (representative):
+  - `"Usage: capture_gateway start <capture_ssid> [capture_password] [--pcap-name <name>] | status | stop"`
+  - `"No upstream IPv4 connection. Use 'wifi_connect' first."`
+  - `"Capture SSID must be 1-32 bytes; optional password must be 8-63 bytes"`
+  - `"Capture Gateway is already active"`
+  - `"PCAP name must fit in ... letters, digits, '.', '_' or '-'; paths are not allowed"`
+  - `"Capture Gateway: recorder failed to arm; gateway rolled back"`
+- **Recommended flow**: `wifi_connect ...` → `capture_gateway start ...` → (optional poll `capture_gateway status`) → clients may join anytime → `stop`.
+- **Related**: `start_rogue_gitm` starts the same GITM session with a mandatory WPA2 mirror SSID and optional same-channel deauth. Do not send `start_pcap gateway` after a successful `capture_gateway start`.
 
 ---
 
