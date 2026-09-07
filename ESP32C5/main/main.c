@@ -19611,7 +19611,11 @@ static int cmd_send_file(int argc, char **argv)
         sent += payload_len;
         remaining -= payload_len;
         block_index++;
-        vTaskDelay(1);
+        /* No yield here on purpose. Each pass already blocks twice - on
+         * uart_wait_tx_done and on the ACK - so the scheduler runs regardless,
+         * and vTaskDelay(1) only added a whole 10 ms tick to every block. That
+         * was 14% of the per-block cost once the receiver reached 1.5 MBaud,
+         * paid for nothing. */
     }
 
 transfer_end:
