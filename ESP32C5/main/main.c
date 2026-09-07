@@ -132,7 +132,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.2"
+#define JANOS_VERSION "1.7.3"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -13603,8 +13603,8 @@ static const cli_hint_t k_cli_hints[] = {
     { "arp_ban", " <MAC> [IP]" },
     { "show_pass", " [portal|evil]" },
     { "list_dir", " [path] [-s]" },
-    { "send_file", " <path> [offset]" },
-    { "uart_baud", " <115200|230400|460800|921600|2000000>" },
+    { "send_file", " <path> [offset] [bsize]" },
+    { "uart_baud", " <115200|230400|460800|921600|1000000|1500000|2000000|3000000|4000000>" },
     { "uart_baud_confirm", "" },
     { "uart_baud_status", "" },
     { "file_delete", " <path> [path2 ...]" },
@@ -18995,12 +18995,38 @@ static bool build_sd_path(char *dest, size_t dest_size, const char *input_path)
 #define UART_BAUD_IDLE_CHECK_US     (1ULL * 1000ULL * 1000ULL)
 #define JANOS_CONSOLE_MAX_COMMANDS  128U
 
-#define FT_BLOCK_SIZE               4096U
-#define FT_ACK_TIMEOUT_MS           5000U
+#define FT_BLOCK_SIZE_DEFAULT       4096U
+#define FT_BLOCK_SIZE_MIN           512U
+#define FT_BLOCK_SIZE_MAX           32768U
+#define FT_BLOCK_HEADER_BYTES       16U
 #define FT_MAX_BLOCK_ATTEMPTS       3U
 #define FT_ACK                      0x06U
 #define FT_NAK                      0x15U
 #define FT_CAN                      0x18U
+
+/* Both ends size their per-block patience from the same two numbers - the
+ * negotiated block size and the rate the line is actually running at - so the
+ * sender is never the first to give up. A fixed pair of constants cannot do
+ * that: 4 KiB at 2 MBaud is 21 ms of wire time while 32 KiB at 115200 is
+ * 2.8 s, and any single number is wrong at one end of that range.
+ *
+ *   wire_ms   = (bsize + 16) * 10 bits / baud       one block on an ideal line
+ *   receiver  = 1000 + 3 * wire_ms                  capped at 30 s
+ *   sender    = max(8000, receiver + 2000)
+ *
+ * The sender's window therefore exceeds the receiver's by at least 2 s, so a
+ * receiver that is merely slow still gets its NAK in before JanOS abandons the
+ * transfer. The 8 s floor is for receivers predating this scheme: they wait a
+ * fixed 6 s for a block payload, which the old 5 s ACK timeout sat inside -
+ * between 5 s and 6 s JanOS had already printed [FT] error ACK timeout and
+ * returned to the REPL while the far end was still preparing a NAK, and the
+ * two desynchronised unrecoverably.
+ *
+ * The computed value is published as ack_ms= in the [FT] begin header so a
+ * receiver can follow it instead of reproducing the formula. */
+#define FT_ACK_TIMEOUT_FLOOR_MS     8000U
+#define FT_ACK_TIMEOUT_MARGIN_MS    2000U
+#define FT_RX_TIMEOUT_CAP_MS        30000U
 
 static SemaphoreHandle_t uart_baud_mutex;
 static esp_timer_handle_t uart_baud_confirm_timer;
@@ -19184,10 +19210,28 @@ static esp_err_t janos_console_cmd_register(const esp_console_cmd_t *cmd)
     return err;
 }
 
+/* The C5 UART divider reaches far past this list, so what limits the top of it
+ * is the wiring between the boards, not the silicon. The rates above 2 MBaud
+ * are here to be tried rather than assumed: an unconfirmed switch reverts to
+ * 115200 after 10 s by itself, so a rate the cable cannot carry costs one
+ * failed transfer and no more. */
 static bool uart_baud_is_allowed(uint32_t rate)
 {
     return rate == 115200U || rate == 230400U || rate == 460800U ||
-           rate == 921600U || rate == 2000000U;
+           rate == 921600U || rate == 1000000U || rate == 1500000U ||
+           rate == 2000000U || rate == 3000000U || rate == 4000000U;
+}
+
+/* The rate the console is running at right now, for sizing transfer timeouts. */
+static uint32_t uart_baud_current(void)
+{
+    if (uart_baud_mutex == NULL) {
+        return uart_current_baud;
+    }
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+    uint32_t rate = uart_current_baud;
+    xSemaphoreGive(uart_baud_mutex);
+    return rate;
 }
 
 static int cmd_uart_baud(int argc, char **argv)
@@ -19197,7 +19241,8 @@ static int cmd_uart_baud(int argc, char **argv)
     unsigned long long parsed = (argc == 2) ? strtoull(argv[1], &end, 10) : 0;
     if (argc != 2 || errno == ERANGE || end == argv[1] || *end != '\0' ||
         parsed > UINT32_MAX || !uart_baud_is_allowed((uint32_t)parsed)) {
-        printf("[UARTB] error allowed=115200,230400,460800,921600,2000000\n");
+        printf("[UARTB] error allowed=115200,230400,460800,921600,1000000,"
+               "1500000,2000000,3000000,4000000\n");
         printf("[UARTB] END\n");
         return 0;
     }
@@ -19299,9 +19344,35 @@ static void ft_put_le32(uint8_t *dest, uint32_t value)
     dest[3] = (uint8_t)(value >> 24);
 }
 
-static int ft_wait_for_response(uint8_t *response)
+/* Time one block spends on an ideal line, header included. */
+static uint32_t ft_block_wire_ms(uint32_t block_size, uint32_t baud)
 {
-    int64_t deadline_us = esp_timer_get_time() + (int64_t)FT_ACK_TIMEOUT_MS * 1000;
+    if (baud == 0U) {
+        baud = JANOS_UART_DEFAULT_BAUD;
+    }
+    uint64_t bit_ms = ((uint64_t)block_size + FT_BLOCK_HEADER_BYTES) * 10ULL * 1000ULL;
+    return (uint32_t)((bit_ms + baud - 1U) / baud);
+}
+
+/* What a receiver is expected to allow itself for one block. Published in the
+ * header via ack_ms so a receiver can follow it instead of recomputing it, but
+ * kept identical to the receiver-side formula for the ones that do. */
+static uint32_t ft_receiver_block_timeout_ms(uint32_t block_size, uint32_t baud)
+{
+    uint32_t timeout = 1000U + 3U * ft_block_wire_ms(block_size, baud);
+    return timeout > FT_RX_TIMEOUT_CAP_MS ? FT_RX_TIMEOUT_CAP_MS : timeout;
+}
+
+static uint32_t ft_ack_timeout_ms(uint32_t block_size, uint32_t baud)
+{
+    uint32_t timeout = ft_receiver_block_timeout_ms(block_size, baud) +
+                       FT_ACK_TIMEOUT_MARGIN_MS;
+    return timeout < FT_ACK_TIMEOUT_FLOOR_MS ? FT_ACK_TIMEOUT_FLOOR_MS : timeout;
+}
+
+static int ft_wait_for_response(uint8_t *response, uint32_t timeout_ms)
+{
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
     while (esp_timer_get_time() < deadline_us) {
         int64_t remaining_ms = (deadline_us - esp_timer_get_time() + 999) / 1000;
         TickType_t wait_ticks = pdMS_TO_TICKS((uint32_t)remaining_ms);
@@ -19331,14 +19402,16 @@ static int cmd_send_file(int argc, char **argv)
     uint64_t sent = 0;
     uint32_t sent_crc = 0;
     uint32_t block_index = 0;
+    uint32_t block_size = FT_BLOCK_SIZE_DEFAULT;
+    uint32_t ack_timeout_ms = 0;
     bool cancelled = false;
 
     uart_baud_set_file_transfer_active(true);
     flockfile(stdout);
     fflush(stdout);
 
-    if (argc < 2 || argc > 3) {
-        ft_send_error("usage: send_file <path> [offset]");
+    if (argc < 2 || argc > 4) {
+        ft_send_error("usage: send_file <path> [offset] [bsize]");
         goto cleanup;
     }
 
@@ -19347,7 +19420,7 @@ static int cmd_send_file(int argc, char **argv)
         goto cleanup;
     }
 
-    if (argc == 3) {
+    if (argc >= 3) {
         char *end = NULL;
         errno = 0;
         unsigned long long parsed = strtoull(argv[2], &end, 10);
@@ -19356,6 +19429,28 @@ static int cmd_send_file(int argc, char **argv)
             goto cleanup;
         }
         offset = (uint64_t)parsed;
+    }
+
+    /* The receiver picks the block size because the receiver is the side with
+     * the RAM constraint: its UART ring has to comfortably exceed one block.
+     * A request outside what JanOS will allocate is clamped rather than
+     * refused, and the effective value goes back out as bsize= - so a caller
+     * must read that field rather than assume it got what it asked for.
+     * Callers that pass no third argument keep the historical 4096. */
+    if (argc == 4) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(argv[3], &end, 10);
+        if (errno == ERANGE || end == argv[3] || *end != '\0' || argv[3][0] == '-') {
+            ft_send_error("invalid block size");
+            goto cleanup;
+        }
+        if (parsed < FT_BLOCK_SIZE_MIN) {
+            parsed = FT_BLOCK_SIZE_MIN;
+        } else if (parsed > FT_BLOCK_SIZE_MAX) {
+            parsed = FT_BLOCK_SIZE_MAX;
+        }
+        block_size = (uint32_t)parsed;
     }
 
     esp_err_t sd_err = init_sd_card();
@@ -19389,10 +19484,38 @@ static int cmd_send_file(int argc, char **argv)
         goto cleanup;
     }
 
-    buffer = malloc(FT_BLOCK_SIZE);
+    buffer = malloc(block_size);
     if (buffer == NULL) {
         ft_send_error("out of memory");
         goto cleanup;
+    }
+
+    /* A resuming receiver holds a partial file it has no way to trust. Checksum
+     * the range it says it already has - the file is still positioned at 0 - so
+     * it can discard a stale prefix before the rest is pushed over the wire
+     * instead of discovering the mismatch after the whole transfer. */
+    uint32_t prefix_crc = 0;
+    uint64_t prefix_since_yield = 0;
+    for (uint64_t left = offset; left > 0; ) {
+        size_t wanted = left > block_size ? block_size : (size_t)left;
+        size_t got = fread(buffer, 1, wanted, file);
+        if (got != wanted || ferror(file)) {
+            ft_send_error("read failed");
+            goto cleanup;
+        }
+        prefix_crc = esp_rom_crc32_le(prefix_crc, buffer, (uint32_t)got);
+        left -= got;
+        /* Unlike the send loop below, nothing here waits on the wire, so a
+         * yield per block would dominate the whole read: at a 10 ms tick and a
+         * 4 KiB block a 90 MB prefix would spend four minutes sleeping and blow
+         * the receiver's header timeout long before the file was checksummed.
+         * Once per 256 KiB keeps the idle task fed at a cost of nothing, and is
+         * counted in bytes so it stays 256 KiB whatever the block size is. */
+        prefix_since_yield += got;
+        if (prefix_since_yield >= 256U * 1024U) {
+            prefix_since_yield = 0;
+            vTaskDelay(1);
+        }
     }
 
     if (fseeko(file, (off_t)offset, SEEK_SET) != 0) {
@@ -19409,12 +19532,20 @@ static int cmd_send_file(int argc, char **argv)
         goto cleanup;
     }
 
+    /* Receivers parse this line with a plain substring search for "<key>=", so
+     * prefix_crc must stay after crc32 and must not contain "crc32=" itself -
+     * either would hand a lookup for crc32= the wrong number. Same reason
+     * bsize= is only safe where it is: size= appears earlier in the line.
+     * New fields go on the end, which is where ack_ms= is. */
+    ack_timeout_ms = ft_ack_timeout_ms(block_size, uart_baud_current());
     char header[192];
     int header_len = snprintf(header, sizeof(header),
                               "[FT] begin size=%" PRIu64 " offset=%" PRIu64
-                              " bsize=%u crc32=00000000\r\n"
+                              " bsize=%" PRIu32 " crc32=00000000 prefix_crc=%08" PRIx32
+                              " ack_ms=%" PRIu32 "\r\n"
                               "[FT] END\r\n\r\n",
-                              total_size, offset, FT_BLOCK_SIZE);
+                              total_size, offset, block_size, prefix_crc,
+                              ack_timeout_ms);
     if (header_len <= 0 || (size_t)header_len >= sizeof(header) ||
         !ft_uart_write_all(header, (size_t)header_len) ||
         uart_wait_tx_done(JANOS_UART_NUM, pdMS_TO_TICKS(2000)) != ESP_OK) {
@@ -19422,14 +19553,14 @@ static int cmd_send_file(int argc, char **argv)
     }
 
     while (remaining > 0) {
-        size_t wanted = remaining > FT_BLOCK_SIZE ? FT_BLOCK_SIZE : (size_t)remaining;
+        size_t wanted = remaining > block_size ? block_size : (size_t)remaining;
         size_t payload_len = fread(buffer, 1, wanted, file);
         if (payload_len != wanted) {
             ft_send_error(ferror(file) ? "read failed" : "file changed during transfer");
             goto cleanup;
         }
 
-        uint8_t block_header[16] = { 'F', 'T', 'B', 0x01 };
+        uint8_t block_header[FT_BLOCK_HEADER_BYTES] = { 'F', 'T', 'B', 0x01 };
         ft_put_le32(block_header + 4, block_index);
         ft_put_le32(block_header + 8, (uint32_t)payload_len);
         ft_put_le32(block_header + 12,
@@ -19439,14 +19570,14 @@ static int cmd_send_file(int argc, char **argv)
         for (uint32_t attempt = 0; attempt < FT_MAX_BLOCK_ATTEMPTS; attempt++) {
             if (!ft_uart_write_all(block_header, sizeof(block_header)) ||
                 !ft_uart_write_all(buffer, payload_len) ||
-                uart_wait_tx_done(JANOS_UART_NUM, pdMS_TO_TICKS(FT_ACK_TIMEOUT_MS)) != ESP_OK) {
+                uart_wait_tx_done(JANOS_UART_NUM, pdMS_TO_TICKS(ack_timeout_ms)) != ESP_OK) {
                 ft_send_error("UART write failed");
                 goto cleanup;
             }
             uart_baud_note_activity();
 
             uint8_t response = 0;
-            int response_status = ft_wait_for_response(&response);
+            int response_status = ft_wait_for_response(&response, ack_timeout_ms);
             if (response_status == 0) {
                 ft_send_error("ACK timeout");
                 goto cleanup;
@@ -24912,8 +25043,8 @@ static void register_commands(void)
 
     const esp_console_cmd_t send_file_cmd = {
         .command = "send_file",
-        .help = "Transfer an SD file over UART: send_file <path> [offset]",
-        .hint = "<path> [offset]",
+        .help = "Transfer an SD file over UART: send_file <path> [offset] [bsize]",
+        .hint = "<path> [offset] [bsize]",
         .func = &cmd_send_file,
         .argtable = NULL
     };

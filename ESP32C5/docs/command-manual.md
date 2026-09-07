@@ -314,7 +314,7 @@ Recon PAN/node tables and CLI snapshots are allocated in PSRAM. The RX queue rem
 
 These commands operate on UART0, the same line used by the interactive console. The selected baud rate is deliberately not stored in NVS: every boot starts at 115200 so bootloader and JanOS startup messages remain readable.
 
-- `uart_baud <rate>` — change the UART0 console rate. Allowed rates are `115200`, `230400`, `460800`, `921600`, and `2000000`. JanOS first sends the following response at the old rate, waits until TX is empty, and only then changes the UART rate:
+- `uart_baud <rate>` — change the UART0 console rate. Allowed rates are `115200`, `230400`, `460800`, `921600`, `1000000`, `1500000`, `2000000`, `3000000`, and `4000000`. Everything above `2000000` is offered to be measured, not because the link is known to carry it: the C5 divider reaches far past the top of this list, so the ceiling is set by the wiring between the boards. An unconfirmed switch reverts by itself (see below), so a rate the cable cannot carry costs one failed transfer and nothing more. JanOS first sends the following response at the old rate, waits until TX is empty, and only then changes the UART rate:
   ```text
   [UARTB] switching rate=<rate> confirm_within=10s
   [UARTB] END
@@ -331,17 +331,35 @@ These commands operate on UART0, the same line used by the interactive console. 
   [UARTB] status rate=<rate> pending=<yes|no>
   [UARTB] END
   ```
-- `send_file <path> [offset]` — read a file from the SD card and transfer it over UART0. Relative paths are rooted at `/sdcard`; `offset` defaults to `0` and permits resuming a partial download. The command does not modify the file or SD card.
+- `send_file <path> [offset] [bsize]` — read a file from the SD card and transfer it over UART0. Relative paths are rooted at `/sdcard`; `offset` defaults to `0` and permits resuming a partial download. The command does not modify the file or SD card.
+
+`bsize` is the payload size of one block, in bytes. It is chosen by the *receiver* because the receiver is the side with the RAM constraint — its UART receive ring has to comfortably exceed one block. A request below `512` or above `32768` is clamped rather than refused, and the value actually used is reported back as `bsize=`, so a caller must read that field instead of assuming it got what it asked for. Omitting the argument keeps the historical `4096`.
+
+A JanOS predating this argument rejects a three-argument `send_file` outright with `[FT] error usage: send_file <path> [offset]`. A receiver that wants a block size should therefore retry once without the third argument when it sees `usage` in the refusal.
 
 On success, `send_file` emits a text header followed by an empty line:
 
 ```text
-[FT] begin size=<total-file-size> offset=<offset> bsize=4096 crc32=00000000
+[FT] begin size=<total-file-size> offset=<offset> bsize=<block-size> crc32=00000000 prefix_crc=<crc32-of-bytes-before-offset> ack_ms=<ack-timeout-ms>
 [FT] END
 
 ```
 
 The opening CRC32 is intentionally zero so transmission can begin immediately without reading the file twice. Verify the received data using the authoritative running CRC32 reported by the final `[FT] done` line.
+
+`prefix_crc` is the CRC32 of the byte range `[0, offset)` — everything JanOS is *not* about to send — and is `00000000` when `offset` is `0`. It is always present, so its absence identifies a JanOS too old to provide it. A resuming receiver checksums its own partial file and compares it against this value before the first block arrives, which turns a stale or corrupted partial into an immediate restart from zero instead of a CRC failure discovered after the whole remainder has crossed the wire.
+
+`ack_ms` is how long JanOS will wait for the response byte after each block, in milliseconds. Both ends size their per-block patience from the same two numbers — the negotiated block size and the rate the line is running at — because no fixed constant is right across the range: one 4 KiB block is 21 ms of wire time at 2 MBaud, while one 32 KiB block is 2.8 s at 115200. The relationship is:
+
+```text
+wire_ms  = (bsize + 16) * 10 bits / baud        one block on an ideal line
+receiver = 1000 + 3 * wire_ms                   capped at 30000
+ack_ms   = max(8000, receiver + 2000)
+```
+
+The sender's window therefore exceeds the receiver's by at least 2000 ms, so a receiver that is merely slow still gets its NAK in before JanOS abandons the transfer. **A receiver must keep its own per-block deadline strictly below `ack_ms`** — subtracting the 2000 ms margin reproduces the `receiver` line above. Receivers predating this field wait a fixed 6 s for a block payload, which the older fixed 5 s ACK timeout sat *inside*: between 5 s and 6 s JanOS had already printed `[FT] error ACK timeout` and returned to the REPL while the far end was still preparing a NAK, desynchronising the two unrecoverably. The 8000 ms floor exists to keep those receivers inside the window. A receiver that does not see `ack_ms` is talking to a JanOS with the old fixed 5 s timeout and must stay well inside it.
+
+Fields in the `[FT] begin` line must not be reordered, and no new field may contain the substring `crc32=`. Receivers locate values by searching for `<key>=`, so a field named e.g. `pre_crc32=`, or `prefix_crc=` placed ahead of `crc32=`, would be picked up by a search for `crc32=` and silently return the wrong number. This is why `bsize=` is safe only where it is: `size=` occurs earlier in the line.
 
 After the empty line, each block is binary and is not escaped:
 
@@ -349,17 +367,17 @@ After the empty line, each block is binary and is not escaped:
 |---|---:|---|
 | magic | 4 bytes | `FTB\x01` |
 | index | 4 bytes | little-endian, starting at 0 |
-| length | 4 bytes | little-endian, payload length up to 4096 |
+| length | 4 bytes | little-endian, payload length up to the negotiated `bsize` |
 | crc32 | 4 bytes | little-endian CRC32 of this payload only |
 | payload | `length` bytes | raw file bytes |
 
-After every block, the receiver must send exactly one response byte within 5 seconds:
+After every block, the receiver must send exactly one response byte within `ack_ms` milliseconds:
 
 - `0x06` (ACK) — accept the block and continue.
 - `0x15` (NAK) — retransmit the same block, up to three total attempts.
 - `0x18` (CAN) — cancel the transfer.
 
-If no response byte arrives within 5 seconds, JanOS ends the transfer with `[FT] error ACK timeout` followed by `[FT] END`, releases the file and transfer buffer, and returns control to the console REPL.
+If no response byte arrives within `ack_ms`, JanOS ends the transfer with `[FT] error ACK timeout` followed by `[FT] END`, releases the file and transfer buffer, and returns control to the console REPL.
 
 A completed transfer ends with:
 
@@ -378,7 +396,7 @@ Cancellation ends with `[FT] cancelled` and `[FT] END`. Validation, SD, open, se
 - `select_html <index>` — load an HTML file by index for portal / rogue AP / evil twin.
 - `set_html <html_string>` — set portal HTML directly from the command line.
 - `list_dir [path] [-s]` — list files in a directory (default `lab/handshakes`); `-s` adds the decimal byte size before each filename.
-- `send_file <path> [offset]` — transfer an SD file over UART0 using the resumable binary protocol documented above.
+- `send_file <path> [offset] [bsize]` — transfer an SD file over UART0 using the resumable binary protocol documented above. `bsize` is the receiver-selected block size, clamped to 512-32768 and echoed back as `bsize=`.
 - `file_delete <path> [path2 ...]` — delete one or more files, e.g. `file_delete lab/handshakes/sample.pcap`. Each path produces the human line `Deleted <path>` plus a machine-readable `[FILE_DELETE] path=<path> result=ok|not_found|is_dir|failed`. The result is printed before the card is synced, and a batch is synced once at the end. Exactly one marker line is emitted per path, in the order the paths were given, whatever happens to any of them — the host maps results positionally, so a missing or reordered line would attribute a result to the wrong file. Quote any path containing a space; `esp_console_split_argv` undoes the quoting, so it arrives as one argument. An absolute path that does not start with `/sdcard` is rebased onto it, so `/lab/handshakes` and `/sdcard/lab/handshakes` now mean the same directory.
 - `list_ssids` (alias `list_ssid`) — list SSIDs from `/sdcard/lab/ssids.txt` with index.
 - `add_ssid <SSID>` — append an SSID (1‑32 chars) to the file.
