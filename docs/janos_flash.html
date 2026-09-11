@@ -394,7 +394,7 @@
   </footer>
 
   <script type="module">
-    import { ESPLoader, Transport } from "https://unpkg.com/esptool-js/bundle.js";
+    import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.6.1/bundle.js";
 
     const ui = {
       status: document.getElementById("statusText"),
@@ -440,7 +440,7 @@
       monitorConnected: false,
     };
 
-    const PAGE_VERSION = "1.0.8";
+    const PAGE_VERSION = "1.0.9";
     const monitorEncoder = new TextEncoder();
     const commandEncoder = new TextEncoder();
 
@@ -454,6 +454,25 @@
     const JANOS_DOWNLOAD_TIMEOUT_MS = 8000;
     const JANOS_ROM_SETTLE_MS = 1500;
     const JANOS_ROM_FALLBACK_SETTLE_MS = 2500;
+
+    // Newer ESP32-C5 silicon reports a chip magic that esptool-js 0.6.1 does
+    // not know yet (added upstream in esptool-js#261, unreleased). The ROM
+    // class, stub and eFuse map are identical, so alias the new magic to the
+    // original one before the loader autodetects the chip.
+    const CHIP_MAGIC_ALIASES = new Map([
+      [0x30e1706f, 0x1101406f], // ESP32-C5 rev 1.2
+    ]);
+    const patchChipMagic = (loader) => {
+      const readReg = loader.readReg.bind(loader);
+      loader.readReg = async (addr, timeout) => {
+        const value = await readReg(addr, timeout);
+        if (addr !== loader.CHIP_DETECT_MAGIC_REG_ADDR) return value;
+        const alias = CHIP_MAGIC_ALIASES.get(value >>> 0);
+        if (alias === undefined) return value;
+        log(`Chip magic 0x${(value >>> 0).toString(16)} aliased to 0x${alias.toString(16)} (newer ESP32-C5 revision).`);
+        return alias;
+      };
+    };
 
     const setFooterVersion = (manifest) => {
       if (!ui.pageVersion) return;
@@ -819,6 +838,7 @@
           attempt += 1;
           try {
             state.esploader = new ESPLoader(loaderOptions);
+            patchChipMagic(state.esploader);
             log("Connecting...");
             state.chip = await state.esploader.main();
             lastErr = null;
@@ -831,6 +851,9 @@
               ? `ROM sync failed, retrying... (${remainingS}s)`
               : `Failed to connect. Hold BOOT + tap RESET, retrying... (${remainingS}s)`);
             log(`Error: ${err?.message || err}`);
+            // esptool-js leaves the port open after a failed sync; close it so
+            // the next attempt does not fail with "port is already open".
+            try { await state.transport.disconnect(); } catch {}
             await sleep(CONNECT_RETRY_DELAY_MS);
           }
         }
