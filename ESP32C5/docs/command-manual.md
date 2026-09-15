@@ -236,7 +236,7 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 
 ## Attacks
 
-- `start_deauth` — deauth selected networks. Prereq `select_networks`.
+- `start_deauth` — deauth selected networks. WPA2 stays classic deauth; WPA3 uses Channel Switch Announcement (CSA); WPA2/WPA3 mixed sends both. Prereq `select_networks`. Syntax unchanged.
 - `start_evil_twin` — clone first selected AP + deauth others, captive portal harvests password. Optional `select_html`.
 - `sae_overflow` — WPA3 SAE client‑overflow on exactly one selected AP.
 - `start_handshake` — capture WPA handshakes (targeted with selection, else scan‑and‑attack loop). Saves PCAP/HCCAPX.

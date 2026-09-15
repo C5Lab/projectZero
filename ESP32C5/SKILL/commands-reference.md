@@ -173,9 +173,10 @@ PCAP saved: /sdcard/lab/pcaps/sniff_1.pcap (1530 frames, 2 drops)
 
 ### `start_deauth`
 - **Syntax**: `start_deauth`
-- **Description**: Starts deauth attack on selected networks.
+- **Description**: Starts deauth attack on selected networks. Per-AP: WPA2 (and similar) get classic deauth; WPA3/OWE get Channel Switch Announcement (CSA beacon + CSA action); WPA2/WPA3 mixed gets both. Syntax is unchanged.
 - **Prerequisite**: `select_networks`
 - **Stop**: Send `stop`.
+- **Notes**: Extra lines such as `"CSA: <SSID> ch=X -> decoy Y"` or `"Deauth+CSA: ..."` may appear at start. Completion/stop markers are unchanged.
 
 ### `start_evil_twin`
 - **Syntax**: `start_evil_twin`

