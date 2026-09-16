@@ -427,7 +427,6 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.GIT_BUILD }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
-          FAP_VERSION: ${{ needs.fap.outputs.fap_version }}
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.firmware.outputs.fw_version) }}
           REPO: ${{ github.repository }}
           PAGES_URL: ${{ needs.pages.outputs.page_url || format('https://{0}.github.io/{1}/', github.repository_owner, github.event.repository.name) }}
@@ -438,11 +437,6 @@ jobs:
             exit 0
           fi
           TAG="${RELEASE_TAG:-$FW_VERSION}"
-          FAP_VER="${FAP_VERSION:-unknown}"
-          BASE_URL="https://github.com/$REPO/releases/download/$TAG"
-          JANOS_ZIP="$BASE_URL/projectZero-${FW_VERSION}.zip"
-          FAP_ZIP="$BASE_URL/projectZero-faps-${FAP_VER}.zip"
-          BUNDLE_ZIP="$BASE_URL/projectZero-${FW_VERSION}-with-fap-${FAP_VER}.zip"
           RELEASE_PAGE="https://github.com/$REPO/releases/tag/$TAG"
           PAGES_LINK="${PAGES_URL:-https://${GITHUB_REPOSITORY%/*}.github.io/${GITHUB_REPOSITORY#*/}/}"
 
@@ -454,31 +448,76 @@ jobs:
             RELEASE_BODY="$(gh release view "$TAG" -R "$REPO" --json body --jq .body 2>/dev/null || true)"
           fi
 
-          base_content=$(
-            printf '%s\n' \
-              "JanOS" \
-              "Release ${TAG} published." \
-              "Release page:" \
-              "${RELEASE_PAGE}" \
-              "Web flasher:" \
-              "${PAGES_LINK}" \
-              "JanOS (${FW_VERSION}):" \
-              "${JANOS_ZIP}" \
-              "FAPs (${FAP_VER}):" \
-              "${FAP_ZIP}" \
-              "Full package:" \
-              "${BUNDLE_ZIP}"
+          export RELEASE_BODY TAG RELEASE_PAGE PAGES_LINK
+          payload=$(python - <<'PY'
+          import json
+          import os
+          import re
+
+          release_page = os.environ["RELEASE_PAGE"]
+          pages_link = os.environ["PAGES_LINK"]
+          repo = os.environ["REPO"]
+          default_pages = f"https://{repo.split('/')[0]}.github.io/{repo.split('/')[1]}/"
+
+          def normalized(url):
+              return url.split("#", 1)[0].split("?", 1)[0].rstrip("/").casefold()
+
+          duplicates = {normalized(url) for url in (release_page, pages_link, default_pages)}
+
+          def redundant(url):
+              return (normalized(url) in duplicates
+                      or normalized(url).startswith(f"https://github.com/{repo}/releases/download/".casefold())
+                      or normalized(url).startswith(f"https://github.com/{repo}/archive/".casefold()))
+
+          lines = []
+          for line in os.environ["RELEASE_BODY"].replace("\r", "").splitlines():
+              # Remove only the generated announcement, not Summary/changelog headings.
+              if re.fullmatch(r"\s*Release \S+ published\.\s*", line):
+                  continue
+              urls = re.findall(r"https?://[^\s<>\)\]]+", line)
+              if urls and all(redundant(url) for url in urls):
+                  # Generated download/link rows (including standalone URLs).
+                  remainder = line
+                  for url in urls:
+                      remainder = remainder.replace(url, "")
+                  if re.fullmatch(r"[\s<>]*", remainder) or re.fullmatch(
+                      r"\s*(?:[-*]\s*)?(?:Release page|Web flasher|JanOS(?: \([^)]*\))?|"
+                      r"FAPs(?: \([^)]*\))?|Full package|BIN|ZIP):\s*[<>]*\s*",
+                      remainder, re.IGNORECASE
+                  ):
+                      continue
+              # Keep meaningful prose/link labels, while removing duplicate destinations.
+              line = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
+                            lambda m: m[1] if redundant(m[2]) else m[0], line)
+              line = re.sub(r"<?https?://[^\s<>\)\]]+>?",
+                            lambda m: "" if redundant(m[0].strip("<>")) else m[0], line)
+              lines.append(line.rstrip())
+          body = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+          content = (f"projectZero {os.environ['TAG']}\n"
+                     f"Release page: {release_page}\nWeb flasher: {pages_link}")
+          suffix = "... More in the release."
+
+          # Count UTF-16 units conservatively; iterate code points, never UTF-8 bytes.
+          def size(text):
+              return len(text.encode("utf-16-le")) // 2
+
+          if size(content) > 2000:
+              raise ValueError("Discord header exceeds 2000 characters")
+          if body:
+              room = 2000 - size(content) - 2
+              if size(body) > room:
+                  budget = room - size(suffix)
+                  if budget < 0:
+                      raise ValueError("No room for the release truncation notice")
+                  kept = []
+                  for char in body:
+                      budget -= size(char)
+                      if budget < 0:
+                          break
+                      kept.append(char)
+                  body = "".join(kept).rstrip() + suffix
+              content += "\n\n" + body
+          print(json.dumps({"content": content, "allowed_mentions": {"parse": []}}))
+          PY
           )
-
-          RELEASE_BODY="$(printf '%s' "$RELEASE_BODY" | tr -d '\r')"
-          base_len=$(printf '%s' "$base_content" | wc -c | tr -d ' ')
-          room=$((1990 - base_len))
-          if [ "$room" -gt 0 ] && [ -n "$(printf '%s' "$RELEASE_BODY" | tr -d '\n[:space:]')" ]; then
-            body_trimmed="$(printf '%s' "$RELEASE_BODY" | head -c "$room")"
-            content="$(printf '%s\n%s' "$base_content" "$body_trimmed")"
-          else
-            content="$base_content"
-          fi
-
-          payload=$(jq -n --arg content "$content" '{content:$content}')
-          curl -X POST -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK"
+          curl --fail-with-body -X POST -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK"
