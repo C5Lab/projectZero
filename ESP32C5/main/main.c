@@ -132,7 +132,7 @@
 #endif
 
 //Version number
-#define JANOS_VERSION "1.7.4"
+#define JANOS_VERSION "1.7.5"
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
@@ -2192,6 +2192,7 @@ static int cmd_start_beacon_spam_ssids(int argc, char **argv);
 static int start_beacon_spam_internal(void);
 static int cmd_select_html(int argc, char **argv);
 static int cmd_show_pass(int argc, char **argv);
+static int cmd_save_pass(int argc, char **argv);
 static int cmd_file_delete(int argc, char **argv);
 static int cmd_start_pcap(int argc, char **argv);
 static int cmd_stop(int argc, char **argv);
@@ -2378,7 +2379,13 @@ static bool wigle_split_key_pair(const char *input,
                                  char *api_token,
                                  size_t api_token_sz);
 // Portal data logging functions
-static void save_evil_twin_password(const char* ssid, const char* password);
+typedef enum {
+    EVIL_TWIN_SAVE_ERROR,
+    EVIL_TWIN_SAVE_EXISTS,
+    EVIL_TWIN_SAVE_SAVED,
+} evil_twin_save_status_t;
+
+static evil_twin_save_status_t save_evil_twin_password(const char* ssid, const char* password);
 static void save_portal_data(const char* ssid, const char* form_data);
 // Whitelist functions
 static void load_whitelist_from_sd(void);
@@ -13719,6 +13726,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "ota_boot", " <ota_0|ota_1>" },
     { "arp_ban", " <MAC> [IP]" },
     { "show_pass", " [portal|evil]" },
+    { "save_pass", " \"<SSID>\" \"<password>\"" },
     { "list_dir", " [path] [-s]" },
     { "send_file", " <path> [offset] [bsize]" },
     { "uart_baud", " <115200|230400|460800|921600|1000000|1500000|2000000|3000000|4000000>" },
@@ -19072,6 +19080,36 @@ static int cmd_show_pass(int argc, char **argv)
     }
 
     return 0;
+}
+
+static int cmd_save_pass(int argc, char **argv)
+{
+    if (argc < 3 || argv[1] == NULL || argv[2] == NULL) {
+        printf("save_pass: error\n");
+        return 1;
+    }
+
+    const char *ssid = argv[1];
+    const char *password = argv[2];
+    size_t ssid_len = strlen(ssid);
+    size_t password_len = strlen(password);
+    if (ssid_len == 0 || ssid_len > 32 || password_len == 0 || password_len > 64) {
+        printf("save_pass: error\n");
+        return 1;
+    }
+
+    evil_twin_save_status_t status = save_evil_twin_password(ssid, password);
+    if (status == EVIL_TWIN_SAVE_EXISTS) {
+        printf("save_pass: exists\n");
+        return 0;
+    }
+    if (status == EVIL_TWIN_SAVE_SAVED) {
+        printf("save_pass: saved\n");
+        return 0;
+    }
+
+    printf("save_pass: error\n");
+    return 1;
 }
 
 static bool build_sd_path(char *dest, size_t dest_size, const char *input_path)
@@ -25153,6 +25191,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&show_pass_cmd));
 
+    const esp_console_cmd_t save_pass_cmd = {
+        .command = "save_pass",
+        .help = "Save cracked Wi-Fi credentials: save_pass \"<SSID>\" \"<password>\"",
+        .hint = NULL,
+        .func = &cmd_save_pass,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&save_pass_cmd));
+
     const esp_console_cmd_t list_dir_cmd = {
         .command = "list_dir",
         .help = "List files inside a directory on SD card: list_dir [path] [-s]",
@@ -28416,19 +28463,19 @@ static int find_next_pcap_file_number(void) {
 }
 
 // Save evil twin password to SD card
-static void save_evil_twin_password(const char* ssid, const char* password) {
+static evil_twin_save_status_t save_evil_twin_password(const char* ssid, const char* password) {
     // Initialize SD card if not already mounted
     esp_err_t ret = init_sd_card();
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to initialize SD card for password logging: %s", esp_err_to_name(ret));
-        return;
+        return EVIL_TWIN_SAVE_ERROR;
     }
     
     // Check if /sdcard directory is accessible
     struct stat st;
     if (stat("/sdcard", &st) != 0) {
         MY_LOG_INFO(TAG, "Error: /sdcard directory not accessible");
-        return;
+        return EVIL_TWIN_SAVE_ERROR;
     }
     
     // Check for duplicate before writing
@@ -28442,7 +28489,7 @@ static void save_evil_twin_password(const char* ssid, const char* password) {
             if (strstr(line, match_line) != NULL) {
                 fclose(file);
                 MY_LOG_INFO(TAG, "Credentials already in eviltwin.txt, skipping");
-                return;
+                return EVIL_TWIN_SAVE_EXISTS;
             }
         }
         fclose(file);
@@ -28457,27 +28504,39 @@ static void save_evil_twin_password(const char* ssid, const char* password) {
         file = fopen("/sdcard/lab/eviltwin.txt", "w");
         if (file == NULL) {
             MY_LOG_INFO(TAG, "Failed to create eviltwin.txt, errno: %d (%s)", errno, strerror(errno));
-            return;
+            return EVIL_TWIN_SAVE_ERROR;
         }
         // Close and reopen in append mode
         fclose(file);
         file = fopen("/sdcard/lab/eviltwin.txt", "a");
         if (file == NULL) {
             MY_LOG_INFO(TAG, "Failed to reopen eviltwin.txt, errno: %d (%s)", errno, strerror(errno));
-            return;
+            return EVIL_TWIN_SAVE_ERROR;
         }
         MY_LOG_INFO(TAG, "Successfully created eviltwin.txt");
     }
     
     // Write SSID and password in CSV format
-    fprintf(file, "\"%s\", \"%s\"\n", ssid, password);
+    if (fprintf(file, "\"%s\", \"%s\"\n", ssid, password) < 0) {
+        MY_LOG_INFO(TAG, "Failed to write eviltwin.txt, errno: %d (%s)", errno, strerror(errno));
+        fclose(file);
+        return EVIL_TWIN_SAVE_ERROR;
+    }
     
     // Flush and close file to ensure data is written to disk
-    fflush(file);
-    fclose(file);
+    if (fflush(file) != 0) {
+        MY_LOG_INFO(TAG, "Failed to flush eviltwin.txt, errno: %d (%s)", errno, strerror(errno));
+        fclose(file);
+        return EVIL_TWIN_SAVE_ERROR;
+    }
+    if (fclose(file) != 0) {
+        MY_LOG_INFO(TAG, "Failed to close eviltwin.txt, errno: %d (%s)", errno, strerror(errno));
+        return EVIL_TWIN_SAVE_ERROR;
+    }
     sd_sync();
     
     MY_LOG_INFO(TAG, "Password saved to eviltwin.txt");
+    return EVIL_TWIN_SAVE_SAVED;
 }
 
 // Save portal form data to SD card
