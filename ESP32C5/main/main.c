@@ -103,6 +103,7 @@
 #include "nrf24_jammer.h"
 #include "zig_recon.h"
 #include "capture_gateway.h"
+#include "crack_worker.h"
 #include <math.h>
 
 // NimBLE includes for BLE scanning
@@ -12658,6 +12659,7 @@ static int cmd_stop(int argc, char **argv) {
     (void)argc; (void)argv;
     oled_display_update_full("> STOPPED", "  All ops halted", "", "  > Idle");
     MY_LOG_INFO(TAG, "Stop command received - stopping all operations...");
+    crack_worker_cancel_all();
 
     // Sampled before any flag is cleared, so the acknowledgement at the end can tell
     // the host whether this stop actually stopped a wardrive or found nothing running.
@@ -25218,6 +25220,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&send_file_cmd));
 
+    const esp_console_cmd_t crack_worker_cmd = {
+        .command = "crack_worker",
+        .help = "Distributed WPA worker: capabilities|probe|receive|reset|start|status|cancel",
+        .hint = "<subcommand> [arguments]",
+        .func = &crack_worker_command,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&crack_worker_cmd));
+
     const esp_console_cmd_t uart_baud_cmd = {
         .command = "uart_baud",
         .help = "Change console UART rate with a 10 second confirmation window",
@@ -25540,6 +25551,8 @@ void app_main(void) {
     repl_config.max_cmdline_length = 256;
 
     ESP_ERROR_CHECK(uart_baud_control_init());
+    crack_worker_init(init_sd_card, uart_baud_set_file_transfer_active,
+                      uart_baud_current);
     esp_console_register_help_command();
     register_commands();
 
