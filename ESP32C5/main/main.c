@@ -104,6 +104,7 @@
 #include "zig_recon.h"
 #include "capture_gateway.h"
 #include "crack_worker.h"
+#include "artifact_inventory_core.h"
 #include <math.h>
 
 // NimBLE includes for BLE scanning
@@ -24333,6 +24334,136 @@ static int cmd_start_jammer24(int argc, char **argv) {
     return 0;
 }
 
+/* ARTIFACT INVENTORY CONSOLE BEGIN */
+static ai_inventory_t *art_inventory;
+static ai_request_t art_request;
+static portMUX_TYPE art_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool art_busy, art_cancel_requested, art_cancel_allowed;
+
+static void art_emit(void *user, const char *line)
+{
+    (void)user;
+    printf("%s\r\n", line);
+    fflush(stdout);
+}
+
+static bool art_cancelled(void *user)
+{
+    (void)user;
+    portENTER_CRITICAL(&art_lock);
+    bool cancelled = art_cancel_requested;
+    portEXIT_CRITICAL(&art_lock);
+    return cancelled;
+}
+
+static uint64_t art_now_ms(void *user)
+{
+    (void)user;
+    return (uint64_t)esp_timer_get_time() / 1000U;
+}
+
+static void art_yield(void *user)
+{
+    (void)user;
+    taskYIELD();
+}
+
+static void art_finishing(void *user)
+{
+    (void)user;
+    portENTER_CRITICAL(&art_lock);
+    art_cancel_allowed = false;
+    portEXIT_CRITICAL(&art_lock);
+}
+
+static const ai_hooks_t art_hooks = {
+    .emit = art_emit,
+    .cancelled = art_cancelled,
+    .now_ms = art_now_ms,
+    .yield = art_yield,
+    .finishing = art_finishing,
+    .user = NULL,
+};
+
+static void art_finish(void)
+{
+    portENTER_CRITICAL(&art_lock);
+    art_busy = false;
+    art_cancel_allowed = false;
+    art_cancel_requested = false;
+    portEXIT_CRITICAL(&art_lock);
+}
+
+static void art_task(void *argument)
+{
+    (void)argument;
+    ai_run(art_inventory, &art_request, &art_hooks);
+    art_finish();
+    vTaskDelete(NULL);
+}
+
+static int cmd_artifact_inventory(int argc, char **argv)
+{
+    ai_request_t request;
+    if (!ai_parse_command(argc, (const char *const *)argv, &request)) {
+        printf("[ARTIFACT/1] END req=0 snapshot=0 status=error reason=invalid_field next=0 more=0 count=0\r\n");
+        fflush(stdout);
+        return 1;
+    }
+    if (request.operation == AI_CAPABILITIES) {
+        ai_run(NULL, &request, &art_hooks);
+        return 0;
+    }
+    portENTER_CRITICAL(&art_lock);
+    bool same_request = art_busy && !strcmp(request.id, art_request.id);
+    if (request.operation == AI_CANCEL) {
+        bool accepted = same_request && art_cancel_allowed;
+        if (accepted) art_cancel_requested = true;
+        portEXIT_CRITICAL(&art_lock);
+        /* Cancellation belongs to the original request; its worker emits END. */
+        return accepted ? 0 : 1;
+    }
+    if (art_busy) {
+        portEXIT_CRITICAL(&art_lock);
+        if (!same_request) {
+            printf("[ARTIFACT/1] END req=%s snapshot=%" PRIu32 " status=error reason=busy next=0 more=0 count=0\r\n",
+                   request.id, request.snapshot);
+            fflush(stdout);
+        }
+        return same_request ? 0 : 1;
+    }
+    art_busy = true;
+    art_cancel_requested = false;
+    art_cancel_allowed = request.operation == AI_INSPECT;
+    art_request = request;
+    portEXIT_CRITICAL(&art_lock);
+    if (!art_inventory) {
+        art_inventory = calloc(1, sizeof(*art_inventory));
+        if (art_inventory) ai_inventory_init(art_inventory, "/sdcard/lab");
+    }
+    if (!art_inventory) {
+        printf("[ARTIFACT/1] END req=%s snapshot=%" PRIu32 " status=error reason=limit_reached next=0 more=0 count=0\r\n",
+               request.id, request.snapshot);
+        fflush(stdout);
+        art_finish();
+        return 1;
+    }
+    /* SD is already mounted by normal device initialization. Inventory does not
+     * call init_sd_card: that helper creates directories and test files. */
+    if (request.operation == AI_INSPECT) {
+        if (xTaskCreate(art_task, "artifact_inspect", 12288, NULL, 1, NULL) == pdPASS) return 0;
+        printf("[ARTIFACT/1] END req=%s snapshot=%" PRIu32 " status=error reason=busy next=0 more=0 count=0\r\n",
+               request.id, request.snapshot);
+        fflush(stdout);
+        art_finish();
+        return 1;
+    }
+    ai_run(art_inventory, &request, &art_hooks);
+    art_finish();
+    return 0;
+}
+/* ARTIFACT INVENTORY CONSOLE END */
+
 // --- Command registration in esp_console ---
 #define esp_console_cmd_register(cmd) janos_console_cmd_register(cmd)
 static void register_commands(void)
@@ -25228,6 +25359,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&crack_worker_cmd));
+
+    const esp_console_cmd_t artifact_inventory_cmd = {
+        .command = "artifact_inventory",
+        .help = "Read-only capture inventory: capabilities, list, inspect, cancel",
+        .hint = NULL,
+        .func = &cmd_artifact_inventory,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&artifact_inventory_cmd));
 
     const esp_console_cmd_t uart_baud_cmd = {
         .command = "uart_baud",

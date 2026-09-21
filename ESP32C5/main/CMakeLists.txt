@@ -1,7 +1,7 @@
 file(TO_CMAKE_PATH "$ENV{IDF_PATH}" CRACK_WORKER_IDF_PATH)
 idf_component_register(SRCS "oled_display.c" "main.c" "attack_handshake.c"
                             "crack_worker.c" "crack_worker_core.c" "crack_worker_transfer.c" "crack_worker_crypto.c"
-                            "crack_worker_sw_sha1.c"
+                            "crack_worker_sw_sha1.c" "artifact_inventory_core.c"
                        INCLUDE_DIRS .
                        PRIV_INCLUDE_DIRS "${CRACK_WORKER_IDF_PATH}/components/mbedtls/mbedtls/library"
                        REQUIRES esp_timer esp_wifi esp_event esp_psram nvs_flash 

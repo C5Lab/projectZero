@@ -168,7 +168,7 @@ while one is running remains `busy`. `STATUS` additionally reports
 `phase=starting|cracking|terminal|idle` and `progress_age_ms=N`. These optional
 health fields are diagnostic; safe resume decisions still use `safe_offset`.
 
-JanOS version is `1.7.5`; protocol capability version 4 is the compatibility
+JanOS remains on the unmerged development version `1.7.5`; protocol capability version 4 is the compatibility
 gate and advertises exactly `protocol=4 sync=ftb1 ack=byte,frame32
 replay=last_block finish=fin32`. A protocol-4 worker missing any mandatory token,
 or a protocol-3 worker, is incompatible with the new distributed sender.
@@ -179,3 +179,144 @@ fully accounted for. It advances after an invalid line is skipped or after a
 candidate has completed verification, never while a candidate is in flight.
 The compute task runs below the console REPL priority so `status` and `cancel`
 remain responsive during PBKDF2 work.
+
+## Read-only artifact inventory (`ARTIFACT/1`)
+
+The current JanOS 1.7.5 development tree adds an independent inventory command. Its capabilities advertise
+`artifact_inventory=1`. The existing `CRACK/1 protocol=4` capability string and
+all transfer behavior remain unchanged; clients discover inventory separately.
+
+```text
+artifact_inventory capabilities
+artifact_inventory list <request-id> <scope> <cursor> <limit>
+artifact_inventory inspect <request-id> <snapshot-id> <entry-id>
+artifact_inventory cancel <request-id>
+```
+
+Request IDs contain 1–32 ASCII letters, digits, `_` or `-`. Integers are unsigned
+decimal with no sign, whitespace or suffix, and are checked before conversion.
+The only scopes are `handshakes` (`/sdcard/lab/handshakes`) and `pcaps`
+(`/sdcard/lab/pcaps`); a client cannot supply a path. Neither scope is recursive.
+Directory entries that are not regular files are omitted. Host tests also reject
+symlinks; the device's FatFs has no symlinks.
+
+`list` with cursor `0` creates a new metadata snapshot. A subsequent nonzero
+cursor addresses the retained snapshot for that scope. Entries are sorted by
+raw filename bytes within that snapshot; entry IDs are one-based, cursors are
+zero-based offsets, and `next` is the next offset. `limit` is 1–32. Every refresh
+invalidates earlier entry IDs and inspection cache entries. Clients must discard
+snapshot IDs across a device reboot or connection reset. Only one snapshot is
+retained. Snapshot IDs never wrap during a boot.
+
+A snapshot retains at most 256 entries and visits at most 4096 directory entries.
+A larger directory produces the retained entries and `END status=error
+reason=limit_reached`; `more` describes only the retained snapshot, so that
+response must not be treated as a complete directory inventory. Listings use
+directory metadata and never read or hash file contents. Raw filename bytes are
+lowercase hex, including whitespace and non-UTF-8 bytes. Names are at most 255
+bytes, paths at most 511 bytes, and protocol lines less than 1024 bytes excluding
+CR/LF. Filename suffixes `.hccapx` and `.pcap` are matched case-sensitively;
+other regular files have `format=unknown`.
+
+### Exact records
+
+Records are single lines with the following field order. Values have no spaces.
+`R` is a request ID, `N` a decimal snapshot ID, `E` an entry ID, and `U64` an
+unsigned decimal value. Capabilities uses the synthetic request/snapshot ID `0`.
+
+```text
+[ARTIFACT/1] CAPABILITIES req=0 snapshot=0 artifact_inventory=1 scopes=handshakes,pcaps page_max=32 entries_max=256 name_max=255 line_max=1024 inspect_max=16777216 validator=hccapx_v1
+[ARTIFACT/1] BEGIN req=R snapshot=N scope=handshakes cursor=0 limit=32
+[ARTIFACT/1] ITEM req=R snapshot=N entry=E name_hex=HEX size=U64 mtime=U64 format=hccapx validation=unknown reason=cache_stale
+[ARTIFACT/1] ACCEPTED req=R snapshot=N entry=E
+[ARTIFACT/1] PROGRESS req=R snapshot=N entry=E bytes=U64 total=U64
+[ARTIFACT/1] RESULT req=R snapshot=N entry=E validation=valid reason=ok crc32=1234abcd bytes=U64
+[ARTIFACT/1] END req=R snapshot=N status=ok reason=ok next=0 more=0 count=0
+```
+
+`format` is `hccapx|pcap|unknown`, `validation` is `valid|invalid|unknown`,
+`status` is `ok|error|cancelled`, and `more` is `0|1`. `mtime` is the filesystem
+modification time in seconds, or zero when unavailable. A completed full read
+returns eight lowercase CRC32 hex digits (IEEE CRC32); an incomplete inspection
+returns `crc32=none`. CRC32 identifies bytes, not their trustworthiness.
+
+Each accepted capabilities, list or inspect request emits exactly one `END`.
+A successful inspection operation ends with `status=ok reason=ok` even when its
+`RESULT` is structurally invalid or unsupported: use RESULT for file validation.
+Operational failures use `status=error`; cancellation uses `status=cancelled`.
+Malformed commands produce a single `END req=0 snapshot=0 status=error
+reason=invalid_field next=0 more=0 count=0` and do not start work.
+
+There is one active inventory operation. A different request while it is busy
+gets one `END ... snapshot=0 status=error reason=busy`; allocation failure before
+a snapshot exists likewise uses the caller's request ID with `snapshot=0`.
+Repeated use of its live request ID
+is coalesced without another response or operation. `cancel R` sets a flag only
+for matching active request `R`; the original operation supplies RESULT/END.
+Cancelling an unknown or already completed ID has no protocol output and cannot
+emit a duplicate terminal record. The adapter atomically closes cancellation
+acceptance before the terminal result; a cancellation accepted just before that
+boundary is rechecked before cache/RESULT/END commit. Inspection runs in a low-priority background
+task so the console can receive cancellation. Listing is synchronously bounded.
+
+### Inspection and cache semantics
+
+Inspection opens source bytes in `rb` mode, uses 4096-byte chunks, performs a
+non-sleeping scheduler yield after each chunk, polls cancellation and a 30-second
+deadline, and reads at most 16 MiB. Progress is emitted every 64 KiB and at
+completion, avoiding a line-rate bottleneck on large files.
+The deadline is cooperative: an underlying filesystem call must return before
+the next check. It verifies file metadata at snapshot lookup, open, and completion,
+including the open file and pathname. A changed or replaced file returns
+`unknown/changed` with no completed CRC. These metadata checks are limited by
+FatFs timestamp granularity; they cannot detect an external same-size rewrite
+that preserves all observable metadata during the inspection.
+
+The HCCAPX validator accepts at most the same 16 records advertised by the
+worker and checks 393-byte record boundaries, signature/version,
+message-pair range, SSID length, key version, EAPOL length/type, declared payload
+length and matching key-version bits. `valid/ok` means structurally consistent,
+not proof that credentials can be recovered. Raw PCAP always remains
+`unknown/unsupported_validator` on this release; Tab5 performs final validation.
+
+Stable RESULT reason codes are:
+
+| Reason | Validation and meaning |
+| --- | --- |
+| `ok` | `valid`: supported HCCAPX records passed structural checks |
+| `empty` | `invalid`: an HCCAPX file has no bytes |
+| `invalid_length` | `invalid`: shorter than one HCCAPX record |
+| `truncated_record` | `invalid`: trailing partial HCCAPX record |
+| `invalid_field` | `invalid`: a supported HCCAPX record has an inconsistent field |
+| `unsupported_format` | `unknown`: unsupported suffix, signature or version |
+| `unsupported_validator` | `unknown`: PCAP awaits validation on Tab5 |
+| `io_error` | `unknown`: filesystem access failed |
+| `changed` | `unknown`: metadata changed or a read ended early |
+| `cancelled` | `unknown`: the matching request was cancelled |
+| `timeout` | `unknown`: the cooperative deadline elapsed |
+| `limit_reached` | `invalid` after a complete HCCAPX read with more than 16 records; `unknown` when the generic 16 MiB inspection limit prevents a complete read |
+| `cache_stale` | `unknown`: snapshot/entry/cache is unavailable or invalid |
+
+`busy`, `invalid_field`, `io_error`, `timeout`, `cancelled`, `cache_stale`, and
+`limit_reached` are also terminal reasons for command, list or scheduling errors.
+
+The inspection cache is volatile RAM attached to the current snapshot, with
+bounds-checked codes and a CRC over cached metadata/result fields. Listing uses
+it only when its integrity and current source metadata match. Stale/corrupt
+cache becomes `unknown/cache_stale`; refresh/reboot discards it. This cache is
+separate from transfer `.verified` markers and neither reads nor writes them.
+Inventory never deletes, renames, truncates, repairs or rewrites source files.
+It also avoids the SD initialization helper, which creates directories/test
+files; inventory requires the device's normal SD mount to have completed.
+
+Host verification (no firmware build):
+
+```sh
+python3 tests/test_artifact_inventory_contract.py
+python3 tests/test_crack_worker_diagnostics.py
+python3 tests/test_crack_worker_job_replay.py
+```
+
+The inventory runner compiles both the pure core and the actual console adapter
+extracted from `main.c`, exercises request lifecycle/cancellation, and checks
+source bytes, file-open modes, metadata-only listing, bounds and cache failures.
