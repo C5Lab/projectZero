@@ -200,6 +200,14 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 
 ## WiFi scanning
 
+### `wifi_analyzer`
+
+- `wifi_analyzer caps` / `status` — analyzer capabilities and lifecycle status.
+- `wifi_analyzer scan [--band 2.4|5|both] [--channels 1,6,11] [--profile quick|detailed|passive] [--limit 1..128]` — one AP survey, default 64 records, using separate PSRAM buffers and `[WFA1]` JSON lines. Existing scan results and selections are preserved.
+- `wifi_analyzer stop` / `clear` — cancel analyzer work or release its idle buffers. This surveys AP signal/channel overlap; it does not measure percentage airtime or spectrum power.
+
+See the [protocol and admission rules](wifi-analyzer-protocol.md) and [hardware smoke-test runbook](wifi-analyzer-smoke-test.md). Firmware compilation and target validation are pending.
+
 ### `scan_networks`
 - `scan_networks` — background Wi‑Fi scan on all channels. Results auto‑print as CSV; wait for `Scan results printed`. CSV: `"index","SSID","","BSSID","channel","security","RSSI","band"`. Wardrive must be stopped first.
 

@@ -9,6 +9,7 @@ Documentation:
 
 - [Command Manual](docs/command-manual.md)
 - [JanOS Capture Gateway](docs/janos-capture-gateway.md) — instrumented APSTA/NAPT gateway for authorized traffic analysis.
+- [Wi-Fi Analyzer](docs/wifi-analyzer-design.md) — opt-in PSRAM-backed AP survey, 64 records by default and up to 128, with isolated legacy Flipper results. See the [WFA/1 protocol](docs/wifi-analyzer-protocol.md), [smoke-test commands](docs/wifi-analyzer-smoke-test.md), and [Tab5 implementation prompt](docs/wifi-analyzer-tab5-prompt.md). Firmware compilation and hardware validation are pending.
 
 ## Build Note: exFAT
 This repo auto-patches your local ESP-IDF `ffconf.h` during CMake configure to force:

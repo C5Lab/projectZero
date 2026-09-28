@@ -4,6 +4,7 @@
 #include <strings.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <assert.h>
 #include <inttypes.h>
 #include <errno.h>
 #include <sys/stat.h>
@@ -28,7 +29,9 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_netif.h"
+#include "esp_netif_defaults.h"
 #include "esp_wifi.h"
+#include "esp_wifi_default.h"
 #include "esp_wifi_ap_get_sta_list.h"
 #include "esp_event.h"
 
@@ -105,6 +108,7 @@
 #include "capture_gateway.h"
 #include "crack_worker.h"
 #include "artifact_inventory_core.h"
+#include "wifi_analyzer.h"
 #include <math.h>
 
 // NimBLE includes for BLE scanning
@@ -1828,6 +1832,33 @@ static uint16_t g_scan_count = 0;
 static volatile bool g_scan_in_progress = false;
 static volatile bool g_scan_done = false;
 static volatile bool g_scan_teardown_in_progress = false; // set when cancelling a scan to switch radio mode (suppresses misleading failure log)
+/* Unlike g_scan_in_progress this counter is not cleared by timeout/stop paths.
+ * Analyzer admission requires the entire legacy completion callback to drain. */
+static portMUX_TYPE analyzer_legacy_scan_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t analyzer_legacy_scan_pending;
+static bool analyzer_legacy_radio_uncertain;
+static bool analyzer_sta_connect_pending;
+
+static void analyzer_legacy_scan_finished(void)
+{
+    portENTER_CRITICAL(&analyzer_legacy_scan_lock);
+    if (analyzer_legacy_scan_pending) --analyzer_legacy_scan_pending;
+    portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
+}
+
+static esp_err_t analyzer_tracked_wifi_connect(void)
+{
+    portENTER_CRITICAL(&analyzer_legacy_scan_lock);
+    analyzer_sta_connect_pending = true;
+    portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        portENTER_CRITICAL(&analyzer_legacy_scan_lock);
+        analyzer_sta_connect_pending = false;
+        portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
+    }
+    return err;
+}
 static volatile uint32_t g_last_scan_status = 1; // 0 => success, non-zero => failure/unknown
 static int64_t g_scan_start_time_us = 0;
 
@@ -2510,6 +2541,9 @@ static void wifi_event_handler(void *event_handler_arg,
         //MY_LOG_INFO(TAG, "WiFi event: %ld", event_id);
         switch (event_id) {
         case WIFI_EVENT_STA_CONNECTED: {
+            portENTER_CRITICAL(&analyzer_legacy_scan_lock);
+            analyzer_sta_connect_pending = false;
+            portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
             const wifi_event_sta_connected_t *e = (const wifi_event_sta_connected_t *)event_data;
             ESP_LOGD(TAG, "Wi-Fi: connected to SSID='%s', channel=%d, bssid=%02X:%02X:%02X:%02X:%02X:%02X",
                      (const char*)e->ssid, e->channel,
@@ -2653,6 +2687,7 @@ static void wifi_event_handler(void *event_handler_arg,
         }
         case WIFI_EVENT_SCAN_DONE: {
             const wifi_event_sta_scan_done_t *e = (const wifi_event_sta_scan_done_t *)event_data;
+            if (wifi_analyzer_on_scan_done(e)) break;
             bool suppress_scan_logs = periodic_rescan_in_progress || wardrive_active || channel_view_scan_mode || g_scan_teardown_in_progress;
 
             if (!suppress_scan_logs) {
@@ -2747,9 +2782,13 @@ static void wifi_event_handler(void *event_handler_arg,
                     ESP_LOGW(TAG, "Failed to restore idle LED after scan: %s", esp_err_to_name(led_err));
                 }
             }
+            analyzer_legacy_scan_finished();
             break;
         }
         case WIFI_EVENT_STA_DISCONNECTED: {
+            portENTER_CRITICAL(&analyzer_legacy_scan_lock);
+            analyzer_sta_connect_pending = false;
+            portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
             const wifi_event_sta_disconnected_t *e = (const wifi_event_sta_disconnected_t *)event_data;
             ESP_LOGW(TAG, "Wi-Fi: connection to AP failed. SSID='%s', reason=%d",
                      (const char*)e->ssid, (int)e->reason);
@@ -2764,7 +2803,7 @@ static void wifi_event_handler(void *event_handler_arg,
                 capture_gateway_set_upstream_ready(false);
                 MY_LOG_INFO(TAG, "Capture Gateway: upstream down (reason=%d)", (int)e->reason);
                 if (!operation_stop_requested) {
-                    esp_err_t reconnect_err = esp_wifi_connect();
+                    esp_err_t reconnect_err = analyzer_tracked_wifi_connect();
                     if (reconnect_err != ESP_OK) {
                         MY_LOG_INFO(TAG, "Capture Gateway: reconnect request failed: %s",
                                     esp_err_to_name(reconnect_err));
@@ -2818,7 +2857,7 @@ static void wifi_event_handler(void *event_handler_arg,
                 } else {
                     ESP_LOGW(TAG, "Evil twin: This is just a disconnect, connectAttemptCount: %d, will try again", connectAttemptCount);
                     connectAttemptCount++;
-                    esp_wifi_connect();
+                    analyzer_tracked_wifi_connect();
                 }
             } else if (applicationState == DEAUTH_EVIL_TWIN) {
                 ESP_LOGW(TAG, "Evil twin: STA disconnect while attack active, keeping state");
@@ -3498,7 +3537,7 @@ static void verify_password(const char* password) {
     MY_LOG_INFO(TAG, "Attempting to connect to SSID='%s' with password='%s'", evilTwinSSID, password);
     connectAttemptCount = 0;
     MY_LOG_INFO(TAG, "Attempting to connect, connectAttemptCount=%d", connectAttemptCount);
-    esp_wifi_connect();
+    analyzer_tracked_wifi_connect();
 }
 
 static void ota_load_channel_from_nvs(void) {
@@ -3905,6 +3944,7 @@ static void wifi_get_24ghz_channel_bounds(uint8_t *first_channel, uint8_t *last_
  */
 static bool ensure_wifi_mode(void)
 {
+    if (wifi_analyzer_busy()) return false;
     switch (current_radio_mode) {
         case RADIO_MODE_WIFI:
             // Already in WiFi mode
@@ -3984,6 +4024,7 @@ static void wait_or_cancel_wifi_scan(void)
  */
 static bool ensure_ble_mode(void)
 {
+    if (wifi_analyzer_busy()) return false;
     if (capture_gateway_is_active()) {
         MY_LOG_INFO(TAG, "Capture Gateway owns the WiFi radio. Stop it before switching to BLE.");
         return false;
@@ -4035,6 +4076,7 @@ static bool ensure_ble_mode(void)
 
 static bool ensure_ieee802154_mode(void)
 {
+    if (wifi_analyzer_busy()) return false;
     if (capture_gateway_is_active()) {
         MY_LOG_INFO(TAG, "Capture Gateway owns the WiFi radio. Stop it before switching to 802.15.4.");
         return false;
@@ -4163,6 +4205,7 @@ static esp_netif_t *ensure_ap_mode(void)
 
 // --- Start background scan ---
 static esp_err_t start_background_scan(uint32_t min_time, uint32_t max_time) {
+    if (wifi_analyzer_busy()) return ESP_ERR_INVALID_STATE;
     if (capture_gateway_is_active()) {
         MY_LOG_INFO(TAG, "Cannot scan while Capture Gateway is active. Use 'stop' first.");
         return ESP_ERR_INVALID_STATE;
@@ -4194,9 +4237,13 @@ static esp_err_t start_background_scan(uint32_t min_time, uint32_t max_time) {
     g_scan_start_time_us = esp_timer_get_time(); // reset start timestamp for every scan path (sniffer, channel view, etc.)
     
     MY_LOG_INFO(TAG, "Starting background WiFi scan...");
+    portENTER_CRITICAL(&analyzer_legacy_scan_lock);
+    ++analyzer_legacy_scan_pending;
+    portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
     esp_err_t ret = esp_wifi_scan_start(&scan_cfg, false); // nieblokujace
     
     if (ret != ESP_OK) {
+        analyzer_legacy_scan_finished();
         g_scan_in_progress = false;
         MY_LOG_INFO(TAG, "Failed to start scan: %s", esp_err_to_name(ret));
         return ret;
@@ -12658,6 +12705,12 @@ static int cmd_start_beacon_spam_ssids(int argc, char **argv) {
 
 static int cmd_stop(int argc, char **argv) {
     (void)argc; (void)argv;
+    /* Never tear down a driver or buffer still owned by the analyzer worker. */
+    if (!wifi_analyzer_stop(5000)) {
+        printf("[WFACTL1] {\"v\":1,\"type\":\"error\",\"command\":\"stop\",\"code\":\"radio_fault\",\"reason\":\"not_quiescent\"}\n");
+        fflush(stdout);
+        return 1;
+    }
     oled_display_update_full("> STOPPED", "  All ops halted", "", "  > Idle");
     MY_LOG_INFO(TAG, "Stop command received - stopping all operations...");
     crack_worker_cancel_all();
@@ -13057,6 +13110,12 @@ static int cmd_stop(int argc, char **argv) {
         
         // Force delete if still running
         if (wardrive_task_handle != NULL) {
+            /* A forcibly deleted blocking scanner cannot prove driver/list
+             * ownership is released. Keep legacy stop behavior, but require a
+             * reboot before admitting the independent analyzer. */
+            portENTER_CRITICAL(&analyzer_legacy_scan_lock);
+            analyzer_legacy_radio_uncertain = true;
+            portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
             vTaskDelete(wardrive_task_handle);
             wardrive_task_handle = NULL;
             MY_LOG_INFO(TAG, "Wardrive task forcefully stopped.");
@@ -14298,13 +14357,22 @@ static int cmd_wifi_connect(int argc, char **argv) {
     // Reset result flag before connecting
     wifi_connect_result = 0;
     wifi_connect_fail_reason = 0;
-    esp_wifi_connect();
+    analyzer_tracked_wifi_connect();
     
     MY_LOG_INFO(TAG, "Waiting for connection result...");
     
     // Wait for connection result (max 15 seconds)
     for (int i = 0; i < 150 && wifi_connect_result == 0; i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (wifi_connect_result != 1) {
+        /* The legacy command can return while the driver's connection attempt
+         * still runs, or after a delayed disconnect from a previous attempt.
+         * Preserve its behavior, but do not let analyzer scans change that radio
+         * configuration without a fresh boot establishing known ownership. */
+        portENTER_CRITICAL(&analyzer_legacy_scan_lock);
+        analyzer_legacy_radio_uncertain = true;
+        portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
     }
     
     if (wifi_connect_result == 1) {
@@ -14536,7 +14604,7 @@ static int capture_gateway_start_session(const char *ssid,
     }
 
     if (!capture_gateway_wait_for_upstream(500, &upstream_ap, &upstream_ip)) {
-        esp_err_t connect_err = esp_wifi_connect();
+        esp_err_t connect_err = analyzer_tracked_wifi_connect();
         if (connect_err != ESP_OK) {
             MY_LOG_INFO(TAG, "Capture Gateway: STA reconnect request: %s",
                         esp_err_to_name(connect_err));
@@ -19198,10 +19266,14 @@ typedef struct {
     esp_console_cmd_func_t func;
     esp_console_cmd_func_with_context_t func_w_context;
     void *context;
+    const char *command;
 } janos_console_cmd_context_t;
 
 static janos_console_cmd_context_t janos_console_cmd_contexts[JANOS_CONSOLE_MAX_COMMANDS];
 static size_t janos_console_cmd_context_count;
+static StaticSemaphore_t janos_command_mutex_storage;
+static SemaphoreHandle_t janos_command_mutex;
+static unsigned janos_commands_inflight;
 
 static void uart_baud_note_activity(void)
 {
@@ -19258,7 +19330,7 @@ static void uart_baud_idle_cb(void *arg)
     int64_t now_us = esp_timer_get_time();
 
     xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
-    if (!uart_file_transfer_active &&
+    if (!uart_file_transfer_active && !wifi_analyzer_busy() &&
         !uart_baud_confirmation_pending &&
         uart_current_baud != JANOS_UART_DEFAULT_BAUD &&
         now_us - uart_last_command_us >= (int64_t)UART_BAUD_IDLE_REVERT_US) {
@@ -19331,11 +19403,35 @@ static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
     janos_console_cmd_context_t *cmd_context =
         (janos_console_cmd_context_t *)context;
 
+    /* Only analyzer handlers retain the admission lock. Legacy commands reserve
+     * an in-flight slot, then run without it so a concurrent stop stays usable.
+     * Analyzer admission cannot overtake their state/task publication. */
+    xSemaphoreTakeRecursive(janos_command_mutex, portMAX_DELAY);
     uart_baud_note_activity();
-    if (cmd_context->func != NULL) {
-        return cmd_context->func(argc, argv);
+    bool analyzer_command = strcmp(cmd_context->command, "wifi_analyzer") == 0;
+    if ((analyzer_command && janos_commands_inflight != 0) ||
+        (wifi_analyzer_busy() && !analyzer_command &&
+        strcmp(cmd_context->command, "stop") != 0 &&
+        strcmp(cmd_context->command, "show_scan_results") != 0 &&
+        strcmp(cmd_context->command, "reboot") != 0)) {
+        printf("[WFACTL1] {\"v\":1,\"type\":\"error\",\"command\":\"console\",\"code\":\"busy\",\"reason\":\"%s\"}\n",
+               analyzer_command ? "command_in_progress" : "wifi_analyzer");
+        fflush(stdout);
+        xSemaphoreGiveRecursive(janos_command_mutex);
+        return 1;
     }
-    return cmd_context->func_w_context(cmd_context->context, argc, argv);
+    if (!analyzer_command) {
+        ++janos_commands_inflight;
+        xSemaphoreGiveRecursive(janos_command_mutex);
+    }
+    int result = cmd_context->func != NULL ? cmd_context->func(argc, argv) :
+        cmd_context->func_w_context(cmd_context->context, argc, argv);
+    if (!analyzer_command) {
+        xSemaphoreTakeRecursive(janos_command_mutex, portMAX_DELAY);
+        --janos_commands_inflight;
+    }
+    xSemaphoreGiveRecursive(janos_command_mutex);
+    return result;
 }
 
 static esp_err_t janos_console_cmd_register(const esp_console_cmd_t *cmd)
@@ -19355,6 +19451,7 @@ static esp_err_t janos_console_cmd_register(const esp_console_cmd_t *cmd)
     context->func = cmd->func;
     context->func_w_context = cmd->func_w_context;
     context->context = cmd->context;
+    context->command = cmd->command;
 
     esp_console_cmd_t wrapped_cmd = *cmd;
     wrapped_cmd.func = NULL;
@@ -24464,10 +24561,124 @@ static int cmd_artifact_inventory(int argc, char **argv)
 }
 /* ARTIFACT INVENTORY CONSOLE END */
 
+/* Analyzer admission is checked under the console admission mutex, only after
+ * all legacy handlers have returned and published their background task state. */
+static const char *analyzer_host_busy_reason(void)
+{
+    static char reason[48];
+    portENTER_CRITICAL(&analyzer_legacy_scan_lock);
+    bool legacy_pending = analyzer_legacy_scan_pending != 0;
+    bool uncertain = analyzer_legacy_radio_uncertain;
+    bool connecting = analyzer_sta_connect_pending;
+    portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
+    if (uncertain) return "legacy_radio_uncertain";
+    if (legacy_pending) return "legacy_scan_draining";
+    if (connecting) return "wifi_connect";
+    if (zig_recon_radio_busy(reason, sizeof(reason))) return reason;
+    if (current_radio_mode != RADIO_MODE_NONE && current_radio_mode != RADIO_MODE_WIFI)
+        return "radio_mode";
+    if (zig_recon_is_active()) return "zig_recon";
+    if (applicationState != IDLE) return "application_state";
+    if (g_scan_teardown_in_progress || periodic_rescan_in_progress || sniffer_scan_phase)
+        return "scan_teardown";
+    if (pcap_arp_active || pcap_arp_task_handle || pcap_rate_active || pcap_rate_task_handle)
+        return "pcap";
+    if (portal_server || karma_mode_active || rogueap_mode_active || rogue_gitm_mode_active ||
+        darksword_exfil_task_handle || dns_server_task_handle) return "portal";
+    if (arp_ban_active || arp_ban_task_handle) return "arp_ban";
+    if (ota_check_in_progress || ota_led_task_handle) return "ota";
+    if (gps_raw_active || gps_raw_task_handle) return "gps_raw";
+    portENTER_CRITICAL(&art_lock);
+    bool artifact_active = art_busy;
+    portEXIT_CRITICAL(&art_lock);
+    if (artifact_active) return "artifact";
+    xSemaphoreTake(uart_baud_mutex, portMAX_DELAY);
+    bool transport_busy = uart_file_transfer_active || uart_baud_confirmation_pending;
+    xSemaphoreGive(uart_baud_mutex);
+    if (transport_busy) return "uart_transfer";
+    return NULL;
+}
+
+static esp_err_t analyzer_host_prepare_wifi(void)
+{
+    if (current_radio_mode == RADIO_MODE_WIFI) return ESP_OK;
+    if (current_radio_mode != RADIO_MODE_NONE) return ESP_ERR_INVALID_STATE;
+    /* The legacy initializer aborts on allocation/driver errors. This opt-in
+     * path returns them to the protocol instead. Shared infrastructure that was
+     * successfully created remains available for a later retry. */
+    esp_err_t err;
+    if (!netif_initialized) {
+        err = esp_netif_init();
+        if (err != ESP_OK) return err;
+        netif_initialized = true;
+    }
+    if (!event_loop_initialized) {
+        err = esp_event_loop_create_default();
+        if (err != ESP_OK) return err;
+        event_loop_initialized = true;
+    }
+    if (sta_netif_handle == NULL) {
+        /* The convenience create_default helper asserts on OOM internally. */
+        esp_netif_config_t netif_config = ESP_NETIF_DEFAULT_WIFI_STA();
+        esp_netif_t *netif = esp_netif_new(&netif_config);
+        if (netif == NULL) return ESP_ERR_NO_MEM;
+        err = esp_netif_attach_wifi_station(netif);
+        if (err == ESP_OK) err = esp_wifi_set_default_wifi_sta_handlers();
+        if (err != ESP_OK) {
+            esp_netif_destroy_default_wifi(netif);
+            return err;
+        }
+        sta_netif_handle = netif;
+    }
+    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
+    err = esp_wifi_init(&init);
+    if (err != ESP_OK) return err;
+    if (!wifi_event_handler_registered) {
+        err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                  &wifi_event_handler, NULL, NULL);
+        if (err != ESP_OK) goto failed;
+        wifi_event_handler_registered = true;
+    }
+    if (!ip_event_handler_registered) {
+        err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                  &ip_event_handler, NULL, NULL);
+        if (err != ESP_OK) goto failed;
+        ip_event_handler_registered = true;
+    }
+    wifi_config_t config = {0};
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) goto failed;
+    err = esp_wifi_set_config(WIFI_IF_STA, &config);
+    if (err != ESP_OK) goto failed;
+    err = esp_wifi_start();
+    if (err != ESP_OK) goto failed;
+    current_radio_mode = RADIO_MODE_WIFI;
+    wifi_initialized = true;
+    /* Keep the driver's configured country. Analyzer never installs a broader
+     * country/channel policy, including when it is the first Wi-Fi command. */
+    return ESP_OK;
+
+failed:
+    (void)esp_wifi_stop();
+    if (esp_wifi_deinit() != ESP_OK) {
+        portENTER_CRITICAL(&analyzer_legacy_scan_lock);
+        analyzer_legacy_radio_uncertain = true;
+        portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
+    }
+    return err;
+}
+
 // --- Command registration in esp_console ---
 #define esp_console_cmd_register(cmd) janos_console_cmd_register(cmd)
 static void register_commands(void)
 {
+    const esp_console_cmd_t analyzer_cmd = {
+        .command = "wifi_analyzer",
+        .help = "AP survey: caps | scan [--band 2.4|5|both] [--channels list] [--profile quick|detailed|passive] [--limit 1..128] | status | stop | clear",
+        .func = &wifi_analyzer_command,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&analyzer_cmd));
+
     const esp_console_cmd_t scan_cmd = {
         .command = "scan_networks",
         .help = "Starts background network scan",
@@ -25691,6 +25902,15 @@ void app_main(void) {
     repl_config.max_cmdline_length = 256;
 
     ESP_ERROR_CHECK(uart_baud_control_init());
+    janos_command_mutex = xSemaphoreCreateRecursiveMutexStatic(&janos_command_mutex_storage);
+    assert(janos_command_mutex != NULL);
+    const wifi_analyzer_hooks_t analyzer_hooks = {
+        .busy_reason = analyzer_host_busy_reason,
+        .prepare_wifi = analyzer_host_prepare_wifi,
+        .baud_rate = uart_baud_current,
+        .tx_activity = uart_baud_note_activity,
+    };
+    wifi_analyzer_init(&analyzer_hooks);
     crack_worker_init(init_sd_card, uart_baud_set_file_transfer_active,
                       uart_baud_current);
     esp_console_register_help_command();
