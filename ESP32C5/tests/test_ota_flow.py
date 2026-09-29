@@ -1,7 +1,6 @@
 """Execute current JanOS OTA C functions on a host, without touching firmware.
 
 Run: python -m unittest discover -s tests -p test_ota_flow.py -v
-Set OTA_STRICT_KNOWN_DEFECTS=1 to report documented defects as failures.
 Requires a host C compiler (CC, cc, gcc or clang). No network/device access.
 """
 
@@ -38,18 +37,20 @@ def production_slice(source):
     if args is None:
         raise RuntimeError("OTA task argument declaration missing; update host adapter")
     functions = (
-        "ota_parse_version", "ota_is_newer_version", "ota_build_branch_url",
+        "ota_boot_is_ready", "ota_parse_version", "ota_is_newer_version", "ota_build_branch_url",
         "ota_is_expected_project", "ota_perform_https_update",
         "ota_has_ip", "ota_is_connected", "ota_start_check", "ota_check_task",
         "ota_load_channel_from_nvs", "ota_save_channel_to_nvs",
         "cmd_ota_channel", "cmd_ota_check", "ota_mark_valid_if_pending",
     )
+    version_helpers = re.findall(r"^static\s+[^;{}\n]*\b(ota_version_\w+)\s*\(", source, re.M)
+    rf_helpers = [name for name in ("ota_rf_layout_compatible", "ota_rf_verify_support_image",
+                                  "ota_rf_verify_support_images", "ota_start_check_source")
+                  if re.search(r"^static\s+[^;{}\n]*\b" + name + r"\s*\(", source, re.M)]
     return "\n".join([*definitions, args.group(),
+                        *(extract_function(source, name) for name in version_helpers),
+                        *(extract_function(source, name) for name in rf_helpers),
                         *(extract_function(source, name) for name in functions)])
-
-
-def known_defect(test):
-    return test if os.environ.get("OTA_STRICT_KNOWN_DEFECTS") == "1" else unittest.expectedFailure(test)
 
 
 class OtaFlowTest(unittest.TestCase):
@@ -64,6 +65,7 @@ class OtaFlowTest(unittest.TestCase):
         source = (ROOT / "main/main.c").read_text(encoding="utf-8")
         (temporary / "ota_production.inc").write_text(production_slice(source), encoding="utf-8")
         executable = temporary / ("ota_host.exe" if os.name == "nt" else "ota_host")
+        cls.executable = executable
         build = subprocess.run([compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
                                 "-I", str(temporary), str(ROOT / "tests/ota_host.c"),
                                 "-o", str(executable)], capture_output=True, text=True)
@@ -83,6 +85,17 @@ class OtaFlowTest(unittest.TestCase):
             "version_mismatch", "retry", "malformed_version", "prerelease",
             "numeric_versions", "null_version", "pending", "valid", "state_fail",
             "url_too_small", "url", "long_tag",
+            "mismatch_newer", "tag_mismatch", "tag_invalid", "tag_prefixed",
+            "running_newer", "running_older", "unterminated_version",
+            "unterminated_project", "channel_snapshot", "nvs_legacy_uppercase",
+            "boot_unconfirmed",
+            "rf_tag_equal", "rf_latest", "rf_latest_equal", "rf_on_dev", "rf_metadata_fail",
+            "rf_classic_layout", "rf_missing_secrets", "rf_wrong_slot", "rf_wrong_subtype",
+            "rf_encrypted", "rf_readonly", "rf_external_flash", "rf_wrong_target",
+            "rf_table_mismatch", "rf_bootloader_mismatch", "rf_support_http_fail",
+            "rf_support_read_fail", "rf_table_truncated", "rf_bootloader_oversized",
+            "rf_image_mismatch", "rf_bad_tag", "rf_dev", "rf_busy", "rf_then_classic",
+            "rf_bootloader_one_byte", "rf_bootloader_prefix", "rf_bootloader_invalid",
         )
         for scenario in scenarios:
             run = subprocess.run([str(executable), scenario], capture_output=True, text=True, timeout=5)
@@ -92,6 +105,18 @@ class OtaFlowTest(unittest.TestCase):
             cls.results[scenario] = dict(rows)
             for key in ("started", "begin", "perform", "finish", "abort", "restart", "busy", "allocs", "mark"):
                 int(cls.results[scenario][key])
+
+        # Same production guard compiled for the ordinary classic table offset.
+        classic_executable = temporary / "ota_host_classic"
+        build = subprocess.run([compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                                "-DCONFIG_PARTITION_TABLE_OFFSET=0x8000", "-I", str(temporary),
+                                str(ROOT / "tests/ota_host.c"), "-o", str(classic_executable)],
+                               capture_output=True, text=True)
+        if build.returncode:
+            raise RuntimeError(build.stderr)
+        run = subprocess.run([str(classic_executable), "rf_tag_equal"], check=True,
+                             capture_output=True, text=True, timeout=5)
+        cls.classic_layout_result = dict(line.split("=", 1) for line in run.stdout.splitlines())
 
     def result(self, scenario):
         return self.results[scenario]
@@ -126,23 +151,18 @@ class OtaFlowTest(unittest.TestCase):
         r = self.result("tag_older")
         self.assertEqual((r["route"], r["tag"], r["restart"]), ("tag", "1.0.0", "1"))
 
-    @known_defect
     def test_accepted_uppercase_channel_routes_to_dev(self):
         self.assertIn("/development/", self.result("uppercase")["url"])
 
-    @known_defect
     def test_uppercase_channel_routes_to_dev_after_nvs_reload(self):
         self.assertIn("/development/", self.result("uppercase_reload")["url"])
 
-    @known_defect
     def test_nvs_open_failure_preserves_active_channel(self):
         self.assertEqual(self.result("nvs_open_fail")["channel"], "main")
 
-    @known_defect
     def test_nvs_set_failure_preserves_active_channel(self):
         self.assertEqual(self.result("nvs_set_fail")["channel"], "main")
 
-    @known_defect
     def test_nvs_commit_failure_preserves_active_channel(self):
         self.assertEqual(self.result("nvs_commit_fail")["channel"], "main")
 
@@ -170,6 +190,75 @@ class OtaFlowTest(unittest.TestCase):
                 r = self.result(scenario)
                 self.assertEqual((r["command"], r["started"], r["begin"]), ("1", "0", "0"))
                 self.assert_idle(scenario)
+
+    def test_unconfirmed_start_cannot_begin_another_update(self):
+        r = self.result("boot_unconfirmed")
+        self.assertEqual((r["command"], r["started"], r["begin"]), ("1", "0", "0"))
+        self.assert_idle("boot_unconfirmed")
+
+    def test_explicit_rf_tag_reinstalls_equal_version_from_rf(self):
+        r = self.result("rf_tag_equal")
+        self.assertEqual((r["source"], r["tag"], r["restart"]), ("rf", "1.7.5", "1"))
+        self.assertEqual(r["support_reads"], "2")
+        self.assert_idle("rf_tag_equal")
+
+    def test_rf_latest_uses_rf_version_gate_and_ignores_classic_dev(self):
+        self.assertEqual(self.result("rf_latest")["source"], "rf")
+        self.assertEqual(self.result("rf_latest")["restart"], "1")
+        self.assertEqual(self.result("rf_latest_equal")["begin"], "0")
+        r = self.result("rf_on_dev")
+        self.assertEqual((r["source"], r["channel"], r["restart"]), ("rf", "dev", "1"))
+        self.assertNotIn("development", r["url"])
+
+    def test_rf_rejects_incompatible_installed_layout_before_fetch(self):
+        for scenario in ("rf_classic_layout", "rf_missing_secrets", "rf_wrong_slot",
+                         "rf_wrong_subtype", "rf_encrypted", "rf_readonly",
+                         "rf_external_flash", "rf_wrong_target"):
+            with self.subTest(scenario=scenario):
+                r = self.result(scenario)
+                self.assertEqual((r["command"], r["started"], r["route"], r["begin"]),
+                                 ("1", "0", "none", "0"))
+                self.assert_idle(scenario)
+        self.assertEqual(self.classic_layout_result["started"], "0")
+
+    def test_rf_support_images_must_match_installed_bytes(self):
+        for scenario in ("rf_table_mismatch", "rf_bootloader_mismatch", "rf_support_http_fail",
+                         "rf_support_read_fail", "rf_table_truncated", "rf_bootloader_oversized"):
+            with self.subTest(scenario=scenario):
+                r = self.result(scenario)
+                self.assertEqual(r["source"], "rf")
+                self.assertEqual((r["begin"], r["restart"]), ("0", "0"))
+                self.assert_idle(scenario)
+
+    def test_rf_requires_complete_verified_bootloader_not_matching_prefix(self):
+        for scenario in ("rf_bootloader_one_byte", "rf_bootloader_prefix", "rf_bootloader_invalid"):
+            with self.subTest(scenario=scenario):
+                r = self.result(scenario)
+                self.assertEqual((r["begin"], r["restart"]), ("0", "0"))
+                self.assertEqual(r["bootloader_verifications"], "1")
+                self.assert_idle(scenario)
+
+    def test_rf_failure_does_not_fall_back_to_classic(self):
+        r = self.result("rf_metadata_fail")
+        self.assertEqual((r["source"], r["begin"], r["restart"]), ("rf", "0", "0"))
+        self.assertEqual(r["fetches"], "1")
+        self.assert_idle("rf_metadata_fail")
+
+    def test_rf_bin_version_guard_is_not_bypassed(self):
+        r = self.result("rf_image_mismatch")
+        self.assertEqual((r["abort"], r["finish"], r["restart"]), ("1", "0", "0"))
+
+    def test_rf_rejects_invalid_tag_and_unsupported_dev(self):
+        for scenario in ("rf_bad_tag", "rf_dev"):
+            with self.subTest(scenario=scenario):
+                r = self.result(scenario)
+                self.assertEqual((r["command"], r["started"], r["fetches"]), ("1", "0", "0"))
+
+    def test_rf_request_is_single_and_does_not_persist_source(self):
+        r = self.result("rf_busy")
+        self.assertEqual((r["started"], r["source"], r["restart"]), ("1", "rf", "1"))
+        r = self.result("rf_then_classic")
+        self.assertEqual((r["source"], r["fetches"], r["restart"]), ("classic", "2", "1"))
 
     def test_second_request_does_not_create_another_task(self):
         r = self.result("busy")
@@ -214,9 +303,29 @@ class OtaFlowTest(unittest.TestCase):
         self.assertEqual((r["finish"], r["abort"], r["restart"]), ("1", "0", "0"))
         self.assert_idle("finish_fail")
 
-    @known_defect
     def test_new_release_with_old_binary_is_not_activated(self):
-        self.assertEqual(self.result("version_mismatch")["restart"], "0")
+        for scenario in ("version_mismatch", "mismatch_newer", "tag_mismatch",
+                         "unterminated_version", "unterminated_project"):
+            with self.subTest(scenario=scenario):
+                r = self.result(scenario)
+                self.assertEqual((r["abort"], r["perform"], r["finish"], r["restart"]), ("1", "0", "0", "0"))
+                self.assert_idle(scenario)
+
+    def test_release_tag_prefix_is_normalized_for_image_match(self):
+        self.assertEqual(self.result("tag_prefixed")["restart"], "1")
+
+    def test_invalid_explicit_tag_never_begins_download(self):
+        self.assertEqual(self.result("tag_invalid")["begin"], "0")
+
+    def test_update_uses_running_descriptor_instead_of_compile_time_version(self):
+        self.assertEqual(self.result("running_newer")["begin"], "0")
+        self.assertEqual(self.result("running_older")["restart"], "1")
+
+    def test_worker_keeps_channel_selected_when_request_was_accepted(self):
+        self.assertIn("/development/", self.result("channel_snapshot")["url"])
+
+    def test_existing_uppercase_nvs_value_is_normalized(self):
+        self.assertEqual(self.result("nvs_legacy_uppercase")["channel"], "dev")
 
     def test_failed_download_allows_retry_in_same_process(self):
         r = self.result("retry")
@@ -229,11 +338,9 @@ class OtaFlowTest(unittest.TestCase):
     def test_null_and_unparseable_versions_are_rejected(self):
         self.assertEqual(self.result("null_version")["value"], "0")
 
-    @known_defect
     def test_malformed_version_is_rejected(self):
         self.assertEqual(self.result("malformed_version")["value"], "0")
 
-    @known_defect
     def test_stable_release_is_newer_than_its_release_candidate(self):
         self.assertEqual(self.result("prerelease")["value"], "1")
 
@@ -248,9 +355,36 @@ class OtaFlowTest(unittest.TestCase):
     def test_branch_url_points_to_current_classic_source(self):
         self.assertEqual(self.result("url")["url"], "https://raw.githubusercontent.com/C5Lab/projectZero/development/ESP32C5/binaries-esp32c5/projectZero.bin")
 
-    @known_defect
     def test_overlong_tag_is_rejected_instead_of_requesting_truncated_tag(self):
         self.assertEqual(self.result("long_tag")["started"], "0")
+
+    def test_version_validation_and_prerelease_order(self):
+        cases = [
+            ("1.7.5", "1.7.xyz", False), ("1.7.5", "2", False),
+            ("1.7.5", "2.0", False), ("1.7.5", "2.0.0junk", False),
+            ("1.7.5", "02.0.0", False), ("1.7.5", "2.00.0", False),
+            ("1.7.5", "2147483648.0.0", False), ("1.7.5", "-2.0.0", False),
+            ("1.7.5", " 2.0.0", False), ("1.7.5", "vv2.0.0", False),
+            ("1.7.5", "2.0.0-", False), ("1.7.5", "2.0.0+", False),
+            ("1.7.5", "2.0.0-rc..1", False), ("1.7.5", "2.0.0-01", False),
+            ("1.7.5", "2.0.0+build..1", False),
+            ("1.7.5", "v1.7.6", True), ("1.7.5", "V1.7.6", True),
+            ("1.7.6-rc.2", "1.7.6-rc.10", True),
+            ("1.7.6-rc.10", "1.7.6-rc.2", False),
+            ("1.7.6-alpha", "1.7.6-alpha.1", True),
+            ("1.7.6-alpha.1", "1.7.6-alpha", False),
+            ("1.7.6-1", "1.7.6-alpha", True),
+            ("1.7.6-alpha", "1.7.6-1", False),
+            ("1.7.6-rc1", "1.7.6", True), ("1.7.6", "1.7.6-rc1", False),
+            ("1.7.6+old", "1.7.6+new", False),
+            ("1.7.6-rc.1+old", "1.7.6-rc.1+new", False),
+            ("1.7.5", "1.7.6+001", True),
+        ]
+        for current, candidate, newer in cases:
+            with self.subTest(current=current, candidate=candidate):
+                run = subprocess.run([str(self.executable), "compare", current, candidate],
+                                     check=True, capture_output=True, text=True, timeout=5)
+                self.assertEqual(run.stdout.strip(), "1" if newer else "0")
 
 
 if __name__ == "__main__":

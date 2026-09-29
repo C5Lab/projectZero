@@ -4,6 +4,7 @@
 #include <strings.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <assert.h>
 #include <inttypes.h>
 #include <errno.h>
@@ -72,12 +73,15 @@
 #include "esp_timer.h"
 #include "esp_rom_crc.h"
 #include "esp_app_format.h"
+#include "esp_app_desc.h"
 
 #include "esp_http_server.h"
 #include "esp_http_client.h"
 #include "esp_tls.h"
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
+#include "esp_flash.h"
+#include "esp_image_format.h"
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
 #include "esp_netif.h"
@@ -142,6 +146,10 @@
 
 #define OTA_GITHUB_OWNER "C5Lab"
 #define OTA_GITHUB_REPO "projectZero"
+#define OTA_RF_GITHUB_OWNER "elpadrino26"
+#define OTA_RF_GITHUB_REPO "janosrf-web-flasher"
+#define OTA_RF_PARTITION_TABLE_OFFSET 0x10000
+#define OTA_RF_BOOTLOADER_OFFSET 0x2000
 #define OTA_ASSET_NAME "projectZero.bin"
 #define OTA_HTTP_MAX_BODY (256 * 1024)
 #define OTA_TASK_STACK_SIZE 12288
@@ -859,6 +867,7 @@ static bool wifi_event_handler_registered = false;
 static bool ip_event_handler_registered = false;
 static bool ota_check_started = false;
 static bool ota_check_in_progress = false;
+static atomic_bool ota_boot_ready = ATOMIC_VAR_INIT(false);
 static char ota_channel[OTA_CHANNEL_MAX_LEN] = "main";
 static bool ota_auto_on_ip = false;
 static TaskHandle_t ota_led_task_handle = NULL;
@@ -2494,11 +2503,9 @@ static void ip_event_handler(void *event_handler_arg,
                              int32_t event_id,
                              void *event_data);
 static void ota_check_task(void *pvParameters);
-static esp_err_t ota_fetch_latest_release(char *url_out, size_t url_len,
-                                          char *tag_out, size_t tag_len);
-static esp_err_t ota_fetch_release_by_tag(const char *tag,
-                                          char *url_out, size_t url_len,
-                                          char *tag_out, size_t tag_len);
+static esp_err_t ota_fetch_release(bool rf, const char *requested_tag,
+                                   char *url_out, size_t url_len,
+                                   char *tag_out, size_t tag_len);
 static esp_err_t ota_build_branch_url(char *url_out, size_t url_len);
 static bool ota_is_newer_version(const char *current, const char *latest);
 static bool ota_has_ip(void);
@@ -2507,6 +2514,7 @@ static bool ota_start_check(const char *tag, bool force_latest);
 static void ota_load_channel_from_nvs(void);
 static bool ota_save_channel_to_nvs(const char *channel);
 static void ota_mark_valid_if_pending(void);
+static bool ota_boot_is_ready(void);
 static void ota_log_boot_info(void);
 static void ota_led_start(void);
 static void ota_led_stop(void);
@@ -2873,26 +2881,84 @@ static void wifi_event_handler(void *event_handler_arg,
     }
 }
 
+// SemVer identifiers are ASCII, nonempty and dot-separated. Numeric prerelease
+// identifiers cannot have leading zeroes; build metadata may have them.
+static bool ota_version_identifiers(const char **cursor, bool prerelease) {
+    const char *p = *cursor;
+    do {
+        const char *start = p;
+        bool numeric = true;
+        while ((*p >= '0' && *p <= '9') || (*p >= 'A' && *p <= 'Z') ||
+               (*p >= 'a' && *p <= 'z') || *p == '-') {
+            if (*p < '0' || *p > '9') numeric = false;
+            p++;
+        }
+        if (p == start || (prerelease && numeric && p - start > 1 && *start == '0')) {
+            return false;
+        }
+        if (*p != '.') break;
+        p++;
+    } while (true);
+    *cursor = p;
+    return true;
+}
+
+// Inputs have already passed ota_parse_version. Build metadata has no precedence.
+static int ota_version_prerelease_compare(const char *left, const char *right) {
+    left += strcspn(left, "-+");
+    right += strcspn(right, "-+");
+    bool left_pre = *left == '-', right_pre = *right == '-';
+    if (!left_pre || !right_pre) return right_pre - left_pre;
+    left++;
+    right++;
+    for (;;) {
+        size_t ll = strcspn(left, ".+"), rl = strcspn(right, ".+");
+        bool ln = strspn(left, "0123456789") == ll;
+        bool rn = strspn(right, "0123456789") == rl;
+        if (ln != rn) return ln ? -1 : 1;
+        if (ln && ll != rl) return ll < rl ? -1 : 1;
+        int cmp = strncmp(left, right, ll < rl ? ll : rl);
+        if (cmp) return cmp < 0 ? -1 : 1;
+        if (ll != rl) return ll < rl ? -1 : 1;
+        left += ll;
+        right += rl;
+        bool more_left = *left == '.', more_right = *right == '.';
+        if (!more_left || !more_right) return more_left - more_right;
+        left++;
+        right++;
+    }
+}
+
 static bool ota_parse_version(const char *version, int *major, int *minor, int *patch) {
     if (!version || !major || !minor || !patch) {
         return false;
     }
 
-    while (*version == 'v' || *version == 'V' || isspace((unsigned char)*version)) {
+    if (*version == 'v' || *version == 'V') version++;
+    int parts[3] = {0};
+    for (int i = 0; i < 3; i++) {
+        const char *start = version;
+        if (*version < '0' || *version > '9') return false;
+        while (*version >= '0' && *version <= '9') {
+            int digit = *version++ - '0';
+            if (parts[i] > (INT_MAX - digit) / 10) return false;
+            parts[i] = parts[i] * 10 + digit;
+        }
+        if (version - start > 1 && *start == '0') return false;
+        if (i < 2 && *version++ != '.') return false;
+    }
+    if (*version == '-') {
         version++;
+        if (!ota_version_identifiers(&version, true)) return false;
     }
-
-    int maj = 0;
-    int min = 0;
-    int pat = 0;
-    int parsed = sscanf(version, "%d.%d.%d", &maj, &min, &pat);
-    if (parsed < 1) {
-        return false;
+    if (*version == '+') {
+        version++;
+        if (!ota_version_identifiers(&version, false)) return false;
     }
-
-    *major = maj;
-    *minor = (parsed >= 2) ? min : 0;
-    *patch = (parsed >= 3) ? pat : 0;
+    if (*version) return false;
+    *major = parts[0];
+    *minor = parts[1];
+    *patch = parts[2];
     return true;
 }
 
@@ -2906,7 +2972,8 @@ static bool ota_is_newer_version(const char *current, const char *latest) {
 
     if (!ota_parse_version(current, &cur_maj, &cur_min, &cur_pat) ||
         !ota_parse_version(latest, &lat_maj, &lat_min, &lat_pat)) {
-        MY_LOG_INFO(TAG, "OTA: version parse failed (current=%s, latest=%s)", current, latest);
+        MY_LOG_INFO(TAG, "OTA: version parse failed (current=%s, latest=%s)",
+                    current ? current : "<null>", latest ? latest : "<null>");
         return false;
     }
 
@@ -2916,7 +2983,8 @@ static bool ota_is_newer_version(const char *current, const char *latest) {
     if (lat_min != cur_min) {
         return lat_min > cur_min;
     }
-    return lat_pat > cur_pat;
+    if (lat_pat != cur_pat) return lat_pat > cur_pat;
+    return ota_version_prerelease_compare(latest, current) > 0;
 }
 
 static esp_err_t ota_http_get(const char *url, char **out_buf, size_t *out_len) {
@@ -2939,28 +3007,63 @@ static esp_err_t ota_http_get(const char *url, char **out_buf, size_t *out_len) 
 
     esp_http_client_set_header(client, "User-Agent", "projectZero-ota");
     esp_http_client_set_header(client, "Accept", "application/vnd.github+json");
+    esp_err_t err = ESP_FAIL;
+    bool opened = false;
+    char *buf = NULL;
+    int64_t content_length = -1;
+    for (int redirects = 0; redirects <= 5; redirects++) {
+        if (esp_http_client_get_transport_type(client) != HTTP_TRANSPORT_OVER_SSL) {
+            MY_LOG_INFO(TAG, "OTA: refused non-HTTPS metadata URL");
+            err = ESP_FAIL;
+            goto done;
+        }
+        err = esp_http_client_open(client, 0);
+        if (err != ESP_OK) {
+            MY_LOG_INFO(TAG, "OTA: http open failed: %s", esp_err_to_name(err));
+            goto done;
+        }
+        opened = true;
 
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        MY_LOG_INFO(TAG, "OTA: http open failed: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        return err;
+        content_length = esp_http_client_fetch_headers(client);
+        if (content_length < 0) {
+            MY_LOG_INFO(TAG, "OTA: http headers failed");
+            err = ESP_FAIL;
+            goto done;
+        }
+        int status = esp_http_client_get_status_code(client);
+        if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
+            if (redirects == 5) {
+                MY_LOG_INFO(TAG, "OTA: too many HTTP redirects");
+                err = ESP_FAIL;
+                goto done;
+            }
+            esp_http_client_close(client);
+            opened = false;
+            err = esp_http_client_set_redirection(client);
+            if (err != ESP_OK) {
+                MY_LOG_INFO(TAG, "OTA: invalid HTTP redirect");
+                goto done;
+            }
+            continue;
+        }
+        if (status != 200) {
+            MY_LOG_INFO(TAG, "OTA: http status %d for %s", status, url);
+            err = ESP_FAIL;
+            goto done;
+        }
+        break;
     }
 
-    esp_http_client_fetch_headers(client);
-    int status = esp_http_client_get_status_code(client);
-    if (status != 200) {
-        MY_LOG_INFO(TAG, "OTA: http status %d for %s", status, url);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return ESP_FAIL;
+    content_length = esp_http_client_get_content_length(client);
+    if (content_length > OTA_HTTP_MAX_BODY) {
+        MY_LOG_INFO(TAG, "OTA: response too large");
+        err = ESP_ERR_NO_MEM;
+        goto done;
     }
-
-    char *buf = heap_caps_calloc(1, OTA_HTTP_MAX_BODY + 1, MALLOC_CAP_SPIRAM);
+    buf = heap_caps_calloc(1, OTA_HTTP_MAX_BODY + 1, MALLOC_CAP_SPIRAM);
     if (!buf) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return ESP_ERR_NO_MEM;
+        err = ESP_ERR_NO_MEM;
+        goto done;
     }
 
     size_t total = 0;
@@ -2968,177 +3071,117 @@ static esp_err_t ota_http_get(const char *url, char **out_buf, size_t *out_len) 
         int read_len = esp_http_client_read(client, buf + total, OTA_HTTP_MAX_BODY - total);
         if (read_len < 0) {
             MY_LOG_INFO(TAG, "OTA: http read failed");
-            free(buf);
-            esp_http_client_close(client);
-            esp_http_client_cleanup(client);
-            return ESP_FAIL;
+            err = ESP_FAIL;
+            goto done;
         }
-        if (read_len == 0) {
-            break;
-        }
+        if (read_len == 0) break;
         total += (size_t)read_len;
     }
-
-    if (total >= OTA_HTTP_MAX_BODY) {
-        MY_LOG_INFO(TAG, "OTA: response too large");
-        free(buf);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return ESP_ERR_NO_MEM;
+    if (total == OTA_HTTP_MAX_BODY) {
+        char extra;
+        int read_len = esp_http_client_read(client, &extra, 1);
+        if (read_len != 0) {
+            MY_LOG_INFO(TAG, "OTA: response too large or read failed");
+            err = ESP_ERR_NO_MEM;
+            goto done;
+        }
+    }
+    if ((content_length >= 0 && total != (size_t)content_length) ||
+        !esp_http_client_is_complete_data_received(client)) {
+        MY_LOG_INFO(TAG, "OTA: incomplete HTTP response");
+        err = ESP_FAIL;
+        goto done;
     }
 
     buf[total] = '\0';
     *out_buf = buf;
     *out_len = total;
+    buf = NULL;
+    err = ESP_OK;
 
-    esp_http_client_close(client);
+done:
+    free(buf);
+    if (opened) esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    return ESP_OK;
+    return err;
 }
 
-static esp_err_t ota_fetch_latest_release(char *url_out, size_t url_len,
-                                          char *tag_out, size_t tag_len) {
-    char api_url[256];
-    int res = snprintf(api_url, sizeof(api_url),
-                       "https://api.github.com/repos/%s/%s/releases/latest",
-                       OTA_GITHUB_OWNER, OTA_GITHUB_REPO);
-    if (res < 0 || res >= (int)sizeof(api_url)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    char *body = NULL;
-    size_t body_len = 0;
-    esp_err_t err = ota_http_get(api_url, &body, &body_len);
-    if (err != ESP_OK) {
-        return err;
-    }
-    (void)body_len;
-
-    cJSON *root = cJSON_Parse(body);
-    if (!root) {
-        free(body);
-        return ESP_FAIL;
-    }
-
-    cJSON *tag = cJSON_GetObjectItem(root, "tag_name");
-    cJSON *assets = cJSON_GetObjectItem(root, "assets");
-    if (!cJSON_IsString(tag) || !cJSON_IsArray(assets)) {
-        cJSON_Delete(root);
-        free(body);
-        return ESP_FAIL;
-    }
-
-    cJSON *asset = NULL;
-    cJSON_ArrayForEach(asset, assets) {
-        cJSON *name = cJSON_GetObjectItem(asset, "name");
-        if (cJSON_IsString(name) && strcmp(name->valuestring, OTA_ASSET_NAME) == 0) {
-            break;
-        }
-    }
-
-    if (!asset) {
-        MY_LOG_INFO(TAG, "OTA: asset %s not found in release", OTA_ASSET_NAME);
-        cJSON_Delete(root);
-        free(body);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    cJSON *download = cJSON_GetObjectItem(asset, "browser_download_url");
-    cJSON *size = cJSON_GetObjectItem(asset, "size");
-    cJSON *updated = cJSON_GetObjectItem(asset, "updated_at");
-    if (!cJSON_IsString(download)) {
-        cJSON_Delete(root);
-        free(body);
-        return ESP_FAIL;
-    }
-
-    snprintf(tag_out, tag_len, "%s", tag->valuestring);
-    snprintf(url_out, url_len, "%s", download->valuestring);
-    if (cJSON_IsNumber(size)) {
-        MY_LOG_INFO(TAG, "OTA: asset size=%lu bytes", (unsigned long)size->valuedouble);
-    }
-    if (cJSON_IsString(updated)) {
-        MY_LOG_INFO(TAG, "OTA: asset updated_at=%s", updated->valuestring);
-    }
-
-    cJSON_Delete(root);
-    free(body);
-    return ESP_OK;
-}
-
-static esp_err_t ota_fetch_release_by_tag(const char *tag,
-                                          char *url_out, size_t url_len,
-                                          char *tag_out, size_t tag_len) {
-    if (!tag || !*tag) {
+static esp_err_t ota_build_release_api_url(bool rf, const char *tag, bool list,
+                                           char *out, size_t len) {
+    if (!out || len == 0 || (list && tag)) return ESP_ERR_INVALID_ARG;
+    int major, minor, patch;
+    if (tag && (!ota_parse_version(tag, &major, &minor, &patch) || strlen(tag) >= 64)) {
         return ESP_ERR_INVALID_ARG;
     }
+    const char *owner = rf ? OTA_RF_GITHUB_OWNER : OTA_GITHUB_OWNER;
+    const char *repo = rf ? OTA_RF_GITHUB_REPO : OTA_GITHUB_REPO;
+    int written = snprintf(out, len, "https://api.github.com/repos/%s/%s/releases%s%s",
+                           owner, repo, list ? "?per_page=5" : (tag ? "/tags/" : "/latest"),
+                           tag ? tag : "");
+    return written < 0 || (size_t)written >= len ? ESP_ERR_INVALID_SIZE : ESP_OK;
+}
 
+static esp_err_t ota_fetch_release(bool rf, const char *requested_tag,
+                                   char *url_out, size_t url_len,
+                                   char *tag_out, size_t tag_len) {
+    if (!url_out || !tag_out || !url_len || !tag_len) return ESP_ERR_INVALID_ARG;
+    url_out[0] = '\0';
+    tag_out[0] = '\0';
     char api_url[256];
-    int res = snprintf(api_url, sizeof(api_url),
-                       "https://api.github.com/repos/%s/%s/releases/tags/%s",
-                       OTA_GITHUB_OWNER, OTA_GITHUB_REPO, tag);
-    if (res < 0 || res >= (int)sizeof(api_url)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
+    esp_err_t err = ota_build_release_api_url(rf, requested_tag, false, api_url, sizeof(api_url));
+    if (err != ESP_OK) return err;
     char *body = NULL;
     size_t body_len = 0;
-    esp_err_t err = ota_http_get(api_url, &body, &body_len);
-    if (err != ESP_OK) {
-        return err;
-    }
-    (void)body_len;
-
+    err = ota_http_get(api_url, &body, &body_len);
+    if (err != ESP_OK) return err;
     cJSON *root = cJSON_Parse(body);
     if (!root) {
         free(body);
         return ESP_FAIL;
     }
-
-    cJSON *tag_json = cJSON_GetObjectItem(root, "tag_name");
+    err = ESP_FAIL;
+    cJSON *tag = cJSON_GetObjectItem(root, "tag_name");
     cJSON *assets = cJSON_GetObjectItem(root, "assets");
-    if (!cJSON_IsString(tag_json) || !cJSON_IsArray(assets)) {
-        cJSON_Delete(root);
-        free(body);
-        return ESP_FAIL;
+    cJSON *draft = cJSON_GetObjectItem(root, "draft");
+    int major, minor, patch;
+    if (!cJSON_IsString(tag) || !cJSON_IsArray(assets) || cJSON_IsTrue(draft) ||
+        !ota_parse_version(tag->valuestring, &major, &minor, &patch) ||
+        (requested_tag && strcmp(requested_tag, tag->valuestring) != 0)) {
+        goto cleanup;
     }
-
     cJSON *asset = NULL;
     cJSON_ArrayForEach(asset, assets) {
         cJSON *name = cJSON_GetObjectItem(asset, "name");
-        if (cJSON_IsString(name) && strcmp(name->valuestring, OTA_ASSET_NAME) == 0) {
-            break;
+        if (cJSON_IsString(name) && strcmp(name->valuestring, OTA_ASSET_NAME) == 0) break;
+    }
+    if (!asset) {
+        MY_LOG_INFO(TAG, "OTA: asset %s not found in release", OTA_ASSET_NAME);
+        err = ESP_ERR_NOT_FOUND;
+        goto cleanup;
+    }
+    cJSON *download = cJSON_GetObjectItem(asset, "browser_download_url");
+    if (!cJSON_IsString(download) || strncmp(download->valuestring, "https://", 8) != 0) goto cleanup;
+    if (strlen(tag->valuestring) >= tag_len || strlen(download->valuestring) >= url_len) {
+        err = ESP_ERR_INVALID_SIZE;
+        goto cleanup;
+    }
+    if (rf) {
+        char expected_url[256];
+        int n = snprintf(expected_url, sizeof(expected_url),
+                         "https://github.com/%s/%s/releases/download/%s/%s",
+                         OTA_RF_GITHUB_OWNER, OTA_RF_GITHUB_REPO, tag->valuestring, OTA_ASSET_NAME);
+        if (n < 0 || (size_t)n >= sizeof(expected_url) || strcmp(expected_url, download->valuestring)) {
+            MY_LOG_INFO(TAG, "OTA RF: unexpected asset URL; refusing other sources");
+            goto cleanup;
         }
     }
-
-    if (!asset) {
-        MY_LOG_INFO(TAG, "OTA: asset %s not found for tag %s", OTA_ASSET_NAME, tag);
-        cJSON_Delete(root);
-        free(body);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    cJSON *download = cJSON_GetObjectItem(asset, "browser_download_url");
-    cJSON *size = cJSON_GetObjectItem(asset, "size");
-    cJSON *updated = cJSON_GetObjectItem(asset, "updated_at");
-    if (!cJSON_IsString(download)) {
-        cJSON_Delete(root);
-        free(body);
-        return ESP_FAIL;
-    }
-
-    snprintf(tag_out, tag_len, "%s", tag_json->valuestring);
-    snprintf(url_out, url_len, "%s", download->valuestring);
-    if (cJSON_IsNumber(size)) {
-        MY_LOG_INFO(TAG, "OTA: asset size=%lu bytes", (unsigned long)size->valuedouble);
-    }
-    if (cJSON_IsString(updated)) {
-        MY_LOG_INFO(TAG, "OTA: asset updated_at=%s", updated->valuestring);
-    }
-
+    memcpy(tag_out, tag->valuestring, strlen(tag->valuestring) + 1);
+    memcpy(url_out, download->valuestring, strlen(download->valuestring) + 1);
+    err = ESP_OK;
+cleanup:
     cJSON_Delete(root);
     free(body);
-    return ESP_OK;
+    return err;
 }
 
 static esp_err_t ota_build_branch_url(char *url_out, size_t url_len) {
@@ -3171,7 +3214,7 @@ static void ota_log_resources(const char *phase) {
                 (unsigned)uxTaskGetStackHighWaterMark(NULL));
 }
 
-static esp_err_t ota_perform_https_update(const char *download_url) {
+static esp_err_t ota_perform_https_update(const char *download_url, const char *expected_version) {
     if (!download_url || !*download_url) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -3203,11 +3246,31 @@ static esp_err_t ota_perform_https_update(const char *download_url) {
         return err;
     }
 
+    if (!memchr(app_desc.project_name, '\0', sizeof(app_desc.project_name)) ||
+        !memchr(app_desc.version, '\0', sizeof(app_desc.version)) ||
+        !memchr(app_desc.idf_ver, '\0', sizeof(app_desc.idf_ver))) {
+        MY_LOG_INFO(TAG, "OTA: unterminated image descriptor");
+        esp_https_ota_abort(ota_handle);
+        return ESP_ERR_INVALID_STATE;
+    }
     MY_LOG_INFO(TAG, "OTA: image project=%s version=%s idf=%s",
                 app_desc.project_name, app_desc.version, app_desc.idf_ver);
     if (!ota_is_expected_project(&app_desc)) {
         esp_https_ota_abort(ota_handle);
         return ESP_ERR_INVALID_STATE;
+    }
+    if (expected_version) {
+        const char *image_version = app_desc.version;
+        if (*expected_version == 'v' || *expected_version == 'V') expected_version++;
+        if (*image_version == 'v' || *image_version == 'V') image_version++;
+        int major, minor, patch;
+        if (!ota_parse_version(image_version, &major, &minor, &patch) ||
+            strcmp(expected_version, image_version) != 0) {
+            MY_LOG_INFO(TAG, "OTA: release/image version mismatch (release=%s, image=%s)",
+                        expected_version, image_version);
+            esp_https_ota_abort(ota_handle);
+            return ESP_ERR_INVALID_STATE;
+        }
     }
 
     ota_log_resources("before perform");
@@ -3334,9 +3397,113 @@ typedef struct {
     char tag[64];
     bool use_tag;
     bool force_latest;
+    bool use_dev;
+    bool rf;
 } ota_check_args_t;
 
-static bool ota_start_check(const char *tag, bool force_latest) {
+// This verifies compatibility, not physical board identity. The explicit RF
+// command is for a known RF board; it never migrates bootloader/table/data.
+static bool ota_rf_layout_compatible(void) {
+    if (CONFIG_PARTITION_TABLE_OFFSET != OTA_RF_PARTITION_TABLE_OFFSET) {
+        MY_LOG_INFO(TAG, "OTA RF: incompatible partition table offset 0x%lx (requires 0x10000); restore RF layout over USB",
+                    (unsigned long)CONFIG_PARTITION_TABLE_OFFSET);
+        return false;
+    }
+    const struct {
+        const char *label;
+        uint8_t type, subtype;
+        uint32_t address, size;
+    } expected[] = {
+        {"nvs", ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, 0x11000, 0x6000},
+        {"otadata", ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, 0x17000, 0x2000},
+        {"phy_init", ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_PHY, 0x19000, 0x1000},
+        {"secrets", ESP_PARTITION_TYPE_DATA, 0x40, 0x1a000, 0x4000},
+        {"ota_0", ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, 0x20000, 0x3f0000},
+        {"ota_1", ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, 0x410000, 0x3f0000},
+    };
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+        const esp_partition_t *part = esp_partition_find_first(expected[i].type, expected[i].subtype,
+                                                              expected[i].label);
+        if (!part || part->address != expected[i].address || part->size != expected[i].size ||
+            part->encrypted || part->readonly || part->flash_chip != esp_flash_default_chip) {
+            MY_LOG_INFO(TAG, "OTA RF: incompatible partition %s; restore RF layout over USB", expected[i].label);
+            return false;
+        }
+    }
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+    if (!running || !next || running->address == next->address ||
+        running->type != ESP_PARTITION_TYPE_APP || next->type != ESP_PARTITION_TYPE_APP ||
+        running->flash_chip != esp_flash_default_chip || next->flash_chip != esp_flash_default_chip ||
+        (running->address != 0x20000 && running->address != 0x410000) ||
+        (next->address != 0x20000 && next->address != 0x410000)) {
+        MY_LOG_INFO(TAG, "OTA RF: incompatible running/target slots");
+        return false;
+    }
+    return true;
+}
+
+static esp_err_t ota_rf_verify_support_image(const char *tag, const char *asset,
+                                            uint32_t address, size_t expected_len) {
+    char url[256];
+    int n = snprintf(url, sizeof(url), "https://github.com/%s/%s/releases/download/%s/%s",
+                     OTA_RF_GITHUB_OWNER, OTA_RF_GITHUB_REPO, tag, asset);
+    if (n < 0 || (size_t)n >= sizeof(url)) return ESP_ERR_INVALID_SIZE;
+    char *body = NULL;
+    size_t len = 0;
+    esp_err_t err = ota_http_get(url, &body, &len);
+    if (err != ESP_OK) return err;
+    if (!len || len != expected_len) {
+        err = ESP_ERR_INVALID_SIZE;
+    } else {
+        // Read only. Even matching app slots do not prove that the bootloader
+        // uses the same otadata/table as the incoming RF application.
+        uint8_t installed[256];
+        for (size_t offset = 0; offset < len; offset += sizeof(installed)) {
+            size_t chunk = len - offset;
+            if (chunk > sizeof(installed)) chunk = sizeof(installed);
+            err = esp_flash_read(esp_flash_default_chip, installed, address + offset, chunk);
+            if (err != ESP_OK) break;
+            if (memcmp(installed, body + offset, chunk) != 0) {
+                err = ESP_ERR_INVALID_STATE;
+                break;
+            }
+        }
+    }
+    free(body);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA RF: %s does not match installed flash or cannot be verified; restore RF via USB (%s)",
+                    asset, esp_err_to_name(err));
+    }
+    return err;
+}
+
+static esp_err_t ota_rf_verify_support_images(const char *tag) {
+    esp_err_t err = ota_rf_verify_support_image(tag, "partition-table.bin",
+                                               OTA_RF_PARTITION_TABLE_OFFSET, 0xc00);
+    if (err != ESP_OK) return err;
+    // IDF validates the installed image and derives its full segment/trailer
+    // extent. A truncated download matching only its prefix must never pass.
+    uint32_t bootloader_len = 0;
+    err = esp_image_verify_bootloader(&bootloader_len);
+    if (err != ESP_OK || !bootloader_len ||
+        bootloader_len > OTA_RF_PARTITION_TABLE_OFFSET - OTA_RF_BOOTLOADER_OFFSET) {
+        MY_LOG_INFO(TAG, "OTA RF: installed bootloader cannot be verified; restore RF via USB");
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ota_rf_verify_support_image(tag, "bootloader.bin", OTA_RF_BOOTLOADER_OFFSET,
+                                       bootloader_len);
+}
+
+static bool ota_start_check_source(const char *tag, bool force_latest, bool rf) {
+    if (!ota_boot_is_ready()) {
+        MY_LOG_INFO(TAG, "OTA: boot confirmation incomplete; update rejected");
+        return false;
+    }
+    if (tag && strlen(tag) >= sizeof(((ota_check_args_t *)0)->tag)) {
+        MY_LOG_INFO(TAG, "OTA: release tag too long");
+        return false;
+    }
     if (!ota_is_connected()) {
         MY_LOG_INFO(TAG, "OTA: not connected or no IP, skipping");
         return false;
@@ -3345,6 +3512,7 @@ static bool ota_start_check(const char *tag, bool force_latest) {
         MY_LOG_INFO(TAG, "OTA: check already in progress");
         return false;
     }
+    if (rf && !ota_rf_layout_compatible()) return false;
 
     ota_check_in_progress = true;
     ota_check_args_t *args = calloc(1, sizeof(*args));
@@ -3359,6 +3527,8 @@ static bool ota_start_check(const char *tag, bool force_latest) {
         args->use_tag = true;
     }
     args->force_latest = force_latest;
+    args->use_dev = !rf && strcmp(ota_channel, "dev") == 0;
+    args->rf = rf;
 
     BaseType_t task_ok = xTaskCreate(ota_check_task, "ota_check",
                                      OTA_TASK_STACK_SIZE, args,
@@ -3371,6 +3541,10 @@ static bool ota_start_check(const char *tag, bool force_latest) {
     }
 
     return true;
+}
+
+static bool ota_start_check(const char *tag, bool force_latest) {
+    return ota_start_check_source(tag, force_latest, false);
 }
 
 static void ota_check_task(void *pvParameters) {
@@ -3388,6 +3562,7 @@ static void ota_check_task(void *pvParameters) {
         strcmp(OTA_ASSET_NAME, "firmware.bin") == 0) {
         MY_LOG_INFO(TAG, "OTA: config not set, skipping update");
         ota_check_in_progress = false;
+        free(args);
         vTaskDelete(NULL);
         return;
     }
@@ -3396,13 +3571,17 @@ static void ota_check_task(void *pvParameters) {
     char download_url[256] = {0};
     esp_err_t err = ESP_OK;
     bool skip_version_check = false;
+    bool rf = args && args->rf;
+    MY_LOG_INFO(TAG, "OTA: source=%s repo=%s/%s", rf ? "rf" : "classic",
+                rf ? OTA_RF_GITHUB_OWNER : OTA_GITHUB_OWNER,
+                rf ? OTA_RF_GITHUB_REPO : OTA_GITHUB_REPO);
     if (args && args->use_tag) {
-        err = ota_fetch_release_by_tag(args->tag, download_url, sizeof(download_url),
+        err = ota_fetch_release(rf, args->tag, download_url, sizeof(download_url),
                                        latest_tag, sizeof(latest_tag));
     } else if (args && args->force_latest) {
-        err = ota_fetch_latest_release(download_url, sizeof(download_url),
+        err = ota_fetch_release(rf, NULL, download_url, sizeof(download_url),
                                        latest_tag, sizeof(latest_tag));
-    } else if (strcmp(ota_channel, "dev") == 0) {
+    } else if (args && args->use_dev) {
         err = ota_build_branch_url(download_url, sizeof(download_url));
         if (err == ESP_OK) {
             snprintf(latest_tag, sizeof(latest_tag), "branch:%s", OTA_DEV_BRANCH);
@@ -3411,7 +3590,7 @@ static void ota_check_task(void *pvParameters) {
             MY_LOG_INFO(TAG, "OTA: branch url=%s", download_url);
         }
     } else {
-        err = ota_fetch_latest_release(download_url, sizeof(download_url),
+        err = ota_fetch_release(rf, NULL, download_url, sizeof(download_url),
                                        latest_tag, sizeof(latest_tag));
     }
     if (err != ESP_OK) {
@@ -3422,23 +3601,40 @@ static void ota_check_task(void *pvParameters) {
         return;
     }
 
+    const esp_app_desc_t *running_desc = esp_app_get_description();
+    const char *current_version = running_desc->version;
+    int major, minor, patch;
+    if (!skip_version_check && !ota_parse_version(latest_tag, &major, &minor, &patch)) {
+        MY_LOG_INFO(TAG, "OTA: invalid release version: %s", latest_tag);
+        ota_check_in_progress = false;
+        free(args);
+        vTaskDelete(NULL);
+        return;
+    }
     if (!skip_version_check && !(args && args->use_tag) &&
-        !ota_is_newer_version(JANOS_VERSION, latest_tag)) {
-        MY_LOG_INFO(TAG, "OTA: no update (current=%s, latest=%s)", JANOS_VERSION, latest_tag);
+        !ota_is_newer_version(current_version, latest_tag)) {
+        MY_LOG_INFO(TAG, "OTA: no update (current=%s, latest=%s)", current_version, latest_tag);
         ota_check_in_progress = false;
         free(args);
         vTaskDelete(NULL);
         return;
     }
 
-    MY_LOG_INFO(TAG, "OTA: current=%s, target=%s", JANOS_VERSION, latest_tag);
+    MY_LOG_INFO(TAG, "OTA: current=%s, target=%s", current_version, latest_tag);
+    if (rf && (!ota_rf_layout_compatible() || ota_rf_verify_support_images(latest_tag) != ESP_OK)) {
+        MY_LOG_INFO(TAG, "OTA RF: compatibility check failed; application was not written");
+        ota_check_in_progress = false;
+        free(args);
+        vTaskDelete(NULL);
+        return;
+    }
     MY_LOG_INFO(TAG, "OTA: updating to %s", latest_tag);
     const esp_partition_t *target_part = esp_ota_get_next_update_partition(NULL);
     MY_LOG_INFO(TAG, "OTA: target partition=%s offset=0x%lx",
                 target_part ? target_part->label : "n/a",
                 target_part ? (unsigned long)target_part->address : 0UL);
     ota_led_start();
-    err = ota_perform_https_update(download_url);
+    err = ota_perform_https_update(download_url, skip_version_check ? NULL : latest_tag);
     ota_led_stop();
     if (err == ESP_OK) {
         MY_LOG_INFO(TAG, "OTA: update applied, restarting");
@@ -3554,9 +3750,8 @@ static void ota_load_channel_from_nvs(void) {
         return;
     }
 
-    if (strcasecmp(ota_channel, "main") != 0 && strcasecmp(ota_channel, "dev") != 0) {
-        snprintf(ota_channel, sizeof(ota_channel), "main");
-    }
+    const char *channel = strcasecmp(ota_channel, "dev") == 0 ? "dev" : "main";
+    snprintf(ota_channel, sizeof(ota_channel), "%s", channel);
 
     nvs_close(handle);
 }
@@ -3777,15 +3972,27 @@ static bool wdgwars_load_key_from_sd(void) {
 
 // ---------------------------------------------------
 
+static bool ota_boot_is_ready(void) {
+    return atomic_load_explicit(&ota_boot_ready, memory_order_acquire);
+}
+
 static void ota_mark_valid_if_pending(void) {
     const esp_partition_t *running = esp_ota_get_running_partition();
     if (!running) {
+        MY_LOG_INFO(TAG, "OTA: running partition unavailable; boot remains unconfirmed");
         return;
     }
 
     esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
     esp_err_t err = esp_ota_get_state_partition(running, &state);
+    if (err == ESP_ERR_NOT_FOUND) {
+        // Legacy/factory layouts can lack OTA state metadata entirely.
+        MY_LOG_INFO(TAG, "OTA: no OTA state metadata; boot ready on %s", running->label);
+        atomic_store_explicit(&ota_boot_ready, true, memory_order_release);
+        return;
+    }
     if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "OTA: state read failed: %s; boot remains unconfirmed", esp_err_to_name(err));
         return;
     }
 
@@ -3796,9 +4003,13 @@ static void ota_mark_valid_if_pending(void) {
             MY_LOG_INFO(TAG, "OTA: mark valid failed: %s", esp_err_to_name(err));
         } else {
             MY_LOG_INFO(TAG, "OTA: app marked valid");
+            atomic_store_explicit(&ota_boot_ready, true, memory_order_release);
         }
-    } else {
+    } else if (state == ESP_OTA_IMG_VALID || state == ESP_OTA_IMG_UNDEFINED) {
         MY_LOG_INFO(TAG, "OTA: running state=%d, no mark needed", (int)state);
+        atomic_store_explicit(&ota_boot_ready, true, memory_order_release);
+    } else {
+        MY_LOG_INFO(TAG, "OTA: unexpected running state=%d; boot remains unconfirmed", (int)state);
     }
 }
 
@@ -14932,16 +15143,26 @@ static int cmd_ota_check(int argc, char **argv) {
     oled_display_update_full("> OTA Update", "  Checking...", "  github.com", "  v" JANOS_VERSION " current");
     const char *tag = NULL;
     bool force_latest = false;
+    bool rf = argc >= 2 && argv[1] && strcasecmp(argv[1], "rf") == 0;
+    int version_arg = rf ? 2 : 1;
 
-    if (argc > 2) {
-        MY_LOG_INFO(TAG, "Usage: ota_check [latest|<tag>]");
+    if (argc < 1 || argc > version_arg + 1) {
+        MY_LOG_INFO(TAG, "Usage: ota_check [rf] [latest|<tag>]");
         return 1;
     }
-    if (argc == 2) {
-        if (strcasecmp(argv[1], "latest") == 0) {
+    if (argc > version_arg) {
+        if (!argv[version_arg]) return 1;
+        if (strcasecmp(argv[version_arg], "latest") == 0) {
             force_latest = true;
         } else {
-            tag = argv[1];
+            tag = argv[version_arg];
+        }
+    }
+    if (rf && tag) {
+        int major, minor, patch;
+        if (!ota_parse_version(tag, &major, &minor, &patch)) {
+            MY_LOG_INFO(TAG, "OTA RF: use latest or an exact release version; dev is not supported");
+            return 1;
         }
     }
 
@@ -14954,7 +15175,7 @@ static int cmd_ota_check(int argc, char **argv) {
         return 1;
     }
 
-    if (!ota_start_check(tag, force_latest)) {
+    if (!(rf ? ota_start_check_source(tag, force_latest, true) : ota_start_check(tag, force_latest))) {
         return 1;
     }
 
@@ -14962,8 +15183,11 @@ static int cmd_ota_check(int argc, char **argv) {
 }
 
 static int cmd_ota_list(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
+    bool rf = argc == 2 && strcasecmp(argv[1], "rf") == 0;
+    if (argc != 1 && !rf) {
+        MY_LOG_INFO(TAG, "Usage: ota_list [rf]");
+        return 1;
+    }
 
     if (!ensure_wifi_mode()) {
         MY_LOG_INFO(TAG, "OTA: WiFi not ready");
@@ -14975,12 +15199,10 @@ static int cmd_ota_list(int argc, char **argv) {
     }
 
     char api_url[256];
-    int res = snprintf(api_url, sizeof(api_url),
-                       "https://api.github.com/repos/%s/%s/releases?per_page=5",
-                       OTA_GITHUB_OWNER, OTA_GITHUB_REPO);
-    if (res < 0 || res >= (int)sizeof(api_url)) {
-        return 1;
-    }
+    if (ota_build_release_api_url(rf, NULL, true, api_url, sizeof(api_url)) != ESP_OK) return 1;
+    MY_LOG_INFO(TAG, "OTA: list source=%s repo=%s/%s", rf ? "rf" : "classic",
+                rf ? OTA_RF_GITHUB_OWNER : OTA_GITHUB_OWNER,
+                rf ? OTA_RF_GITHUB_REPO : OTA_GITHUB_REPO);
 
     char *body = NULL;
     size_t body_len = 0;
@@ -15048,11 +15270,12 @@ static int cmd_ota_channel(int argc, char **argv) {
         return 1;
     }
 
-    snprintf(ota_channel, sizeof(ota_channel), "%s", argv[1]);
-    if (!ota_save_channel_to_nvs(ota_channel)) {
+    const char *channel = strcasecmp(argv[1], "dev") == 0 ? "dev" : "main";
+    if (!ota_save_channel_to_nvs(channel)) {
         MY_LOG_INFO(TAG, "OTA: failed to save channel");
         return 1;
     }
+    snprintf(ota_channel, sizeof(ota_channel), "%s", channel);
 
     MY_LOG_INFO(TAG, "OTA channel set to: %s", ota_channel);
     return 0;
@@ -15061,6 +15284,11 @@ static int cmd_ota_channel(int argc, char **argv) {
 static int cmd_ota_info(int argc, char **argv) {
     (void)argc;
     (void)argv;
+
+    MY_LOG_INFO(TAG, "OTA default source: classic (%s/%s), channel=%s", OTA_GITHUB_OWNER, OTA_GITHUB_REPO, ota_channel);
+    MY_LOG_INFO(TAG, "OTA RF source: %s/%s (one-shot: ota_check rf <tag>)", OTA_RF_GITHUB_OWNER, OTA_RF_GITHUB_REPO);
+    MY_LOG_INFO(TAG, "OTA partition table offset: 0x%lx", (unsigned long)CONFIG_PARTITION_TABLE_OFFSET);
+    MY_LOG_INFO(TAG, "OTA RF layout: %s", ota_rf_layout_compatible() ? "compatible (release files still require verification)" : "incompatible");
 
     const esp_partition_t *boot = esp_ota_get_boot_partition();
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -15116,6 +15344,10 @@ static int cmd_ota_info(int argc, char **argv) {
 }
 
 static int cmd_ota_boot(int argc, char **argv) {
+    if (!ota_boot_is_ready()) {
+        MY_LOG_INFO(TAG, "OTA: boot confirmation incomplete; slot change rejected");
+        return 1;
+    }
     if (argc != 2) {
         MY_LOG_INFO(TAG, "Usage: ota_boot <ota_0|ota_1>");
         return 1;
@@ -25402,7 +25634,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t ota_check_cmd = {
         .command = "ota_check",
-        .help = "Check GitHub release and apply OTA update (requires WiFi)",
+        .help = "Install release: ota_check [rf] [latest|<tag>] (WiFi; explicit tag permits reinstall)",
         .hint = NULL,
         .func = &cmd_ota_check,
         .argtable = NULL
@@ -25411,7 +25643,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t ota_list_cmd = {
         .command = "ota_list",
-        .help = "List recent GitHub releases (first 10)",
+        .help = "List recent releases: ota_list [rf] (first 5; no installation)",
         .hint = NULL,
         .func = &cmd_ota_list,
         .argtable = NULL
@@ -25826,7 +26058,6 @@ void app_main(void) {
     wpasec_load_key_from_nvs();
     wigle_load_key_from_nvs();
     wdgwars_load_key_from_nvs();
-    ota_mark_valid_if_pending();
     ota_log_boot_info();
     //printf("NVS initialized OK\n");
 
@@ -25933,6 +26164,9 @@ void app_main(void) {
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&boot_button_config));
+    // Core console and boot-button input are ready. Optional SD/display/GPS/network
+    // availability is not a condition for accepting a newly booted OTA image.
+    ota_mark_valid_if_pending();
 
     if (boot_button_task_handle == NULL) {
         BaseType_t boot_task_created = xTaskCreate(

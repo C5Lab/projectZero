@@ -12,7 +12,8 @@ idf_component_register(SRCS "oled_display.c" "main.c" "attack_handshake.c"
                                 frame_analyzer hccapx_serializer pcap_serializer sniffer
                                 nrf24_jammer zig_recon capture_gateway
                                 esp_driver_uart esp_driver_gpio esp_driver_spi esp_driver_sdspi
-                                esp_lcd esp_driver_i2c)
+                                esp_lcd esp_driver_i2c
+                       PRIV_REQUIRES spi_flash bootloader_support)
 
 # Suppress strict null-pointer warnings from GCC 15 in IDF v6.0
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=nonnull)
