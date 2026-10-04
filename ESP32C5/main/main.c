@@ -628,6 +628,7 @@ typedef struct {
     bool beacon_captured;
     bool has_existing_file;     // Already captured on SD
     int64_t last_deauth_us;
+    int64_t first_seen_us;      // FIFO: first discovery time, not refreshed on beacon updates
 } hs_ap_target_t;
 
 // Client discovered by sniffing
@@ -6243,6 +6244,11 @@ static void blackout_attack_task(void *pvParameters) {
 
 // Helper function to check if handshake file already exists for a given SSID
 static bool check_handshake_file_exists(const char *ssid) {
+    // Empty SSID (hidden AP): strncmp(name, "", 0) matches every file. Use BSSID check instead.
+    if (!ssid || ssid[0] == '\0') {
+        return false;
+    }
+
     char ssid_safe[33];
     
     // Sanitize SSID for filename
@@ -7579,21 +7585,77 @@ static int hs_find_ap(const uint8_t *bssid) {
     return -1;
 }
 
+static bool hs_ap_has_partial_hs(const hs_ap_target_t *ap) {
+    if (!ap || ap->complete) return false;
+    return ap->captured_m1 || ap->captured_m2 || ap->captured_m3 || ap->captured_m4;
+}
+
+// Reuse a slot in place so other clients' hs_ap_index values stay valid.
+static void hs_evict_ap_slot(int idx) {
+    if (idx < 0 || idx >= hs_ap_count || !hs_ap_targets) return;
+    if (hs_clients) {
+        for (int i = 0; i < hs_client_count; i++) {
+            if (hs_clients[i].hs_ap_index == idx) {
+                hs_clients[i].hs_ap_index = -1;
+            }
+        }
+    }
+    memset(&hs_ap_targets[idx], 0, sizeof(hs_ap_target_t));
+}
+
+// Oldest first_seen_us; skip in-progress EAPOL unless every slot is partial.
+static int hs_pick_fifo_victim(void) {
+    if (hs_ap_count <= 0 || !hs_ap_targets) return -1;
+
+    int eligible = -1;
+    int64_t eligible_seen = 0;
+    int any = -1;
+    int64_t any_seen = 0;
+
+    for (int i = 0; i < hs_ap_count; i++) {
+        int64_t seen = hs_ap_targets[i].first_seen_us;
+        if (any < 0 || seen < any_seen) {
+            any = i;
+            any_seen = seen;
+        }
+        if (!hs_ap_has_partial_hs(&hs_ap_targets[i])) {
+            if (eligible < 0 || seen < eligible_seen) {
+                eligible = i;
+                eligible_seen = seen;
+            }
+        }
+    }
+
+    return (eligible >= 0) ? eligible : any;
+}
+
 // Add or update AP from beacon. Returns index.
 static int hs_add_or_update_ap(const uint8_t *bssid, const char *ssid, uint8_t channel,
                                 wifi_auth_mode_t authmode, int rssi) {
     int idx = hs_find_ap(bssid);
     if (idx >= 0) {
-        // Update existing
+        // Update existing — do not refresh first_seen_us (FIFO by first discovery)
         if (ssid && ssid[0]) strncpy(hs_ap_targets[idx].ssid, ssid, 32);
         hs_ap_targets[idx].channel = channel;
         hs_ap_targets[idx].rssi = rssi;
         if (authmode != WIFI_AUTH_OPEN) hs_ap_targets[idx].authmode = authmode;
         return idx;
     }
-    if (hs_ap_count >= HS_MAX_APS) return -1;
-    
-    idx = hs_ap_count++;
+
+    if (hs_ap_count >= HS_MAX_APS) {
+        idx = hs_pick_fifo_victim();
+        if (idx < 0) return -1;
+        MY_LOG_INFO(TAG, "FIFO evict '%s' (%02X:%02X:%02X:%02X:%02X:%02X) for '%s'",
+                    hs_ap_targets[idx].ssid,
+                    hs_ap_targets[idx].bssid[0], hs_ap_targets[idx].bssid[1],
+                    hs_ap_targets[idx].bssid[2], hs_ap_targets[idx].bssid[3],
+                    hs_ap_targets[idx].bssid[4], hs_ap_targets[idx].bssid[5],
+                    ssid ? ssid : "");
+        hs_evict_ap_slot(idx);
+    } else {
+        idx = hs_ap_count++;
+    }
+
     memcpy(hs_ap_targets[idx].bssid, bssid, 6);
     if (ssid) strncpy(hs_ap_targets[idx].ssid, ssid, 32);
     hs_ap_targets[idx].ssid[32] = '\0';
@@ -7607,6 +7669,7 @@ static int hs_add_or_update_ap(const uint8_t *bssid, const char *ssid, uint8_t c
     hs_ap_targets[idx].complete = false;
     hs_ap_targets[idx].beacon_captured = false;
     hs_ap_targets[idx].last_deauth_us = 0;
+    hs_ap_targets[idx].first_seen_us = esp_timer_get_time();
     
     // Check if we already have a handshake file for this network
     hs_ap_targets[idx].has_existing_file = 
@@ -7615,8 +7678,15 @@ static int hs_add_or_update_ap(const uint8_t *bssid, const char *ssid, uint8_t c
     
     if (hs_ap_targets[idx].has_existing_file) {
         // Tab5 parses: strstr("Skipping") && strstr("PCAP already exists")
-        MY_LOG_INFO(TAG, "Skipping '%s' - PCAP already exists", 
-                   hs_ap_targets[idx].ssid);
+        if (hs_ap_targets[idx].ssid[0]) {
+            MY_LOG_INFO(TAG, "Skipping '%s' - PCAP already exists",
+                       hs_ap_targets[idx].ssid);
+        } else {
+            MY_LOG_INFO(TAG, "Skipping hidden %02X:%02X:%02X:%02X:%02X:%02X - PCAP already exists",
+                       hs_ap_targets[idx].bssid[0], hs_ap_targets[idx].bssid[1],
+                       hs_ap_targets[idx].bssid[2], hs_ap_targets[idx].bssid[3],
+                       hs_ap_targets[idx].bssid[4], hs_ap_targets[idx].bssid[5]);
+        }
     }
     
     return idx;
