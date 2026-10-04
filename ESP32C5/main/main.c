@@ -2120,8 +2120,24 @@ static bool init_psram_buffers(void)
 #define VENDOR_RECORD_NAME_BYTES (VENDOR_RECORD_SIZE - 4)
 #define MAX_VENDOR_NAME_LEN (VENDOR_RECORD_NAME_BYTES + 1)
 #define SD_OUI_BIN_PATH "/sdcard/lab/oui_wifi.bin"
+#define SD_MISSING_VENDOR_PATH "/sdcard/lab/missing_vendor.txt"
 #define VENDOR_NVS_NAMESPACE "vendorcfg"
 #define VENDOR_NVS_KEY_ENABLED "enabled"
+#define VENDOR_NVS_KEY_LOGMISS "logmiss"
+
+// --- vendor binary format v2 (string-interned, forward-compatible) ---
+// Layout: [16B header][index: record_count * entry(OUI[3]+nameOff u24 LE)]
+//         [name table: (len u8 + utf8 bytes) blobs, deduplicated]
+// Legacy v1 = headerless, fixed 64B records; detected by absence of magic.
+#define VENDOR_V2_MAGIC "JVND"
+#define VENDOR_V2_HEADER_SIZE 16
+#define VENDOR_V2_INDEX_ENTRY_SIZE 6   // OUI[3] + name offset u24 LE
+#define VENDOR_FMT_NONE 0
+#define VENDOR_FMT_V1   1
+#define VENDOR_FMT_V2   2
+
+// Unknown-vendor collector: in-RAM dedup set of OUIs already logged
+#define VENDOR_MISSING_SEEN_MAX 256
 #define GPS_NVS_NAMESPACE "gpscfg"
 #define GPS_NVS_KEY_MODULE "module"
 
@@ -2179,6 +2195,17 @@ static bool vendor_last_valid = false;
 static bool vendor_last_hit = false;
 static bool vendor_lookup_enabled = false;
 static size_t vendor_record_count = 0;
+// Persistent handle + format state (opened once in ensure_vendor_file_checked)
+static FILE *vendor_fp = NULL;
+static int vendor_format = VENDOR_FMT_NONE;
+static size_t vendor_entry_size = VENDOR_RECORD_SIZE; // v1: 64, v2: 6
+static uint32_t vendor_names_offset = 0;              // v2 only
+static uint8_t *vendor_index = NULL;                  // v2 index cached in PSRAM (NULL = read from file)
+// Unknown-vendor collector
+static bool vendor_log_missing = false;
+static uint8_t vendor_missing_seen[VENDOR_MISSING_SEEN_MAX][3];
+static int vendor_missing_seen_count = 0;
+static void vendor_release_resources(void);
 static display_type_t display_forced_mode = DISPLAY_NONE; /* DISPLAY_NONE = auto */
 
 
@@ -4735,6 +4762,9 @@ static void vendor_persist_state(void) {
     uint8_t value = vendor_lookup_enabled ? 1 : 0;
     err = nvs_set_u8(handle, VENDOR_NVS_KEY_ENABLED, value);
     if (err == ESP_OK) {
+        err = nvs_set_u8(handle, VENDOR_NVS_KEY_LOGMISS, vendor_log_missing ? 1 : 0);
+    }
+    if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
     if (err != ESP_OK) {
@@ -4761,6 +4791,14 @@ static void vendor_load_state_from_nvs(void) {
     } else if (err != ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGW(TAG, "Vendor NVS get failed: %s", esp_err_to_name(err));
     }
+
+    uint8_t logmiss = vendor_log_missing ? 1 : 0;
+    err = nvs_get_u8(handle, VENDOR_NVS_KEY_LOGMISS, &logmiss);
+    if (err == ESP_OK) {
+        vendor_log_missing = logmiss != 0;
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "Vendor NVS get logmiss failed: %s", esp_err_to_name(err));
+    }
     nvs_close(handle);
 }
 
@@ -4776,6 +4814,8 @@ static esp_err_t vendor_set_enabled(bool enabled) {
     vendor_file_checked = false;
     vendor_file_present = false;
     vendor_record_count = 0;
+    vendor_missing_seen_count = 0;   // reset dedup set so a new session re-logs
+    vendor_release_resources();      // close handle / free PSRAM index
     vendor_persist_state();
     return ESP_OK;
 }
@@ -5337,39 +5377,162 @@ static void boot_handle_action(bool is_long_press) {
     }
 }
 
+// Little-endian readers for the v2 on-disk format
+static inline uint32_t vendor_rd_u24(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+}
+static inline uint32_t vendor_rd_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void vendor_release_resources(void) {
+    if (vendor_fp) {
+        fclose(vendor_fp);
+        vendor_fp = NULL;
+    }
+    if (vendor_index) {
+        heap_caps_free(vendor_index);
+        vendor_index = NULL;
+    }
+    vendor_format = VENDOR_FMT_NONE;
+    vendor_entry_size = VENDOR_RECORD_SIZE;
+    vendor_names_offset = 0;
+}
+
+static bool vendor_missing_already_seen(const uint8_t *oui) {
+    for (int i = 0; i < vendor_missing_seen_count; i++) {
+        if (memcmp(vendor_missing_seen[i], oui, 3) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Append an unresolved OUI to /sdcard/lab/missing_vendor.txt once per unique
+// prefix, for offline analysis. Gated by `vendor log on`; only reached on a real
+// not-found (file present, OUI absent) and after LAA MACs were already skipped.
+static void vendor_note_missing(const uint8_t *mac) {
+    if (!vendor_log_missing || !vendor_file_present) {
+        return;
+    }
+    if (vendor_missing_already_seen(mac)) {
+        return;
+    }
+    if (vendor_missing_seen_count >= VENDOR_MISSING_SEEN_MAX) {
+        return; // dedup set full: stop logging to protect the SD card
+    }
+    memcpy(vendor_missing_seen[vendor_missing_seen_count++], mac, 3);
+
+    FILE *mf = fopen(SD_MISSING_VENDOR_PATH, "a");
+    if (!mf) {
+        return;
+    }
+    fprintf(mf, "%02X:%02X:%02X,%02X:%02X:%02X:%02X:%02X:%02X,%lld\n",
+            mac[0], mac[1], mac[2],
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            (long long)(esp_timer_get_time() / 1000));
+    fclose(mf);
+}
+
 static void ensure_vendor_file_checked(void) {
     if (vendor_file_checked) {
         return;
     }
     if (!sd_card_mounted) {
         // SD card not ready yet, defer lookup until later
-        vendor_file_checked = false;
         vendor_file_present = false;
         vendor_record_count = 0;
         return;
     }
+
+    vendor_release_resources();
+    vendor_file_present = false;
+    vendor_record_count = 0;
+
     FILE *file = fopen(SD_OUI_BIN_PATH, "rb");
-    if (file) {
-        vendor_file_present = true;
-        if (fseek(file, 0, SEEK_END) == 0) {
-            long file_size = ftell(file);
-            if (file_size >= (long)VENDOR_RECORD_SIZE) {
-                vendor_record_count = (size_t)file_size / VENDOR_RECORD_SIZE;
-            } else {
-                vendor_record_count = 0;
-            }
-        } else {
-            vendor_record_count = 0;
-        }
-        MY_LOG_INFO(TAG, "Vendor binary file detected (%u entries)", (unsigned int)vendor_record_count);
-        fclose(file);
-        if (vendor_record_count == 0) {
-            vendor_file_present = false;
-        }
-    } else {
-        vendor_file_present = false;
-        vendor_record_count = 0;
+    if (!file) {
         MY_LOG_INFO(TAG, "Vendor binary file not found");
+        vendor_file_checked = true;
+        vendor_last_valid = false;
+        vendor_last_hit = false;
+        vendor_lookup_buffer[0] = '\0';
+        return;
+    }
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        vendor_file_checked = true;
+        return;
+    }
+    long file_size = ftell(file);
+
+    // Detect v2 by magic header; anything else is treated as legacy v1.
+    uint8_t header[VENDOR_V2_HEADER_SIZE];
+    bool is_v2 = false;
+    if (file_size >= (long)VENDOR_V2_HEADER_SIZE &&
+        fseek(file, 0, SEEK_SET) == 0 &&
+        fread(header, 1, VENDOR_V2_HEADER_SIZE, file) == VENDOR_V2_HEADER_SIZE &&
+        memcmp(header, VENDOR_V2_MAGIC, 4) == 0 &&
+        header[4] == VENDOR_FMT_V2) {
+        is_v2 = true;
+    }
+
+    if (is_v2) {
+        vendor_format = VENDOR_FMT_V2;
+        vendor_entry_size = header[6] ? header[6] : VENDOR_V2_INDEX_ENTRY_SIZE;
+        vendor_record_count = vendor_rd_u32(&header[8]);
+        vendor_names_offset = vendor_rd_u32(&header[12]);
+
+        uint64_t index_bytes = (uint64_t)vendor_record_count * vendor_entry_size;
+        if (vendor_names_offset < VENDOR_V2_HEADER_SIZE + index_bytes ||
+            (long)vendor_names_offset > file_size) {
+            MY_LOG_INFO(TAG, "Vendor v2 header inconsistent, ignoring file");
+            fclose(file);
+            vendor_format = VENDOR_FMT_NONE;
+            vendor_record_count = 0;
+            vendor_file_checked = true;
+            return;
+        }
+
+        // Cache the whole index in PSRAM so lookups never touch the SD for the
+        // search itself (names are still fetched on a hit). Falls back to
+        // reading the index from the file when the allocation fails.
+        if (index_bytes > 0 && index_bytes < (64ull * 1024 * 1024)) {
+            uint8_t *idx = heap_caps_malloc((size_t)index_bytes, MALLOC_CAP_SPIRAM);
+            if (!idx) {
+                idx = heap_caps_malloc((size_t)index_bytes, MALLOC_CAP_8BIT);
+            }
+            if (idx) {
+                if (fseek(file, VENDOR_V2_HEADER_SIZE, SEEK_SET) == 0 &&
+                    fread(idx, 1, (size_t)index_bytes, file) == (size_t)index_bytes) {
+                    vendor_index = idx;
+                } else {
+                    heap_caps_free(idx);
+                }
+            }
+        }
+
+        vendor_file_present = (vendor_record_count > 0);
+        vendor_fp = file; // kept open for name fetches / uncached index reads
+        MY_LOG_INFO(TAG, "Vendor v2 loaded (%u entries, index %s)",
+                    (unsigned int)vendor_record_count,
+                    vendor_index ? "in PSRAM" : "on SD");
+    } else {
+        // Legacy v1: headerless, fixed 64-byte records
+        vendor_format = VENDOR_FMT_V1;
+        vendor_entry_size = VENDOR_RECORD_SIZE;
+        vendor_record_count = (file_size >= (long)VENDOR_RECORD_SIZE)
+                                  ? (size_t)file_size / VENDOR_RECORD_SIZE
+                                  : 0;
+        vendor_file_present = (vendor_record_count > 0);
+        vendor_fp = file;
+        MY_LOG_INFO(TAG, "Vendor v1 loaded (%u entries)",
+                    (unsigned int)vendor_record_count);
+    }
+
+    if (!vendor_file_present) {
+        vendor_release_resources();
     }
     vendor_file_checked = true;
     vendor_last_valid = false;
@@ -5377,80 +5540,141 @@ static void ensure_vendor_file_checked(void) {
     vendor_lookup_buffer[0] = '\0';
 }
 
-static const char* lookup_vendor_name(const uint8_t *bssid) {
-    if (!vendor_lookup_enabled || !bssid) {
+static const char* lookup_vendor_name(const uint8_t *mac) {
+    if (!vendor_lookup_enabled || !mac) {
         vendor_last_valid = false;
         return NULL;
     }
 
-    if (vendor_last_valid && memcmp(vendor_last_oui, bssid, 3) == 0) {
+    // Locally-administered / randomized MACs (bit 1 of the first octet) are not
+    // real IEEE OUIs and can never resolve. Skip before any SD access — this is
+    // the bulk of lookups during sniffing (phone privacy MACs).
+    if (mac[0] & 0x02) {
+        vendor_last_valid = false;
+        return NULL;
+    }
+
+    if (vendor_last_valid && memcmp(vendor_last_oui, mac, 3) == 0) {
         return vendor_last_hit ? vendor_lookup_buffer : NULL;
     }
 
     ensure_vendor_file_checked();
-    if (!vendor_file_present) {
+    if (!vendor_file_present || vendor_record_count == 0) {
         vendor_last_valid = false;
         return NULL;
     }
 
-    FILE *file = fopen(SD_OUI_BIN_PATH, "rb");
-    if (!file) {
-        vendor_file_present = false;
+    bool found = false;
+    bool io_error = false;
+
+    if (vendor_format == VENDOR_FMT_V2) {
+        size_t low = 0, high = vendor_record_count;
+        uint8_t entry[VENDOR_V2_INDEX_ENTRY_SIZE];
+        uint32_t name_off = 0;
+        while (low < high) {
+            size_t mid = low + (high - low) / 2;
+            const uint8_t *e;
+            if (vendor_index) {
+                e = vendor_index + mid * vendor_entry_size;
+            } else {
+                long off = (long)(VENDOR_V2_HEADER_SIZE + mid * vendor_entry_size);
+                if (!vendor_fp || fseek(vendor_fp, off, SEEK_SET) != 0 ||
+                    fread(entry, 1, VENDOR_V2_INDEX_ENTRY_SIZE, vendor_fp)
+                        != VENDOR_V2_INDEX_ENTRY_SIZE) {
+                    io_error = true;
+                    break;
+                }
+                e = entry;
+            }
+            int cmp = memcmp(e, mac, 3);
+            if (cmp == 0) {
+                name_off = vendor_rd_u24(e + 3);
+                found = true;
+                break;
+            } else if (cmp < 0) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        if (found) {
+            uint8_t len = 0;
+            if (vendor_fp &&
+                fseek(vendor_fp, (long)(vendor_names_offset + name_off), SEEK_SET) == 0 &&
+                fread(&len, 1, 1, vendor_fp) == 1) {
+                if (len > MAX_VENDOR_NAME_LEN - 1) {
+                    len = MAX_VENDOR_NAME_LEN - 1;
+                }
+                size_t got = fread(vendor_lookup_buffer, 1, len, vendor_fp);
+                vendor_lookup_buffer[got] = '\0';
+            } else {
+                io_error = true;
+                found = false;
+            }
+        }
+    } else { // VENDOR_FMT_V1
+        size_t low = 0, high = vendor_record_count;
+        uint8_t record[VENDOR_RECORD_SIZE];
+        while (low < high) {
+            size_t mid = low + (high - low) / 2;
+            long offset = (long)(mid * VENDOR_RECORD_SIZE);
+            if (!vendor_fp || fseek(vendor_fp, offset, SEEK_SET) != 0 ||
+                fread(record, 1, VENDOR_RECORD_SIZE, vendor_fp) != VENDOR_RECORD_SIZE) {
+                io_error = true;
+                break;
+            }
+            int cmp = memcmp(record, mac, 3);
+            if (cmp == 0) {
+                uint8_t name_len = record[3];
+                if (name_len > VENDOR_RECORD_NAME_BYTES) {
+                    name_len = VENDOR_RECORD_NAME_BYTES;
+                }
+                memcpy(vendor_lookup_buffer, &record[4], name_len);
+                vendor_lookup_buffer[name_len] = '\0';
+                found = true;
+                break;
+            } else if (cmp < 0) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+    }
+
+    if (io_error) {
+        // Handle may have gone stale (SD remounted) — force a re-open next time.
+        vendor_release_resources();
         vendor_file_checked = false;
         vendor_last_valid = false;
         return NULL;
     }
 
-    if (vendor_record_count == 0) {
-        fclose(file);
-        vendor_last_valid = false;
-        return NULL;
-    }
-
-    size_t low = 0;
-    size_t high = vendor_record_count;
-    uint8_t record[VENDOR_RECORD_SIZE];
-    bool found = false;
-    while (low < high) {
-        size_t mid = low + (high - low) / 2;
-        long offset = (long)(mid * VENDOR_RECORD_SIZE);
-        if (fseek(file, offset, SEEK_SET) != 0) {
-            break;
-        }
-        if (fread(record, 1, VENDOR_RECORD_SIZE, file) != VENDOR_RECORD_SIZE) {
-            break;
-        }
-
-        int cmp = memcmp(record, bssid, 3);
-        if (cmp == 0) {
-            uint8_t name_len = record[3];
-            if (name_len > VENDOR_RECORD_NAME_BYTES) {
-                name_len = VENDOR_RECORD_NAME_BYTES;
-            }
-            memcpy(vendor_lookup_buffer, &record[4], name_len);
-            vendor_lookup_buffer[name_len] = '\0';
-            memcpy(vendor_last_oui, bssid, 3);
-            vendor_last_valid = true;
-            vendor_last_hit = true;
-            found = true;
-            break;
-        } else if (cmp < 0) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-
-    fclose(file);
+    memcpy(vendor_last_oui, mac, 3);
+    vendor_last_valid = true;
+    vendor_last_hit = found;
     if (found) {
         return vendor_lookup_buffer;
     }
 
-    memcpy(vendor_last_oui, bssid, 3);
-    vendor_last_valid = true;
-    vendor_last_hit = false;
     vendor_lookup_buffer[0] = '\0';
+    vendor_note_missing(mac);
     return NULL;
+}
+
+// Human-readable vendor label for list/sniffer views. Distinguishes three cases:
+//   real OUI -> manufacturer name
+//   locally-administered MAC (bit 0x02) -> "random" (phone privacy / virtual BSSID)
+//   real OUI not in the database -> "Unknown"
+// (CSV scan output stays on the raw name/"" to keep the host parser unchanged.)
+static const char* vendor_label(const uint8_t *mac) {
+    const char *name = lookup_vendor_name(mac);
+    if (name) {
+        return name;
+    }
+    if (mac && (mac[0] & 0x02)) {
+        return "random";
+    }
+    return "Unknown";
 }
 
 
@@ -15715,10 +15939,10 @@ static int cmd_list_hosts_vendor(int argc, char **argv) {
         tmp.addr = hosts[i].ip_addr;
         uint8_t *m = hosts[i].mac;
         if (hosts[i].mac_known) {
-            const char *vendor = lookup_vendor_name(m);
+            const char *vendor = vendor_label(m);
             MY_LOG_INFO(TAG, "  " IPSTR "  ->  %02X:%02X:%02X:%02X:%02X:%02X  [%s]  [ARP]",
                 IP2STR(&tmp), m[0], m[1], m[2], m[3], m[4], m[5],
-                vendor ? vendor : "Unknown");
+                vendor);
             arp_cnt++;
         } else {
             MY_LOG_INFO(TAG, "  " IPSTR "  ->  (MAC unknown)  [ICMP]", IP2STR(&tmp));
@@ -17735,19 +17959,19 @@ static int cmd_show_sniffer_results_vendor(int argc, char **argv) {
         displayed_count++;
         
         // Print AP info in compact format: SSID, CH: CLIENT_COUNT [Vendor]
-        const char *ap_vendor = lookup_vendor_name(ap->bssid);
+        const char *ap_vendor = vendor_label(ap->bssid);
         printf("%s, CH%d: %d [%s]\n", ap->ssid, ap->channel, ap->client_count,
-               ap_vendor ? ap_vendor : "Unknown");
+               ap_vendor);
         
         // Print each client MAC on a separate line with 1 space indentation and vendor
         if (ap->client_count > 0) {
             for (int j = 0; j < ap->client_count; j++) {
                 sniffer_client_t *client = &ap->clients[j];
-                const char *client_vendor = lookup_vendor_name(client->mac);
+                const char *client_vendor = vendor_label(client->mac);
                 printf(" %02X:%02X:%02X:%02X:%02X:%02X [%s]\n",
                        client->mac[0], client->mac[1], client->mac[2],
                        client->mac[3], client->mac[4], client->mac[5],
-                       client_vendor ? client_vendor : "Unknown");
+                       client_vendor);
             }
         }
         
@@ -17813,12 +18037,12 @@ static int cmd_show_probes_vendor(int argc, char **argv) {
     // Display each probe request with vendor: SSID (MAC) [Vendor]
     for (int i = 0; i < probe_request_count; i++) {
         probe_request_t *probe = &probe_requests[i];
-        const char *vendor_name = lookup_vendor_name(probe->mac);
+        const char *vendor_name = vendor_label(probe->mac);
         printf("%s (%02X:%02X:%02X:%02X:%02X:%02X) [%s]\n",
                probe->ssid,
                probe->mac[0], probe->mac[1], probe->mac[2],
                probe->mac[3], probe->mac[4], probe->mac[5],
-               vendor_name ? vendor_name : "Unknown");
+               vendor_name);
         
         vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to avoid overwhelming UART
     }
@@ -17887,8 +18111,8 @@ static int cmd_list_probes_vendor(int argc, char **argv) {
         // If not displayed yet, display it
         if (!already_displayed) {
             unique_count++;
-            const char *vendor_name = lookup_vendor_name(probe->mac);
-            printf("%d %s [%s]\n", unique_count, probe->ssid, vendor_name ? vendor_name : "Unknown");
+            const char *vendor_name = vendor_label(probe->mac);
+            printf("%d %s [%s]\n", unique_count, probe->ssid, vendor_name);
             
             vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to avoid overwhelming UART
         }
@@ -18511,7 +18735,7 @@ static int cmd_boot_button(int argc, char **argv) {
 
 static int cmd_vendor(int argc, char **argv) {
     if (argc < 2) {
-        MY_LOG_INFO(TAG, "Usage: vendor set <on|off> | vendor read");
+        MY_LOG_INFO(TAG, "Usage: vendor set <on|off> | vendor log <on|off> | vendor read");
         return 1;
     }
 
@@ -18549,6 +18773,26 @@ static int cmd_vendor(int argc, char **argv) {
         return 0;
     }
 
+    if (strcasecmp(argv[1], "log") == 0) {
+        if (argc < 3) {
+            MY_LOG_INFO(TAG, "Usage: vendor log <on|off>");
+            return 1;
+        }
+        if (strcasecmp(argv[2], "on") == 0) {
+            vendor_log_missing = true;
+        } else if (strcasecmp(argv[2], "off") == 0) {
+            vendor_log_missing = false;
+        } else {
+            MY_LOG_INFO(TAG, "Usage: vendor log <on|off>");
+            return 1;
+        }
+        vendor_missing_seen_count = 0;   // fresh dedup set
+        vendor_persist_state();
+        MY_LOG_INFO(TAG, "Missing-vendor log: %s -> %s",
+                    vendor_log_missing ? "on" : "off", SD_MISSING_VENDOR_PATH);
+        return 0;
+    }
+
     if (strcasecmp(argv[1], "read") == 0) {
         if (vendor_is_enabled() && sd_card_mounted) {
             ensure_vendor_file_checked();
@@ -18558,15 +18802,17 @@ static int cmd_vendor(int argc, char **argv) {
             if (!sd_card_mounted) {
                 MY_LOG_INFO(TAG, "Vendor file: waiting for SD card");
             } else {
-                MY_LOG_INFO(TAG, "Vendor file: %s (%u entries)",
+                MY_LOG_INFO(TAG, "Vendor file: %s (%u entries, format v%d)",
                             vendor_file_present ? "available" : "missing",
-                            (unsigned int)vendor_record_count);
+                            (unsigned int)vendor_record_count,
+                            vendor_format);
             }
         }
+        MY_LOG_INFO(TAG, "Missing-vendor log: %s", vendor_log_missing ? "on" : "off");
         return 0;
     }
 
-    MY_LOG_INFO(TAG, "Usage: vendor set <on|off> | vendor read");
+    MY_LOG_INFO(TAG, "Usage: vendor set <on|off> | vendor log <on|off> | vendor read");
     return 1;
 }
 
