@@ -106,6 +106,7 @@
 #include "frame_analyzer_parser.h"
 #include "frame_analyzer_types.h"
 #include "sniffer.h"
+#include "sniffer_extended.h"
 #include "oled_display.h"
 #include "nrf24_jammer.h"
 #include "zig_recon.h"
@@ -269,6 +270,8 @@ typedef struct {
     uint8_t mac[6];
     int rssi;
     uint32_t last_seen;
+    int rx_rssi;
+    bool rx_rssi_known;
 } sniffer_client_t;
 
 typedef struct {
@@ -280,6 +283,11 @@ typedef struct {
     sniffer_client_t clients[MAX_CLIENTS_PER_AP];
     int client_count;
     uint32_t last_seen;
+    sx_ap_t extended;
+    int rx_rssi;
+    bool rx_rssi_known;
+    uint32_t rx_last_seen;
+    bool rx_seen;
 } sniffer_ap_t;
 
 // GPS data structure
@@ -358,7 +366,7 @@ static uint8_t arp_ban_gateway_mac[6];
 static ip4_addr_t arp_ban_gateway_ip;
 
 // Sniffer state (allocated in PSRAM)
-static sniffer_ap_t *sniffer_aps = NULL;                    // ~75 KB in PSRAM
+static sniffer_ap_t *sniffer_aps = NULL;                    // bounded AP/client/extension table in PSRAM
 static int sniffer_ap_count = 0;
 static volatile bool sniffer_active = false;
 static volatile bool sniffer_scan_phase = false;
@@ -409,6 +417,20 @@ static TaskHandle_t channel_view_task_handle = NULL;
 // Probe request storage (allocated in PSRAM)
 static probe_request_t *probe_requests = NULL;              // ~9.4 KB in PSRAM
 static int probe_request_count = 0;
+/* All sniffer table writers and readers share this mutex. RX never waits. */
+static SemaphoreHandle_t sniffer_data_mutex;
+typedef struct {
+    uint32_t rx, mgmt, data, bad_length, rx_error, selected_reject, matched, short_dump, zero_dump;
+    uint16_t last_sig_len, last_dump_len;
+    uint8_t last_rx_state, last_channel;
+    uint32_t assoc_rx, reassoc_rx, probe_resp_rx;
+    uint32_t request_rejected, request_incomplete, request_untracked, request_named;
+    uint8_t last_request_bssid[6], last_request_ssid_len;
+    uint16_t last_request_sig_len, last_request_dump_len;
+    bool last_request_parsed, last_request_complete;
+} sniffer_rx_diagnostics_t;
+static sniffer_rx_diagnostics_t sniffer_rx_diagnostics;
+static atomic_uint sniffer_rx_lock_busy;
 
 // Channel hopping for sniffer (like Marauder dual-band)
 static int sniffer_current_channel = 1;
@@ -419,7 +441,7 @@ static const int sniffer_channel_hop_delay_ms = 250; // 250ms per channel like M
 static volatile uint32_t sniff_oled_packets = 0;
 static volatile bool sniff_oled_dirty = false;
 static TaskHandle_t sniffer_channel_task_handle = NULL;
-static uint32_t sniffer_packet_counter = 0;
+static atomic_uint_least32_t sniffer_packet_counter = 0;
 static uint32_t sniffer_last_debug_packet = 0;
 
 // PCAP capture state
@@ -2089,6 +2111,7 @@ static int whitelistedBssidsCount = 0;
 
 static bool init_psram_buffers(void)
 {
+    sniffer_data_mutex = xSemaphoreCreateMutex();
     sniffer_aps = heap_caps_calloc(MAX_SNIFFER_APS, sizeof(sniffer_ap_t), MALLOC_CAP_SPIRAM);
     probe_requests = heap_caps_calloc(MAX_PROBE_REQUESTS, sizeof(probe_request_t), MALLOC_CAP_SPIRAM);
     bt_found_devices = heap_caps_calloc(BT_INITIAL_CAPACITY, sizeof(*bt_found_devices), MALLOC_CAP_SPIRAM);
@@ -2105,7 +2128,7 @@ static bool init_psram_buffers(void)
     wdp_seen_networks = heap_caps_calloc(WDP_INITIAL_CAPACITY, sizeof(wdp_network_t), MALLOC_CAP_SPIRAM);
     wdp_seen_capacity = WDP_INITIAL_CAPACITY;
     
-    if (!sniffer_aps || !probe_requests || !bt_found_devices || !bt_devices || !wardrive_scan_results ||
+    if (!sniffer_data_mutex || !sniffer_aps || !probe_requests || !bt_found_devices || !bt_devices || !wardrive_scan_results ||
         !handshake_targets || !sd_html_files || !target_bssids || !whiteListedBssids || !selected_stations ||
         !hs_ap_targets || !hs_clients || !ducb_channels || !wdp_seen_networks) {
         MY_LOG_INFO(TAG, "PSRAM allocation failed!");
@@ -17837,17 +17860,39 @@ static int cmd_start_sniffer_noscan(int argc, char **argv) {
     return 0;
 }
 
+static sniffer_ap_t *sniffer_take_snapshot(int *count, uint32_t *now) {
+    /* Allocate before locking; no UART, vendor lookup or radio operations under lock. */
+    sniffer_ap_t *copy = heap_caps_malloc(MAX_SNIFFER_APS * sizeof(*copy), MALLOC_CAP_SPIRAM);
+    if (!copy) return NULL;
+    xSemaphoreTake(sniffer_data_mutex, portMAX_DELAY);
+    *count = sniffer_ap_count;
+    *now = (uint32_t)(esp_timer_get_time() / 1000);
+    memcpy(copy, sniffer_aps, (size_t)*count * sizeof(*copy));
+    xSemaphoreGive(sniffer_data_mutex);
+    return copy;
+}
+
 static int cmd_show_sniffer_results(int argc, char **argv) {
-    (void)argc; (void)argv;
+    const bool extended = argc == 2 && strcmp(argv[1], "extended") == 0;
+    int sniffer_ap_count = 0;
+    uint32_t now = 0;
+    char suffix[SX_AP_SUFFIX_BYTES] = {0};
+    sniffer_ap_t *sniffer_aps = sniffer_take_snapshot(&sniffer_ap_count, &now);
+    if (!sniffer_aps) {
+        MY_LOG_INFO(TAG, "Cannot allocate sniffer snapshot.");
+        return 1;
+    }
     
     // Allow showing results even after sniffer is stopped
     if (sniffer_active && sniffer_scan_phase) {
         MY_LOG_INFO(TAG, "Sniffer is still scanning networks. Please wait...");
+        free(sniffer_aps);
         return 0;
     }
     
     if (sniffer_ap_count == 0) {
         MY_LOG_INFO(TAG, "No sniffer data available. Use 'start_sniffer' to collect data.");
+        free(sniffer_aps);
         return 0;
     }
     
@@ -17886,16 +17931,22 @@ static int cmd_show_sniffer_results(int argc, char **argv) {
         
         displayed_count++;
         
+        if (extended) {
+            sx_format_ap(suffix, sizeof(suffix), &ap->extended, ap->bssid,
+                         ap->rx_rssi, ap->rx_rssi_known,
+                         ap->rx_seen ? ap->rx_last_seen : ap->last_seen, true, now);
+        }
         // Print AP info in compact format: SSID, CH: CLIENT_COUNT
-        printf("%s, CH%d: %d\n", ap->ssid, ap->channel, ap->client_count);
+        printf("%s, CH%d: %d%s\n", ap->ssid, ap->channel, ap->client_count, suffix);
         
         // Print each client MAC on a separate line with 1 space indentation
         if (ap->client_count > 0) {
             for (int j = 0; j < ap->client_count; j++) {
                 sniffer_client_t *client = &ap->clients[j];
-                printf(" %02X:%02X:%02X:%02X:%02X:%02X\n",
+                if (extended) sx_format_client(suffix, sizeof(suffix), client->rx_rssi, client->rx_rssi_known, client->last_seen, now);
+                printf(" %02X:%02X:%02X:%02X:%02X:%02X%s\n",
                        client->mac[0], client->mac[1], client->mac[2],
-                       client->mac[3], client->mac[4], client->mac[5]);
+                       client->mac[3], client->mac[4], client->mac[5], suffix);
             }
         }
         
@@ -17906,20 +17957,31 @@ static int cmd_show_sniffer_results(int argc, char **argv) {
         MY_LOG_INFO(TAG, "No APs with clients found.");
     }
     
+    free(sniffer_aps);
     return 0;
 }
 
 static int cmd_show_sniffer_results_vendor(int argc, char **argv) {
-    (void)argc; (void)argv;
+    const bool extended = argc == 2 && strcmp(argv[1], "extended") == 0;
+    int sniffer_ap_count = 0;
+    uint32_t now = 0;
+    char suffix[SX_AP_SUFFIX_BYTES] = {0};
+    sniffer_ap_t *sniffer_aps = sniffer_take_snapshot(&sniffer_ap_count, &now);
+    if (!sniffer_aps) {
+        MY_LOG_INFO(TAG, "Cannot allocate sniffer snapshot.");
+        return 1;
+    }
     
     // Allow showing results even after sniffer is stopped
     if (sniffer_active && sniffer_scan_phase) {
         MY_LOG_INFO(TAG, "Sniffer is still scanning networks. Please wait...");
+        free(sniffer_aps);
         return 0;
     }
     
     if (sniffer_ap_count == 0) {
         MY_LOG_INFO(TAG, "No sniffer data available. Use 'start_sniffer' to collect data.");
+        free(sniffer_aps);
         return 0;
     }
     
@@ -17958,20 +18020,26 @@ static int cmd_show_sniffer_results_vendor(int argc, char **argv) {
         
         displayed_count++;
         
+        if (extended) {
+            sx_format_ap(suffix, sizeof(suffix), &ap->extended, ap->bssid,
+                         ap->rx_rssi, ap->rx_rssi_known,
+                         ap->rx_seen ? ap->rx_last_seen : ap->last_seen, true, now);
+        }
         // Print AP info in compact format: SSID, CH: CLIENT_COUNT [Vendor]
         const char *ap_vendor = vendor_label(ap->bssid);
-        printf("%s, CH%d: %d [%s]\n", ap->ssid, ap->channel, ap->client_count,
-               ap_vendor);
+        printf("%s, CH%d: %d [%s]%s\n", ap->ssid, ap->channel, ap->client_count,
+               ap_vendor, suffix);
         
         // Print each client MAC on a separate line with 1 space indentation and vendor
         if (ap->client_count > 0) {
             for (int j = 0; j < ap->client_count; j++) {
                 sniffer_client_t *client = &ap->clients[j];
+                if (extended) sx_format_client(suffix, sizeof(suffix), client->rx_rssi, client->rx_rssi_known, client->last_seen, now);
                 const char *client_vendor = vendor_label(client->mac);
-                printf(" %02X:%02X:%02X:%02X:%02X:%02X [%s]\n",
+                printf(" %02X:%02X:%02X:%02X:%02X:%02X [%s]%s\n",
                        client->mac[0], client->mac[1], client->mac[2],
                        client->mac[3], client->mac[4], client->mac[5],
-                       client_vendor);
+                       client_vendor, suffix);
             }
         }
         
@@ -17982,12 +18050,14 @@ static int cmd_show_sniffer_results_vendor(int argc, char **argv) {
         MY_LOG_INFO(TAG, "No APs with clients found.");
     }
     
+    free(sniffer_aps);
     return 0;
 }
 
 static int cmd_clear_sniffer_results(int argc, char **argv) {
     (void)argc; (void)argv;
     
+    xSemaphoreTake(sniffer_data_mutex, portMAX_DELAY);
     // Clear all sniffer data
     sniffer_ap_count = 0;
     memset(sniffer_aps, 0, MAX_SNIFFER_APS * sizeof(sniffer_ap_t));
@@ -17995,7 +18065,10 @@ static int cmd_clear_sniffer_results(int argc, char **argv) {
     memset(probe_requests, 0, MAX_PROBE_REQUESTS * sizeof(probe_request_t));
     sniffer_packet_counter = 0;
     sniffer_last_debug_packet = 0;
+    memset(&sniffer_rx_diagnostics, 0, sizeof(sniffer_rx_diagnostics));
+    atomic_store(&sniffer_rx_lock_busy, 0);
     
+    xSemaphoreGive(sniffer_data_mutex);
     MY_LOG_INFO(TAG, "Sniffer results cleared.");
     return 0;
 }
@@ -18122,6 +18195,36 @@ static int cmd_list_probes_vendor(int argc, char **argv) {
 }
 
 static int cmd_sniffer_debug(int argc, char **argv) {
+    sniffer_rx_diagnostics_t diagnostic;
+    int ap_count, client_count = 0;
+    xSemaphoreTake(sniffer_data_mutex, portMAX_DELAY);
+    diagnostic = sniffer_rx_diagnostics;
+    ap_count = sniffer_ap_count;
+    for (int i = 0; i < ap_count; ++i) client_count += sniffer_aps[i].client_count;
+    xSemaphoreGive(sniffer_data_mutex);
+    printf("[SnifferRX] rx=%lu mgmt=%lu data=%lu bad_length=%lu rx_error=%lu selected_reject=%lu matched=%lu short_dump=%lu zero_dump=%lu lock_busy=%u sig_len=%u dump_len=%u rx_state=%u channel=%u\n",
+           (unsigned long)diagnostic.rx, (unsigned long)diagnostic.mgmt,
+           (unsigned long)diagnostic.data, (unsigned long)diagnostic.bad_length,
+           (unsigned long)diagnostic.rx_error, (unsigned long)diagnostic.selected_reject,
+           (unsigned long)diagnostic.matched, (unsigned long)diagnostic.short_dump,
+           (unsigned long)diagnostic.zero_dump, atomic_load(&sniffer_rx_lock_busy),
+           diagnostic.last_sig_len, diagnostic.last_dump_len,
+           diagnostic.last_rx_state, diagnostic.last_channel);
+    printf("[SnifferCapture] pipeline=legacy-v2 packets=%lu aps=%d clients=%d\n",
+           (unsigned long)sniffer_packet_counter, ap_count, client_count);
+    printf("[SnifferSSID] assoc_rx=%lu reassoc_rx=%lu probe_resp_rx=%lu request_rejected=%lu request_incomplete=%lu request_untracked=%lu request_named=%lu\n",
+           (unsigned long)diagnostic.assoc_rx, (unsigned long)diagnostic.reassoc_rx,
+           (unsigned long)diagnostic.probe_resp_rx, (unsigned long)diagnostic.request_rejected,
+           (unsigned long)diagnostic.request_incomplete, (unsigned long)diagnostic.request_untracked,
+           (unsigned long)diagnostic.request_named);
+    if (diagnostic.assoc_rx || diagnostic.reassoc_rx)
+        printf("[SnifferSSIDLast] bssid=%02X:%02X:%02X:%02X:%02X:%02X parsed=%d complete=%d ssid_len=%u sig_len=%u dump_len=%u\n",
+               diagnostic.last_request_bssid[0], diagnostic.last_request_bssid[1],
+               diagnostic.last_request_bssid[2], diagnostic.last_request_bssid[3],
+               diagnostic.last_request_bssid[4], diagnostic.last_request_bssid[5],
+               diagnostic.last_request_parsed, diagnostic.last_request_complete,
+               diagnostic.last_request_ssid_len, diagnostic.last_request_sig_len,
+               diagnostic.last_request_dump_len);
     if (argc < 2) {
         MY_LOG_INFO(TAG, "Current sniffer debug mode: %s", sniff_debug ? "ON" : "OFF");
         MY_LOG_INFO(TAG, "Usage: sniffer_debug <0|1>");
@@ -18140,11 +18243,7 @@ static int cmd_sniffer_debug(int argc, char **argv) {
     MY_LOG_INFO(TAG, "Sniffer debug mode %s", sniff_debug ? "ENABLED" : "DISABLED");
     
     if (sniff_debug) {
-        MY_LOG_INFO(TAG, "Debug logging will show detailed packet analysis:");
-        MY_LOG_INFO(TAG, "- Packet type, length, channel, RSSI");
-        MY_LOG_INFO(TAG, "- All MAC addresses in packet");
-        MY_LOG_INFO(TAG, "- AP matching process");
-        MY_LOG_INFO(TAG, "- Reason for packet acceptance/rejection");
+        MY_LOG_INFO(TAG, "Use 'sniffer_debug' to read RX counters and metadata; no per-packet UART logging.");
     }
     
     return 0;
@@ -25296,7 +25395,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t show_sniffer_cmd = {
         .command = "show_sniffer_results",
-        .help = "Shows sniffer results sorted by client count",
+        .help = "Shows sniffer results sorted by client count. Optional: extended",
         .hint = NULL,
         .func = &cmd_show_sniffer_results,
         .argtable = NULL
@@ -25304,7 +25403,7 @@ static void register_commands(void)
     ESP_ERROR_CHECK(esp_console_cmd_register(&show_sniffer_cmd));
     const esp_console_cmd_t show_sniffer_vendor_cmd = {
         .command = "show_sniffer_results_vendor",
-        .help = "Shows sniffer results sorted by client count with vendors",
+        .help = "Shows sniffer results sorted by client count with vendors. Optional: extended",
         .hint = NULL,
         .func = &cmd_show_sniffer_results_vendor,
         .argtable = NULL
@@ -27095,55 +27194,42 @@ static bool is_own_device_mac(const uint8_t *mac) {
 static void add_client_to_ap(int ap_index, const uint8_t *client_mac, int rssi) {
     static uint32_t add_client_counter = 0;
     add_client_counter++;
-    
+
     if ((add_client_counter % 10) == 0) {
         //printf("ADD_CLIENT_HEARTBEAT: Call %lu, AP index %d\n", add_client_counter, ap_index);
     }
-    
+
     if (ap_index < 0 || ap_index >= sniffer_ap_count) {
-        if (sniff_debug) {
-            MY_LOG_INFO(TAG, "[DEBUG] add_client_to_ap: Invalid AP index %d (max: %d)", ap_index, sniffer_ap_count);
-        }
+
         return;
     }
-    
+
     sniffer_ap_t *ap = &sniffer_aps[ap_index];
-    
+
     // Check if client already exists
     for (int i = 0; i < ap->client_count; i++) {
         if (memcmp(ap->clients[i].mac, client_mac, 6) == 0) {
             // Update existing client
             ap->clients[i].rssi = rssi;
             ap->clients[i].last_seen = esp_timer_get_time() / 1000; // ms
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] add_client_to_ap: Updated existing client %02X:%02X:%02X:%02X:%02X:%02X in AP %s (RSSI: %d)", 
-                           client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5], 
-                           ap->ssid, rssi);
-            }
+
             return;
         }
     }
-    
+
     // Add new client if space available
     if (ap->client_count < MAX_CLIENTS_PER_AP) {
         int index = ap->client_count++;
         memcpy(ap->clients[index].mac, client_mac, 6);
         ap->clients[index].rssi = rssi;
         ap->clients[index].last_seen = esp_timer_get_time() / 1000; // ms
-        if (sniff_debug) {
-            MY_LOG_INFO(TAG, "[DEBUG] add_client_to_ap: Added NEW client %02X:%02X:%02X:%02X:%02X:%02X to AP %s (RSSI: %d, total clients: %d)", 
-                       client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5], 
-                       ap->ssid, rssi, ap->client_count);
-        }
+
     } else {
-        if (sniff_debug) {
-            MY_LOG_INFO(TAG, "[DEBUG] add_client_to_ap: Cannot add client - AP %s is full (%d/%d clients)", 
-                       ap->ssid, ap->client_count, MAX_CLIENTS_PER_AP);
-        }
+
     }
 }
 
-static void sniffer_process_scan_results(void) {
+static void sniffer_process_scan_results_locked(void) {
     if (!g_scan_done || g_scan_count == 0) {
         return;
     }
@@ -27164,7 +27250,11 @@ static void sniffer_process_scan_results(void) {
                 // Update info but keep clients
                 sniffer_aps[j].channel = scan_ap->primary;
                 sniffer_aps[j].rssi = scan_ap->rssi;
+                sniffer_aps[j].rx_rssi = scan_ap->rssi;
+                sniffer_aps[j].rx_rssi_known = true;
                 sniffer_aps[j].last_seen = esp_timer_get_time() / 1000;
+                sniffer_aps[j].rx_last_seen = sniffer_aps[j].last_seen;
+                sniffer_aps[j].rx_seen = true;
                 break;
             }
         }
@@ -27172,14 +27262,20 @@ static void sniffer_process_scan_results(void) {
         // Add new AP if not present
         if (!ap_exists) {
             sniffer_ap_t *new_ap = &sniffer_aps[sniffer_ap_count++];
+            memset(new_ap, 0, sizeof(*new_ap));
+            sx_init(&new_ap->extended);
             memcpy(new_ap->bssid, scan_ap->bssid, 6);
             strncpy(new_ap->ssid, (char*)scan_ap->ssid, sizeof(new_ap->ssid) - 1);
             new_ap->ssid[sizeof(new_ap->ssid) - 1] = '\0';
             new_ap->channel = scan_ap->primary;
             new_ap->authmode = scan_ap->authmode;
             new_ap->rssi = scan_ap->rssi;
+            new_ap->rx_rssi = scan_ap->rssi;
+            new_ap->rx_rssi_known = true;
             new_ap->client_count = 0;
             new_ap->last_seen = esp_timer_get_time() / 1000;
+            new_ap->rx_last_seen = new_ap->last_seen;
+            new_ap->rx_seen = true;
             added_count++;
         }
     }
@@ -27187,7 +27283,13 @@ static void sniffer_process_scan_results(void) {
     MY_LOG_INFO(TAG, "Sniffer: added %d new APs, total %d APs in database", added_count, sniffer_ap_count);
 }
 
-static void sniffer_merge_scan_results(void) {
+static void sniffer_process_scan_results(void) {
+    xSemaphoreTake(sniffer_data_mutex, portMAX_DELAY);
+    sniffer_process_scan_results_locked();
+    xSemaphoreGive(sniffer_data_mutex);
+}
+
+static void sniffer_merge_scan_results_locked(void) {
     if (!g_scan_done || g_scan_count == 0) {
         return;
     }
@@ -27212,7 +27314,11 @@ static void sniffer_merge_scan_results(void) {
             sniffer_ap->channel = scan_ap->primary;
             sniffer_ap->authmode = scan_ap->authmode;
             sniffer_ap->rssi = scan_ap->rssi;
+            sniffer_ap->rx_rssi = scan_ap->rssi;
+            sniffer_ap->rx_rssi_known = true;
             sniffer_ap->last_seen = esp_timer_get_time() / 1000; // ms
+            sniffer_ap->rx_last_seen = sniffer_ap->last_seen;
+            sniffer_ap->rx_seen = true;
             continue;
         }
 
@@ -27222,20 +27328,31 @@ static void sniffer_merge_scan_results(void) {
 
         sniffer_ap_t *sniffer_ap = &sniffer_aps[sniffer_ap_count++];
         memset(sniffer_ap, 0, sizeof(*sniffer_ap));
+        sx_init(&sniffer_ap->extended);
         memcpy(sniffer_ap->bssid, scan_ap->bssid, 6);
         strncpy(sniffer_ap->ssid, (char*)scan_ap->ssid, sizeof(sniffer_ap->ssid) - 1);
         sniffer_ap->ssid[sizeof(sniffer_ap->ssid) - 1] = '\0';
         sniffer_ap->channel = scan_ap->primary;
         sniffer_ap->authmode = scan_ap->authmode;
         sniffer_ap->rssi = scan_ap->rssi;
+        sniffer_ap->rx_rssi = scan_ap->rssi;
+        sniffer_ap->rx_rssi_known = true;
         sniffer_ap->client_count = 0;
         sniffer_ap->last_seen = esp_timer_get_time() / 1000; // ms
+        sniffer_ap->rx_last_seen = sniffer_ap->last_seen;
+        sniffer_ap->rx_seen = true;
     }
 
     MY_LOG_INFO(TAG, "Sniffer list now has %d APs", sniffer_ap_count);
 }
 
-static void sniffer_init_selected_networks(void) {
+static void sniffer_merge_scan_results(void) {
+    xSemaphoreTake(sniffer_data_mutex, portMAX_DELAY);
+    sniffer_merge_scan_results_locked();
+    xSemaphoreGive(sniffer_data_mutex);
+}
+
+static void sniffer_init_selected_networks_locked(void) {
     if (g_selected_count == 0 || !g_scan_done) {
         MY_LOG_INFO(TAG, "Cannot initialize selected networks - no selection or scan data");
         return;
@@ -27277,20 +27394,30 @@ static void sniffer_init_selected_networks(void) {
                 // Update info but keep clients
                 sniffer_aps[j].channel = scan_ap->primary;
                 sniffer_aps[j].rssi = scan_ap->rssi;
+                sniffer_aps[j].rx_rssi = scan_ap->rssi;
+                sniffer_aps[j].rx_rssi_known = true;
                 sniffer_aps[j].last_seen = esp_timer_get_time() / 1000;
+                sniffer_aps[j].rx_last_seen = sniffer_aps[j].last_seen;
+                sniffer_aps[j].rx_seen = true;
                 break;
             }
         }
         if (!ap_exists && sniffer_ap_count < MAX_SNIFFER_APS) {
             sniffer_ap_t *new_ap = &sniffer_aps[sniffer_ap_count++];
+            memset(new_ap, 0, sizeof(*new_ap));
+            sx_init(&new_ap->extended);
             memcpy(new_ap->bssid, scan_ap->bssid, 6);
             strncpy(new_ap->ssid, (char*)scan_ap->ssid, sizeof(new_ap->ssid) - 1);
             new_ap->ssid[sizeof(new_ap->ssid) - 1] = '\0';
             new_ap->channel = scan_ap->primary;
             new_ap->authmode = scan_ap->authmode;
             new_ap->rssi = scan_ap->rssi;
+            new_ap->rx_rssi = scan_ap->rssi;
+            new_ap->rx_rssi_known = true;
             new_ap->client_count = 0;
             new_ap->last_seen = esp_timer_get_time() / 1000;
+            new_ap->rx_last_seen = new_ap->last_seen;
+            new_ap->rx_seen = true;
         }
         
         MY_LOG_INFO(TAG, "  [%d] SSID='%s' Ch=%d", i + 1, (char*)scan_ap->ssid, scan_ap->primary);
@@ -27310,6 +27437,12 @@ static void sniffer_init_selected_networks(void) {
         }
         MY_LOG_INFO(TAG, "Channel hopping list: [%s]", channel_list);
     }
+}
+
+static void sniffer_init_selected_networks(void) {
+    xSemaphoreTake(sniffer_data_mutex, portMAX_DELAY);
+    sniffer_init_selected_networks_locked();
+    xSemaphoreGive(sniffer_data_mutex);
 }
 
 static void sniffer_channel_hop(void) {
@@ -27349,6 +27482,7 @@ static void sniffer_channel_hop(void) {
 // Task that handles time-based channel hopping (independent of packet flow)
 static void sniffer_channel_task(void *pvParameters) {
     int64_t sniff_oled_last_us = 0;
+    uint32_t last_reported_packets = sniffer_packet_counter;
     
     while (sniffer_active) {
         vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
@@ -27365,6 +27499,11 @@ static void sniffer_channel_task(void *pvParameters) {
             sniffer_channel_hop();
         }
         
+        uint32_t packets = sniffer_packet_counter;
+        if (!sniff_debug && packets / 20 != last_reported_packets / 20) {
+            printf("Sniffer packet count: %lu\n", (unsigned long)packets);
+            last_reported_packets = packets;
+        }
         // OLED update (~500ms)
         int64_t now_us = esp_timer_get_time();
         if (now_us - sniff_oled_last_us > 500000) {
@@ -27963,104 +28102,65 @@ static void pcap_arp_spoof_task(void *param) {
     vTaskDelete(NULL);
 }
 
-static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
-    sniffer_packet_counter++;
-    sniff_oled_packets = sniffer_packet_counter;
-    sniff_oled_dirty = true;
     
-    if (!sniffer_active || sniffer_scan_phase) {
-        return; // No debug logging here - too frequent
-    }
     
-    // Show packet count every 20 packets when debug is OFF
-    if (!sniff_debug && (sniffer_packet_counter % 20) == 0) {
-        printf("Sniffer packet count: %lu\n", sniffer_packet_counter);
-    }
     
-    // Perform packet-based channel hopping (10 packets OR time-based task will handle it)
-    if ((sniffer_packet_counter % 10) == 0) {
-        //MY_LOG_INFO(TAG, "Sniffer: Packet-based channel hop (10 packets)");
-        sniffer_channel_hop();
-    }
     
-    // Throttle debug logging - only every 100th packet when debug is on
-    bool should_debug = sniff_debug && ((sniffer_packet_counter - sniffer_last_debug_packet) >= 100);
-    if (should_debug) {
-        sniffer_last_debug_packet = sniffer_packet_counter;
-        printf("DEBUG_CHECKPOINT: Processing packet %lu\n", sniffer_packet_counter);
-    }
     
+
+static void sniffer_capture_legacy_locked(void *buf, wifi_promiscuous_pkt_type_t type) {
     const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
     const uint8_t *frame = pkt->payload;
     int len = pkt->rx_ctrl.sig_len;
-    
-    if (should_debug) {
-        const char* type_str = (type == WIFI_PKT_MGMT) ? "MGMT" : 
-                              (type == WIFI_PKT_DATA) ? "DATA" : 
-                              (type == WIFI_PKT_CTRL) ? "CTRL" : "UNKNOWN";
-        
-        MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Type=%s, Len=%d, Ch=%d, RSSI=%d", 
-                   sniffer_packet_counter, type_str, len, sniffer_current_channel, pkt->rx_ctrl.rssi);
-        
-        if (len >= 24) {
-            MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Addr1=%02X:%02X:%02X:%02X:%02X:%02X, Addr2=%02X:%02X:%02X:%02X:%02X:%02X, Addr3=%02X:%02X:%02X:%02X:%02X:%02X",
-                       sniffer_packet_counter,
-                       frame[4], frame[5], frame[6], frame[7], frame[8], frame[9],
-                       frame[10], frame[11], frame[12], frame[13], frame[14], frame[15],
-                       frame[16], frame[17], frame[18], frame[19], frame[20], frame[21]);
-        }
-    }
-    
+    /* Preserve capture decisions, but never read beyond a supplied shorter dump. */
+    if (pkt->rx_ctrl.dump_len && pkt->rx_ctrl.dump_len < (unsigned)len)
+        len = pkt->rx_ctrl.dump_len;
+
+
+
     // Filter only MGMT and DATA packets (like Marauder)
     if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) {
         // Skip logging for non-MGMT/DATA packets - too frequent
         return;
     }
-    
+
     if (len < 24) { // Minimum 802.11 header size
         return; // Skip logging - too frequent
     }
-    
+
     // Skip broadcast packets ONLY for DATA packets
     // MGMT packets (beacons, probe requests) normally have broadcast destinations
     bool is_broadcast_dest = (frame[4] == 0xff && frame[5] == 0xff && frame[6] == 0xff &&
                              frame[7] == 0xff && frame[8] == 0xff && frame[9] == 0xff);
-    
+
     if (is_broadcast_dest && type == WIFI_PKT_DATA) {
         return; // Skip logging - too frequent
     }
-    
+
     // Parse 802.11 header (like Marauder)
     uint8_t frame_type = frame[0] & 0xFC;
     uint8_t to_ds = (frame[1] & 0x01) != 0;
     uint8_t from_ds = (frame[1] & 0x02) != 0;
-    
+
     // Extract addresses based on 802.11 standard
     uint8_t *addr1 = (uint8_t *)&frame[4];   // Address 1
-    uint8_t *addr2 = (uint8_t *)&frame[10];  // Address 2  
+    uint8_t *addr2 = (uint8_t *)&frame[10];  // Address 2
     uint8_t *addr3 = (uint8_t *)&frame[16];  // Address 3
-    
-    if (sniff_debug) {
-        // Minimal debug logging to avoid blocking
-        printf("PKT_%lu: %s T=%d F=%d\n", sniffer_packet_counter, 
-               (type == WIFI_PKT_MGMT) ? "MGMT" : "DATA", to_ds, from_ds);
-    }
-    
+
+
+
     // Process MGMT packets for client detection (like Marauder)
     if (type == WIFI_PKT_MGMT) {
-        if (should_debug) printf("DEBUG: Processing MGMT packet %lu\n", sniffer_packet_counter);
-        
+
+
         uint8_t *client_mac = NULL;
         uint8_t *ap_mac = NULL;
         bool is_client_frame = false;
-        
+
         switch (frame_type) {
             case 0x80: // Beacon - update AP info only
                 ap_mac = addr2; // Source is AP
-                if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Beacon from AP: %02X:%02X:%02X:%02X:%02X:%02X", 
-                               sniffer_packet_counter, ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
-                }
+
                 // Update AP info if exists
                 for (int i = 0; i < sniffer_ap_count; i++) {
                     if (memcmp(sniffer_aps[i].bssid, ap_mac, 6) == 0) {
@@ -28070,80 +28170,65 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                     }
                 }
                 return; // Don't process beacons for client detection
-                
+
             case 0x40: // Probe Request - client looking for networks
                 client_mac = addr2; // Source is client
                 is_client_frame = true;
-                if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Probe Request from client: %02X:%02X:%02X:%02X:%02X:%02X", 
-                               sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5]);
-                }
+
                 break;
-                
+
             case 0x00: // Association Request - client trying to connect to AP
                 client_mac = addr2; // Source is client
                 ap_mac = addr1;     // Destination is AP
                 is_client_frame = true;
-                if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Association Request from client %02X:%02X:%02X:%02X:%02X:%02X to AP %02X:%02X:%02X:%02X:%02X:%02X", 
-                               sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5],
-                               ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
-                }
+
                 break;
-                
+
             case 0xB0: // Authentication - client authenticating with AP
                 client_mac = addr2; // Source is client
                 ap_mac = addr1;     // Destination is AP
                 is_client_frame = true;
-                if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Authentication from client %02X:%02X:%02X:%02X:%02X:%02X to AP %02X:%02X:%02X:%02X:%02X:%02X", 
-                               sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5],
-                               ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
-                }
+
                 break;
-                
+
             default:
-                if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - Other MGMT frame type 0x%02X", sniffer_packet_counter, frame_type);
-                }
+
                 return;
         }
-        
+
         // Process client frames
         if (is_client_frame && client_mac) {
             // Skip multicast/broadcast client MAC
             if (is_multicast_mac(client_mac) || is_own_device_mac(client_mac)) {
-                if (sniff_debug) {
-                    MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - multicast or own device MAC", sniffer_packet_counter);
-                }
+
                 return;
             }
-            
+
             // For probe requests, extract SSID and store
             if (frame_type == 0x40) {
                 // Parse probe request to extract SSID
                 // Probe request format: MAC header (24 bytes) + Frame body
                 // Frame body starts with fixed parameters, then tagged parameters
                 // SSID is usually the first tagged parameter (Tag Number = 0)
-                
+
                 if (len > 24 && probe_request_count < MAX_PROBE_REQUESTS) {
                     const uint8_t *body = frame + 24; // Skip MAC header
                     int body_len = len - 24;
-                    
+
                     char ssid[33] = {0};
                     bool ssid_found = false;
                     uint8_t ssid_length = 0;
-                    
+
                     // Parse tagged parameters to find SSID (tag 0)
                     int offset = 0;
                     while (offset + 2 <= body_len) {
                         uint8_t tag_number = body[offset];
                         uint8_t tag_length = body[offset + 1];
-                        
+
                         if (offset + 2 + tag_length > body_len) {
                             break; // Invalid tag
                         }
-                        
+
                         if (tag_number == 0) { // SSID tag
                             ssid_length = tag_length;
                             if (tag_length > 0 && tag_length <= 32) {
@@ -28156,10 +28241,10 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                             }
                             break;
                         }
-                        
+
                         offset += 2 + tag_length;
                     }
-                    
+
                     // Store probe request if SSID found and not broadcast probe
                     if (ssid_found && ssid_length > 0) {
                         // Check if this MAC+SSID combination already exists
@@ -28174,7 +28259,7 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                                 break;
                             }
                         }
-                        
+
                         // Add new probe request if not exists
                         if (!already_exists) {
                             memcpy(probe_requests[probe_request_count].mac, client_mac, 6);
@@ -28182,18 +28267,14 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                             probe_requests[probe_request_count].rssi = pkt->rx_ctrl.rssi;
                             probe_requests[probe_request_count].last_seen = esp_timer_get_time() / 1000;
                             probe_request_count++;
-                            
-                            if (sniff_debug) {
-                                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Stored probe request for SSID '%s' from %02X:%02X:%02X:%02X:%02X:%02X", 
-                                           sniffer_packet_counter, ssid,
-                                           client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5]);
-                            }
+
+
                         }
                     }
                 }
                 return; // Don't process probe requests for AP client association
             }
-            
+
             // For association/auth requests, find or create the target AP
             if (ap_mac) {
                 int ap_index = -1;
@@ -28203,155 +28284,213 @@ static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t 
                         break;
                     }
                 }
-                
+
                 // If AP not found, create it dynamically (only in normal mode)
                 // In selected mode, only monitor pre-selected networks
                 if (ap_index < 0 && !sniffer_selected_mode && sniffer_ap_count < MAX_SNIFFER_APS) {
                     ap_index = sniffer_ap_count++;
+                    sx_init(&sniffer_aps[ap_index].extended);
                     memcpy(sniffer_aps[ap_index].bssid, ap_mac, 6);
-                    snprintf(sniffer_aps[ap_index].ssid, sizeof(sniffer_aps[ap_index].ssid), 
+                    snprintf(sniffer_aps[ap_index].ssid, sizeof(sniffer_aps[ap_index].ssid),
                             "MGMT_%02X%02X", ap_mac[4], ap_mac[5]);
                     sniffer_aps[ap_index].channel = sniffer_current_channel;
                     sniffer_aps[ap_index].authmode = WIFI_AUTH_OPEN;
                     sniffer_aps[ap_index].rssi = pkt->rx_ctrl.rssi;
                     sniffer_aps[ap_index].client_count = 0;
                     sniffer_aps[ap_index].last_seen = esp_timer_get_time() / 1000;
-                    
-                    if (sniff_debug) {
-                        MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: CREATED new AP %s from MGMT frame", 
-                                   sniffer_packet_counter, sniffer_aps[ap_index].ssid);
-                    }
+
+
                 }
-                
+
                 if (ap_index >= 0) {
-                    if (sniff_debug) {
-                        MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: ACCEPTED - Adding client %02X:%02X:%02X:%02X:%02X:%02X to AP %s", 
-                                   sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5],
-                                   sniffer_aps[ap_index].ssid);
-                    }
+
                     add_client_to_ap(ap_index, client_mac, pkt->rx_ctrl.rssi);
                 } else {
-                    if (sniff_debug) {
-                        MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - AP list full, cannot create new AP", sniffer_packet_counter);
-                    }
+
                 }
             }
         }
         return;
     }
-    
+
     // Process DATA packets using 802.11 ToDS/FromDS logic (like Marauder)
     if (type == WIFI_PKT_DATA) {
-        if (should_debug) printf("DEBUG: Processing DATA packet %lu\n", sniffer_packet_counter);
-        
+
+
         uint8_t *client_mac = NULL;
         uint8_t *ap_mac = NULL;
-        
-        if (sniff_debug) {
-            MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: Processing DATA packet, ToDS=%d, FromDS=%d", 
-                       sniffer_packet_counter, to_ds, from_ds);
-        }
-        
+
+
+
         // Determine AP and client MAC based on ToDS/FromDS bits (802.11 standard)
         if (to_ds && !from_ds) {
             // STA -> AP: addr1=AP, addr2=STA, addr3=DA
             ap_mac = addr1;      // Destination is AP
             client_mac = addr2;  // Source is client
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: STA->AP direction", sniffer_packet_counter);
-            }
+
         } else if (!to_ds && from_ds) {
-            // AP -> STA: addr1=STA, addr2=AP, addr3=SA  
+            // AP -> STA: addr1=STA, addr2=AP, addr3=SA
             ap_mac = addr2;      // Source is AP
             client_mac = addr1;  // Destination is client
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: AP->STA direction", sniffer_packet_counter);
-            }
+
         } else if (!to_ds && !from_ds) {
             // IBSS (ad-hoc): addr1=DA, addr2=SA, addr3=BSSID
             ap_mac = addr3;      // BSSID
             client_mac = addr2;  // Source
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: IBSS direction", sniffer_packet_counter);
-            }
+
         } else {
             // WDS (to_ds && from_ds) - skip for now
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - WDS frame (ToDS=1, FromDS=1)", sniffer_packet_counter);
-            }
+
             return;
         }
-        
-        if (sniff_debug) {
-            MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: AP MAC: %02X:%02X:%02X:%02X:%02X:%02X, Client MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
-                       sniffer_packet_counter, 
-                       ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
-                       client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5]);
-        }
-        
+
+
+
         // Skip multicast/broadcast client MAC
         if (is_multicast_mac(client_mac)) {
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - client is multicast/broadcast", sniffer_packet_counter);
-            }
+
             return;
         }
-        
+
         // Skip our own device as client
         if (is_own_device_mac(client_mac)) {
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - client is our own device", sniffer_packet_counter);
-            }
+
             return;
         }
-        
+
         // Find the AP in our known list
         int ap_index = -1;
-        if (should_debug) printf("DEBUG: Searching %d APs for match\n", sniffer_ap_count);
-        
+
+
         for (int i = 0; i < sniffer_ap_count; i++) {
             if (memcmp(sniffer_aps[i].bssid, ap_mac, 6) == 0) {
                 ap_index = i;
-                if (should_debug) printf("DEBUG: Found AP match at index %d\n", i);
+
                 break;
             }
         }
-        
+
         // If AP not found, try to add it dynamically (only in normal mode)
         // In selected mode, only monitor pre-selected networks
         if (ap_index < 0 && !sniffer_selected_mode && sniffer_ap_count < MAX_SNIFFER_APS) {
             ap_index = sniffer_ap_count++;
+            sx_init(&sniffer_aps[ap_index].extended);
             memcpy(sniffer_aps[ap_index].bssid, ap_mac, 6);
-            snprintf(sniffer_aps[ap_index].ssid, sizeof(sniffer_aps[ap_index].ssid), 
+            snprintf(sniffer_aps[ap_index].ssid, sizeof(sniffer_aps[ap_index].ssid),
                     "Unknown_%02X%02X", ap_mac[4], ap_mac[5]); // Use last 2 bytes for unique name
             sniffer_aps[ap_index].channel = sniffer_current_channel;
             sniffer_aps[ap_index].authmode = WIFI_AUTH_OPEN; // Unknown
             sniffer_aps[ap_index].rssi = pkt->rx_ctrl.rssi;
             sniffer_aps[ap_index].client_count = 0;
             sniffer_aps[ap_index].last_seen = esp_timer_get_time() / 1000;
-            
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: CREATED new AP %s for BSSID %02X:%02X:%02X:%02X:%02X:%02X", 
-                           sniffer_packet_counter, sniffer_aps[ap_index].ssid,
-                           ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
-            }
+
+
         }
-        
+
         if (ap_index >= 0) {
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: ACCEPTED - Adding client %02X:%02X:%02X:%02X:%02X:%02X to AP %s", 
-                           sniffer_packet_counter, client_mac[0], client_mac[1], client_mac[2], 
-                           client_mac[3], client_mac[4], client_mac[5], sniffer_aps[ap_index].ssid);
-            }
+
             add_client_to_ap(ap_index, client_mac, pkt->rx_ctrl.rssi);
         } else {
-            if (sniff_debug) {
-                MY_LOG_INFO(TAG, "[DEBUG] Packet #%lu: REJECTED - AP list full (%d/%d), cannot add new AP %02X:%02X:%02X:%02X:%02X:%02X", 
-                           sniffer_packet_counter, sniffer_ap_count, MAX_SNIFFER_APS,
-                           ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5]);
+
+        }
+    }
+}
+
+static void sniffer_capture_extended_locked(const wifi_promiscuous_pkt_t *pkt,
+                                            wifi_promiscuous_pkt_type_t type) {
+    ++sniffer_rx_diagnostics.rx;
+    if (type == WIFI_PKT_MGMT) ++sniffer_rx_diagnostics.mgmt;
+    if (type == WIFI_PKT_DATA) ++sniffer_rx_diagnostics.data;
+    sniffer_rx_diagnostics.last_sig_len = pkt->rx_ctrl.sig_len;
+    sniffer_rx_diagnostics.last_dump_len = pkt->rx_ctrl.dump_len;
+    sniffer_rx_diagnostics.last_rx_state = pkt->rx_ctrl.rx_state;
+    sniffer_rx_diagnostics.last_channel = pkt->rx_ctrl.channel;
+    size_t received = pkt->rx_ctrl.sig_len, dumped = pkt->rx_ctrl.dump_len;
+    /* C5 captures can report dump_len > sig_len (e.g. 608/604).
+     * A larger dump never extends the public sig_len payload bound. */
+    if (received < 28) { ++sniffer_rx_diagnostics.bad_length; return; }
+    size_t len = received - 4;
+    bool complete = true;
+    if (!dumped) ++sniffer_rx_diagnostics.zero_dump;
+    else if (dumped < len) { len = dumped; complete = false; ++sniffer_rx_diagnostics.short_dump; }
+    if (len < 24) { ++sniffer_rx_diagnostics.bad_length; return; }
+    if (pkt->rx_ctrl.rx_state) { ++sniffer_rx_diagnostics.rx_error; return; }
+    const uint8_t *f = pkt->payload, *bssid = NULL;
+    uint8_t subtype = f[0] & 0xfc;
+    bool request = type == WIFI_PKT_MGMT && (subtype == 0 || subtype == 0x20);
+    if (type == WIFI_PKT_MGMT) {
+        if (subtype == 0) ++sniffer_rx_diagnostics.assoc_rx;
+        else if (subtype == 0x20) ++sniffer_rx_diagnostics.reassoc_rx;
+        else if (subtype == 0x50) ++sniffer_rx_diagnostics.probe_resp_rx;
+    }
+    sx_observation_t observation;
+    bool parsed = type == WIFI_PKT_MGMT && sx_parse(f, len, &observation);
+    if (request) {
+        memcpy(sniffer_rx_diagnostics.last_request_bssid, f+16, 6);
+        sniffer_rx_diagnostics.last_request_sig_len = received;
+        sniffer_rx_diagnostics.last_request_dump_len = dumped;
+        sniffer_rx_diagnostics.last_request_parsed = parsed;
+        sniffer_rx_diagnostics.last_request_complete = parsed && complete && observation.complete;
+        sniffer_rx_diagnostics.last_request_ssid_len = parsed ? observation.ssid_len : 0;
+        if (!parsed) ++sniffer_rx_diagnostics.request_rejected;
+        else if (!complete || !observation.complete) ++sniffer_rx_diagnostics.request_incomplete;
+    }
+    if (parsed) {
+        if (!complete) observation.complete = false;
+        bssid = observation.bssid;
+    } else if (type == WIFI_PKT_DATA && (f[0] & 0x0c) == 8) {
+        bool to_ds = (f[1] & 1) != 0, from_ds = (f[1] & 2) != 0;
+        if (to_ds && !from_ds) bssid = f+4;
+        else if (!to_ds && from_ds) bssid = f+10;
+        else if (!to_ds && !from_ds) bssid = f+16;
+    } else if (type == WIFI_PKT_MGMT && f[0] == 0xb0 && len >= 30) bssid = f+16;
+    if (!bssid) return;
+    /* Enrichment never creates/moves APs or clients and never changes legacy fields. */
+    int index = -1;
+    for (int i = 0; i < sniffer_ap_count; ++i)
+        if (!memcmp(sniffer_aps[i].bssid, bssid, 6)) { index = i; break; }
+    if (index < 0) {
+        if (request) ++sniffer_rx_diagnostics.request_untracked;
+        if (sniffer_selected_mode) ++sniffer_rx_diagnostics.selected_reject;
+        return;
+    }
+    ++sniffer_rx_diagnostics.matched;
+    sniffer_ap_t *ap = &sniffer_aps[index];
+    ap->rx_last_seen = (uint32_t)(esp_timer_get_time() / 1000);
+    ap->rx_seen = true;
+    if (parsed) sx_apply(&ap->extended, &observation);
+    if (request && parsed && observation.complete && observation.ssid_len)
+        ++sniffer_rx_diagnostics.request_named;
+    if (!memcmp(f+10, bssid, 6)) {
+        ap->rx_rssi = pkt->rx_ctrl.rssi; ap->rx_rssi_known = true;
+    } else {
+        for (int i = 0; i < ap->client_count; ++i) {
+            if (!memcmp(ap->clients[i].mac, f+10, 6)) {
+                ap->clients[i].rx_rssi = pkt->rx_ctrl.rssi;
+                ap->clients[i].rx_rssi_known = true;
+                break;
             }
         }
     }
+}
+
+static void sniffer_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!buf) return;
+    ++sniffer_packet_counter;
+    sniff_oled_packets = sniffer_packet_counter; sniff_oled_dirty = true;
+    if (!sniffer_active || sniffer_scan_phase) return;
+    /* Keep the previous packet-based hop schedule, alongside the channel task. */
+    if ((sniffer_packet_counter % 10) == 0) sniffer_channel_hop();
+    if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
+    if (xSemaphoreTake(sniffer_data_mutex, 0) != pdTRUE) {
+        atomic_fetch_add(&sniffer_rx_lock_busy, 1);
+        return;
+    }
+    if (sniffer_active && !sniffer_scan_phase) {
+        sniffer_capture_legacy_locked(buf, type);
+        sniffer_capture_extended_locked(buf, type);
+    }
+    xSemaphoreGive(sniffer_data_mutex);
 }
 
 // === SNIFFER DOG HELPER FUNCTIONS ===
@@ -29689,5 +29828,3 @@ static bool is_bssid_whitelisted(const uint8_t *bssid) {
     
     return false;
 }
-
-

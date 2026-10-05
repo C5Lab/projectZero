@@ -1,3 +1,6 @@
 2026-09-28 scan data flow analysis: no observations.
 2026-09-28 analyzer design and Python protocol contract delivered: no observations.
 2026-09-28 JanOS analyzer implementation/review/documentation checkpoint: no observations.
+2026-10-05 sniffer parser, UART compatibility and RX integration checkpoint: no observations.
+2026-10-05 sniffer extension delivered, 144 tests and ESP-IDF build verified: no observations.
+2026-10-05 sniffer RX zero-dump regression and diagnostics: 144 tests and build passed; hardware cause pending user output.

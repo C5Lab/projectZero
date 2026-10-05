@@ -228,13 +228,14 @@ See the [protocol and admission rules](wifi-analyzer-protocol.md) and [hardware 
 
 ## Sniffing & monitoring
 
-- `start_sniffer` — client sniffer; sniffs selected networks or scans first. Streams `Sniffer packet count: N`.
+- `start_sniffer` — client sniffer; sniffs selected networks or scans first. Passive enrichment collects SSID/security/WPS during capture; packet processing does not log or print from the radio callback.
 - `start_sniffer_noscan` — sniffer using existing scan results (no new scan).
 - `show_sniffer_results` / `show_sniffer_results_vendor` — APs with associated clients (vendor variant adds MAC vendor names).
+- `show_sniffer_results extended` / `show_sniffer_results_vendor extended` — append versioned passive metadata to the same AP/client lines. No extra capture or radio switching. See [exact UART contract and manual test](sniffer-extended-uart.md).
 - `clear_sniffer_results` — clear clients/probes/counters.
 - `show_probes` / `show_probes_vendor` — captured probe requests (SSID + source MAC).
 - `list_probes` / `list_probes_vendor` — probe SSIDs with 1‑based index (for `start_karma`).
-- `sniffer_debug <0|1>` — toggle verbose sniffer logging.
+- `sniffer_debug` — read `[SnifferRX]` packet/rejection counters and last RX metadata. `sniffer_debug <0|1>` retains the debug flag; packet callbacks do not print. The channel task reports `Sniffer packet count` progress.
 - `start_sniffer_dog` — capture AP‑STA pairs and immediately send targeted deauth (`[SnifferDog #N] DEAUTH sent: ...`).
 - `deauth_detector [i1 i2 ...]` — detect deauth frames (all channels, or selected). Output `[DEAUTH] CH: .. | AP: .. (BSSID) | RSSI: ..`.
 - `start_ap_locator` — lock onto one selected AP's channel and print its RSSI once per second (`[AP Locator] ...`). Needs exactly one selected network.

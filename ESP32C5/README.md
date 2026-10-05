@@ -8,6 +8,7 @@ The firmware boots into an `esp_console` REPL, so most capabilities are exposed 
 Documentation:
 
 - [Command Manual](docs/command-manual.md)
+- [Passive sniffer extension](docs/sniffer-extended-uart.md) — opt-in UART metadata, binary SSIDs, RSN/WPA/PMF, WPS, fixtures and manual tests; legacy result lines remain compatible.
 - [JanOS Capture Gateway](docs/janos-capture-gateway.md) — instrumented APSTA/NAPT gateway for authorized traffic analysis.
 - [Wi-Fi Analyzer](docs/wifi-analyzer-design.md) — opt-in PSRAM-backed AP survey, 64 records by default and up to 128, with isolated legacy Flipper results. See the [WFA/1 protocol](docs/wifi-analyzer-protocol.md), [smoke-test commands](docs/wifi-analyzer-smoke-test.md), and [Tab5 implementation prompt](docs/wifi-analyzer-tab5-prompt.md). Firmware compilation and hardware validation are pending.
 
