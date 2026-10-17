@@ -1,0 +1,32 @@
+{
+  "algorithm_mappings": 261,
+  "algorithm_ouis": 235,
+  "duplicates_removed": 1748,
+  "format": "JWPS-2",
+  "invalid_checksum_associations_preserved": 764,
+  "invalid_checksum_rows_preserved": 855,
+  "lock_sha256": "19701bf3955ff8e091753f7e62528706d6373bf34ab65a2a24784448a0f2f262",
+  "malformed_rows": 9,
+  "sha256": "1017ec33b8b4bd0917a4d6691bca44e4716557f87c1069da94ec0dba97cedcb4",
+  "size": 18162,
+  "source_id": "f31b7019",
+  "source_revisions": {
+    "airgeddon_known_pins": "700ad7d63df04e565bcd14d2aec6f935fcec5185",
+    "default_wps_pins": "56a23e58a86a6ad9e8edd74cec4113c77f55a240"
+  },
+  "static_associations": 3101,
+  "static_ouis": 605,
+  "unknown_algorithm_names": {
+    "vacante": 23
+  },
+  "unsupported_algorithm_mappings": 7,
+  "unsupported_ouis": [
+    "0012BF",
+    "1CC63C",
+    "38229D",
+    "507E5D",
+    "743170",
+    "849CA6",
+    "880355"
+  ]
+}

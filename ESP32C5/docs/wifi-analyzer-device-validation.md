@@ -1,5 +1,11 @@
 # Wi-Fi Analyzer device validation follow-up
 
+> Historical analyzer-only device record. It remains valid for the captured
+> image and observations below, but does not by itself accept the later shared
+> WPS/analyzer lease hardening. Use
+> [janos-radio-compatibility-validation.md](janos-radio-compatibility-validation.md)
+> for the current matrix.
+
 ## Evidence provided by the user
 
 The user built and ran JanOS. Captures show successful 2.4 GHz and 5 GHz scans,

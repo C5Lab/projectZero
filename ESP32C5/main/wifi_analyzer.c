@@ -41,6 +41,7 @@ static wifi_band_mode_t s_saved_band;
 static uint8_t s_saved_primary;
 static wifi_second_chan_t s_saved_secondary;
 static bool s_saved_radio;
+static uint32_t s_lease_generation;
 
 static uint64_t now_ms(void)
 {
@@ -152,6 +153,9 @@ void wifi_analyzer_init(const wifi_analyzer_hooks_t *hooks)
 
 static bool reserve(void)
 {
+    uint32_t generation = 0;
+    if (!s_hooks.lease_acquire || !s_hooks.lease_acquire(&generation) ||
+        generation == 0U) return false;
     portENTER_CRITICAL(&s_lock);
     bool ok = s_state == WFA_IDLE;
     if (ok) {
@@ -162,15 +166,25 @@ static bool reserve(void)
         s_last_error = NULL;
     }
     portEXIT_CRITICAL(&s_lock);
+    if (!ok) {
+        (void)s_hooks.lease_release(generation, true);
+        return false;
+    }
+    s_lease_generation = generation;
     return ok;
 }
 
 static void release(bool fault)
 {
+    uint32_t generation = s_lease_generation;
+    bool lease_ok = generation != 0U && s_hooks.lease_release &&
+        s_hooks.lease_release(generation, !fault);
+    if (!lease_ok) fault = true;
     portENTER_CRITICAL(&s_lock);
     s_armed = false;
     s_worker = NULL;
     s_state = fault ? WFA_QUARANTINED : WFA_IDLE;
+    if (!fault) s_lease_generation = 0U;
     portEXIT_CRITICAL(&s_lock);
 }
 
@@ -484,6 +498,8 @@ bool wifi_analyzer_stop(uint32_t timeout_ms)
     if (busy) s_cancel = true;
     portEXIT_CRITICAL(&s_lock);
     if (!busy) return true;
+    if (s_hooks.lease_cancel && s_lease_generation != 0U)
+        (void)s_hooks.lease_cancel(s_lease_generation);
     uint64_t deadline = now_ms() + timeout_ms;
     while (wifi_analyzer_busy() && now_ms() < deadline) vTaskDelay(pdMS_TO_TICKS(20));
     return !wifi_analyzer_busy();
@@ -580,6 +596,15 @@ int wifi_analyzer_command(int argc, char **argv)
         const char *code = !restored ? "restore_failed" :
                            !strcmp(error, "radio_busy") ? "busy" : error;
         control_error("scan", code, restored ? error : "restore_failed");
+        return 1;
+    }
+    if (!s_hooks.lease_mark_running ||
+        !s_hooks.lease_mark_running(s_lease_generation)) {
+        bool restored = restore_radio();
+        set_error(restored ? "lease_state_failed" : "restore_failed");
+        release(!restored);
+        control_error("scan", "radio_fault",
+                      restored ? "lease_state_failed" : "restore_failed");
         return 1;
     }
     s_started_ms = now_ms();

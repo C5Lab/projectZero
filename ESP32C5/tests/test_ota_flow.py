@@ -79,7 +79,7 @@ class OtaFlowTest(unittest.TestCase):
             "nvs_open_fail", "nvs_set_fail", "nvs_commit_fail", "nvs_invalid",
             "nvs_missing", "nvs_roundtrip", "invalid_channel", "invalid_args",
             "offline", "no_ip", "no_netif", "ip_error", "wifi_mode_fail",
-            "busy", "alloc_fail", "task_fail", "disconnect_before_task",
+            "busy", "lease_busy", "alloc_fail", "task_fail", "disconnect_before_task",
             "metadata_fail", "begin_fail", "descriptor_fail", "wrong_project",
             "perform_fail", "incomplete", "finish_fail", "stall",
             "version_mismatch", "retry", "malformed_version", "prerelease",
@@ -263,6 +263,12 @@ class OtaFlowTest(unittest.TestCase):
     def test_second_request_does_not_create_another_task(self):
         r = self.result("busy")
         self.assertEqual((r["started"], r["command"], r["restart"]), ("1", "1", "1"))
+
+    def test_shared_radio_lease_blocks_ota_before_worker_creation(self):
+        r = self.result("lease_busy")
+        self.assertEqual((r["command"], r["started"], r["fetches"]),
+                         ("1", "0", "0"))
+        self.assert_idle("lease_busy")
 
     def test_allocation_or_task_failure_releases_busy(self):
         for scenario in ("alloc_fail", "task_fail"):

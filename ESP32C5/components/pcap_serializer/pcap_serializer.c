@@ -9,6 +9,7 @@
 #include "pcap_serializer.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
 #include "esp_log.h"

@@ -211,7 +211,8 @@ workflow and must be included. Its confirmed local checkout is
 `main/main.c` Monster OTA block confirms it sends commands and monitors logs;
 the C5 owns Wi-Fi, release selection, download and flash. Tab5 already tracks
 RF version and Sub-GHz capability, which do not alone establish a trusted OTA
-variant. The discussion plan is [ota-rf-implementation-plan.md](ota-rf-implementation-plan.md).
+variant. The remaining discussion plan is kept with other unfinished work in
+[the Superpowers plan directory](superpowers/plans/2026-09-29-ota-rf-tab5.md).
 
 Before either stage, define the shared device-identification contract: explicit
 classic/RF/unknown variant, running firmware version and supported update

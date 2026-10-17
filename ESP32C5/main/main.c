@@ -101,6 +101,8 @@
 #include "esp_netif_net_stack.h"
 
 #include "attack_handshake.h"
+#include "handshake_radio_policy.h"
+#include "bssid_protection.h"
 #include "hccapx_serializer.h"
 #include "pcap_serializer.h"
 #include "frame_analyzer_parser.h"
@@ -114,6 +116,10 @@
 #include "crack_worker.h"
 #include "artifact_inventory_core.h"
 #include "wifi_analyzer.h"
+#include "janos_console_admission.h"
+#include "janos_radio_lease.h"
+#include "janos_wps_runtime.h"
+#include "wifi_country_policy.h"
 #include <math.h>
 
 // NimBLE includes for BLE scanning
@@ -191,6 +197,9 @@
 
 #define DISPLAY_NVS_NAMESPACE "display"
 #define DISPLAY_NVS_KEY_MODE  "mode"
+
+#define WIFI_COUNTRY_NVS_NAMESPACE "wifi_country"
+#define WIFI_COUNTRY_NVS_KEY       "profile"
 
 
 
@@ -649,6 +658,7 @@ typedef struct {
     bool complete;
     bool beacon_captured;
     bool has_existing_file;     // Already captured on SD
+    bool existing_file_checked; // SD lookup is deferred to the worker task
     int64_t last_deauth_us;
     int64_t first_seen_us;      // FIFO: first discovery time, not refreshed on beacon updates
 } hs_ap_target_t;
@@ -675,6 +685,11 @@ static double ducb_discounted_total = 0.0;         // Σ γ^(t-s) across all arm
 // Per-dwell reward counters (reset each dwell)
 static volatile int hs_dwell_new_clients = 0;
 static volatile int hs_dwell_eapol_frames = 0;
+static bool hs_sniffer_promiscuous_armed = false;
+static StaticSemaphore_t hs_sniffer_mutex_storage;
+static SemaphoreHandle_t hs_sniffer_mutex = NULL;
+static atomic_uint hs_sniffer_callbacks_inflight = ATOMIC_VAR_INIT(0);
+static atomic_bool hs_sniffer_callback_accepting = ATOMIC_VAR_INIT(false);
 
 // Beacon spam task
 static TaskHandle_t beacon_spam_task_handle = NULL;
@@ -888,8 +903,13 @@ static esp_netif_t *sta_netif_handle = NULL;
 static esp_netif_t *ap_netif_handle = NULL;
 static bool wifi_event_handler_registered = false;
 static bool ip_event_handler_registered = false;
+static wifi_country_policy_record_t wifi_country_configured = {
+    WIFI_COUNTRY_POLICY_VERSION, "PH"
+};
+static const char *wifi_country_record_health = "default_ph";
 static bool ota_check_started = false;
 static bool ota_check_in_progress = false;
+static janos_radio_lease_t janos_radio_lease;
 static atomic_bool ota_boot_ready = ATOMIC_VAR_INIT(false);
 static char ota_channel[OTA_CHANNEL_MAX_LEN] = "main";
 static bool ota_auto_on_ip = false;
@@ -1775,7 +1795,7 @@ static void send_beacon_frame(const uint8_t *frame_buffer, int size) {
     }
 }
 
-static esp_err_t wifi_apply_extended_country(void);
+static esp_err_t wifi_apply_configured_country(void);
 static void wifi_get_24ghz_channel_bounds(uint8_t *first_channel, uint8_t *last_channel);
 
 /**
@@ -2099,9 +2119,13 @@ static int sd_mount_freq_khz = 0;
 
 // Whitelist for BSSID protection (allocated in PSRAM)
 #define MAX_WHITELISTED_BSSIDS 150
+#define BSSID_PROTECTION_FILE_PATH "/sdcard/lab/white.txt"
+#define BSSID_PROTECTION_TMP_PATH  "/sdcard/lab/white.tmp"
 typedef struct {
     uint8_t bssid[6];
 } whitelisted_bssid_t;
+_Static_assert(sizeof(whitelisted_bssid_t) == BSSID_PROTECTION_ADDRESS_LEN,
+               "whitelist entries must be packed BSSIDs");
 static whitelisted_bssid_t *whiteListedBssids = NULL;       // ~0.9 KB in PSRAM
 static int whitelistedBssidsCount = 0;
 
@@ -2297,6 +2321,7 @@ static int cmd_zig_recon_list(int argc, char **argv);
 static int cmd_zig_recon_nodes(int argc, char **argv);
 static int cmd_zig_recon_clear(int argc, char **argv);
 static int cmd_wifi_connect(int argc, char **argv);
+static int cmd_wifi_country(int argc, char **argv);
 static int cmd_capture_gateway(int argc, char **argv);
 static int cmd_list_hosts(int argc, char **argv);
 static int cmd_list_hosts_vendor(int argc, char **argv);
@@ -2343,7 +2368,7 @@ static void beacon_spam_task(void *pvParameters);
 static bool check_handshake_file_exists(const char *ssid);
 static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid);
 static void handshake_cleanup(void);
-static void attack_network_with_burst(const wifi_ap_record_t *ap);
+static bool attack_network_with_burst(const wifi_ap_record_t *ap);
 static const char *display_mode_to_str(display_type_t mode);
 static bool display_mode_from_str(const char *s, display_type_t *out_mode);
 static void display_mode_load_from_nvs(void);
@@ -2353,7 +2378,8 @@ static void ducb_init(void);
 static int ducb_select_channel(void);
 static void ducb_update(int channel_idx, double reward);
 static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
-static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid, uint8_t channel);
+static bool hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid,
+                                    uint8_t channel, wifi_interface_t tx_if);
 static bool hs_save_handshake_to_sd(int ap_idx);
 static void gps_raw_task(void *pvParameters);
 // Wardrive promisc helpers
@@ -2483,6 +2509,7 @@ static void save_portal_data(const char* ssid, const char* form_data);
 // Whitelist functions
 static void load_whitelist_from_sd(void);
 static bool is_bssid_whitelisted(const uint8_t *bssid);
+static int cmd_radio_protect(int argc, char **argv);
 // SAE WPA3 attack methods forward declarations:
 //add methods declarations below:
 static void inject_sae_commit_frame();
@@ -2596,6 +2623,13 @@ static void wifi_event_handler(void *event_handler_arg,
                                esp_event_base_t event_base,
                                int32_t event_id,
                                void *event_data) {
+    janos_radio_lease_snapshot_t radio_lease =
+        janos_radio_lease_snapshot(&janos_radio_lease);
+    if (radio_lease.owner == JANOS_RADIO_OWNER_WPS) {
+        /* The WPS adapter owns temporary event handlers for its transaction.
+         * Do not let legacy JanOS state machines consume those events. */
+        return;
+    }
     if (event_base == WIFI_EVENT) {
         //MY_LOG_INFO(TAG, "WiFi event: %ld", event_id);
         switch (event_id) {
@@ -3547,6 +3581,14 @@ static esp_err_t ota_rf_verify_support_images(const char *tag) {
 }
 
 static bool ota_start_check_source(const char *tag, bool force_latest, bool rf) {
+    janos_radio_lease_snapshot_t radio_lease =
+        janos_radio_lease_snapshot(&janos_radio_lease);
+    if (radio_lease.owner != JANOS_RADIO_OWNER_NONE) {
+        MY_LOG_INFO(TAG, "OTA refused: radio lease owned by %u generation %u",
+                    (unsigned)radio_lease.owner,
+                    (unsigned)radio_lease.generation);
+        return false;
+    }
     if (!ota_boot_is_ready()) {
         MY_LOG_INFO(TAG, "OTA: boot confirmation incomplete; update rejected");
         return false;
@@ -3707,6 +3749,9 @@ static void ip_event_handler(void *event_handler_arg,
                              void *event_data) {
     (void)event_handler_arg;
     (void)event_data;
+
+    if (janos_radio_lease_snapshot(&janos_radio_lease).owner ==
+        JANOS_RADIO_OWNER_WPS) return;
 
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         if (capture_gateway_is_active()) {
@@ -4093,6 +4138,24 @@ static void ota_log_boot_info(void) {
 
 // --- Wi-Fi initialization (STA only - uses less memory) ---
 // AP mode will be enabled dynamically when needed (Evil Twin, Portal)
+static esp_err_t wifi_init_with_configured_country(const wifi_init_config_t *config)
+{
+    esp_err_t err = esp_wifi_init(config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = wifi_apply_configured_country();
+    if (err != ESP_OK) {
+        esp_err_t deinit_err = esp_wifi_deinit();
+        if (deinit_err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Failed to deinitialize WiFi after country error: %s",
+                        esp_err_to_name(deinit_err));
+        }
+    }
+    return err;
+}
+
 static esp_err_t wifi_init_ap_sta(void) {
     // Initialize netif only once (shared between WiFi and BLE modes)
     if (!netif_initialized) {
@@ -4112,7 +4175,7 @@ static esp_err_t wifi_init_ap_sta(void) {
     }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(wifi_init_with_configured_country(&cfg));
 
     // Register event handler only once (survives WiFi reinit after mode switch)
     if (!wifi_event_handler_registered) {
@@ -4150,20 +4213,155 @@ static esp_err_t wifi_init_ap_sta(void) {
     return ESP_OK;
 }
 
-static esp_err_t wifi_apply_extended_country(void)
+static esp_err_t wifi_country_save(const wifi_country_policy_record_t *record)
 {
-    wifi_country_t wifi_country = {
-        .cc = "PH",
-        .schan = 1,
-        .nchan = 14,
-        .policy = WIFI_COUNTRY_POLICY_AUTO,
-    };
+    uint8_t encoded[WIFI_COUNTRY_POLICY_RECORD_SIZE];
+    if (wifi_country_policy_encode(record, encoded, sizeof(encoded)) !=
+        WIFI_COUNTRY_POLICY_OK) return ESP_ERR_INVALID_ARG;
 
-    esp_err_t err = esp_wifi_set_country(&wifi_country);
-    if (err != ESP_OK) {
-        MY_LOG_INFO(TAG, "Failed to set WiFi country for channels 1-13: %s", esp_err_to_name(err));
-    }
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIFI_COUNTRY_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(handle, WIFI_COUNTRY_NVS_KEY, encoded, sizeof(encoded));
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
     return err;
+}
+
+static void wifi_country_load(void)
+{
+    wifi_country_configured = wifi_country_policy_default();
+    wifi_country_record_health = "default_ph";
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIFI_COUNTRY_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return;
+    if (err != ESP_OK) {
+        wifi_country_record_health = "read_error_fallback_ph";
+        return;
+    }
+    uint8_t encoded[WIFI_COUNTRY_POLICY_RECORD_SIZE];
+    size_t length = sizeof(encoded);
+    err = nvs_get_blob(handle, WIFI_COUNTRY_NVS_KEY, encoded, &length);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return;
+    wifi_country_policy_record_t loaded;
+    if (err != ESP_OK || wifi_country_policy_decode(encoded, length, &loaded) !=
+        WIFI_COUNTRY_POLICY_OK) {
+        wifi_country_record_health = "invalid_fallback_ph";
+        return;
+    }
+    wifi_country_configured = loaded;
+    wifi_country_record_health = "valid";
+}
+
+static esp_err_t wifi_apply_configured_country(void)
+{
+    esp_err_t err;
+    if (wifi_country_policy_is_ph(&wifi_country_configured)) {
+        wifi_country_t country = {
+            .cc = "PH",
+            .schan = 1,
+            .nchan = 14,
+            .policy = WIFI_COUNTRY_POLICY_MANUAL,
+        };
+        err = esp_wifi_set_country(&country);
+    } else {
+        err = esp_wifi_set_country_code(wifi_country_configured.cc, false);
+    }
+
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to set WiFi country %s: %s",
+                    wifi_country_configured.cc, esp_err_to_name(err));
+        return err;
+    }
+
+    wifi_country_t readback = { 0 };
+    err = esp_wifi_get_country(&readback);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to read back WiFi country %s: %s",
+                    wifi_country_configured.cc, esp_err_to_name(err));
+        return err;
+    }
+    bool mismatch = readback.cc[0] != wifi_country_configured.cc[0] ||
+                    readback.cc[1] != wifi_country_configured.cc[1] ||
+                    readback.policy != WIFI_COUNTRY_POLICY_MANUAL;
+    if (wifi_country_policy_is_ph(&wifi_country_configured))
+        mismatch = mismatch || readback.schan != 1 || readback.nchan != 14;
+    if (mismatch) {
+        MY_LOG_INFO(TAG,
+                    "WiFi country readback mismatch: cc=%c%c schan=%u nchan=%u policy=%d",
+                    readback.cc[0], readback.cc[1], readback.schan, readback.nchan,
+                    (int)readback.policy);
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_OK;
+}
+
+static void wifi_country_print_status(void)
+{
+    wifi_country_t active = {0};
+    bool have_active = wifi_initialized && esp_wifi_get_country(&active) == ESP_OK;
+    if (have_active) {
+        printf("{\"schema_version\":1,\"record_type\":\"wifi_country_status\","
+               "\"configured_cc\":\"%s\",\"default_cc\":\"PH\",\"record_health\":\"%s\","
+               "\"active_cc\":\"%c%c\",\"active_schan\":%u,\"active_nchan\":%u,"
+               "\"active_policy\":\"%s\"}\n",
+               wifi_country_configured.cc, wifi_country_record_health,
+               active.cc[0], active.cc[1], active.schan, active.nchan,
+               active.policy == WIFI_COUNTRY_POLICY_MANUAL ? "manual" : "auto");
+    } else {
+        printf("{\"schema_version\":1,\"record_type\":\"wifi_country_status\","
+               "\"configured_cc\":\"%s\",\"default_cc\":\"PH\",\"record_health\":\"%s\","
+               "\"active_cc\":null}\n",
+               wifi_country_configured.cc, wifi_country_record_health);
+    }
+}
+
+static int cmd_wifi_country(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "status") == 0) {
+        wifi_country_print_status();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "list") == 0) {
+        printf("{\"schema_version\":1,\"record_type\":\"wifi_country_profiles\","
+               "\"default_cc\":\"PH\",\"profiles\":[");
+        for (size_t i = 0; i < wifi_country_policy_count(); ++i)
+            printf("%s\"%s\"", i == 0 ? "" : ",", wifi_country_policy_at(i));
+        puts("]}");
+        return 0;
+    }
+
+    wifi_country_policy_record_t requested = wifi_country_policy_default();
+    const char *action = NULL;
+    if (argc == 2 && strcmp(argv[1], "reset") == 0) {
+        action = "reset";
+    } else if (argc == 3 && strcmp(argv[1], "set") == 0) {
+        if (wifi_country_policy_normalize(argv[2], requested.cc) !=
+            WIFI_COUNTRY_POLICY_OK) {
+            printf("{\"schema_version\":1,\"record_type\":\"wifi_country_result\","
+                   "\"result\":\"unsupported_cc\",\"cc\":\"%s\"}\n", argv[2]);
+            return 1;
+        }
+        action = "set";
+    } else {
+        puts("Usage: wifi_country status|list|set <CC>|reset");
+        return 1;
+    }
+
+    esp_err_t err = wifi_country_save(&requested);
+    if (err != ESP_OK) {
+        printf("{\"schema_version\":1,\"record_type\":\"wifi_country_result\","
+               "\"result\":\"store_error\",\"error\":%d}\n", (int)err);
+        return 1;
+    }
+    wifi_country_configured = requested;
+    wifi_country_record_health = "valid";
+    printf("WiFi country next boot: %s (default: PH)\n", requested.cc);
+    printf("{\"schema_version\":1,\"record_type\":\"wifi_country_result\","
+           "\"result\":\"%s\",\"configured_cc\":\"%s\","
+           "\"applies_after_reboot\":true}\n", action, requested.cc);
+    return 0;
 }
 
 static void wifi_get_24ghz_channel_bounds(uint8_t *first_channel, uint8_t *last_channel)
@@ -4221,7 +4419,7 @@ static bool ensure_wifi_mode(void)
                 return false;
             }
             
-            wifi_apply_extended_country();
+            wifi_apply_configured_country();
             
             current_radio_mode = RADIO_MODE_WIFI;
             wifi_initialized = true;
@@ -7879,6 +8077,10 @@ static int hs_pick_fifo_victim(void) {
 // Add or update AP from beacon. Returns index.
 static int hs_add_or_update_ap(const uint8_t *bssid, const char *ssid, uint8_t channel,
                                 wifi_auth_mode_t authmode, int rssi) {
+    if (is_bssid_whitelisted(bssid)) {
+        return -1;
+    }
+
     int idx = hs_find_ap(bssid);
     if (idx >= 0) {
         // Update existing — do not refresh first_seen_us (FIFO by first discovery)
@@ -7918,23 +8120,11 @@ static int hs_add_or_update_ap(const uint8_t *bssid, const char *ssid, uint8_t c
     hs_ap_targets[idx].last_deauth_us = 0;
     hs_ap_targets[idx].first_seen_us = esp_timer_get_time();
     
-    // Check if we already have a handshake file for this network
-    hs_ap_targets[idx].has_existing_file = 
-        check_handshake_file_exists(ssid ? ssid : "") ||
-        check_handshake_file_exists_by_bssid(bssid);
-    
-    if (hs_ap_targets[idx].has_existing_file) {
-        // Tab5 parses: strstr("Skipping") && strstr("PCAP already exists")
-        if (hs_ap_targets[idx].ssid[0]) {
-            MY_LOG_INFO(TAG, "Skipping '%s' - PCAP already exists",
-                       hs_ap_targets[idx].ssid);
-        } else {
-            MY_LOG_INFO(TAG, "Skipping hidden %02X:%02X:%02X:%02X:%02X:%02X - PCAP already exists",
-                       hs_ap_targets[idx].bssid[0], hs_ap_targets[idx].bssid[1],
-                       hs_ap_targets[idx].bssid[2], hs_ap_targets[idx].bssid[3],
-                       hs_ap_targets[idx].bssid[4], hs_ap_targets[idx].bssid[5]);
-        }
-    }
+    // Filesystem access is deliberately deferred to the worker.  A Wi-Fi
+    // promiscuous callback must never scan the SD card while holding the
+    // callback/worker mutex.
+    hs_ap_targets[idx].has_existing_file = false;
+    hs_ap_targets[idx].existing_file_checked = false;
     
     return idx;
 }
@@ -8013,14 +8203,26 @@ static uint8_t hs_get_eapol_msg_num(eapol_key_packet_t *eapol_key) {
 // Sniffer Handshake: Targeted Deauth
 // ============================================================================
 
-static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid, uint8_t channel) {
-    // Ensure we're on the correct channel
-    uint8_t current_channel;
-    wifi_second_chan_t second_chan;
-    esp_wifi_get_channel(&current_channel, &second_chan);
-    if (current_channel != channel) {
-        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-        vTaskDelay(pdMS_TO_TICKS(5));
+static bool hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid,
+                                    uint8_t channel, wifi_interface_t tx_if) {
+    if (is_bssid_whitelisted(ap_bssid)) {
+        return false;
+    }
+
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    esp_err_t read_err = esp_wifi_get_mode(&mode);
+    wifi_mode_t expected_mode = tx_if == WIFI_IF_STA
+        ? WIFI_MODE_STA : WIFI_MODE_APSTA;
+    uint8_t current_channel = 0;
+    wifi_second_chan_t second_channel = WIFI_SECOND_CHAN_NONE;
+    esp_err_t channel_err = esp_wifi_get_channel(&current_channel, &second_channel);
+    if (read_err != ESP_OK || channel_err != ESP_OK ||
+        mode != expected_mode || current_channel != channel) {
+        MY_LOG_INFO(TAG,
+                    "Handshake D-UCB TX preflight failed: requested_channel=%u readback=%u mode=%d expected_mode=%d mode_error=%s channel_error=%s",
+                    channel, current_channel, (int)mode, (int)expected_mode,
+                    esp_err_to_name(read_err), esp_err_to_name(channel_err));
+        return false;
     }
     
     // Build targeted deauth frame (destination = station, not broadcast)
@@ -8042,7 +8244,7 @@ static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *a
     
     // Send burst of 5 packets
     for (int i = 0; i < 5; i++) {
-        esp_err_t ret = esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame), false);
+        esp_err_t ret = esp_wifi_80211_tx(tx_if, deauth_frame, sizeof(deauth_frame), false);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "[HS-DEAUTH] Failed to send deauth #%d: %s", i + 1, esp_err_to_name(ret));
         }
@@ -8054,9 +8256,14 @@ static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *a
     memcpy(&deauth_frame[10], station_mac, 6); // Source: Station
     memcpy(&deauth_frame[16], ap_bssid, 6);   // BSSID: AP
     for (int i = 0; i < 3; i++) {
-        esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame), false);
+        esp_err_t ret = esp_wifi_80211_tx(tx_if, deauth_frame, sizeof(deauth_frame), false);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "[HS-DEAUTH] Failed to send reverse deauth #%d: %s",
+                     i + 1, esp_err_to_name(ret));
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+    return true;
 }
 
 // ============================================================================
@@ -8165,7 +8372,7 @@ static bool hs_save_handshake_to_sd(int ap_idx) {
 // Sniffer Handshake: Promiscuous Callback
 // ============================================================================
 
-static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+static void hs_sniffer_process_packet(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (!handshake_attack_active) return;
     
     // Only process MGMT and DATA
@@ -8333,6 +8540,41 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
     }
 }
 
+static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    atomic_fetch_add_explicit(&hs_sniffer_callbacks_inflight, 1,
+                              memory_order_acq_rel);
+    SemaphoreHandle_t sniffer_mutex = hs_sniffer_mutex;
+    if (atomic_load_explicit(&hs_sniffer_callback_accepting,
+                             memory_order_acquire) &&
+        sniffer_mutex != NULL &&
+        xSemaphoreTake(sniffer_mutex, 0) == pdTRUE) {
+        hs_sniffer_process_packet(buf, type);
+        xSemaphoreGive(sniffer_mutex);
+    }
+    atomic_fetch_sub_explicit(&hs_sniffer_callbacks_inflight, 1,
+                              memory_order_acq_rel);
+}
+
+static bool handshake_quiesce_sniffer_callbacks(TickType_t timeout_ticks)
+{
+    atomic_store_explicit(&hs_sniffer_callback_accepting, false,
+                          memory_order_release);
+    (void)esp_wifi_set_promiscuous(false);
+    hs_sniffer_promiscuous_armed = false;
+
+    TickType_t started = xTaskGetTickCount();
+    while (atomic_load_explicit(&hs_sniffer_callbacks_inflight,
+                                memory_order_acquire) != 0) {
+        if (timeout_ticks != portMAX_DELAY &&
+            (xTaskGetTickCount() - started) >= timeout_ticks) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return true;
+}
+
 // Cleanup function for handshake attack
 static void handshake_cleanup(void) {
     MY_LOG_INFO(TAG, "Handshake attack cleanup...");
@@ -8340,24 +8582,34 @@ static void handshake_cleanup(void) {
     // Stop any active handshake attack (selected mode uses this)
     attack_handshake_stop();
     
-    // Disable promiscuous mode (sniffer mode uses this)
-    esp_wifi_set_promiscuous(false);
+    // Disable new callbacks and wait until any callback already in flight has
+    // released its local mutex handle before resetting shared state.
+    (void)handshake_quiesce_sniffer_callbacks(portMAX_DELAY);
     
     // Reset state
     handshake_attack_active = false;
-    handshake_attack_task_handle = NULL;
     handshake_target_count = 0;
     handshake_current_index = 0;
     memset(handshake_targets, 0, MAX_AP_CNT * sizeof(wifi_ap_record_t));
     memset(handshake_captured, 0, sizeof(handshake_captured));
     
-    // Reset sniffer handshake state
+    // Reset sniffer handshake state only after the Wi-Fi callback has left
+    // the shared tables.  Selected-target mode may not have created the
+    // sniffer mutex, so retain a direct-reset fallback for that path.
+    bool sniffer_state_locked = false;
+    if (hs_sniffer_mutex != NULL) {
+        sniffer_state_locked =
+            xSemaphoreTake(hs_sniffer_mutex, portMAX_DELAY) == pdTRUE;
+    }
     hs_ap_count = 0;
     hs_client_count = 0;
     hs_dwell_new_clients = 0;
     hs_dwell_eapol_frames = 0;
     if (hs_ap_targets) memset(hs_ap_targets, 0, HS_MAX_APS * sizeof(hs_ap_target_t));
     if (hs_clients) memset(hs_clients, 0, HS_MAX_CLIENTS * sizeof(hs_client_entry_t));
+    if (sniffer_state_locked) {
+        xSemaphoreGive(hs_sniffer_mutex);
+    }
     
     // Restore idle LED
     esp_err_t led_err = led_set_idle();
@@ -8393,8 +8645,199 @@ static void __attribute__((unused)) quick_scan_all_channels(void) {
     MY_LOG_INFO(TAG, "Channel scan complete");
 }
 
+static bool handshake_prepare_target_radio(const wifi_ap_record_t *ap)
+{
+    handshake_radio_path_t path =
+        handshake_radio_path_for_channel(ap->primary);
+    if (path == HANDSHAKE_RADIO_PATH_APSTA_TX_AP) {
+        if (!ensure_ap_mode()) {
+            MY_LOG_INFO(TAG,
+                        "Handshake radio prepare failed: channel=%u path=legacy_apsta",
+                        ap->primary);
+            return false;
+        }
+        wifi_mode_t mode = WIFI_MODE_NULL;
+        esp_err_t err = esp_wifi_get_mode(&mode);
+        if (err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Handshake APSTA mode read failed: %s",
+                        esp_err_to_name(err));
+            return false;
+        }
+        if (mode != WIFI_MODE_APSTA) {
+            err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+            if (err != ESP_OK) {
+                MY_LOG_INFO(TAG, "Handshake APSTA switch failed: %s",
+                            esp_err_to_name(err));
+                return false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        err = esp_wifi_get_mode(&mode);
+        if (err != ESP_OK || mode != WIFI_MODE_APSTA) {
+            MY_LOG_INFO(TAG,
+                        "Handshake APSTA verification failed: mode=%d error=%s",
+                        (int)mode, esp_err_to_name(err));
+            return false;
+        }
+        MY_LOG_INFO(TAG,
+                    "Handshake radio selected: channel=%u path=legacy_apsta tx_if=AP",
+                    ap->primary);
+        return true;
+    }
+
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    esp_err_t err = esp_wifi_get_mode(&mode);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Handshake DFS mode read failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    if (mode != WIFI_MODE_STA) {
+        err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (err != ESP_OK) {
+            MY_LOG_INFO(TAG, "Handshake DFS STA switch failed: %s", esp_err_to_name(err));
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    err = esp_wifi_get_mode(&mode);
+    if (err != ESP_OK || mode != WIFI_MODE_STA) {
+        MY_LOG_INFO(TAG,
+                    "Handshake DFS STA verification failed: mode=%d error=%s",
+                    (int)mode, esp_err_to_name(err));
+        return false;
+    }
+
+    MY_LOG_INFO(TAG,
+                "Handshake radio selected: channel=%u path=dfs_sta tx_if=STA",
+                ap->primary);
+    return true;
+}
+
+/* Prepare one scan-all D-UCB arm using the same APSTA/STA policy as an
+ * explicitly selected target.  ESP-IDF drops the promiscuous callback when
+ * ensure_ap_mode() restarts Wi-Fi, so every mode transition rearms the
+ * sniffer before the dwell begins. */
+static bool handshake_prepare_sniffer_channel(uint8_t channel,
+                                               wifi_interface_t *tx_if)
+{
+    if (tx_if == NULL || !handshake_attack_active || operation_stop_requested) {
+        return false;
+    }
+
+    handshake_radio_path_t path = handshake_radio_path_for_channel(channel);
+    wifi_mode_t desired_mode = path == HANDSHAKE_RADIO_PATH_STA_TX_STA
+        ? WIFI_MODE_STA : WIFI_MODE_APSTA;
+    wifi_interface_t desired_tx_if = path == HANDSHAKE_RADIO_PATH_STA_TX_STA
+        ? WIFI_IF_STA : WIFI_IF_AP;
+
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    esp_err_t err = esp_wifi_get_mode(&mode);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Handshake D-UCB mode read failed on channel %u: %s",
+                    channel, esp_err_to_name(err));
+        return false;
+    }
+
+    bool mode_changed = mode != desired_mode;
+    if (mode_changed) {
+        if (!handshake_quiesce_sniffer_callbacks(pdMS_TO_TICKS(1000))) {
+            MY_LOG_INFO(TAG,
+                        "Handshake D-UCB callback drain timed out on channel %u",
+                        channel);
+            return false;
+        }
+
+        if (desired_mode == WIFI_MODE_APSTA) {
+            if (!ensure_ap_mode()) {
+                MY_LOG_INFO(TAG,
+                            "Handshake D-UCB APSTA switch failed on channel %u",
+                            channel);
+                return false;
+            }
+        } else {
+            err = esp_wifi_set_mode(WIFI_MODE_STA);
+            if (err != ESP_OK) {
+                MY_LOG_INFO(TAG,
+                            "Handshake D-UCB STA switch failed on channel %u: %s",
+                            channel, esp_err_to_name(err));
+                return false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+        err = esp_wifi_get_mode(&mode);
+        if (err != ESP_OK || mode != desired_mode) {
+            MY_LOG_INFO(TAG,
+                        "Handshake D-UCB mode verification failed: channel=%u mode=%d expected=%d error=%s",
+                        channel, (int)mode, (int)desired_mode,
+                        esp_err_to_name(err));
+            return false;
+        }
+    }
+
+    err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG,
+                    "Handshake D-UCB channel switch failed: channel=%u path=%s error=%s",
+                    channel,
+                    path == HANDSHAKE_RADIO_PATH_STA_TX_STA ? "dfs_sta" : "legacy_apsta",
+                    esp_err_to_name(err));
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    uint8_t readback_channel = 0;
+    wifi_second_chan_t second_channel = WIFI_SECOND_CHAN_NONE;
+    err = esp_wifi_get_channel(&readback_channel, &second_channel);
+    if (err != ESP_OK || readback_channel != channel) {
+        MY_LOG_INFO(TAG,
+                    "Handshake D-UCB channel verification failed: requested=%u readback=%u error=%s",
+                    channel, readback_channel, esp_err_to_name(err));
+        return false;
+    }
+
+    if (!handshake_attack_active || operation_stop_requested) {
+        return false;
+    }
+
+    if (!hs_sniffer_promiscuous_armed) {
+        wifi_promiscuous_filter_t filter = {
+            .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT |
+                           WIFI_PROMIS_FILTER_MASK_DATA
+        };
+        err = esp_wifi_set_promiscuous_filter(&filter);
+        if (err == ESP_OK) {
+            err = esp_wifi_set_promiscuous_rx_cb(hs_sniffer_promiscuous_cb);
+        }
+        if (err == ESP_OK) {
+            atomic_store_explicit(&hs_sniffer_callback_accepting, true,
+                                  memory_order_release);
+            err = esp_wifi_set_promiscuous(true);
+        }
+        if (err != ESP_OK) {
+            atomic_store_explicit(&hs_sniffer_callback_accepting, false,
+                                  memory_order_release);
+            MY_LOG_INFO(TAG,
+                        "Handshake D-UCB sniffer rearm failed on channel %u: %s",
+                        channel, esp_err_to_name(err));
+            return false;
+        }
+        hs_sniffer_promiscuous_armed = true;
+    }
+
+    if (mode_changed) {
+        MY_LOG_INFO(TAG,
+                    "Handshake D-UCB radio selected: channel=%u path=%s tx_if=%s",
+                    channel,
+                    path == HANDSHAKE_RADIO_PATH_STA_TX_STA ? "dfs_sta" : "legacy_apsta",
+                    desired_tx_if == WIFI_IF_STA ? "STA" : "AP");
+    }
+    *tx_if = desired_tx_if;
+    return true;
+}
+
 // Attack network with deauth burst (5 packets)
-static void attack_network_with_burst(const wifi_ap_record_t *ap) {
+static bool attack_network_with_burst(const wifi_ap_record_t *ap) {
     MY_LOG_INFO(TAG, "Burst attacking '%s' (Ch %d, RSSI: %d dBm)", 
                 ap->ssid, ap->primary, ap->rssi);
     
@@ -8402,8 +8845,20 @@ static void attack_network_with_burst(const wifi_ap_record_t *ap) {
     snprintf(burst_l2, sizeof(burst_l2), ">> %s", (const char *)ap->ssid);
     snprintf(burst_l3, sizeof(burst_l3), "  Ch %d  %ddB", ap->primary, ap->rssi);
     
+    if (!handshake_prepare_target_radio(ap)) {
+        oled_display_update_full("> WPA Capture", burst_l2, burst_l3, "  Radio error");
+        return false;
+    }
+
     // Start attack on this network
-    attack_handshake_start(ap, ATTACK_HANDSHAKE_METHOD_BROADCAST);
+    esp_err_t start_err = attack_handshake_start(
+        ap, ATTACK_HANDSHAKE_METHOD_BROADCAST);
+    if (start_err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Handshake start failed for '%s': %s",
+                    ap->ssid, esp_err_to_name(start_err));
+        oled_display_update_full("> WPA Capture", burst_l2, burst_l3, "  Start failed");
+        return false;
+    }
     
     // Wait and check for handshake - 3 deauth bursts with 3s wait each
     for (int burst = 0; burst < 3 && handshake_attack_active && !operation_stop_requested; burst++) {
@@ -8430,7 +8885,7 @@ static void attack_network_with_burst(const wifi_ap_record_t *ap) {
                 // Wait 2s to capture any remaining frames
                 vTaskDelay(pdMS_TO_TICKS(2000));
                 attack_handshake_stop();
-                return; // Success!
+                return true;
             }
         }
         
@@ -8441,6 +8896,7 @@ static void attack_network_with_burst(const wifi_ap_record_t *ap) {
     MY_LOG_INFO(TAG, "✗ No handshake for '%s' after 3 bursts", ap->ssid);
     oled_display_update_full("> WPA Capture", burst_l2, burst_l3, "  No handshake");
     attack_handshake_stop();
+    return false;
 }
 
 // ============================================================================
@@ -8491,9 +8947,9 @@ static void handshake_attack_task_selected(void) {
                 oled_display_update_full(hs_l1, hs_l2, hs_l3, "  Attacking...");
             }
             
-            attack_network_with_burst(ap);
+            bool captured = attack_network_with_burst(ap);
             
-            if (attack_handshake_is_complete()) {
+            if (captured) {
                 handshake_captured[i] = true;
                 captured_count++;
                 MY_LOG_INFO(TAG, "Handshake #%d captured!", captured_count);
@@ -8543,26 +8999,35 @@ static void handshake_attack_task_sniffer(void) {
     
     // 1. Initialize D-UCB
     ducb_init();
+    if (hs_sniffer_mutex == NULL) {
+        hs_sniffer_mutex = xSemaphoreCreateMutexStatic(&hs_sniffer_mutex_storage);
+    }
+    if (hs_sniffer_mutex == NULL) {
+        MY_LOG_INFO(TAG, "Failed to create handshake sniffer mutex");
+        return;
+    }
     
     // 2. Reset sniffer state
+    if (xSemaphoreTake(hs_sniffer_mutex, portMAX_DELAY) != pdTRUE) {
+        MY_LOG_INFO(TAG, "Failed to lock handshake sniffer state");
+        return;
+    }
     hs_ap_count = 0;
     hs_client_count = 0;
+    hs_dwell_new_clients = 0;
+    hs_dwell_eapol_frames = 0;
     memset(hs_ap_targets, 0, HS_MAX_APS * sizeof(hs_ap_target_t));
     memset(hs_clients, 0, HS_MAX_CLIENTS * sizeof(hs_client_entry_t));
+    xSemaphoreGive(hs_sniffer_mutex);
     
     // 3. Initialize PCAP + HCCAPX serializers
     pcap_serializer_init();
     hccapx_serializer_init((const uint8_t *)"", 0); // Will be re-inited per-AP as needed
     
-    // 4. Set up promiscuous mode with our callback
-    wifi_promiscuous_filter_t filter = {
-        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
-    };
-    esp_wifi_set_promiscuous_filter(&filter);
-    esp_wifi_set_promiscuous_rx_cb(hs_sniffer_promiscuous_cb);
-    esp_wifi_set_promiscuous(true);
+    // 4. The first selected channel arms promiscuous mode.  Later mode
+    // transitions rearm it after the Wi-Fi driver has been reconfigured.
+    hs_sniffer_promiscuous_armed = false;
     
-    MY_LOG_INFO(TAG, "Promiscuous mode enabled. Sniffing...");
     // Tab5 parses: strstr("PHASE") && strstr("Attack")
     MY_LOG_INFO(TAG, "===== PHASE: Sniffer Attack (D-UCB) =====");
     // Tab5 parses: strstr("Scanning") for progress
@@ -8570,32 +9035,59 @@ static void handshake_attack_task_sniffer(void) {
     
     int64_t last_stats_time = esp_timer_get_time();
     int total_handshakes_captured = 0;
+    bool sniffer_started_logged = false;
     
     // 5. Main D-UCB loop
     while (handshake_attack_active && !operation_stop_requested) {
         // Select channel via D-UCB
         int ch_idx = ducb_select_channel();
         int channel = ducb_channels[ch_idx].channel;
+        wifi_interface_t tx_if = WIFI_IF_AP;
+
+        if (!handshake_prepare_sniffer_channel(channel, &tx_if)) {
+            // A rejected arm earns zero reward but is counted as explored, so
+            // one unavailable channel cannot pin the scheduler forever.
+            ducb_update(ch_idx, 0.0);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        if (!sniffer_started_logged) {
+            MY_LOG_INFO(TAG, "Promiscuous mode enabled. Sniffing...");
+            sniffer_started_logged = true;
+        }
         
-        // Switch channel
-        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-        
+        int ap_count_snapshot = 0;
+        int client_count_snapshot = 0;
+        if (xSemaphoreTake(hs_sniffer_mutex, portMAX_DELAY) != pdTRUE) {
+            ducb_update(ch_idx, 0.0);
+            continue;
+        }
+        ap_count_snapshot = hs_ap_count;
+        client_count_snapshot = hs_client_count;
+        // The callback updates these counters under the same mutex, so the
+        // reset marks an exact start of the current D-UCB dwell window.
+        hs_dwell_new_clients = 0;
+        hs_dwell_eapol_frames = 0;
+        xSemaphoreGive(hs_sniffer_mutex);
+
         {
             char hss_l2[64], hss_l3[64], hss_l4[64];
             snprintf(hss_l2, sizeof(hss_l2), "  Scan Ch %d", channel);
-            snprintf(hss_l3, sizeof(hss_l3), "  AP:%d Cli:%d", hs_ap_count, hs_client_count);
+            snprintf(hss_l3, sizeof(hss_l3), "  AP:%d Cli:%d",
+                     ap_count_snapshot, client_count_snapshot);
             snprintf(hss_l4, sizeof(hss_l4), "  Cap:%d D-UCB", total_handshakes_captured);
             oled_display_update_full("> WPA Sniffer", hss_l2, hss_l3, hss_l4);
         }
-        
-        // Reset per-dwell counters
-        hs_dwell_new_clients = 0;
-        hs_dwell_eapol_frames = 0;
         
         // Dwell on this channel
         vTaskDelay(pdMS_TO_TICKS(HS_DWELL_TIME_MS));
         
         if (!handshake_attack_active || operation_stop_requested) break;
+
+        if (xSemaphoreTake(hs_sniffer_mutex, portMAX_DELAY) != pdTRUE) {
+            ducb_update(ch_idx, 0.0);
+            continue;
+        }
         
         // After dwell: process discovered clients for targeted deauth
         int64_t now = esp_timer_get_time();
@@ -8606,6 +9098,18 @@ static void handshake_attack_task_sniffer(void) {
             if (client->hs_ap_index < 0 || client->hs_ap_index >= hs_ap_count) continue;
             
             hs_ap_target_t *ap = &hs_ap_targets[client->hs_ap_index];
+
+            if (!ap->existing_file_checked) {
+                ap->has_existing_file =
+                    check_handshake_file_exists(ap->ssid) ||
+                    check_handshake_file_exists_by_bssid(ap->bssid);
+                ap->existing_file_checked = true;
+                if (ap->has_existing_file) {
+                    // Keep the legacy marker consumed by Tab5 and ADV clients.
+                    MY_LOG_INFO(TAG, "Skipping '%s' - PCAP already exists",
+                                ap->ssid[0] ? ap->ssid : "hidden");
+                }
+            }
             
             // Skip if AP already captured or has existing file
             if (ap->complete || ap->has_existing_file) continue;
@@ -8641,19 +9145,31 @@ static void handshake_attack_task_sniffer(void) {
                 hccapx_serializer_init((const uint8_t *)ap->ssid, ssid_len);
             }
             
-            hs_send_targeted_deauth(client->mac, ap->bssid, ap->channel);
-            client->last_deauth_us = now;
-            client->deauthed = true;
-            ap->last_deauth_us = now;
-            deauth_count_this_dwell++;
+            if (hs_send_targeted_deauth(client->mac, ap->bssid,
+                                        ap->channel, tx_if)) {
+                client->last_deauth_us = now;
+                client->deauthed = true;
+                ap->last_deauth_us = now;
+                deauth_count_this_dwell++;
+            }
             
             // Limit deauths per dwell to avoid channel congestion
             if (deauth_count_this_dwell >= 3) break;
         }
+        xSemaphoreGive(hs_sniffer_mutex);
         
         // If we deauthed someone, stay on this channel a bit longer to catch handshake
         if (deauth_count_this_dwell > 0) {
-            vTaskDelay(pdMS_TO_TICKS(2000)); // 2s extra to catch reconnection
+            for (int i = 0; i < 20 && handshake_attack_active &&
+                 !operation_stop_requested; ++i) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+        }
+
+        if (!handshake_attack_active || operation_stop_requested) break;
+        if (xSemaphoreTake(hs_sniffer_mutex, portMAX_DELAY) != pdTRUE) {
+            ducb_update(ch_idx, 0.0);
+            continue;
         }
         
         // Calculate D-UCB reward
@@ -8728,10 +9244,12 @@ static void handshake_attack_task_sniffer(void) {
             
             last_stats_time = now;
         }
+        xSemaphoreGive(hs_sniffer_mutex);
     }
     
-    // Disable promiscuous mode
-    esp_wifi_set_promiscuous(false);
+    // Disable promiscuous mode and drain an already-running callback before
+    // the common cleanup resets tables or releases the worker handle.
+    (void)handshake_quiesce_sniffer_callbacks(portMAX_DELAY);
     
     // Tab5 parses: strstr("Attack Cycle Complete")
     MY_LOG_INFO(TAG, "===== Attack Cycle Complete =====");
@@ -8762,6 +9280,7 @@ static void handshake_attack_task(void *pvParameters) {
     handshake_cleanup();
     
     MY_LOG_INFO(TAG, "Handshake attack task finished.");
+    handshake_attack_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
@@ -8789,10 +9308,11 @@ static int cmd_start_handshake(int argc, char **argv) {
     if (!ensure_wifi_mode()) {
         return 1;
     }
-    
-    // Enable AP mode for raw frame injection (deauth packets)
-    if (!ensure_ap_mode()) {
-        MY_LOG_INFO(TAG, "Failed to enable AP mode for deauth injection");
+
+    esp_err_t country_err = wifi_apply_configured_country();
+    if (country_err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to enforce configured WiFi country for handshake: %s",
+                    esp_err_to_name(country_err));
         return 1;
     }
     
@@ -8835,6 +9355,10 @@ static int cmd_start_handshake(int argc, char **argv) {
             return 1;
         }
     }
+
+    // Reload for every run so edits to /sdcard/lab/white.txt take effect
+    // immediately, without rebooting JanOS.
+    load_whitelist_from_sd();
     
     // Reset stop flag
     operation_stop_requested = false;
@@ -8849,14 +9373,47 @@ static int cmd_start_handshake(int argc, char **argv) {
     if (g_selected_count > 0) {
         // Selected networks mode
         handshake_selected_mode = true;
-        handshake_target_count = g_selected_count;
+
+        uint8_t candidate_bssids[MAX_AP_CNT][BSSID_PROTECTION_ADDRESS_LEN];
+        size_t accepted_positions[MAX_AP_CNT];
+        for (int i = 0; i < g_selected_count; ++i) {
+            int idx = g_selected_indices[i];
+            memcpy(candidate_bssids[i], g_scan_results[idx].bssid,
+                   BSSID_PROTECTION_ADDRESS_LEN);
+        }
+
+        size_t accepted_count = bssid_protection_filter(
+            (const uint8_t *)whiteListedBssids,
+            (size_t)whitelistedBssidsCount,
+            &candidate_bssids[0][0],
+            (size_t)g_selected_count,
+            accepted_positions,
+            MAX_AP_CNT);
+
+        for (int i = 0; i < g_selected_count; ++i) {
+            int idx = g_selected_indices[i];
+            if (is_bssid_whitelisted(g_scan_results[idx].bssid)) {
+                MY_LOG_INFO(TAG,
+                            "Skipping protected BSSID %02X:%02X:%02X:%02X:%02X:%02X from white.txt",
+                            g_scan_results[idx].bssid[0], g_scan_results[idx].bssid[1],
+                            g_scan_results[idx].bssid[2], g_scan_results[idx].bssid[3],
+                            g_scan_results[idx].bssid[4], g_scan_results[idx].bssid[5]);
+            }
+        }
+
+        handshake_target_count = (int)accepted_count;
+        if (handshake_target_count == 0) {
+            MY_LOG_INFO(TAG, "All selected handshake targets are protected by /sdcard/lab/white.txt");
+            return 1;
+        }
         
         MY_LOG_INFO(TAG, "Starting WPA Handshake Capture - Selected Networks Mode");
-        MY_LOG_INFO(TAG, "Targets: %d network(s)", g_selected_count);
+        MY_LOG_INFO(TAG, "Targets: %d network(s)", handshake_target_count);
         
-        // Copy selected networks to handshake targets
-        for (int i = 0; i < g_selected_count; i++) {
-            int idx = g_selected_indices[i];
+        // Copy only unprotected selected networks to handshake targets.
+        for (int i = 0; i < handshake_target_count; i++) {
+            size_t selected_position = accepted_positions[i];
+            int idx = g_selected_indices[selected_position];
             memcpy(&handshake_targets[i], &g_scan_results[idx], sizeof(wifi_ap_record_t));
             MY_LOG_INFO(TAG, "  [%d] SSID='%s' Ch=%d", 
                        i + 1, (const char*)handshake_targets[i].ssid, handshake_targets[i].primary);
@@ -8867,7 +9424,7 @@ static int cmd_start_handshake(int argc, char **argv) {
     } else {
         // Sniffer + D-UCB mode (replaces old scan-all)
         handshake_selected_mode = false;
-        
+
         MY_LOG_INFO(TAG, "Starting WPA Handshake Capture - Sniffer + D-UCB Mode");
         MY_LOG_INFO(TAG, "No networks selected - promiscuous sniffer with D-UCB channel selection");
         MY_LOG_INFO(TAG, "Will discover APs/clients from traffic and send targeted deauth");
@@ -13102,7 +13659,7 @@ static int start_beacon_spam_internal(void) {
         return 1;
     }
 
-    wifi_apply_extended_country();
+    wifi_apply_configured_country();
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -13233,6 +13790,12 @@ static int cmd_start_beacon_spam_ssids(int argc, char **argv) {
 
 static int cmd_stop(int argc, char **argv) {
     (void)argc; (void)argv;
+    if (!janos_wps_runtime_stop(5000)) {
+        printf("{\"schema_version\":1,\"record_type\":\"terminal\","
+               "\"operation\":\"stop\",\"operation_result\":\"wps_not_quiescent\"}\n");
+        fflush(stdout);
+        return 1;
+    }
     /* Never tear down a driver or buffer still owned by the analyzer worker. */
     if (!wifi_analyzer_stop(5000)) {
         printf("[WFACTL1] {\"v\":1,\"type\":\"error\",\"command\":\"stop\",\"code\":\"radio_fault\",\"reason\":\"not_quiescent\"}\n");
@@ -13382,6 +13945,9 @@ static int cmd_stop(int argc, char **argv) {
     if (handshake_attack_active || handshake_attack_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Stopping handshake attack task...");
         handshake_attack_active = false;
+        (void)esp_wifi_set_promiscuous(false);
+        bool callbacks_quiesced =
+            handshake_quiesce_sniffer_callbacks(pdMS_TO_TICKS(1000));
         
         // Wait a bit for task to finish
         for (int i = 0; i < 20 && handshake_attack_task_handle != NULL; i++) {
@@ -13390,8 +13956,27 @@ static int cmd_stop(int argc, char **argv) {
         
         // Force delete if still running
         if (handshake_attack_task_handle != NULL) {
+            // Re-check after the cooperative wait: a worker that was already
+            // preparing an arm when stop began may have briefly rearmed the
+            // callback before observing handshake_attack_active=false.
+            callbacks_quiesced =
+                handshake_quiesce_sniffer_callbacks(portMAX_DELAY);
             vTaskDelete(handshake_attack_task_handle);
             handshake_attack_task_handle = NULL;
+            // A force-deleted worker may have owned this mutex while writing
+            // a capture.  Promiscuous reception is already disabled above,
+            // so it is safe to discard the orphaned mutex and recreate the
+            // static object for the next start_handshake invocation.
+            if (callbacks_quiesced && hs_sniffer_mutex != NULL) {
+                vSemaphoreDelete(hs_sniffer_mutex);
+            }
+            if (callbacks_quiesced) {
+                hs_sniffer_mutex =
+                    xSemaphoreCreateMutexStatic(&hs_sniffer_mutex_storage);
+            }
+            if (!callbacks_quiesced || hs_sniffer_mutex == NULL) {
+                MY_LOG_INFO(TAG, "Failed to recreate handshake sniffer mutex");
+            }
             MY_LOG_INFO(TAG, "Handshake attack task forcefully stopped.");
         }
         
@@ -20056,13 +20641,17 @@ static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
     xSemaphoreTakeRecursive(janos_command_mutex, portMAX_DELAY);
     uart_baud_note_activity();
     bool analyzer_command = strcmp(cmd_context->command, "wifi_analyzer") == 0;
-    if ((analyzer_command && janos_commands_inflight != 0) ||
-        (wifi_analyzer_busy() && !analyzer_command &&
-        strcmp(cmd_context->command, "stop") != 0 &&
-        strcmp(cmd_context->command, "show_scan_results") != 0 &&
-        strcmp(cmd_context->command, "reboot") != 0)) {
-        printf("[WFACTL1] {\"v\":1,\"type\":\"error\",\"command\":\"console\",\"code\":\"busy\",\"reason\":\"%s\"}\n",
-               analyzer_command ? "command_in_progress" : "wifi_analyzer");
+    bool wps_command = strcmp(cmd_context->command, "wps") == 0 ||
+        strcmp(cmd_context->command, "secret") == 0;
+    janos_radio_lease_snapshot_t lease =
+        janos_radio_lease_snapshot(&janos_radio_lease);
+    janos_console_admission_result_t admission = janos_console_admission_decide(
+        lease.owner, cmd_context->command, argc > 1 ? argv[1] : NULL,
+        janos_commands_inflight, wifi_analyzer_busy());
+    if (admission != JANOS_CONSOLE_ADMIT) {
+        char response[160] = {0};
+        if (janos_console_admission_format(response, sizeof(response),
+                                           admission)) puts(response);
         fflush(stdout);
         xSemaphoreGiveRecursive(janos_command_mutex);
         return 1;
@@ -20073,6 +20662,11 @@ static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
     }
     int result = cmd_context->func != NULL ? cmd_context->func(argc, argv) :
         cmd_context->func_w_context(cmd_context->context, argc, argv);
+    if (wps_command && argc >= 2 && strcmp(argv[1], "verify") == 0) {
+        /* The runtime wipes argv[3]; also discard the REPL's retained copy of
+         * the secret-bearing command instead of leaving it in RAM history. */
+        linenoiseHistoryFree();
+    }
     if (!analyzer_command) {
         xSemaphoreTakeRecursive(janos_command_mutex, portMAX_DELAY);
         --janos_commands_inflight;
@@ -25224,6 +25818,14 @@ static const char *analyzer_host_busy_reason(void)
     if (zig_recon_radio_busy(reason, sizeof(reason))) return reason;
     if (current_radio_mode != RADIO_MODE_NONE && current_radio_mode != RADIO_MODE_WIFI)
         return "radio_mode";
+    if (current_radio_mode == RADIO_MODE_WIFI && wifi_initialized) {
+        wifi_ap_record_t access_point = {0};
+        if (esp_wifi_sta_get_ap_info(&access_point) == ESP_OK)
+            return "wifi_connected";
+        bool promiscuous = false;
+        if (esp_wifi_get_promiscuous(&promiscuous) != ESP_OK || promiscuous)
+            return "promiscuous_or_uncertain";
+    }
     if (zig_recon_is_active()) return "zig_recon";
     if (applicationState != IDLE) return "application_state";
     if (g_scan_teardown_in_progress || periodic_rescan_in_progress || sniffer_scan_phase)
@@ -25244,6 +25846,38 @@ static const char *analyzer_host_busy_reason(void)
     xSemaphoreGive(uart_baud_mutex);
     if (transport_busy) return "uart_transfer";
     return NULL;
+}
+
+static bool analyzer_host_lease_acquire(uint32_t *generation)
+{
+    if (analyzer_host_busy_reason() != NULL) return false;
+    return janos_radio_lease_acquire(&janos_radio_lease,
+                                     JANOS_RADIO_OWNER_ANALYZER,
+                                     generation) == JANOS_RADIO_LEASE_OK;
+}
+
+static bool analyzer_host_lease_release(uint32_t generation, bool restored)
+{
+    if (!janos_radio_lease_begin_cleanup(&janos_radio_lease,
+                                         JANOS_RADIO_OWNER_ANALYZER,
+                                         generation)) return false;
+    return janos_radio_lease_finish_cleanup(&janos_radio_lease,
+                                            JANOS_RADIO_OWNER_ANALYZER,
+                                            generation, restored);
+}
+
+static bool analyzer_host_lease_mark_running(uint32_t generation)
+{
+    return janos_radio_lease_mark_running(&janos_radio_lease,
+                                           JANOS_RADIO_OWNER_ANALYZER,
+                                           generation);
+}
+
+static bool analyzer_host_lease_cancel(uint32_t generation)
+{
+    return janos_radio_lease_request_cancel(&janos_radio_lease,
+                                             JANOS_RADIO_OWNER_ANALYZER,
+                                             generation);
 }
 
 static esp_err_t analyzer_host_prepare_wifi(void)
@@ -25278,7 +25912,7 @@ static esp_err_t analyzer_host_prepare_wifi(void)
         sta_netif_handle = netif;
     }
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
-    err = esp_wifi_init(&init);
+    err = wifi_init_with_configured_country(&init);
     if (err != ESP_OK) return err;
     if (!wifi_event_handler_registered) {
         err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
@@ -25301,8 +25935,8 @@ static esp_err_t analyzer_host_prepare_wifi(void)
     if (err != ESP_OK) goto failed;
     current_radio_mode = RADIO_MODE_WIFI;
     wifi_initialized = true;
-    /* Keep the driver's configured country. Analyzer never installs a broader
-     * country/channel policy, including when it is the first Wi-Fi command. */
+    /* Country policy is installed centrally by wifi_init_with_configured_country().
+     * Analyzer only consumes that host-owned radio configuration. */
     return ESP_OK;
 
 failed:
@@ -25319,6 +25953,34 @@ failed:
 #define esp_console_cmd_register(cmd) janos_console_cmd_register(cmd)
 static void register_commands(void)
 {
+    const esp_console_cmd_t wifi_country_cmd = {
+        .command = "wifi_country",
+        .help = "WiFi regulatory profile: status | list | set <CC> | reset (default PH)",
+        .func = &cmd_wifi_country,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_country_cmd));
+
+    const esp_console_cmd_t radio_protect_cmd = {
+        .command = "radio_protect",
+        .help = "Protect BSSIDs in /sdcard/lab/white.txt: add <BSSID> | remove <BSSID> | list | clear",
+        .func = &cmd_radio_protect,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&radio_protect_cmd));
+
+    const esp_console_cmd_t wps_cmd = {
+        .command = "wps",
+        .help = "WPS lab session: verify <owned-bssid> <8-digit-pin> | status | stop",
+        .func = &janos_wps_command,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wps_cmd));
+
+    const esp_console_cmd_t secret_cmd = {
+        .command = "secret",
+        .help = "Volatile WPS result: status | reveal | erase",
+        .func = &janos_wps_secret_command,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&secret_cmd));
+
     const esp_console_cmd_t analyzer_cmd = {
         .command = "wifi_analyzer",
         .help = "AP survey: caps | scan [--band 2.4|5|both] [--channels list] [--profile quick|detailed|passive] [--limit 1..128] | status | stop | clear",
@@ -25536,7 +26198,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t handshake_cmd = {
         .command = "start_handshake",
-        .help = "Starts WPA Handshake capture attack. With selected networks: attacks only those. Without: scans every 5min and attacks all.",
+        .help = "Starts WPA handshake capture. With selections: explicit targets. Without: continuous D-UCB discovery/capture.",
         .hint = NULL,
         .func = &cmd_start_handshake,
         .argtable = NULL
@@ -26426,6 +27088,7 @@ void app_main(void) {
 
     // NVS must be ready before loading persisted display mode.
     ESP_ERROR_CHECK(nvs_flash_init());
+    wifi_country_load();
     display_mode_load_from_nvs();
     oled_display_set_forced_type(display_forced_mode);
 
@@ -26550,13 +27213,30 @@ void app_main(void) {
     ESP_ERROR_CHECK(uart_baud_control_init());
     janos_command_mutex = xSemaphoreCreateRecursiveMutexStatic(&janos_command_mutex_storage);
     assert(janos_command_mutex != NULL);
+    janos_radio_lease_init(&janos_radio_lease);
     const wifi_analyzer_hooks_t analyzer_hooks = {
         .busy_reason = analyzer_host_busy_reason,
         .prepare_wifi = analyzer_host_prepare_wifi,
         .baud_rate = uart_baud_current,
         .tx_activity = uart_baud_note_activity,
+        .lease_acquire = analyzer_host_lease_acquire,
+        .lease_mark_running = analyzer_host_lease_mark_running,
+        .lease_cancel = analyzer_host_lease_cancel,
+        .lease_release = analyzer_host_lease_release,
     };
     wifi_analyzer_init(&analyzer_hooks);
+    uint8_t wps_boot_mac[6];
+    ESP_ERROR_CHECK(esp_read_mac(wps_boot_mac, ESP_MAC_WIFI_STA));
+    const janos_wps_runtime_hooks_t wps_hooks = {
+        .busy_reason = analyzer_host_busy_reason,
+        .prepare_wifi = analyzer_host_prepare_wifi,
+        .mount_sd = init_sd_card,
+        .tx_activity = uart_baud_note_activity,
+    };
+    bool wps_runtime_ready = janos_wps_runtime_init(
+        &janos_radio_lease, &wps_hooks, wps_boot_mac);
+    memset(wps_boot_mac, 0, sizeof(wps_boot_mac));
+    ESP_ERROR_CHECK(wps_runtime_ready ? ESP_OK : ESP_FAIL);
     crack_worker_init(init_sd_card, uart_baud_set_file_transfer_active,
                       uart_baud_current);
     esp_console_register_help_command();
@@ -29752,7 +30432,7 @@ static void load_whitelist_from_sd(void) {
     }
     
     // Try to open white.txt file
-    FILE *file = fopen("/sdcard/lab/white.txt", "r");
+    FILE *file = fopen(BSSID_PROTECTION_FILE_PATH, "r");
     if (file == NULL) {
         return;
     }
@@ -29774,23 +30454,8 @@ static void load_whitelist_from_sd(void) {
             continue;
         }
         
-        // Parse BSSID in format: XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX
         uint8_t bssid[6];
-        int matches = 0;
-        
-        // Try with colon separator
-        matches = sscanf(line, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-                        &bssid[0], &bssid[1], &bssid[2],
-                        &bssid[3], &bssid[4], &bssid[5]);
-        
-        // If that didn't work, try with dash separator
-        if (matches != 6) {
-            matches = sscanf(line, "%hhx-%hhx-%hhx-%hhx-%hhx-%hhx",
-                            &bssid[0], &bssid[1], &bssid[2],
-                            &bssid[3], &bssid[4], &bssid[5]);
-        }
-        
-        if (matches == 6) {
+        if (bssid_protection_parse(line, bssid)) {
             // Valid BSSID found, add to whitelist
             memcpy(whiteListedBssids[whitelistedBssidsCount].bssid, bssid, 6);
             whitelistedBssidsCount++;
@@ -29816,15 +30481,166 @@ static void load_whitelist_from_sd(void) {
 
 // Check if a BSSID is in the whitelist
 static bool is_bssid_whitelisted(const uint8_t *bssid) {
-    if (bssid == NULL || whitelistedBssidsCount == 0) {
+    return bssid_protection_contains((const uint8_t *)whiteListedBssids,
+                                     (size_t)whitelistedBssidsCount,
+                                     bssid);
+}
+
+static bool radio_protect_write_file(void)
+{
+    if (!sd_mkdir_recursive("/sdcard/lab")) {
+        MY_LOG_INFO(TAG, "radio_protect: cannot create /sdcard/lab: %s",
+                    strerror(errno));
         return false;
     }
-    
-    for (int i = 0; i < whitelistedBssidsCount; i++) {
-        if (memcmp(bssid, whiteListedBssids[i].bssid, 6) == 0) {
-            return true;
+
+    FILE *file = fopen(BSSID_PROTECTION_TMP_PATH, "w");
+    if (file == NULL) {
+        MY_LOG_INFO(TAG, "radio_protect: cannot open temporary file: %s",
+                    strerror(errno));
+        return false;
+    }
+
+    bool ok = true;
+    for (int i = 0; i < whitelistedBssidsCount; ++i) {
+        const uint8_t *bssid = whiteListedBssids[i].bssid;
+        if (fprintf(file, "%02X:%02X:%02X:%02X:%02X:%02X\n",
+                    bssid[0], bssid[1], bssid[2],
+                    bssid[3], bssid[4], bssid[5]) < 0) {
+            ok = false;
+            break;
         }
     }
-    
-    return false;
+    if (ok && fflush(file) != 0) ok = false;
+    int descriptor = fileno(file);
+    if (ok && descriptor >= 0 && fsync(descriptor) != 0) ok = false;
+    if (fclose(file) != 0) ok = false;
+    if (!ok) {
+        unlink(BSSID_PROTECTION_TMP_PATH);
+        MY_LOG_INFO(TAG, "radio_protect: failed to write white.txt: %s",
+                    strerror(errno));
+        return false;
+    }
+
+    /* FatFs does not replace an existing destination during rename. The
+     * temporary file prevents a partial white.txt from ever being consumed. */
+    unlink(BSSID_PROTECTION_FILE_PATH);
+    if (rename(BSSID_PROTECTION_TMP_PATH, BSSID_PROTECTION_FILE_PATH) != 0) {
+        unlink(BSSID_PROTECTION_TMP_PATH);
+        MY_LOG_INFO(TAG, "radio_protect: cannot publish white.txt: %s",
+                    strerror(errno));
+        return false;
+    }
+    sd_sync();
+    return true;
+}
+
+static void radio_protect_print_entry(const char *record_type,
+                                      const char *result,
+                                      const uint8_t bssid[6],
+                                      int index)
+{
+    printf("{\"schema_version\":1,\"record_type\":\"%s\"",
+           record_type);
+    if (result != NULL) printf(",\"result\":\"%s\"", result);
+    if (index >= 0) printf(",\"index\":%d", index);
+    if (bssid != NULL) {
+        printf(",\"bssid\":\"%02X:%02X:%02X:%02X:%02X:%02X\"",
+               bssid[0], bssid[1], bssid[2],
+               bssid[3], bssid[4], bssid[5]);
+    }
+    printf(",\"count\":%d}\n", whitelistedBssidsCount);
+}
+
+static int cmd_radio_protect(int argc, char **argv)
+{
+    if (argc < 2 || argc > 3) {
+        puts("Usage: radio_protect add <BSSID> | remove <BSSID> | list | clear");
+        return 1;
+    }
+    bool takes_bssid = strcmp(argv[1], "add") == 0 ||
+                       strcmp(argv[1], "remove") == 0;
+    if ((takes_bssid && argc != 3) || (!takes_bssid && argc != 2)) {
+        puts("Usage: radio_protect add <BSSID> | remove <BSSID> | list | clear");
+        return 1;
+    }
+    if (!takes_bssid && strcmp(argv[1], "list") != 0 &&
+        strcmp(argv[1], "clear") != 0) {
+        puts("Usage: radio_protect add <BSSID> | remove <BSSID> | list | clear");
+        return 1;
+    }
+
+    esp_err_t mount_err = init_sd_card();
+    if (mount_err != ESP_OK) {
+        printf("{\"schema_version\":1,\"record_type\":\"radio_protect\","
+               "\"result\":\"mount_error\",\"error\":%d}\n",
+               (int)mount_err);
+        return 1;
+    }
+    load_whitelist_from_sd();
+
+    if (strcmp(argv[1], "list") == 0) {
+        for (int i = 0; i < whitelistedBssidsCount; ++i) {
+            radio_protect_print_entry("radio_protect_entry", NULL,
+                                      whiteListedBssids[i].bssid, i);
+        }
+        radio_protect_print_entry("radio_protect", "listed", NULL, -1);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "clear") == 0) {
+        whitelistedBssidsCount = 0;
+        memset(whiteListedBssids, 0,
+               MAX_WHITELISTED_BSSIDS * sizeof(*whiteListedBssids));
+        if (!radio_protect_write_file()) return 1;
+        load_whitelist_from_sd();
+        radio_protect_print_entry("radio_protect", "cleared", NULL, -1);
+        return 0;
+    }
+
+    uint8_t bssid[BSSID_PROTECTION_ADDRESS_LEN];
+    if (!bssid_protection_parse(argv[2], bssid)) {
+        printf("{\"schema_version\":1,\"record_type\":\"radio_protect\","
+               "\"result\":\"invalid_bssid\"}\n");
+        return 1;
+    }
+
+    if (strcmp(argv[1], "add") == 0) {
+        size_t count = (size_t)whitelistedBssidsCount;
+        bssid_protection_add_result_t result = bssid_protection_add(
+            (uint8_t *)whiteListedBssids, &count,
+            MAX_WHITELISTED_BSSIDS, bssid);
+        if (result == BSSID_PROTECTION_EXISTS) {
+            radio_protect_print_entry("radio_protect", "exists", bssid, -1);
+            return 0;
+        }
+        if (result != BSSID_PROTECTION_ADDED) {
+            radio_protect_print_entry("radio_protect",
+                                      result == BSSID_PROTECTION_FULL ? "full" : "error",
+                                      bssid, -1);
+            return 1;
+        }
+        whitelistedBssidsCount = (int)count;
+        if (!radio_protect_write_file()) {
+            load_whitelist_from_sd();
+            return 1;
+        }
+        load_whitelist_from_sd();
+        radio_protect_print_entry("radio_protect", "added", bssid, -1);
+        return 0;
+    }
+
+    size_t count = (size_t)whitelistedBssidsCount;
+    if (!bssid_protection_remove((uint8_t *)whiteListedBssids, &count, bssid)) {
+        radio_protect_print_entry("radio_protect", "not_found", bssid, -1);
+        return 0;
+    }
+    whitelistedBssidsCount = (int)count;
+    if (!radio_protect_write_file()) {
+        load_whitelist_from_sd();
+        return 1;
+    }
+    load_whitelist_from_sd();
+    radio_protect_print_entry("radio_protect", "removed", bssid, -1);
+    return 0;
 }

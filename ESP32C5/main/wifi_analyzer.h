@@ -12,6 +12,11 @@ typedef struct {
     esp_err_t (*prepare_wifi)(void);
     uint32_t (*baud_rate)(void);
     void (*tx_activity)(void);
+    /* Shared JanOS radio admission. Mutations are serialized by the host. */
+    bool (*lease_acquire)(uint32_t *generation);
+    bool (*lease_mark_running)(uint32_t generation);
+    bool (*lease_cancel)(uint32_t generation);
+    bool (*lease_release)(uint32_t generation, bool restored);
 } wifi_analyzer_hooks_t;
 
 void wifi_analyzer_init(const wifi_analyzer_hooks_t *hooks);

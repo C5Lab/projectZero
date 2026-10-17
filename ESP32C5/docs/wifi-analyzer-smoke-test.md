@@ -1,11 +1,10 @@
-# JanOS Wi-Fi analyzer smoke test for a later device session
+# JanOS Wi-Fi analyzer smoke test
 
-This is a runbook, not a record of tests already performed. The current user
-instruction is **no C compilation, firmware build, flash, or serial/hardware
-test**. A later agent must keep that constraint unless the user changes it.
-The focused Python contract and source-integration suites passed 53 tests on
-2026-09-28; that does not
-validate the ESP-IDF worker or legacy Flipper devices.
+This is a reusable runbook. Historical analyzer device results are recorded in
+`wifi-analyzer-device-validation.md`; do not treat them as evidence for a new
+firmware image. Obtain explicit authorization before build/flash and record the
+exact image identity. The integrated WPS/analyzer checks live in
+`janos-radio-compatibility-validation.md`.
 
 ## Preparation after authorization
 
@@ -55,6 +54,8 @@ empty snapshot is not evidence that every requested channel was visited.
 | Universal `stop` during a scan | It joins analyzer shutdown before legacy radio teardown. No use-after-free, mixed analyzer/legacy scan event, or false success terminal. |
 | `wifi_analyzer clear` while idle | `cleared` acknowledgement and released analyzer PSRAM; legacy scan results remain. While active it returns busy. |
 | `show_scan_results` during and after analyzer work | The previous legacy snapshot and index mapping are unchanged. |
+| Start `wps verify <owned-bssid> <known-pin>` during analyzer ownership | Exact WFACTL1 `type:error`, `code:busy`, `reason:radio_lease`, nonzero console result, and no WPS `accepted`. `wps status` and `secret status` remain readable. |
+| While WPS owns the radio, request analyzer `scan` and analyzer `stop` | Both mutations get the same old busy/nonzero contract; analyzer `caps`/`status` and `show_scan_results` remain readable. |
 
 Also test a successful empty scan, scan-driver failure, retrieval failure, TX
 failure, timeout, stop near publication, and a late scan completion when those

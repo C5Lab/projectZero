@@ -75,9 +75,16 @@ static bool is_array_zero(uint8_t *array, unsigned size){
 }
 
 void hccapx_serializer_init(const uint8_t *ssid, unsigned size){
+    memset(&hccapx, 0, sizeof(hccapx));
+    hccapx.signature = HCCAPX_SIGNATURE;
+    hccapx.version = HCCAPX_VERSION;
+    hccapx.message_pair = 255;
+    hccapx.keyver = HCCAPX_KEYVER_WPA2;
+    message_ap = 0;
+    message_sta = 0;
+    eapol_source = 0;
     hccapx.essid_len = size;
     memcpy(hccapx.essid, ssid, size);
-    hccapx.message_pair = 255;
 }
 
 hccapx_t *hccapx_serializer_get(){
@@ -138,8 +145,9 @@ static void ap_message_m1(eapol_key_packet_t *eapol_key_packet){
  */
 static void ap_message_m3(eapol_packet_t* eapol_packet, eapol_key_packet_t *eapol_key_packet){
     ESP_LOGD(TAG, "From AP M3");
+    bool first_ap_message = message_ap == 0;
     message_ap = 3;
-    if(message_ap == 0){
+    if(first_ap_message){
         // No AP message was processed yet. ANonce has to be copied into HCCAPX buffer.
         memcpy(hccapx.nonce_ap, eapol_key_packet->key_nonce, 32);
     }

@@ -1,0 +1,121 @@
+/* SPDX-FileCopyrightText: 2026 JanOS contributors */
+/* SPDX-License-Identifier: Apache-2.0 */
+#include "janos_console_admission.h"
+
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef struct {
+    janos_radio_owner_t owner;
+    const char *command;
+    const char *subcommand;
+    uint32_t inflight;
+    bool analyzer_busy;
+    janos_console_admission_result_t expected;
+} admission_case_t;
+
+static void policy_matrix(void)
+{
+    static const admission_case_t cases[] = {
+        {JANOS_RADIO_OWNER_NONE, "wifi_analyzer", "scan", 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_NONE, "wifi_analyzer", "scan", 1, false, JANOS_CONSOLE_BUSY_COMMAND_IN_PROGRESS},
+        {JANOS_RADIO_OWNER_ANALYZER, "wifi_analyzer", "status", 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_ANALYZER, "wifi_analyzer", "caps", 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_ANALYZER, "wifi_analyzer", "stop", 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_ANALYZER, "wifi_analyzer", "scan", 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_ANALYZER, "wps", "status", 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_ANALYZER, "secret", "status", 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_ANALYZER, "show_scan_results", NULL, 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_ANALYZER, "wps", "verify", 0, true, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_ANALYZER, "wps", "stop", 0, true, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_WPS, "wps", "status", 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "wps", "stop", 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "wps", "verify", 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "secret", "status", 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "secret", "reveal", 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "secret", "erase", 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "wifi_analyzer", "caps", 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "wifi_analyzer", "status", 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "wifi_analyzer", "scan", 0, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_WPS, "wifi_analyzer", "stop", 0, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_WPS, "show_scan_results", NULL, 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "stop", NULL, 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "reboot", NULL, 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "help", NULL, 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_NONE, "channel_view", NULL, 0, true, JANOS_CONSOLE_BUSY_WIFI_ANALYZER},
+        {JANOS_RADIO_OWNER_NONE, "show_scan_results", NULL, 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_NONE, "wps", "status", 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_NONE, "secret", "status", 0, true, JANOS_CONSOLE_ADMIT},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        janos_console_admission_result_t actual = janos_console_admission_decide(
+            cases[i].owner, cases[i].command, cases[i].subcommand,
+            cases[i].inflight, cases[i].analyzer_busy);
+        if (actual != cases[i].expected) {
+            fprintf(stderr, "case %zu failed: got %d want %d\n", i,
+                    (int)actual, (int)cases[i].expected);
+            assert(actual == cases[i].expected);
+        }
+    }
+}
+
+static void invalid_inputs_fail_closed(void)
+{
+    assert(janos_console_admission_decide(JANOS_RADIO_OWNER_NONE, NULL, NULL,
+                                          0, false) ==
+           JANOS_CONSOLE_BUSY_RADIO_LEASE);
+    assert(janos_console_admission_decide(JANOS_RADIO_OWNER_NONE, "", NULL,
+                                          0, false) ==
+           JANOS_CONSOLE_BUSY_RADIO_LEASE);
+    assert(janos_console_admission_decide((janos_radio_owner_t)99, "status",
+                                          NULL, 0, false) ==
+           JANOS_CONSOLE_BUSY_RADIO_LEASE);
+}
+
+static void reasons_are_stable(void)
+{
+    assert(janos_console_admission_reason(JANOS_CONSOLE_ADMIT) == NULL);
+    assert(strcmp(janos_console_admission_reason(
+                      JANOS_CONSOLE_BUSY_COMMAND_IN_PROGRESS),
+                  "command_in_progress") == 0);
+    assert(strcmp(janos_console_admission_reason(
+                      JANOS_CONSOLE_BUSY_RADIO_LEASE),
+                  "radio_lease") == 0);
+    assert(strcmp(janos_console_admission_reason(
+                      JANOS_CONSOLE_BUSY_WIFI_ANALYZER),
+                  "wifi_analyzer") == 0);
+    assert(strcmp(janos_console_admission_reason(
+                      (janos_console_admission_result_t)99),
+                  "radio_lease") == 0);
+}
+
+static void busy_wire_is_byte_stable(void)
+{
+    char line[160] = {0};
+    assert(janos_console_admission_format(
+        line, sizeof(line), JANOS_CONSOLE_BUSY_RADIO_LEASE));
+    assert(strcmp(line,
+        "[WFACTL1] {\"v\":1,\"type\":\"error\",\"command\":\"console\","
+        "\"code\":\"busy\",\"reason\":\"radio_lease\"}") == 0);
+    assert(janos_console_admission_format(
+        line, sizeof(line), JANOS_CONSOLE_BUSY_COMMAND_IN_PROGRESS));
+    assert(strstr(line, "\"reason\":\"command_in_progress\"") != NULL);
+    assert(!janos_console_admission_format(
+        line, sizeof(line), JANOS_CONSOLE_ADMIT));
+    assert(!janos_console_admission_format(
+        line, 8U, JANOS_CONSOLE_BUSY_WIFI_ANALYZER));
+    assert(!janos_console_admission_format(
+        NULL, sizeof(line), JANOS_CONSOLE_BUSY_WIFI_ANALYZER));
+}
+
+int main(void)
+{
+    policy_matrix();
+    invalid_inputs_fail_closed();
+    reasons_are_stable();
+    busy_wire_is_byte_stable();
+    puts("PASS: JanOS console admission policy");
+    return 0;
+}

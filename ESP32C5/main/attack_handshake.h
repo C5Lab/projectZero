@@ -10,6 +10,7 @@
 #define ATTACK_HANDSHAKE_H
 
 #include <stdbool.h>
+#include "esp_err.h"
 #include "esp_wifi_types.h"
 
 /**
@@ -29,7 +30,7 @@ typedef enum{
  * @param ap_record target AP record
  * @param method attack method chosen 
  */
-void attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_methods_t method);
+esp_err_t attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_methods_t method);
 
 /**
  * @brief Stops handshake attack.

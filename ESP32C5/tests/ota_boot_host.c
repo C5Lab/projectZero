@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <setjmp.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -21,11 +22,23 @@ typedef struct {
     esp_err_t (*prepare_wifi)(void);
     int (*baud_rate)(void);
     void (*tx_activity)(void);
+    bool (*lease_acquire)(uint32_t *generation);
+    bool (*lease_mark_running)(uint32_t generation);
+    bool (*lease_cancel)(uint32_t generation);
+    bool (*lease_release)(uint32_t generation, bool restored);
 } wifi_analyzer_hooks_t;
+typedef struct { int unused; } janos_radio_lease_t;
+typedef struct {
+    const char *(*busy_reason)(void);
+    esp_err_t (*prepare_wifi)(void);
+    esp_err_t (*mount_sd)(void);
+    void (*tx_activity)(void);
+} janos_wps_runtime_hooks_t;
 
 enum { ESP_OK = 0, ESP_FAIL = -1, ESP_OTA_IMG_UNDEFINED = 0,
        ESP_OTA_IMG_PENDING_VERIFY = 1, ESP_OTA_IMG_VALID = 2,
        ESP_ERR_NOT_FOUND = -2 };
+#define ESP_MAC_WIFI_STA 0
 #define TAG "test"
 #define JANOS_UART_DEFAULT_BAUD 115200
 #define ESP_CONSOLE_REPL_CONFIG_DEFAULT() ((esp_console_repl_config_t){0})
@@ -86,6 +99,22 @@ static esp_err_t uart_baud_control_init(void) {
 static void *xSemaphoreCreateRecursiveMutexStatic(void *storage) { return storage; }
 static const char *analyzer_host_busy_reason(void) { return NULL; }
 static esp_err_t analyzer_host_prepare_wifi(void) { return ESP_OK; }
+static bool analyzer_host_lease_acquire(uint32_t *generation)
+{ if (generation) *generation = 1; return true; }
+static bool analyzer_host_lease_mark_running(uint32_t generation)
+{ (void)generation; return true; }
+static bool analyzer_host_lease_cancel(uint32_t generation)
+{ (void)generation; return true; }
+static bool analyzer_host_lease_release(uint32_t generation, bool restored)
+{ (void)generation; return restored; }
+static janos_radio_lease_t janos_radio_lease;
+static void janos_radio_lease_init(janos_radio_lease_t *lease) { (void)lease; }
+static esp_err_t esp_read_mac(uint8_t mac[6], int type)
+{ (void)type; memset(mac, 0x42, 6); return ESP_OK; }
+static bool janos_wps_runtime_init(janos_radio_lease_t *lease,
+                                   const janos_wps_runtime_hooks_t *hooks,
+                                   const uint8_t mac[6])
+{ (void)lease; (void)hooks; (void)mac; return true; }
 static int uart_baud_current(void) { return JANOS_UART_DEFAULT_BAUD; }
 static void uart_baud_note_activity(void) {}
 static esp_err_t init_sd_card(void) { event("sd"); return ESP_FAIL; }

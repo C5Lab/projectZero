@@ -1,9 +1,12 @@
 # WFA/1: JanOS Wi-Fi analyzer protocol
 
-Status: implemented in JanOS source as a one-shot scanner, pending firmware build
-and device validation. `tools/wifi_analyzer_contract.py` validates the **snapshot
-stream** from a capture. It does not validate CLI/control replies or scan hardware.
-See the [architecture and compatibility design](wifi-analyzer-design.md).
+Status: implemented and exercised on ESP32-C5. The historical device evidence is
+in [wifi-analyzer-device-validation.md](wifi-analyzer-device-validation.md);
+the current analyzer/WPS hardening matrix remains in
+[janos-radio-compatibility-validation.md](janos-radio-compatibility-validation.md).
+`tools/wifi_analyzer_contract.py` validates the **snapshot stream** from a capture.
+It does not validate CLI/control replies or scan hardware. See the
+[architecture and compatibility design](wifi-analyzer-design.md).
 
 ## Commands
 
@@ -41,6 +44,7 @@ Examples of required shapes:
 [WFACTL1] {"v":1,"type":"caps","protocol":"WFA/1","default_records":64,"max_records":128,"max_line_bytes":1024,"bands":["2.4","5"],"profiles":["quick","detailed","passive"],"width_metadata":"sdk_unverified","channel_scope":"requested_driver_filtered"}
 [WFACTL1] {"v":1,"type":"status","state":"idle","boot":"0123456789abcdef","active_scan":null,"last_success_scan":1,"last_error":null,"psram_bytes":65536,"capacity":64,"driver_scan_id":1}
 [WFACTL1] {"v":1,"type":"error","command":"scan","code":"busy","reason":"wardrive"}
+[WFACTL1] {"v":1,"type":"error","command":"console","code":"busy","reason":"radio_lease"}
 [WFACTL1] {"v":1,"type":"stopped","state":"idle"}
 [WFACTL1] {"v":1,"type":"cleared","state":"idle"}
 ```
@@ -57,6 +61,15 @@ are `idle`, `preparing`, `scanning`, `collecting`, `publishing`, `cancelling`,
 completion keeps radio ownership reserved until a late completion allows cleanup
 or the device restarts.
 
+A console-admission refusal uses the existing `type:error`, `code:busy` WFACTL1
+shape and returns a nonzero console result. The ESP console may consequently
+append its generic command-error line. `radio_lease` means another JanOS service
+currently owns the shared radio; retry only after that operation has finished.
+The dispatcher does not emit `type:"busy"`, `owner` or `retryable` fields. Safe
+cross-owner reads are `caps`/`status`, `wps status`, `secret status` and
+`show_scan_results`; owner-specific stop commands never stop the other owner.
+See the executable-policy matrix in [janos-radio-lease.md](janos-radio-lease.md).
+
 Pre-admission error codes: `invalid_argument`, `unsupported_channel`, `busy`,
 `no_psram`, `no_internal_memory`, `radio_fault`, `wifi_init_failed`,
 `radio_config_failed`, `restore_failed`, `unavailable`. They produce no `begin`. `caps` and `status` do not allocate
@@ -64,7 +77,7 @@ bulk buffers or change radio mode. Stop/clear acknowledgements are emitted only
 after the respective action is complete. Unknown additive control fields may be
 ignored. Unsupported versions must be rejected by the host.
 
-`busy` reasons include `wifi_analyzer`, `command_in_progress`,
+`busy` reasons include `radio_lease`, `wifi_analyzer`, `command_in_progress`,
 `legacy_scan_draining`, `wifi_connect`, `radio_busy`, and
 `legacy_radio_uncertain`. A forced legacy wardrive deletion or failed/timed-out
 `wifi_connect`, or a failed Wi-Fi initialization cleanup, leaves radio ownership uncertain; analyzer admission stays

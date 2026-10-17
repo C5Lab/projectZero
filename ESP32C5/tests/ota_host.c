@@ -35,6 +35,10 @@ typedef struct {
 typedef struct { int unused; } esp_netif_t;
 typedef struct { struct { uint32_t addr; } ip; } esp_netif_ip_info_t;
 typedef struct { int unused; } wifi_ap_record_t;
+typedef struct { int unused; } janos_radio_lease_t;
+typedef struct { unsigned owner, state, generation; bool cancel_requested; }
+    janos_radio_lease_snapshot_t;
+enum { JANOS_RADIO_OWNER_NONE = 0, JANOS_RADIO_OWNER_ANALYZER = 1 };
 typedef struct {
     const char *url;
     int timeout_ms, buffer_size, buffer_size_tx;
@@ -73,6 +77,11 @@ static int bootloader_verifications;
 static const char *source_profile = "none";
 
 static bool ota_check_in_progress;
+static janos_radio_lease_t janos_radio_lease;
+static unsigned radio_lease_owner;
+static janos_radio_lease_snapshot_t janos_radio_lease_snapshot(
+    const janos_radio_lease_t *lease)
+{ (void)lease; return (janos_radio_lease_snapshot_t){.owner = radio_lease_owner}; }
 static atomic_bool ota_boot_ready = ATOMIC_VAR_INIT(true);
 static char ota_channel[8] = "main";
 static bool associated = true, has_ip = true, has_netif = true, ip_ok = true, mode_ok = true;
@@ -417,6 +426,8 @@ int main(int argc, char **argv) {
     } else if (!strcmp(s, "long_tag")) {
         static char long_tag[100]; memset(long_tag, 'x', sizeof(long_tag) - 1);
         check[1] = long_tag; check_argc = 2;
+    } else if (!strcmp(s, "lease_busy")) {
+        radio_lease_owner = JANOS_RADIO_OWNER_ANALYZER;
     } else require(!strcmp(s, "newer") || !strcmp(s, "busy") || !strcmp(s, "disconnect_before_task"), "unknown scenario");
 
     if (do_check) {

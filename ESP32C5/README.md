@@ -7,10 +7,39 @@ The firmware boots into an `esp_console` REPL, so most capabilities are exposed 
 
 Documentation:
 
-- [Command Manual](docs/command-manual.md)
+- [Command Manual](docs/command-manual.md) — complete CLI catalog, including a
+  [quick reference for the new WPS/radio commands](docs/command-manual.md#new-cli-commands-in-the-wpsradio-update).
 - [Passive sniffer extension](docs/sniffer-extended-uart.md) — opt-in UART metadata, binary SSIDs, RSN/WPA/PMF, WPS, fixtures and manual tests; legacy result lines remain compatible.
 - [JanOS Capture Gateway](docs/janos-capture-gateway.md) — instrumented APSTA/NAPT gateway for authorized traffic analysis.
-- [Wi-Fi Analyzer](docs/wifi-analyzer-design.md) — opt-in PSRAM-backed AP survey, 64 records by default and up to 128, with isolated legacy Flipper results. See the [WFA/1 protocol](docs/wifi-analyzer-protocol.md), [smoke-test commands](docs/wifi-analyzer-smoke-test.md), and [Tab5 implementation prompt](docs/wifi-analyzer-tab5-prompt.md). Firmware compilation and hardware validation are pending.
+- [Wi-Fi Analyzer](docs/wifi-analyzer-design.md) — opt-in PSRAM-backed AP survey, 64 records by default and up to 128, with isolated legacy Flipper results. See the [WFA/1 protocol](docs/wifi-analyzer-protocol.md), [smoke-test commands](docs/wifi-analyzer-smoke-test.md), and [device evidence](docs/wifi-analyzer-device-validation.md).
+- [JanOS known-PIN WPS](docs/janos-wps.md) — production commands, asynchronous schema-v1 results, volatile one-shot secrets and authenticated-M7 SD export.
+- [RF database tooling](tools/rfdb/README.md) — reproducible generation of the
+  vendor/OUI and laboratory JWPS databases, including provenance and source
+  release bundles.
+- [Shared radio ownership](docs/janos-radio-lease.md) — analyzer/WPS admission, stable busy contract, cancellation, quarantine, OTA exclusion and exact MAC restoration. The [validation runbook](docs/janos-radio-compatibility-validation.md) separates host, build and device evidence.
+- [Wi-Fi country `PH` and DFS handshake fix](docs/wifi-country-ph-dfs-fix.md) — persistent country policy, driver read-back and the hybrid APSTA/STA handshake path.
+
+## Generated RF database artifacts
+
+The RF database generators write their local outputs to `out/`:
+
+- `out/vendors.bin` is the compact vendor/OUI database copied to
+  `/sdcard/lab/vendors.bin`;
+- `out/wps_pin.bin` is the compact JWPS laboratory candidate database copied to
+  `/sdcard/lab/wps_pin.bin`;
+- the matching `*.report.json` files record source revisions, hashes, format
+  versions, and generation statistics;
+- `rfdb-source-*.tar` archives contain the corresponding verified inputs,
+  generators, license texts, notices, and manifest required for source-complete
+  distribution.
+
+These are generated artifacts rather than firmware source files. When a
+`vendors.bin` or `wps_pin.bin` is distributed, the matching source archive must
+be distributed through the same release channel. See
+[RF database tooling](tools/rfdb/README.md) for build commands and
+[third-party notices](THIRD_PARTY_NOTICES.md) for licenses and provenance.
+Production JanOS currently accepts an explicitly supplied known WPS PIN; JWPS
+lookup and campaign workflows remain standalone laboratory capabilities.
 
 ## Build Note: exFAT
 This repo auto-patches your local ESP-IDF `ffconf.h` during CMake configure to force:
@@ -35,7 +64,10 @@ Important notes:
 ### OTA Commands
 - `wifi_connect <SSID> <Password> [ota] [<IP> <Netmask> <GW> [DNS1] [DNS2]]`: Connect to Wi-Fi as STA. Add `ota` to trigger OTA right after DHCP, or pass static IP settings (optionally with DNS).
 - `wifi_disconnect`: Disconnect from the current Wi-Fi AP (STA).
-- `ota_check [latest|<tag>]`: Check and apply OTA. Default respects `ota_channel`. `latest` forces GitHub releases/latest. `<tag>` forces a specific release.
+- `ota_check [rf] [latest|<tag>]`: Check and apply OTA. Default respects
+  `ota_channel`; `rf` selects the RF-support release path. `latest` forces the
+  selected source's latest release and `<tag>` forces a specific release. An
+  active analyzer/WPS radio lease refuses OTA before worker creation.
 - `ota_list`: List recent GitHub releases (up to 5) with dates.
 - `ota_channel [main|dev]`: Get/set OTA channel (saved in NVS).
   - `main`: GitHub release/latest.

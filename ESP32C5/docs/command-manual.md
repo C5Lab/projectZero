@@ -198,6 +198,36 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 
 # Part 2 — Full command catalog
 
+## New CLI commands in the WPS/radio update
+
+The following top-level commands are new relative to the preceding passive
+Wi-Fi reporting release. This is the quick reference; the detailed entries
+later in this manual define output, persistence, admission and error behavior.
+
+| Command | Purpose | Detailed documentation |
+| --- | --- | --- |
+| `wps verify <bssid> <8-digit-pin>` | Start asynchronous verification of one known WPS PIN against an explicitly owned AP. | [JanOS known-PIN WPS](janos-wps.md) |
+| `wps status` | Read WPS phase, run/generation, result, cleanup and memory telemetry. | [JanOS known-PIN WPS](janos-wps.md#status-stop-and-cancellation) |
+| `wps stop` | Cooperatively cancel WPS and wait for radio cleanup. | [JanOS known-PIN WPS](janos-wps.md#status-stop-and-cancellation) |
+| `secret status` | Inspect the volatile credential-vault state without revealing data. | [JanOS known-PIN WPS](janos-wps.md#secret-lifecycle-and-memory) |
+| `secret reveal` | Reveal the recovered PIN/key once, then wipe the retained copy. | [JanOS known-PIN WPS](janos-wps.md#secret-lifecycle-and-memory) |
+| `secret erase` | Explicitly wipe the volatile WPS result. | [JanOS known-PIN WPS](janos-wps.md#secret-lifecycle-and-memory) |
+| `wifi_country status` | Show configured and active Wi-Fi country information. | [Settings](#settings) |
+| `wifi_country list` | List accepted two-character country profiles. | [Settings](#settings) |
+| `wifi_country set <CC>` | Persist a country profile for application after reboot. | [Settings](#settings) |
+| `wifi_country reset` | Restore the default `PH` profile for the next boot. | [Settings](#settings) |
+| `radio_protect add <BSSID>` | Add a protected BSSID to `/sdcard/lab/white.txt`. | [Attacks](#attacks) |
+| `radio_protect remove <BSSID>` | Remove a protected BSSID. | [Attacks](#attacks) |
+| `radio_protect list` | List active protected BSSIDs. | [Attacks](#attacks) |
+| `radio_protect clear` | Clear the persisted and active protection list. | [Attacks](#attacks) |
+
+`wifi_analyzer` is not new in this update. Its shared-radio admission and
+cleanup behavior changed, while its existing `caps`, `scan`, `status`, `stop`
+and `clear` CLI remains compatible. Likewise, `start_handshake` keeps its
+existing syntax while adding protected-BSSID filtering and hybrid DFS radio
+handling. Production JanOS does not expose the standalone laboratory commands
+for Pixie, JWPS/campaign or persistent `sta_mac` policy.
+
 ## WiFi scanning
 
 ### `wifi_analyzer`
@@ -206,7 +236,38 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 - `wifi_analyzer scan [--band 2.4|5|both] [--channels 1,6,11] [--profile quick|detailed|passive] [--limit 1..128]` — one AP survey, default 64 records, using separate PSRAM buffers and `[WFA1]` JSON lines. Existing scan results and selections are preserved.
 - `wifi_analyzer stop` / `clear` — cancel analyzer work or release its idle buffers. This surveys AP signal/channel overlap; it does not measure percentage airtime or spectrum power.
 
-See the [protocol and admission rules](wifi-analyzer-protocol.md) and [hardware smoke-test runbook](wifi-analyzer-smoke-test.md). Firmware compilation and target validation are pending.
+See the [protocol and admission rules](wifi-analyzer-protocol.md), [shared-radio
+contract](janos-radio-lease.md), [hardware smoke-test runbook](wifi-analyzer-smoke-test.md)
+and [device evidence](wifi-analyzer-device-validation.md).
+
+### `wps` and `secret`
+
+- `wps verify <bssid> <8-digit-pin>` — asynchronously verify one known WPS PIN
+  against an explicitly owned AP. A successful start emits a schema-v1
+  `accepted` record followed later by exactly one `terminal` record. Invalid or
+  refused input returns nonzero. The REPL can visibly echo the supplied PIN.
+- `wps status` — safe status read: phase, run/generation, operation/cleanup result
+  and current/peak WPS allocation counters.
+- `wps stop` — cooperatively stop WPS only and wait for cleanup. It does not stop
+  an analyzer-owned radio.
+- `secret status` — report the volatile WPS result as `empty`, `available` or
+  `expired` without exposing it.
+- `secret reveal` — print and consume the retained PIN/network key once. Empty or
+  expired state is a JSON result, not a generic command error.
+- `secret erase` — wipe the retained result; it prints no dedicated acknowledgement.
+
+Bulk WPS scratch is PSRAM-only; secret allocations/vault are internal RAM and
+wiped. The vault TTL is five minutes. Authenticated-M7 results are also exported
+as sensitive plaintext JSON below `/sdcard/lab/wps/results/`; current production
+terminal records do not expose storage outcome. Failed sessions may append a
+secret-free, deduplicated device observation to
+`/sdcard/lab/wps/unknown_devices.jsonl`; this still contains potentially
+sensitive BSSID/SSID and identity metadata, but never PIN candidates, keys or
+cryptographic session material. See [JanOS known-PIN WPS](janos-wps.md)
+and the [radio compatibility runbook](janos-radio-compatibility-validation.md).
+
+Production JanOS does not currently provide Pixie, JWPS/campaign, RTC epoch or
+`sta_mac` policy commands. `sta_mac ...` belongs to a standalone probe.
 
 ### `scan_networks`
 - `scan_networks` — background Wi‑Fi scan on all channels. Results auto‑print as CSV; wait for `Scan results printed`. CSV: `"index","SSID","","BSSID","channel","security","RSSI","band"`. Wardrive must be stopped first.
@@ -248,7 +309,11 @@ See the [protocol and admission rules](wifi-analyzer-protocol.md) and [hardware 
 - `start_deauth` — deauth selected networks. WPA2 stays classic deauth; WPA3 uses Channel Switch Announcement (CSA); WPA2/WPA3 mixed sends both. Prereq `select_networks`. Syntax unchanged.
 - `start_evil_twin` — clone first selected AP + deauth others, captive portal harvests password. Optional `select_html`.
 - `sae_overflow` — WPA3 SAE client‑overflow on exactly one selected AP.
-- `start_handshake` — capture WPA handshakes (targeted with selection, else scan‑and‑attack loop). Saves PCAP/HCCAPX.
+- `start_handshake` — capture WPA handshakes (targeted with selection, else scan‑and‑attack loop). Saves PCAP/HCCAPX. Before every run it reloads `/sdcard/lab/white.txt`; each non-empty line may contain one BSSID using `:` or `-` separators. Protected BSSIDs are removed from an explicit selection and are neither learned nor deauthenticated by the automatic D-UCB path. A mixed selection continues with its unprotected entries; a selection containing only protected entries is rejected without starting the worker. Both explicit targets and automatic D-UCB use the same hybrid radio policy: non-DFS channels select APSTA/`WIFI_IF_AP`, while DFS channels 52–64 and 100–144 select STA/`WIFI_IF_STA`. D-UCB verifies mode and channel before dwell and repeats the readback immediately before TX, rearms promiscuous capture after every APSTA↔STA transition, and records zero reward instead of transmitting when an arm cannot be prepared. Callback and worker serialize access to capture state; `stop` disables promiscuous reception before any forced task cleanup. If the driver rejects raw DFS transmission for an explicit target, capture continues passively and emits one fallback warning instead of repeated TX errors.
+- `radio_protect add <BSSID>` — add a protected BSSID to `/sdcard/lab/white.txt`. Accepts `:` or `-` separators, rejects group/broadcast addresses, avoids duplicates and reloads the active list immediately.
+- `radio_protect remove <BSSID>` — remove a protected BSSID and reload the list. Removing an absent entry is an idempotent success with `result:"not_found"`.
+- `radio_protect list` — print the active protected BSSID entries and their count.
+- `radio_protect clear` — clear the protection file and active list.
 - `save_handshake` — manually save a captured complete 4‑way handshake.
 - `start_blackout` — scan all networks every 3 min and deauth everything.
 - `start_beacon_spam "SSID1" "SSID2" ...` — broadcast fake beacons (max 32 SSIDs, 1‑32 chars each).
@@ -426,6 +491,21 @@ Cancellation ends with `[FT] cancelled` and `[FT] END`. Validation, SD, open, se
 
 ## Settings
 
+- `wifi_country status` — show the configured profile and, when the Wi-Fi
+  driver is active, its read-back country, channel range and policy.
+- `wifi_country list` — list the accepted two-character profiles. `PH` is the
+  JanOS default and fallback; the other entries follow the ESP-IDF 6.0.2
+  `esp_wifi_set_country_code()` table.
+- `wifi_country set <CC>` — validate and persist a profile in NVS. Lowercase is
+  normalized to uppercase. The new profile is applied after reboot.
+- `wifi_country reset` — persist the default `PH` profile for the next boot.
+
+Country configuration is applied centrally after every Wi-Fi driver
+initialization and read back before the radio is accepted. `PH` uses the JanOS
+manual profile `schan=1`, `nchan=14`; other profiles use the corresponding IDF
+regulatory table in manual mode. Changing a country profile does not bypass
+DFS restrictions or permit SoftAP/APSTA operation on DFS channels.
+
 - `channel_time set <min|max> <ms>` / `channel_time read <min|max>` — scan dwell per channel (100‑1500 ms, min<max).
 - `vendor set <on|off>` / `vendor read` — MAC vendor lookup in results.
 - `display set <auto|ssd1306|sh1107|sh1106|unit_lcd>` / `display read` — OLED/LCD type.
@@ -434,7 +514,9 @@ Cancellation ends with `[FT] cancelled` and `[FT] END`. Validation, SD, open, se
 
 ## OTA updates
 
-- `ota_check [latest|<tag>]` — check GitHub and apply a firmware update. Prereq WiFi.
+- `ota_check [rf] [latest|<tag>]` — check GitHub and apply a firmware update.
+  `rf` selects the RF-support release path. Prereq WiFi; an active analyzer/WPS
+  lease refuses OTA before worker creation.
 - `ota_list` — list recent releases (`OTA[n]: <tag> (main|dev) <date> <title>`).
 - `ota_channel [main|dev]` — get/set update channel.
 - `ota_info` — partition info (boot/running/next).

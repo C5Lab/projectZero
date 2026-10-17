@@ -1,8 +1,10 @@
 # JanOS Wi-Fi Analyzer: implementation and compatibility design
 
-Status: implemented in JanOS source on 2026-09-28, pending firmware build and
-device validation. This document distinguishes source behavior from hardware
-evidence. The Flipper application remains unchanged. The companion Tab5 reader,
+Status: implemented in JanOS and exercised on ESP32-C5. Historical analyzer
+evidence is recorded in `wifi-analyzer-device-validation.md`; the integrated
+WPS/analyzer hardening matrix is tracked separately in
+`janos-radio-compatibility-validation.md`. This document distinguishes source
+behavior from hardware evidence. The Flipper application remains unchanged. The companion Tab5 reader,
 transport worker and LVGL analyzer screen are now implemented in the sibling
 `M5MonsterC5-Tab5` checkout; see its `docs/wifi-analyzer.md` for usage and validation.
 
@@ -94,9 +96,16 @@ then release the mutex while running, so concurrent `stop` remains usable.
 Analyzer handlers retain the admission lock and refuse to start while an ordinary
 handler is still in flight. Analyzer state has its own critical-section lock,
 independent of `applicationState` and `operation_stop_requested`. While active,
-the dispatcher permits `wifi_analyzer`, `stop`, `show_scan_results`, and `reboot`;
-the built-in `help` command is also available. Other registered commands receive
-a `[WFACTL1]` busy error before their handlers run. The event handler consumes
+the dispatcher permits safe status/read commands, the current owner's stop,
+global `stop`, `show_scan_results`, and `reboot`; the built-in `help` command is
+also available. Other registered commands receive the existing
+`[WFACTL1]` `type:error`, `code:busy` response with a nonzero console result
+before their handlers run. `radio_lease` is one of the established busy reasons.
+There is no `type:"busy"`/zero-result variant. Analyzer and WPS
+owner/subcommand admission is defined by the portable matrix in
+[`janos-radio-lease.md`](janos-radio-lease.md); status reads and
+`show_scan_results` remain available, while each owner-specific stop controls
+only its own service. The event handler consumes
 analyzer-owned scan completions before legacy state or output changes.
 
 Admission sequence:

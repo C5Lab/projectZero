@@ -214,9 +214,132 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         self.assertIn("analyzer_legacy_radio_uncertain = true", prepare)
         self.assertRegex(prepare, r"failed\s*:\s*\(void\)esp_wifi_stop\(\)")
 
+    def test_every_wifi_init_applies_and_verifies_configured_country(self):
+        country_source = function_body(MAIN, "wifi_apply_configured_country")
+        country = tokens(country_source)
+        self.assertIn("wifi_country_configured", country)
+        self.assertIn("wifi_country_policy_is_ph", country)
+        self.assertIn("esp_wifi_set_country_code", country)
+        self.assertIn("esp_wifi_set_country(&country)", country)
+        self.assertIn("esp_wifi_get_country(&readback)", country)
+        self.assertIn("WIFI_COUNTRY_POLICY_MANUAL", country)
+
+        wrapper = tokens(function_body(MAIN, "wifi_init_with_configured_country"))
+        self.assertLess(wrapper.index("esp_wifi_init(config)"),
+                        wrapper.index("wifi_apply_configured_country()"))
+        self.assertIn("esp_wifi_deinit()", wrapper)
+        self.assertEqual(len(re.findall(r"\besp_wifi_init\s*\(", tokens(MAIN))), 1)
+
+        legacy = tokens(function_body(MAIN, "wifi_init_ap_sta"))
+        analyzer = tokens(function_body(MAIN, "analyzer_host_prepare_wifi"))
+        self.assertIn("wifi_init_with_configured_country(&cfg)", legacy)
+        self.assertIn("wifi_init_with_configured_country(&init)", analyzer)
+
+    def test_handshake_reasserts_configured_country_before_starting_worker(self):
+        handshake_source = function_body(MAIN, "cmd_start_handshake")
+        handshake = tokens(handshake_source)
+        ready = handshake.index("ensure_wifi_mode()")
+        country = handshake.index("wifi_apply_configured_country()")
+        worker = handshake.index("xTaskCreate(")
+        self.assertLess(ready, country)
+        self.assertLess(country, worker)
+        self.assertIn("Failed to enforce configured WiFi country", handshake_source)
+
+    def test_ducb_handshake_uses_per_channel_hybrid_radio_policy(self):
+        command = tokens(function_body(MAIN, "cmd_start_handshake"))
+        worker = tokens(function_body(MAIN, "handshake_attack_task_sniffer"))
+        prepare = tokens(function_body(MAIN, "handshake_prepare_sniffer_channel"))
+        deauth = tokens(function_body(MAIN, "hs_send_targeted_deauth"))
+        callback = tokens(function_body(MAIN, "hs_sniffer_promiscuous_cb"))
+        packet = tokens(function_body(MAIN, "hs_sniffer_process_packet"))
+        cleanup = tokens(function_body(MAIN, "handshake_cleanup"))
+        stop = tokens(function_body(MAIN, "cmd_stop"))
+        task = tokens(function_body(MAIN, "handshake_attack_task"))
+
+        # The command must not lock scan-all mode in APSTA before D-UCB has
+        # selected whether the current arm is DFS or non-DFS.
+        self.assertNotIn("ensure_ap_mode()", command)
+
+        # Every D-UCB arm is prepared and verified before dwell/reward/TX.
+        self.assertIn("handshake_prepare_sniffer_channel(channel, &tx_if)", worker)
+        self.assertLess(worker.index("handshake_prepare_sniffer_channel(channel, &tx_if)"),
+                        worker.index("vTaskDelay(pdMS_TO_TICKS(HS_DWELL_TIME_MS))"))
+        self.assertIn("continue", worker.split(
+            "if (!handshake_prepare_sniffer_channel(channel, &tx_if))", 1
+        )[1].split("vTaskDelay(pdMS_TO_TICKS(HS_DWELL_TIME_MS))", 1)[0])
+        compact_worker = re.sub(r"\s+", "", worker)
+        self.assertIn("hs_send_targeted_deauth(client->mac,ap->bssid,ap->channel,tx_if)",
+                      compact_worker)
+
+        # The same channel policy as explicit targets selects mode and TX
+        # interface, verifies both, and rearms promiscuous capture after a
+        # mode transition.
+        self.assertIn("handshake_radio_path_for_channel(channel)", prepare)
+        self.assertIn("WIFI_MODE_STA", prepare)
+        self.assertIn("WIFI_MODE_APSTA", prepare)
+        self.assertIn("WIFI_IF_STA", prepare)
+        self.assertIn("WIFI_IF_AP", prepare)
+        self.assertIn("esp_wifi_get_mode", prepare)
+        self.assertIn("esp_wifi_set_channel", prepare)
+        self.assertIn("esp_wifi_get_channel", prepare)
+        self.assertIn("esp_wifi_set_promiscuous_rx_cb(hs_sniffer_promiscuous_cb)", prepare)
+
+        # Both directions of targeted deauth use the interface chosen for the
+        # active D-UCB channel rather than the historical hard-coded AP path.
+        self.assertGreaterEqual(deauth.count("esp_wifi_80211_tx(tx_if"), 2)
+        self.assertNotIn("esp_wifi_80211_tx(WIFI_IF_AP", deauth)
+        self.assertLess(deauth.index("esp_wifi_get_mode"),
+                        deauth.index("esp_wifi_80211_tx(tx_if"))
+        self.assertLess(deauth.index("esp_wifi_get_channel"),
+                        deauth.index("esp_wifi_80211_tx(tx_if"))
+
+        # The Wi-Fi callback and worker serialize access to the AP/client
+        # tables and capture serializers.  The callback never blocks the Wi-Fi
+        # task when the worker owns the snapshot.
+        self.assertIn("SemaphoreHandle_t sniffer_mutex = hs_sniffer_mutex", callback)
+        self.assertIn("xSemaphoreTake(sniffer_mutex, 0)", callback)
+        self.assertIn("xSemaphoreGive(sniffer_mutex)", callback)
+        self.assertIn("atomic_fetch_add_explicit(&hs_sniffer_callbacks_inflight", callback)
+        self.assertIn("atomic_fetch_sub_explicit(&hs_sniffer_callbacks_inflight", callback)
+        self.assertNotIn("check_handshake_file_exists", packet)
+        self.assertIn("check_handshake_file_exists", worker)
+        self.assertIn("xSemaphoreTake(hs_sniffer_mutex, portMAX_DELAY)", worker)
+        self.assertIn("xSemaphoreGive(hs_sniffer_mutex)", worker)
+        first_worker_lock = worker.index("xSemaphoreTake(hs_sniffer_mutex, portMAX_DELAY)")
+        self.assertLess(first_worker_lock, worker.index("hs_dwell_new_clients = 0"))
+        self.assertIn("xSemaphoreTake(hs_sniffer_mutex, portMAX_DELAY)", cleanup)
+        self.assertIn("xSemaphoreGive(hs_sniffer_mutex)", cleanup)
+
+        # Stop disables promiscuous reception before a worker can be force
+        # deleted, and the post-deauth listen is interruptible.
+        stop_trigger = stop.index("handshake_attack_active = false")
+        promisc_off = stop.index("esp_wifi_set_promiscuous(false)", stop_trigger)
+        worker_delete = stop.index("vTaskDelete(handshake_attack_task_handle)", stop_trigger)
+        self.assertLess(stop_trigger, promisc_off)
+        self.assertLess(promisc_off, worker_delete)
+        recreated = stop.index("xSemaphoreCreateMutexStatic(&hs_sniffer_mutex_storage)",
+                               worker_delete)
+        self.assertGreater(recreated, worker_delete)
+        self.assertLess(stop.index("handshake_quiesce_sniffer_callbacks", stop_trigger),
+                        worker_delete)
+        self.assertNotIn("handshake_attack_task_handle = NULL", cleanup)
+        self.assertLess(task.index("handshake_cleanup()"),
+                        task.index("handshake_attack_task_handle = NULL"))
+        self.assertNotIn("vTaskDelay(pdMS_TO_TICKS(2000))", worker)
+
+    def test_wifi_country_cli_is_persistent_and_additive(self):
+        registration = function_body(MAIN, "register_commands")
+        self.assertIn('.command = "wifi_country"', registration)
+        self.assertIn("cmd_wifi_country", registration)
+        command = tokens(function_body(MAIN, "cmd_wifi_country"))
+        self.assertIn("wifi_country_save", command)
+        self.assertIn("applies_after_reboot", function_body(MAIN, "cmd_wifi_country"))
+        self.assertIn('"wifi_country_policy.c"', CMAKE)
+
     def test_legacy_dispatch_releases_lock_while_inflight_blocks_analyzer(self):
         dispatch = tokens(function_body(MAIN, "janos_console_cmd_dispatch"))
-        self.assertIn("analyzer_command && janos_commands_inflight != 0", dispatch)
+        decision = dispatch.index("janos_console_admission_decide(")
+        self.assertIn("janos_commands_inflight", dispatch[decision:])
         self.assertLess(dispatch.index("++janos_commands_inflight"),
                         dispatch.index("xSemaphoreGiveRecursive(janos_command_mutex)",
                                        dispatch.index("++janos_commands_inflight")))
@@ -227,8 +350,37 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         self.assertLess(unlocked, handler)
         self.assertLess(handler, relocked)
         self.assertLess(relocked, dispatch.index("--janos_commands_inflight"))
-        self.assertIn('strcmp(cmd_context->command, "stop") != 0',
-                      function_body(MAIN, "janos_console_cmd_dispatch"))
+
+    def test_radio_contention_keeps_v1_busy_error_and_nonzero_result(self):
+        dispatch = function_body(MAIN, "janos_console_cmd_dispatch")
+        busy_branch = dispatch.split(
+            "if (admission != JANOS_CONSOLE_ADMIT)", 1
+        )[1].split("if (!analyzer_command)", 1)[0]
+        self.assertIn("janos_console_admission_format(", busy_branch)
+        self.assertIn("puts(response)", busy_branch)
+        self.assertIn("return 1;", busy_branch)
+        self.assertNotIn("return 0;", busy_branch)
+
+    def test_dispatch_uses_portable_admission_before_handler_and_inflight(self):
+        dispatch = function_body(MAIN, "janos_console_cmd_dispatch")
+        self.assertIn("janos_console_admission_decide(", dispatch)
+        self.assertIn("janos_console_admission_format(", dispatch)
+        decision = dispatch.index("janos_console_admission_decide(")
+        formatted = dispatch.index("janos_console_admission_format(", decision)
+        refusal = dispatch.index("return 1;", formatted)
+        inflight = dispatch.index("++janos_commands_inflight")
+        handler = dispatch.index("int result = cmd_context->func")
+        self.assertLess(decision, formatted)
+        self.assertLess(formatted, refusal)
+        self.assertLess(refusal, inflight)
+        self.assertLess(inflight, handler)
+        self.assertIn("argc > 1 ? argv[1] : NULL", dispatch)
+        self.assertIn("janos_commands_inflight", dispatch[decision:formatted])
+        self.assertIn("wifi_analyzer_busy()", dispatch[decision:formatted])
+        self.assertNotIn("lease_command_allowed", dispatch)
+
+        cmake = (ROOT / "main" / "CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertIn('"janos_console_admission.c"', cmake)
 
     def test_uncertain_legacy_radio_blocks_scan_after_forced_delete_or_connect_failure(self):
         stop = tokens(function_body(MAIN, "cmd_stop"))

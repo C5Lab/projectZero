@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "sources": [
+    {
+      "id": "airgeddon_known_pins",
+      "license": "GPL-3.0-only",
+      "license_file": "LICENSES/GPL-3.0-only.txt",
+      "local_name": "airgeddon-known-pins-700ad7d6.db",
+      "project": "airgeddon",
+      "retrieved_utc": "2026-10-13T00:00:00Z",
+      "revision": "700ad7d63df04e565bcd14d2aec6f935fcec5185",
+      "sha256": "b9e681d9345e424e0d87eecc4ac2e5e4ca19f450e9b91fb25a0fa8648dac346b",
+      "url": "https://raw.githubusercontent.com/v1s1t0r1sh3r3/airgeddon/700ad7d63df04e565bcd14d2aec6f935fcec5185/known_pins.db"
+    },
+    {
+      "id": "default_wps_pins",
+      "license": "GPL-3.0-only",
+      "license_file": "LICENSES/GPL-3.0-only.txt",
+      "local_name": "default-wps-pins-56a23e58.csv",
+      "project": "Default-WPS-PINs",
+      "retrieved_utc": "2026-10-13T00:00:00Z",
+      "revision": "56a23e58a86a6ad9e8edd74cec4113c77f55a240",
+      "sha256": "07e8266b3640f93d49d2b040ef7e710bd2b34c7f4a2b7ef99af1b12e119a999d",
+      "url": "https://raw.githubusercontent.com/fulvius31/Default-WPS-PINs/56a23e58a86a6ad9e8edd74cec4113c77f55a240/pins.csv"
+    },
+    {
+      "id": "wireshark_manuf",
+      "license": "GPL-2.0-or-later",
+      "license_file": "LICENSES/GPL-2.0-or-later.txt",
+      "local_name": "wireshark-manuf-data-0451baac.c",
+      "project": "Wireshark",
+      "retrieved_utc": "2026-10-12T22:24:42Z",
+      "revision": "0451baac5b807b69db16a8d027fb5f199cc0ad5a",
+      "sha256": "9e311f92985979b92c948949c20934120bbed7015fd5344f7999e91650532c87",
+      "url": "https://gitlab.com/wireshark/wireshark/-/raw/0451baac5b807b69db16a8d027fb5f199cc0ad5a/epan/manuf-data.c"
+    }
+  ]
+}
