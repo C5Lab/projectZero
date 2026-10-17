@@ -89,7 +89,21 @@ class JanosWpsBuildGraphTest(unittest.TestCase):
         header = header_path.read_text(encoding="utf-8")
         self.assertIn("JANOS_WPS_IDF_MAJOR 6", header)
         self.assertIn("JANOS_WPS_IDF_MINOR 0", header)
-        self.assertIn("JANOS_WPS_IDF_PATCH 2", header)
+        self.assertIn("JANOS_WPS_IDF_PATCH 1", header)
+
+        transport = (COMPONENT / "janos_wps_transport.c").read_text(
+            encoding="utf-8")
+        self.assertIn('#include "janos_wps_build.h"', transport)
+        self.assertIn("ESP_IDF_VERSION_MAJOR != JANOS_WPS_IDF_MAJOR", transport)
+        self.assertIn("ESP_IDF_VERSION_MINOR != JANOS_WPS_IDF_MINOR", transport)
+        self.assertIn("ESP_IDF_VERSION_PATCH != JANOS_WPS_IDF_PATCH", transport)
+
+        cmake = (COMPONENT / "CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertNotIn("JANOS_WPS_EXPECTED_IDF_", cmake)
+
+        stub = (ROOT / "tests" / "host_stubs" / "wps_transport" /
+                "esp_idf_version.h").read_text(encoding="utf-8")
+        self.assertIn("ESP_IDF_VERSION_PATCH 1", stub)
         self.assertRegex(header, r"JANOS_WPS_FEATURE_KNOWN_PIN\s+\(1u\s*<<\s*0\)")
         self.assertRegex(header, r"JANOS_WPS_FEATURE_FRAGMENTATION\s+\(1u\s*<<\s*1\)")
         self.assertRegex(header, r"JANOS_WPS_FEATURE_SECRET_VAULT\s+\(1u\s*<<\s*2\)")

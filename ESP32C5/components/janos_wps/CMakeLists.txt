@@ -41,8 +41,3 @@ idf_component_register(
                       "${JANOS_WPS_IDF_PATH}/components/mbedtls/mbedtls/include"
     REQUIRES esp_wifi esp_event esp_timer esp_hw_support heap nvs_flash
              wpa_supplicant mbedtls fatfs sdmmc esp_driver_spi)
-
-target_compile_definitions(${COMPONENT_LIB} PRIVATE
-    JANOS_WPS_EXPECTED_IDF_MAJOR=6
-    JANOS_WPS_EXPECTED_IDF_MINOR=0
-    JANOS_WPS_EXPECTED_IDF_PATCH=2)

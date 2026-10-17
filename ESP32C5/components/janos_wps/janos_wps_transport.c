@@ -1,6 +1,7 @@
 /* SPDX-FileCopyrightText: 2026 JanOS contributors */
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "janos_wps_transport.h"
+#include "janos_wps_build.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -12,8 +13,10 @@
 #include "esp_wifi_driver.h"
 #include "esp_wps.h"
 
-#if ESP_IDF_VERSION_MAJOR != 6 || ESP_IDF_VERSION_MINOR != 0 || ESP_IDF_VERSION_PATCH != 2
-#error "JanOS WPS private API adapter is pinned to ESP-IDF 6.0.2"
+#if ESP_IDF_VERSION_MAJOR != JANOS_WPS_IDF_MAJOR || \
+    ESP_IDF_VERSION_MINOR != JANOS_WPS_IDF_MINOR || \
+    ESP_IDF_VERSION_PATCH != JANOS_WPS_IDF_PATCH
+#error "JanOS WPS private API adapter does not support this ESP-IDF version"
 #endif
 
 static bool ignore_scan(struct wps_scan_ie *scan) { (void)scan; return false; }

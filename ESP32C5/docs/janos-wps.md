@@ -5,7 +5,7 @@ explicitly selected laboratory access points. The current implementation verifie
 one known eight-digit WPS PIN and, after authenticated M7, retains the recovered
 PIN and network key for a bounded one-time reveal.
 
-The adapter is pinned to **ESP-IDF 6.0.2** because it uses private Wi-Fi/WPS APIs.
+The adapter is pinned to **ESP-IDF 6.0.1** because it uses private Wi-Fi/WPS APIs.
 Do not build this component against another IDF release without revalidating the
 adapter and the full radio-compatibility matrix.
 

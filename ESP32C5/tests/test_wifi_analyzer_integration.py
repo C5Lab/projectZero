@@ -245,10 +245,11 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         self.assertLess(country, worker)
         self.assertIn("Failed to enforce configured WiFi country", handshake_source)
 
-    def test_ducb_handshake_uses_per_channel_hybrid_radio_policy(self):
+    def test_ducb_handshake_uses_single_apsta_radio_path(self):
         command = tokens(function_body(MAIN, "cmd_start_handshake"))
         worker = tokens(function_body(MAIN, "handshake_attack_task_sniffer"))
         prepare = tokens(function_body(MAIN, "handshake_prepare_sniffer_channel"))
+        target_prepare = tokens(function_body(MAIN, "handshake_prepare_target_radio"))
         deauth = tokens(function_body(MAIN, "hs_send_targeted_deauth"))
         callback = tokens(function_body(MAIN, "hs_sniffer_promiscuous_cb"))
         packet = tokens(function_body(MAIN, "hs_sniffer_process_packet"))
@@ -256,42 +257,51 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         stop = tokens(function_body(MAIN, "cmd_stop"))
         task = tokens(function_body(MAIN, "handshake_attack_task"))
 
-        # The command must not lock scan-all mode in APSTA before D-UCB has
-        # selected whether the current arm is DFS or non-DFS.
-        self.assertNotIn("ensure_ap_mode()", command)
+        # Handshake capture uses one legacy-compatible radio contract for all
+        # channels.  APSTA is established once before either selected-target
+        # or scan-all work starts.
+        country = command.index("wifi_apply_configured_country()")
+        busy = command.index("handshake_attack_active || handshake_attack_task_handle != NULL")
+        apsta = command.index("ensure_ap_mode()")
+        worker_start = command.index("xTaskCreate(")
+        self.assertLess(country, apsta)
+        self.assertLess(busy, apsta)
+        self.assertLess(apsta, worker_start)
 
         # Every D-UCB arm is prepared and verified before dwell/reward/TX.
-        self.assertIn("handshake_prepare_sniffer_channel(channel, &tx_if)", worker)
-        self.assertLess(worker.index("handshake_prepare_sniffer_channel(channel, &tx_if)"),
+        self.assertIn("handshake_prepare_sniffer_channel(channel)", worker)
+        self.assertLess(worker.index("handshake_prepare_sniffer_channel(channel)"),
                         worker.index("vTaskDelay(pdMS_TO_TICKS(HS_DWELL_TIME_MS))"))
         self.assertIn("continue", worker.split(
-            "if (!handshake_prepare_sniffer_channel(channel, &tx_if))", 1
+            "if (!handshake_prepare_sniffer_channel(channel))", 1
         )[1].split("vTaskDelay(pdMS_TO_TICKS(HS_DWELL_TIME_MS))", 1)[0])
         compact_worker = re.sub(r"\s+", "", worker)
-        self.assertIn("hs_send_targeted_deauth(client->mac,ap->bssid,ap->channel,tx_if)",
+        self.assertIn("hs_send_targeted_deauth(client->mac,ap->bssid,ap->channel)",
                       compact_worker)
 
-        # The same channel policy as explicit targets selects mode and TX
-        # interface, verifies both, and rearms promiscuous capture after a
-        # mode transition.
-        self.assertIn("handshake_radio_path_for_channel(channel)", prepare)
-        self.assertIn("WIFI_MODE_STA", prepare)
+        # D-UCB and explicit-target paths verify APSTA and channel readback;
+        # neither performs per-channel STA/APSTA transitions.
         self.assertIn("WIFI_MODE_APSTA", prepare)
-        self.assertIn("WIFI_IF_STA", prepare)
-        self.assertIn("WIFI_IF_AP", prepare)
         self.assertIn("esp_wifi_get_mode", prepare)
         self.assertIn("esp_wifi_set_channel", prepare)
         self.assertIn("esp_wifi_get_channel", prepare)
         self.assertIn("esp_wifi_set_promiscuous_rx_cb(hs_sniffer_promiscuous_cb)", prepare)
+        self.assertNotIn("WIFI_MODE_STA", prepare)
+        self.assertNotIn("handshake_radio_path_for_channel", prepare)
+        self.assertIn("WIFI_MODE_APSTA", target_prepare)
+        self.assertNotIn("ensure_ap_mode()", target_prepare)
+        self.assertNotIn("WIFI_MODE_STA", target_prepare)
+        self.assertNotIn("handshake_radio_path_for_channel", target_prepare)
 
-        # Both directions of targeted deauth use the interface chosen for the
-        # active D-UCB channel rather than the historical hard-coded AP path.
-        self.assertGreaterEqual(deauth.count("esp_wifi_80211_tx(tx_if"), 2)
-        self.assertNotIn("esp_wifi_80211_tx(WIFI_IF_AP", deauth)
+        # Both directions of targeted deauth retain the historical AP TX path.
+        self.assertGreaterEqual(deauth.count("esp_wifi_80211_tx(WIFI_IF_AP"), 2)
+        self.assertNotIn("WIFI_IF_STA", deauth)
         self.assertLess(deauth.index("esp_wifi_get_mode"),
-                        deauth.index("esp_wifi_80211_tx(tx_if"))
+                        deauth.index("esp_wifi_80211_tx(WIFI_IF_AP"))
         self.assertLess(deauth.index("esp_wifi_get_channel"),
-                        deauth.index("esp_wifi_80211_tx(tx_if"))
+                        deauth.index("esp_wifi_80211_tx(WIFI_IF_AP"))
+
+        self.assertNotIn('"handshake_radio_policy.c"', CMAKE)
 
         # The Wi-Fi callback and worker serialize access to the AP/client
         # tables and capture serializers.  The callback never blocks the Wi-Fi
@@ -326,6 +336,40 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         self.assertLess(task.index("handshake_cleanup()"),
                         task.index("handshake_attack_task_handle = NULL"))
         self.assertNotIn("vTaskDelay(pdMS_TO_TICKS(2000))", worker)
+
+    def test_handshake_tx_done_telemetry_is_filtered_and_fully_unwound(self):
+        command = tokens(function_body(MAIN, "cmd_start_handshake"))
+        callback = tokens(function_body(MAIN, "handshake_tx_done_callback"))
+        start = tokens(function_body(MAIN, "handshake_tx_telemetry_start"))
+        stop_telemetry = tokens(function_body(MAIN, "handshake_tx_telemetry_stop"))
+        cleanup = tokens(function_body(MAIN, "handshake_cleanup"))
+        stop = tokens(function_body(MAIN, "cmd_stop"))
+
+        self.assertIn("tx_info == NULL || tx_info->data == NULL", callback)
+        self.assertIn("(tx_info->data[0] & 0xfcU) != 0xc0U", callback)
+        self.assertIn("tx_info->tx_status == WIFI_SEND_SUCCESS", callback)
+        self.assertIn("handshake_tx_telemetry_record", callback)
+        self.assertNotRegex(callback, r"\b(?:printf|puts|MY_LOG_\w+|ESP_LOG\w+)\s*\(")
+
+        self.assertIn("handshake_tx_telemetry_reset", start)
+        self.assertIn("esp_wifi_register_80211_tx_cb(handshake_tx_done_callback)", start)
+        self.assertIn("esp_wifi_register_80211_tx_cb(NULL)", stop_telemetry)
+        self.assertIn("handshake_tx_telemetry_snapshot", stop_telemetry)
+        self.assertIn("tx_done_success", stop_telemetry)
+        self.assertIn("tx_done_fail", stop_telemetry)
+
+        telemetry_start = command.index("handshake_tx_telemetry_start()")
+        worker_start = command.index("xTaskCreate(")
+        self.assertLess(telemetry_start, worker_start)
+        failed_create = command.split("if (result != pdPASS)", 1)[1]
+        self.assertIn("handshake_tx_telemetry_stop", failed_create)
+
+        self.assertLess(cleanup.index("attack_handshake_stop()"),
+                        cleanup.index("handshake_tx_telemetry_stop"))
+        force_delete = stop.index("vTaskDelete(handshake_attack_task_handle)")
+        self.assertGreater(stop.index("handshake_tx_telemetry_stop", force_delete),
+                           force_delete)
+        self.assertIn('"handshake_tx_telemetry.c"', CMAKE)
 
     def test_wifi_country_cli_is_persistent_and_additive(self):
         registration = function_body(MAIN, "register_commands")

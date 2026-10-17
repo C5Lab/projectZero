@@ -1,4 +1,4 @@
-"""Compile and execute the portable handshake radio policy contract."""
+"""Execute the portable handshake TX-completion counters."""
 
 import os
 from pathlib import Path
@@ -16,16 +16,16 @@ def wsl_path(path):
     return f"/mnt/{path.drive.rstrip(':').lower()}/{path.relative_to(path.anchor).as_posix()}"
 
 
-class HandshakeRadioPolicyTest(unittest.TestCase):
-    def test_policy_contract(self):
-        compiler = next((shutil.which(c) for c in
+class HandshakeTxTelemetryTest(unittest.TestCase):
+    def test_success_failure_and_reset_contract(self):
+        compiler = next((shutil.which(candidate) for candidate in
                          (os.environ.get("CC", ""), "cc", "gcc", "clang")
-                         if c and shutil.which(c)), None)
-        with tempfile.TemporaryDirectory() as directory:
-            executable = Path(directory) / "handshake_radio_policy_test"
+                         if candidate and shutil.which(candidate)), None)
+        with tempfile.TemporaryDirectory(prefix="janos-handshake-tx-") as directory:
+            executable = Path(directory) / "handshake_tx_telemetry_test"
             flags = ["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic"]
-            sources = [ROOT / "tests/handshake_radio_policy_test.c",
-                       ROOT / "main/handshake_radio_policy.c"]
+            sources = [ROOT / "tests/handshake_tx_telemetry_test.c",
+                       ROOT / "main/handshake_tx_telemetry.c"]
             if compiler:
                 command = [compiler, *flags, "-I", str(ROOT / "main"),
                            *map(str, sources), "-o", str(executable)]
@@ -36,11 +36,13 @@ class HandshakeRadioPolicyTest(unittest.TestCase):
                 run = ["wsl.exe", wsl_path(executable)]
             else:
                 self.fail("Host C compiler required (native or WSL)")
-            built = subprocess.run(command, capture_output=True, text=True)
+
+            built = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
             self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
-            result = subprocess.run(run, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("PASS: handshake radio policy", result.stdout)
+            executed = subprocess.run(run, cwd=ROOT, capture_output=True,
+                                      text=True, timeout=10)
+            self.assertEqual(executed.returncode, 0,
+                             executed.stdout + executed.stderr)
 
 
 if __name__ == "__main__":

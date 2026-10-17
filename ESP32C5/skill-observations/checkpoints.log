@@ -68,3 +68,5 @@
 2026-10-16 CLI documentation checkpoint: no new reusable skill observations after command-registry comparison, consolidated manual update, and documentation parity verification.
 2026-10-16 documentation cleanup checkpoint: no new reusable skill observations after separating public reference docs from unfinished Superpowers work, removing completed plans, and validating relative links.
 2026-10-16 WPS mini-OS Task 2 checkpoint: no new reusable skill observations after focused red tests and hash-verified engine relocation.
+2026-10-17 ESP-IDF 6.0.1 WPS pin checkpoint: no new reusable skill observations after guard diagnosis, red-green contract testing, and full firmware build.
+2026-10-17 handshake TX telemetry checkpoint: no new reusable skill observations after callback lifecycle design, red-green counter tests, and full host regression verification.

