@@ -215,7 +215,7 @@ later in this manual define output, persistence, admission and error behavior.
 | `wifi_country status` | Show configured and active Wi-Fi country information. | [Settings](#settings) |
 | `wifi_country list` | List accepted two-character country profiles. | [Settings](#settings) |
 | `wifi_country set <CC>` | Persist a country profile for application after reboot. | [Settings](#settings) |
-| `wifi_country reset` | Restore the default `PH` profile for the next boot. | [Settings](#settings) |
+| `wifi_country reset` | Restore the default `PA` profile for the next boot. | [Settings](#settings) |
 | `radio_protect add <BSSID>` | Add a protected BSSID to `/sdcard/lab/white.txt`. | [Attacks](#attacks) |
 | `radio_protect remove <BSSID>` | Remove a protected BSSID. | [Attacks](#attacks) |
 | `radio_protect list` | List active protected BSSIDs. | [Attacks](#attacks) |
@@ -229,6 +229,36 @@ cleanup. Production JanOS does not expose the standalone laboratory commands
 for Pixie, JWPS/campaign or persistent `sta_mac` policy.
 
 ## WiFi scanning
+
+### `test_radio_channel`
+- **Syntax**: `test_radio_channel <integer>` (1..255).
+- **Description**: Initialize Wi-Fi if needed, then attempt to set the requested
+  primary channel with no secondary channel. Preserve the current Wi-Fi mode
+  (including STA/APSTA), band mode and country profile. The driver decides whether
+  the channel is supported under those settings.
+- **Result**: Print the current mode, set/read error names, actual channel and
+  `PASS`/`FAIL`. Success requires both API calls to succeed and channel readback to
+  match. Return nonzero on invalid input, refusal or failure.
+- **State**: Leave the radio on the resulting channel. Refuse while another command
+  is in progress, the radio is in use, or STA is connected; use `stop` first for
+  active operations. BLE/802.15.4 modes are refused.
+- **Example**: `test_radio_channel 52`
+```
+[RADIO] requested=52 mode=APSTA(3) set=ESP_OK read=ESP_OK actual=52 secondary=0 result=PASS
+```
+
+### `test_radio_channels`
+
+- **Syntax**: `test_radio_channels` (no arguments).
+- **Description**: Run `test_radio_channel` for each of the following 28 channels,
+  in this order, continuing after channel failures:
+  `36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165,169,173,177`.
+- **Output**: Individual `[RADIO]` records followed by `[RADIO-SUMMARY]` with
+  `total`, `passed`, `failed` and `result`, then `[RADIO-PASS]` and `[RADIO-FAIL]`
+  channel lists (`none` for an empty list).
+- **State**: Preserve the current Wi-Fi mode, band mode and country profile;
+  leave the radio on the last successfully set channel. The same radio admission
+  restrictions as `test_radio_channel` apply. Return zero only if all 28 tests pass.
 
 ### `wifi_analyzer`
 
@@ -493,15 +523,15 @@ Cancellation ends with `[FT] cancelled` and `[FT] END`. Validation, SD, open, se
 
 - `wifi_country status` — show the configured profile and, when the Wi-Fi
   driver is active, its read-back country, channel range and policy.
-- `wifi_country list` — list the accepted two-character profiles. `PH` is the
-  JanOS default and fallback; the other entries follow the ESP-IDF 6.0.2
-  `esp_wifi_set_country_code()` table.
+- `wifi_country list` — list all 176 profiles from the ESP-IDF 6.0 ESP32-C5
+  regulatory table, including countries/territories, `EU` and world-safe `01`.
+  `PA` remains the JanOS default and fallback.
 - `wifi_country set <CC>` — validate and persist a profile in NVS. Lowercase is
   normalized to uppercase. The new profile is applied after reboot.
-- `wifi_country reset` — persist the default `PH` profile for the next boot.
+- `wifi_country reset` — persist the default `PA` profile for the next boot.
 
 Country configuration is applied centrally after every Wi-Fi driver
-initialization and read back before the radio is accepted. `PH` uses the JanOS
+initialization and read back before the radio is accepted. `PA` uses the JanOS
 manual profile `schan=1`, `nchan=14`; other profiles use the corresponding IDF
 regulatory table in manual mode. Changing a country profile does not bypass
 DFS restrictions or permit SoftAP/APSTA operation on DFS channels.

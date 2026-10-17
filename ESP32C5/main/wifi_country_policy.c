@@ -3,18 +3,31 @@
 #include <ctype.h>
 #include <string.h>
 
-/* PH is a deliberate JanOS extension. The remaining entries mirror the
- * country codes accepted by esp_wifi_set_country_code() in ESP-IDF 6.0.2. */
+/* Complete ESP-IDF v6.0 ESP32-C5 regdomain_table (176 profiles).
+ * Source: components/esp_wifi/regulatory/esp_wifi_regulatory.c.
+ * Includes territories, EU and the world-safe profile 01. Keep PA first as
+ * the JanOS default; all other entries follow in alphabetical order. */
 static const char *const supported_codes[] = {
-    "PH", "01", "AT", "AU", "BE", "BG", "BR", "CA", "CH", "CN", "CY", "CZ",
-    "DE", "DK", "EE", "ES", "FI", "FR", "GB", "GR", "HK", "HR", "HU", "IE",
-    "IN", "IS", "IT", "JP", "KR", "LI", "LT", "LU", "LV", "MT", "MX", "NL",
-    "NO", "NZ", "PL", "PT", "RO", "SE", "SI", "SK", "TW", "US"
+    "PA", "01", "AD", "AE", "AF", "AI", "AL", "AM", "AN", "AR", "AS", "AT",
+    "AU", "AW", "AZ", "BA", "BB", "BD", "BE", "BF", "BG", "BH", "BL", "BM",
+    "BN", "BO", "BR", "BS", "BT", "BY", "BZ", "CA", "CF", "CH", "CI", "CL",
+    "CN", "CO", "CR", "CU", "CX", "CY", "CZ", "DE", "DK", "DM", "DO", "DZ",
+    "EC", "EE", "EG", "ES", "ET", "EU", "FI", "FM", "FR", "GB", "GD", "GE",
+    "GF", "GH", "GL", "GP", "GR", "GT", "GU", "GY", "HK", "HN", "HR", "HT",
+    "HU", "ID", "IE", "IL", "IN", "IR", "IS", "IT", "JM", "JO", "JP", "KE",
+    "KH", "KN", "KP", "KR", "KW", "KY", "KZ", "LB", "LC", "LI", "LK", "LS",
+    "LT", "LU", "LV", "MA", "MC", "MD", "ME", "MF", "MH", "MK", "MN", "MO",
+    "MP", "MQ", "MR", "MT", "MU", "MV", "MW", "MX", "MY", "NA", "NG", "NI",
+    "NL", "NO", "NP", "NZ", "OM", "PE", "PF", "PG", "PH", "PK", "PL", "PM",
+    "PR", "PT", "PW", "PY", "QA", "RE", "RO", "RS", "RU", "RW", "SA", "SE",
+    "SG", "SI", "SK", "SN", "SR", "SV", "SY", "TC", "TD", "TG", "TH", "TN",
+    "TR", "TT", "TW", "TZ", "UA", "UG", "US", "UY", "UZ", "VC", "VE", "VI",
+    "VN", "VU", "WF", "WS", "YE", "YT", "ZA", "ZW",
 };
 
 wifi_country_policy_record_t wifi_country_policy_default(void)
 {
-    return (wifi_country_policy_record_t){WIFI_COUNTRY_POLICY_VERSION, "PH"};
+    return (wifi_country_policy_record_t){WIFI_COUNTRY_POLICY_VERSION, "PA"};
 }
 
 size_t wifi_country_policy_count(void)
@@ -52,10 +65,10 @@ wifi_country_policy_status_t wifi_country_policy_normalize(
     return WIFI_COUNTRY_POLICY_OK;
 }
 
-bool wifi_country_policy_is_ph(const wifi_country_policy_record_t *record)
+bool wifi_country_policy_is_pa(const wifi_country_policy_record_t *record)
 {
     return record != NULL && record->version == WIFI_COUNTRY_POLICY_VERSION &&
-           record->cc[0] == 'P' && record->cc[1] == 'H' && record->cc[2] == '\0';
+           record->cc[0] == 'P' && record->cc[1] == 'A' && record->cc[2] == '\0';
 }
 
 wifi_country_policy_status_t wifi_country_policy_encode(

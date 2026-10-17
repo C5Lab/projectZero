@@ -218,7 +218,7 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         country_source = function_body(MAIN, "wifi_apply_configured_country")
         country = tokens(country_source)
         self.assertIn("wifi_country_configured", country)
-        self.assertIn("wifi_country_policy_is_ph", country)
+        self.assertIn("wifi_country_policy_is_pa", country)
         self.assertIn("esp_wifi_set_country_code", country)
         self.assertIn("esp_wifi_set_country(&country)", country)
         self.assertIn("esp_wifi_get_country(&readback)", country)
@@ -399,7 +399,7 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         dispatch = function_body(MAIN, "janos_console_cmd_dispatch")
         busy_branch = dispatch.split(
             "if (admission != JANOS_CONSOLE_ADMIT)", 1
-        )[1].split("if (!analyzer_command)", 1)[0]
+        )[1].split("if (!serialized_command)", 1)[0]
         self.assertIn("janos_console_admission_format(", busy_branch)
         self.assertIn("puts(response)", busy_branch)
         self.assertIn("return 1;", busy_branch)

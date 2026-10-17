@@ -1,8 +1,8 @@
-# Wi-Fi country `PH` and handshake radio compatibility
+# Wi-Fi country `PA` and handshake radio compatibility
 
 ## Current behavior
 
-JanOS persistently configures `PH` as the default Wi-Fi country profile. The
+JanOS persistently configures `PA` as the default Wi-Fi country profile. The
 handshake engine uses the original single radio contract for every channel:
 
 ```text
@@ -20,12 +20,12 @@ This rollback is intentionally narrow. D-UCB scheduling, protected-BSSID
 filtering, channel and mode read-back, promiscuous callback synchronization,
 capture serialization and stop cleanup remain in place.
 
-## Persistent `PH` country policy
+## Persistent `PA` country policy
 
 The default policy record contains:
 
 ```text
-country: PH
+country: PA
 policy: manual
 2.4 GHz start channel: 1
 2.4 GHz channel count: 14
@@ -39,9 +39,12 @@ key: profile
 ```
 
 When the namespace or key is missing, malformed or unreadable, JanOS falls
-back to `PH`. For `PH`, JanOS applies an explicit `wifi_country_t` record with
+back to `PA`. For `PA`, JanOS applies an explicit `wifi_country_t` record with
 `schan=1`, `nchan=14` and `WIFI_COUNTRY_POLICY_MANUAL`. Other supported country
-codes use `esp_wifi_set_country_code()` in manual mode.
+codes use `esp_wifi_set_country_code()` in manual mode. JanOS accepts all 176
+profiles from the ESP-IDF 6.0 ESP32-C5 regulatory table, including territories,
+`EU` and the world-safe profile `01`. The complete list is available through
+`wifi_country list`.
 
 ## Read-back and lifecycle
 
@@ -49,7 +52,7 @@ After applying a profile JanOS calls `esp_wifi_get_country()` and verifies:
 
 - the two-character country code;
 - manual policy mode;
-- for `PH`, start channel `1` and channel count `14`.
+- for `PA`, start channel `1` and channel count `14`.
 
 The configured profile is reapplied after Wi-Fi initialization, after returning
 from BLE or IEEE 802.15.4, before starting the handshake engine and after
@@ -65,7 +68,7 @@ wifi_country reset
 ```
 
 `set` and `reset` persist the choice in NVS and apply it after reboot. `reset`
-restores `PH`.
+restores `PA`.
 
 ## Handshake startup and D-UCB
 

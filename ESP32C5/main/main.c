@@ -964,9 +964,9 @@ static esp_netif_t *ap_netif_handle = NULL;
 static bool wifi_event_handler_registered = false;
 static bool ip_event_handler_registered = false;
 static wifi_country_policy_record_t wifi_country_configured = {
-    WIFI_COUNTRY_POLICY_VERSION, "PH"
+    WIFI_COUNTRY_POLICY_VERSION, "PA"
 };
-static const char *wifi_country_record_health = "default_ph";
+static const char *wifi_country_record_health = "default_pa";
 static bool ota_check_started = false;
 static bool ota_check_in_progress = false;
 static janos_radio_lease_t janos_radio_lease;
@@ -2382,6 +2382,8 @@ static int cmd_zig_recon_nodes(int argc, char **argv);
 static int cmd_zig_recon_clear(int argc, char **argv);
 static int cmd_wifi_connect(int argc, char **argv);
 static int cmd_wifi_country(int argc, char **argv);
+static int cmd_test_radio_channel(int argc, char **argv);
+static int cmd_test_radio_channels(int argc, char **argv);
 static int cmd_capture_gateway(int argc, char **argv);
 static int cmd_list_hosts(int argc, char **argv);
 static int cmd_list_hosts_vendor(int argc, char **argv);
@@ -4291,12 +4293,12 @@ static esp_err_t wifi_country_save(const wifi_country_policy_record_t *record)
 static void wifi_country_load(void)
 {
     wifi_country_configured = wifi_country_policy_default();
-    wifi_country_record_health = "default_ph";
+    wifi_country_record_health = "default_pa";
     nvs_handle_t handle;
     esp_err_t err = nvs_open(WIFI_COUNTRY_NVS_NAMESPACE, NVS_READONLY, &handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) return;
     if (err != ESP_OK) {
-        wifi_country_record_health = "read_error_fallback_ph";
+        wifi_country_record_health = "read_error_fallback_pa";
         return;
     }
     uint8_t encoded[WIFI_COUNTRY_POLICY_RECORD_SIZE];
@@ -4307,7 +4309,7 @@ static void wifi_country_load(void)
     wifi_country_policy_record_t loaded;
     if (err != ESP_OK || wifi_country_policy_decode(encoded, length, &loaded) !=
         WIFI_COUNTRY_POLICY_OK) {
-        wifi_country_record_health = "invalid_fallback_ph";
+        wifi_country_record_health = "invalid_fallback_pa";
         return;
     }
     wifi_country_configured = loaded;
@@ -4317,9 +4319,9 @@ static void wifi_country_load(void)
 static esp_err_t wifi_apply_configured_country(void)
 {
     esp_err_t err;
-    if (wifi_country_policy_is_ph(&wifi_country_configured)) {
+    if (wifi_country_policy_is_pa(&wifi_country_configured)) {
         wifi_country_t country = {
-            .cc = "PH",
+            .cc = "PA",
             .schan = 1,
             .nchan = 14,
             .policy = WIFI_COUNTRY_POLICY_MANUAL,
@@ -4345,7 +4347,7 @@ static esp_err_t wifi_apply_configured_country(void)
     bool mismatch = readback.cc[0] != wifi_country_configured.cc[0] ||
                     readback.cc[1] != wifi_country_configured.cc[1] ||
                     readback.policy != WIFI_COUNTRY_POLICY_MANUAL;
-    if (wifi_country_policy_is_ph(&wifi_country_configured))
+    if (wifi_country_policy_is_pa(&wifi_country_configured))
         mismatch = mismatch || readback.schan != 1 || readback.nchan != 14;
     if (mismatch) {
         MY_LOG_INFO(TAG,
@@ -4363,7 +4365,7 @@ static void wifi_country_print_status(void)
     bool have_active = wifi_initialized && esp_wifi_get_country(&active) == ESP_OK;
     if (have_active) {
         printf("{\"schema_version\":1,\"record_type\":\"wifi_country_status\","
-               "\"configured_cc\":\"%s\",\"default_cc\":\"PH\",\"record_health\":\"%s\","
+               "\"configured_cc\":\"%s\",\"default_cc\":\"PA\",\"record_health\":\"%s\","
                "\"active_cc\":\"%c%c\",\"active_schan\":%u,\"active_nchan\":%u,"
                "\"active_policy\":\"%s\"}\n",
                wifi_country_configured.cc, wifi_country_record_health,
@@ -4371,7 +4373,7 @@ static void wifi_country_print_status(void)
                active.policy == WIFI_COUNTRY_POLICY_MANUAL ? "manual" : "auto");
     } else {
         printf("{\"schema_version\":1,\"record_type\":\"wifi_country_status\","
-               "\"configured_cc\":\"%s\",\"default_cc\":\"PH\",\"record_health\":\"%s\","
+               "\"configured_cc\":\"%s\",\"default_cc\":\"PA\",\"record_health\":\"%s\","
                "\"active_cc\":null}\n",
                wifi_country_configured.cc, wifi_country_record_health);
     }
@@ -4385,7 +4387,7 @@ static int cmd_wifi_country(int argc, char **argv)
     }
     if (argc == 2 && strcmp(argv[1], "list") == 0) {
         printf("{\"schema_version\":1,\"record_type\":\"wifi_country_profiles\","
-               "\"default_cc\":\"PH\",\"profiles\":[");
+               "\"default_cc\":\"PA\",\"profiles\":[");
         for (size_t i = 0; i < wifi_country_policy_count(); ++i)
             printf("%s\"%s\"", i == 0 ? "" : ",", wifi_country_policy_at(i));
         puts("]}");
@@ -4417,7 +4419,7 @@ static int cmd_wifi_country(int argc, char **argv)
     }
     wifi_country_configured = requested;
     wifi_country_record_health = "valid";
-    printf("WiFi country next boot: %s (default: PH)\n", requested.cc);
+    printf("WiFi country next boot: %s (default: PA)\n", requested.cc);
     printf("{\"schema_version\":1,\"record_type\":\"wifi_country_result\","
            "\"result\":\"%s\",\"configured_cc\":\"%s\","
            "\"applies_after_reboot\":true}\n", action, requested.cc);
@@ -20606,12 +20608,15 @@ static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
     janos_console_cmd_context_t *cmd_context =
         (janos_console_cmd_context_t *)context;
 
-    /* Only analyzer handlers retain the admission lock. Legacy commands reserve
-     * an in-flight slot, then run without it so a concurrent stop stays usable.
-     * Analyzer admission cannot overtake their state/task publication. */
+    /* Analyzer and channel-test handlers retain the admission lock. Legacy
+     * commands reserve an in-flight slot, then run without it so a concurrent
+     * stop stays usable. Radio admission cannot overtake their state/task publication. */
     xSemaphoreTakeRecursive(janos_command_mutex, portMAX_DELAY);
     uart_baud_note_activity();
     bool analyzer_command = strcmp(cmd_context->command, "wifi_analyzer") == 0;
+    bool serialized_command = analyzer_command ||
+        strcmp(cmd_context->command, "test_radio_channel") == 0 ||
+        strcmp(cmd_context->command, "test_radio_channels") == 0;
     bool wps_command = strcmp(cmd_context->command, "wps") == 0 ||
         strcmp(cmd_context->command, "secret") == 0;
     janos_radio_lease_snapshot_t lease =
@@ -20627,7 +20632,7 @@ static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
         xSemaphoreGiveRecursive(janos_command_mutex);
         return 1;
     }
-    if (!analyzer_command) {
+    if (!serialized_command) {
         ++janos_commands_inflight;
         xSemaphoreGiveRecursive(janos_command_mutex);
     }
@@ -20638,7 +20643,7 @@ static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
          * the secret-bearing command instead of leaving it in RAM history. */
         linenoiseHistoryFree();
     }
-    if (!analyzer_command) {
+    if (!serialized_command) {
         xSemaphoreTakeRecursive(janos_command_mutex, portMAX_DELAY);
         --janos_commands_inflight;
     }
@@ -25819,6 +25824,108 @@ static const char *analyzer_host_busy_reason(void)
     return NULL;
 }
 
+static int cmd_test_radio_channel(int argc, char **argv)
+{
+    if (argc != 2) {
+        puts("Usage: test_radio_channel <integer channel 1..255>");
+        return 1;
+    }
+    char *end = NULL;
+    errno = 0;
+    long requested = strtol(argv[1], &end, 10);
+    if (errno != 0 || end == argv[1] || *end != '\0' ||
+        requested < 1 || requested > UINT8_MAX) {
+        puts("Invalid channel: expected an integer in 1..255.");
+        return 1;
+    }
+
+    /* Called with the console admission lock held, before any radio mutation. */
+    const char *busy = analyzer_host_busy_reason();
+    if (busy != NULL) {
+        printf("[RADIO] requested=%ld result=BUSY reason=%s\n", requested, busy);
+        return 1;
+    }
+    if (!ensure_wifi_mode()) {
+        printf("[RADIO] requested=%ld result=FAIL reason=wifi_init\n", requested);
+        return 1;
+    }
+
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    esp_err_t err = esp_wifi_get_mode(&mode);
+    if (err != ESP_OK) {
+        printf("[RADIO] requested=%ld result=FAIL mode_error=%s\n",
+               requested, esp_err_to_name(err));
+        return 1;
+    }
+    const char *mode_name = mode == WIFI_MODE_STA ? "STA" :
+                            mode == WIFI_MODE_AP ? "AP" :
+                            mode == WIFI_MODE_APSTA ? "APSTA" : "OTHER";
+
+    /* Keep the current mode, band and country so driver restrictions are visible. */
+    esp_err_t set_err = esp_wifi_set_channel((uint8_t)requested,
+                                            WIFI_SECOND_CHAN_NONE);
+    if (set_err == ESP_OK) vTaskDelay(pdMS_TO_TICKS(20));
+    uint8_t actual = 0;
+    wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
+    esp_err_t read_err = esp_wifi_get_channel(&actual, &secondary);
+    bool passed = set_err == ESP_OK && read_err == ESP_OK &&
+                  actual == (uint8_t)requested && secondary == WIFI_SECOND_CHAN_NONE;
+    printf("[RADIO] requested=%ld mode=%s(%d) set=%s read=%s actual=%u secondary=%d result=%s\n",
+           requested, mode_name, (int)mode, esp_err_to_name(set_err),
+           esp_err_to_name(read_err), actual, (int)secondary, passed ? "PASS" : "FAIL");
+    return passed ? 0 : 1;
+}
+
+static int cmd_test_radio_channels(int argc, char **argv)
+{
+    (void)argv;
+    if (argc != 1) {
+        puts("Usage: test_radio_channels");
+        return 1;
+    }
+    const char *busy = analyzer_host_busy_reason();
+    if (busy != NULL) {
+        printf("[RADIO-SUMMARY] result=BUSY reason=%s\n", busy);
+        return 1;
+    }
+    if (!ensure_wifi_mode()) {
+        puts("[RADIO-SUMMARY] result=FAIL reason=wifi_init");
+        return 1;
+    }
+
+    static const uint8_t channels[] = {
+        36, 40, 44, 48, 52, 56, 60, 64,
+        100, 104, 108, 112, 116, 120, 124, 128,
+        132, 136, 140, 144, 149, 153, 157, 161,
+        165, 169, 173, 177
+    };
+    const unsigned total = sizeof(channels) / sizeof(channels[0]);
+    bool passed[sizeof(channels) / sizeof(channels[0])];
+    unsigned passed_count = 0;
+    for (unsigned i = 0; i < total; ++i) {
+        char channel[4];
+        snprintf(channel, sizeof(channel), "%u", channels[i]);
+        char *channel_argv[] = {"test_radio_channel", channel};
+        passed[i] = cmd_test_radio_channel(2, channel_argv) == 0;
+        if (passed[i]) ++passed_count;
+    }
+
+    printf("[RADIO-SUMMARY] total=%u passed=%u failed=%u result=%s\n",
+           total, passed_count, total - passed_count,
+           passed_count == total ? "PASS" : "FAIL");
+    for (int result = 1; result >= 0; --result) {
+        printf("[RADIO-%s] channels=", result ? "PASS" : "FAIL");
+        unsigned listed = 0;
+        for (unsigned i = 0; i < total; ++i) {
+            if (passed[i] == (bool)result)
+                printf("%s%u", listed++ ? "," : "", channels[i]);
+        }
+        if (listed == 0) fputs("none", stdout);
+        putchar('\n');
+    }
+    return passed_count == total ? 0 : 1;
+}
+
 static bool analyzer_host_lease_acquire(uint32_t *generation)
 {
     if (analyzer_host_busy_reason() != NULL) return false;
@@ -25924,9 +26031,23 @@ failed:
 #define esp_console_cmd_register(cmd) janos_console_cmd_register(cmd)
 static void register_commands(void)
 {
+    const esp_console_cmd_t test_radio_channel_cmd = {
+        .command = "test_radio_channel",
+        .help = "Set and verify a WiFi channel in the current mode: test_radio_channel <integer 1..255>",
+        .func = &cmd_test_radio_channel,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&test_radio_channel_cmd));
+
+    const esp_console_cmd_t test_radio_channels_cmd = {
+        .command = "test_radio_channels",
+        .help = "Test 28 primary 5GHz channels (36..177) and summarize PASS/FAIL results",
+        .func = &cmd_test_radio_channels,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&test_radio_channels_cmd));
+
     const esp_console_cmd_t wifi_country_cmd = {
         .command = "wifi_country",
-        .help = "WiFi regulatory profile: status | list | set <CC> | reset (default PH)",
+        .help = "WiFi regulatory profile: status | list | set <CC> | reset (default PA)",
         .func = &cmd_wifi_country,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_country_cmd));

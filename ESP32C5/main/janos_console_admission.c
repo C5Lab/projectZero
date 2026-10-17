@@ -50,7 +50,9 @@ janos_console_admission_result_t janos_console_admission_decide(
         return wps_command ? JANOS_CONSOLE_ADMIT :
                              JANOS_CONSOLE_BUSY_RADIO_LEASE;
     }
-    if (analyzer_command && commands_inflight != 0U) {
+    if ((analyzer_command || equals(command, "test_radio_channel") ||
+         equals(command, "test_radio_channels")) &&
+        commands_inflight != 0U) {
         return JANOS_CONSOLE_BUSY_COMMAND_IN_PROGRESS;
     }
     if (analyzer_busy && !analyzer_command) {

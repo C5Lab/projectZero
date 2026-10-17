@@ -17,7 +17,7 @@ Documentation:
   vendor/OUI and laboratory JWPS databases, including provenance and source
   release bundles.
 - [Shared radio ownership](docs/janos-radio-lease.md) — analyzer/WPS admission, stable busy contract, cancellation, quarantine, OTA exclusion and exact MAC restoration. The [validation runbook](docs/janos-radio-compatibility-validation.md) separates host, build and device evidence.
-- [Wi-Fi country `PH` and DFS handshake fix](docs/wifi-country-ph-dfs-fix.md) — persistent country policy, driver read-back and the hybrid APSTA/STA handshake path.
+- [Wi-Fi country `PA` and DFS handshake fix](docs/wifi-country-ph-dfs-fix.md) — persistent country policy, driver read-back and the hybrid APSTA/STA handshake path.
 
 ## Generated RF database artifacts
 

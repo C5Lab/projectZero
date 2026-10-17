@@ -1,5 +1,6 @@
 #include "wifi_country_policy.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,13 +11,15 @@ static void test_default_and_normalization(void)
 {
     wifi_country_policy_record_t record = wifi_country_policy_default();
     CHECK(record.version == WIFI_COUNTRY_POLICY_VERSION);
-    CHECK(strcmp(record.cc, "PH") == 0);
+    CHECK(strcmp(record.cc, "PA") == 0);
+    CHECK(wifi_country_policy_is_pa(&record));
+    CHECK(!wifi_country_policy_is_pa(NULL));
 
     char cc[WIFI_COUNTRY_CODE_SIZE] = {0};
     CHECK(wifi_country_policy_normalize("pl", cc) == WIFI_COUNTRY_POLICY_OK);
     CHECK(strcmp(cc, "PL") == 0);
-    CHECK(wifi_country_policy_normalize("PH", cc) == WIFI_COUNTRY_POLICY_OK);
-    CHECK(strcmp(cc, "PH") == 0);
+    CHECK(wifi_country_policy_normalize("pa", cc) == WIFI_COUNTRY_POLICY_OK);
+    CHECK(strcmp(cc, "PA") == 0);
 
     const char *bad[] = {"", "P", "POL", "P1", "ZZ", "ph ", " PL", NULL};
     for (size_t i = 0; bad[i] != NULL; ++i) {
@@ -30,15 +33,34 @@ static void test_default_and_normalization(void)
 
 static void test_supported_profiles(void)
 {
-    const char *supported[] = {"PH", "01", "AT", "AU", "BE", "BG", "BR", "CA",
-        "CH", "CN", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GB",
-        "GR", "HK", "HR", "HU", "IE", "IN", "IS", "IT", "JP", "KR", "LI",
-        "LT", "LU", "LV", "MT", "MX", "NL", "NO", "NZ", "PL", "PT", "RO",
-        "SE", "SI", "SK", "TW", "US"};
-    CHECK(wifi_country_policy_count() == sizeof(supported) / sizeof(supported[0]));
-    for (size_t i = 0; i < wifi_country_policy_count(); ++i) {
-        CHECK(strcmp(wifi_country_policy_at(i), supported[i]) == 0);
+    /* Profiles outside the former short list, plus existing/default profiles. */
+    const char *supported[] = {"RU", "PH", "AE", "AR", "ID", "IL", "SG", "TH",
+        "TR", "UA", "ZA", "ZW", "EU", "AN", "YT", "PA", "PL", "US", "01"};
+    CHECK(wifi_country_policy_count() == 176);
+    CHECK(strcmp(wifi_country_policy_at(0), "PA") == 0);
+    for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); ++i)
         CHECK(wifi_country_policy_is_supported(supported[i]));
+
+    for (size_t i = 0; i < wifi_country_policy_count(); ++i) {
+        const char *profile = wifi_country_policy_at(i);
+        CHECK(profile != NULL && strlen(profile) == 2);
+        CHECK(wifi_country_policy_is_supported(profile));
+        for (size_t j = 0; j < i; ++j)
+            CHECK(strcmp(profile, wifi_country_policy_at(j)) != 0);
+
+        char lowercase[3] = {(char)tolower((unsigned char)profile[0]),
+                             (char)tolower((unsigned char)profile[1]), '\0'};
+        char normalized[WIFI_COUNTRY_CODE_SIZE];
+        CHECK(wifi_country_policy_normalize(lowercase, normalized) == WIFI_COUNTRY_POLICY_OK);
+        CHECK(strcmp(normalized, profile) == 0);
+
+        wifi_country_policy_record_t record = {WIFI_COUNTRY_POLICY_VERSION, {0}};
+        memcpy(record.cc, normalized, sizeof(record.cc));
+        uint8_t bytes[WIFI_COUNTRY_POLICY_RECORD_SIZE];
+        CHECK(wifi_country_policy_encode(&record, bytes, sizeof(bytes)) == WIFI_COUNTRY_POLICY_OK);
+        wifi_country_policy_record_t decoded = {0};
+        CHECK(wifi_country_policy_decode(bytes, sizeof(bytes), &decoded) == WIFI_COUNTRY_POLICY_OK);
+        CHECK(decoded.version == record.version && strcmp(decoded.cc, profile) == 0);
     }
     CHECK(wifi_country_policy_at(wifi_country_policy_count()) == NULL);
     CHECK(!wifi_country_policy_is_supported("ZZ"));

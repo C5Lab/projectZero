@@ -27,7 +27,7 @@ wifi_country_policy_record_t wifi_country_policy_default(void);
 wifi_country_policy_status_t wifi_country_policy_normalize(
     const char *text, char out[WIFI_COUNTRY_CODE_SIZE]);
 bool wifi_country_policy_is_supported(const char *cc);
-bool wifi_country_policy_is_ph(const wifi_country_policy_record_t *record);
+bool wifi_country_policy_is_pa(const wifi_country_policy_record_t *record);
 size_t wifi_country_policy_count(void);
 const char *wifi_country_policy_at(size_t index);
 wifi_country_policy_status_t wifi_country_policy_encode(
