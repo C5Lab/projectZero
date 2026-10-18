@@ -421,7 +421,7 @@ All attacks stop with `stop`.
 - `scan_bt` — one‑time 10 s BLE scan (lists devices, AirTag/SmartTag counts).
 - `scan_bt <MAC>` — continuous RSSI tracking of one device. Stop with `stop`.
 - `scan_airtag` — continuous AirTag/SmartTag scan; prints `<airtags>,<smarttags>` every ~30 s. Stop with `stop`.
-- `start_blespam [20|50|100|200|500]` — Apple Action Modal BLE spam (Continuity Nearby Action). Default interval 20 ms. Prints `[BLESPAM] packets=N delay=M` about once a second. Stop with `stop`.
+- `start_blespam [20|50|100|200|500]` — BLE spam mixing Apple Action Modal (Continuity Nearby Action) and Samsung Watch Pair (EasySetup Watch). Default interval 20 ms. Prints `[BLESPAM] packets=N apple=X samsung=Y delay=M` about once a second. Stop with `stop`.
 
 (See Part 1 for `start_antisurveillance`.)
 

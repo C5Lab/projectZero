@@ -588,14 +588,14 @@ F1:2E:71:9F:C8:68  RSSI: -90 dBm  Name: Forerunner 935
 
 ### `start_blespam`
 - **Syntax**: `start_blespam` or `start_blespam [20|50|100|200|500]`
-- **Description**: Apple Continuity Nearby Action advertising (Momentum BLE Spam "Apple Action Modal"). Non-connectable manufacturer beacons, random action type each packet, random MAC once per session. Optional delay is the advertising cycle in milliseconds (default 20). Switches the radio to BLE (tears down WiFi).
+- **Description**: Mixes Momentum BLE Spam "Apple Action Modal" (Continuity Nearby Action) and "Samsung Watch Pair" (EasySetup Watch) on alternate advertising cycles. Apple keeps one random MAC for the session; Samsung randomizes MAC every packet. Optional delay is the advertising cycle in milliseconds (default 20). Switches the radio to BLE (tears down WiFi).
 - **Start output**:
 ```
-BLE spam started (Apple Action Modal). Use 'stop' to end.
+BLE spam started (Apple Action Modal + Samsung Watch Pair). Use 'stop' to end.
 ```
 - **Periodic output** (about once a second):
 ```
-[BLESPAM] packets=42 delay=20
+[BLESPAM] packets=42 apple=21 samsung=21 delay=20
 ```
 - **Error outputs**:
   - `"Usage: start_blespam [20|50|100|200|500]"` (invalid or extra arguments)
@@ -604,7 +604,7 @@ BLE spam started (Apple Action Modal). Use 'stop' to end.
   - `"Cannot start BLE spam while wardrive is running. Use 'stop' first."`
   - `"Cannot start BLE spam while anti-surveillance is running. Use 'stop' first."`
   - `"BLE initialization failed"`
-- **Completion marker**: `"BLE spam started (Apple Action Modal). Use 'stop' to end."`
+- **Completion marker**: `"BLE spam started (Apple Action Modal + Samsung Watch Pair). Use 'stop' to end."`
 - **Stop**: Send `stop`. Host can also watch `"BLE spam stopped."`
 
 ---
