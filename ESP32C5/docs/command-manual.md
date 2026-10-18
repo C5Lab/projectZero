@@ -237,19 +237,30 @@ outside this command family.
 
 ### `test_radio_channel`
 - **Syntax**: `test_radio_channel <integer>` (1..255).
-- **Description**: Initialize Wi-Fi if needed, then attempt to set the requested
-  primary channel with no secondary channel. Preserve the current Wi-Fi mode
-  (including STA/APSTA), band mode and country profile. The driver decides whether
-  the channel is supported under those settings.
+- **Description**: Initialize Wi-Fi if needed, enable APSTA and verify the mode,
+  then attempt to set the requested primary channel with no secondary channel.
+  Preserve the current band mode and country profile. The driver decides whether
+  the channel is supported under those settings. Also check the active country's
+  rules in the linked ESP-IDF regulatory table, including its DFS flag and any
+  manual 5 GHz channel mask.
 - **Result**: Print the current mode, set/read error names, actual channel and
-  `PASS`/`FAIL`. Success requires both API calls to succeed and channel readback to
-  match. Return nonzero on invalid input, refusal or failure.
-- **State**: Leave the radio on the resulting channel. Refuse while another command
+  `PASS`/`FAIL`, plus `country`, `allowed`, `dfs` and `reason`. Success requires
+  both API calls to succeed, channel readback to match (including no secondary
+  channel), and the channel to be allowed without DFS. DFS channels fail with
+  `reason=dfs_required` even when setting/readback succeeds. Channels outside the
+  country's rules fail with `reason=country_disallowed`. Unknown rules or a
+  failed country read cannot pass. `dfs=unknown` means the channel is disallowed
+  or its rules are unknown. This checks driver configuration and policy; it does
+  not measure radar activity, interference or successful packet transmission.
+  Return nonzero on invalid input, refusal or failure.
+- **State**: Leave Wi-Fi in APSTA on the resulting channel. Failure to enable or
+  verify APSTA returns `reason=apsta_init` or `reason=apsta_mode` before setting a
+  channel. Refuse while another command
   is in progress, the radio is in use, or STA is connected; use `stop` first for
   active operations. BLE/802.15.4 modes are refused.
-- **Example**: `test_radio_channel 52`
+- **Example**: `test_radio_channel 52` with active country `US`
 ```
-[RADIO] requested=52 mode=APSTA(3) set=ESP_OK read=ESP_OK actual=52 secondary=0 result=PASS
+[RADIO] requested=52 mode=APSTA(3) set=ESP_OK read=ESP_OK actual=52 secondary=0 result=FAIL country=US allowed=1 dfs=1 reason=dfs_required
 ```
 
 ### `test_radio_channels`
@@ -261,9 +272,13 @@ outside this command family.
 - **Output**: Individual `[RADIO]` records followed by `[RADIO-SUMMARY]` with
   `total`, `passed`, `failed` and `result`, then `[RADIO-PASS]` and `[RADIO-FAIL]`
   channel lists (`none` for an empty list).
-- **State**: Preserve the current Wi-Fi mode, band mode and country profile;
+- **State**: Enable and retain APSTA; preserve the current band mode and country profile;
   leave the radio on the last successfully set channel. The same radio admission
   restrictions as `test_radio_channel` apply. Return zero only if all 28 tests pass.
+- **Expected policy results** with the current ESP-IDF tables and successful
+  driver/readback checks: `US` has 12 PASS and 16 DFS failures (52–64 and 100–144);
+  `PA` has 24 PASS and 4 disallowed channels (144,169,173,177), with no DFS on its
+  allowed channels. Both summaries therefore return nonzero.
 
 ### `wifi_analyzer`
 
@@ -554,6 +569,18 @@ Cancellation ends with `[FT] cancelled` and `[FT] END`. Validation, SD, open, se
 - `wifi_country set <CC>` — validate and persist a profile in NVS. Lowercase is
   normalized to uppercase. The new profile is applied after reboot.
 - `wifi_country reset` — persist the default `PA` profile for the next boot.
+
+At the first boot of a different firmware image (UART/USB flash, OTA or a return
+to another image), JanOS resets and saves `PA` in NVS. The country and the
+running image's full ELF SHA-256 are stored together in `wifi_country/profile`.
+Later boots of the same image preserve a profile selected with `wifi_country set`.
+Reflashing the identical BIN does not trigger a reset. On first upgrading from
+the old three-byte country record, the previous choice is replaced by `PA` once.
+After a firmware-triggered reset, `status` reports
+`record_health="firmware_reset_pa"`; subsequent boots report `valid`. Empty NVS
+is initialized with a saved `PA` profile (`default_pa`). Storage failures use PA
+in memory and report a fallback health value; the reset is retried on a later boot.
+Other NVS settings are preserved.
 
 Country configuration is applied centrally after every Wi-Fi driver
 initialization and read back before the radio is accepted. `PA` uses the JanOS

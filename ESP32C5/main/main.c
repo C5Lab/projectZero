@@ -130,6 +130,8 @@
 #define esp_wifi_set_storage janos_wps_wifi_set_storage
 #include "wifi_country_policy.h"
 #include "wifi_country_driver.h"
+#include "wifi_country_store.h"
+#include "wifi_channel_policy.h"
 #include <math.h>
 
 // NimBLE includes for BLE scanning
@@ -208,8 +210,6 @@
 #define DISPLAY_NVS_NAMESPACE "display"
 #define DISPLAY_NVS_KEY_MODE  "mode"
 
-#define WIFI_COUNTRY_NVS_NAMESPACE "wifi_country"
-#define WIFI_COUNTRY_NVS_KEY       "profile"
 
 
 
@@ -4352,43 +4352,16 @@ static esp_err_t wifi_init_ap_sta(void) {
 
 static esp_err_t wifi_country_save(const wifi_country_policy_record_t *record)
 {
-    uint8_t encoded[WIFI_COUNTRY_POLICY_RECORD_SIZE];
-    if (wifi_country_policy_encode(record, encoded, sizeof(encoded)) !=
-        WIFI_COUNTRY_POLICY_OK) return ESP_ERR_INVALID_ARG;
-
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(WIFI_COUNTRY_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) return err;
-    err = nvs_set_blob(handle, WIFI_COUNTRY_NVS_KEY, encoded, sizeof(encoded));
-    if (err == ESP_OK) err = nvs_commit(handle);
-    nvs_close(handle);
-    return err;
+    return wifi_country_store_save(record);
 }
 
 static void wifi_country_load(void)
 {
-    wifi_country_configured = wifi_country_policy_default();
-    wifi_country_record_health = "default_pa";
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(WIFI_COUNTRY_NVS_NAMESPACE, NVS_READONLY, &handle);
-    if (err == ESP_ERR_NVS_NOT_FOUND) return;
-    if (err != ESP_OK) {
-        wifi_country_record_health = "read_error_fallback_pa";
-        return;
-    }
-    uint8_t encoded[WIFI_COUNTRY_POLICY_RECORD_SIZE];
-    size_t length = sizeof(encoded);
-    err = nvs_get_blob(handle, WIFI_COUNTRY_NVS_KEY, encoded, &length);
-    nvs_close(handle);
-    if (err == ESP_ERR_NVS_NOT_FOUND) return;
-    wifi_country_policy_record_t loaded;
-    if (err != ESP_OK || wifi_country_policy_decode(encoded, length, &loaded) !=
-        WIFI_COUNTRY_POLICY_OK) {
-        wifi_country_record_health = "invalid_fallback_pa";
-        return;
-    }
-    wifi_country_configured = loaded;
-    wifi_country_record_health = "valid";
+    esp_err_t err = wifi_country_store_load(&wifi_country_configured,
+                                           &wifi_country_record_health);
+    if (err != ESP_OK)
+        MY_LOG_INFO(TAG, "WiFi country storage: %s (%s)",
+                    wifi_country_record_health, esp_err_to_name(err));
 }
 
 static esp_err_t wifi_apply_configured_country(void)
@@ -26537,6 +26510,10 @@ static int cmd_test_radio_channel(int argc, char **argv)
         printf("[RADIO] requested=%ld result=FAIL reason=wifi_init\n", requested);
         return 1;
     }
+    if (ensure_ap_mode() == NULL) {
+        printf("[RADIO] requested=%ld result=FAIL reason=apsta_init\n", requested);
+        return 1;
+    }
 
     wifi_mode_t mode = WIFI_MODE_NULL;
     esp_err_t err = esp_wifi_get_mode(&mode);
@@ -26545,22 +26522,55 @@ static int cmd_test_radio_channel(int argc, char **argv)
                requested, esp_err_to_name(err));
         return 1;
     }
-    const char *mode_name = mode == WIFI_MODE_STA ? "STA" :
-                            mode == WIFI_MODE_AP ? "AP" :
-                            mode == WIFI_MODE_APSTA ? "APSTA" : "OTHER";
+    /* ensure_ap_mode also accepts AP-only mode; diagnostics require both
+     * interfaces. Verify the actual driver mode before touching any channel. */
+    if (mode != WIFI_MODE_APSTA) {
+        err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+        if (err == ESP_OK) err = esp_wifi_get_mode(&mode);
+        if (err != ESP_OK || mode != WIFI_MODE_APSTA) {
+            printf("[RADIO] requested=%ld result=FAIL reason=apsta_mode mode_error=%s actual_mode=%d\n",
+                   requested, esp_err_to_name(err), (int)mode);
+            return 1;
+        }
+    }
+    const char *mode_name = "APSTA";
 
-    /* Keep the current mode, band and country so driver restrictions are visible. */
+    wifi_country_t country = {0};
+    err = esp_wifi_get_country(&country);
+    if (err != ESP_OK) {
+        printf("[RADIO] requested=%ld result=FAIL reason=country_read country_error=%s\n",
+               requested, esp_err_to_name(err));
+        return 1;
+    }
+    wifi_channel_policy_t policy = wifi_channel_policy_classify(&country,
+                                                               (uint8_t)requested);
+
+    /* Test in APSTA, retaining the current band and country restrictions. */
     esp_err_t set_err = esp_wifi_set_channel((uint8_t)requested,
                                             WIFI_SECOND_CHAN_NONE);
     if (set_err == ESP_OK) vTaskDelay(pdMS_TO_TICKS(20));
     uint8_t actual = 0;
     wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
     esp_err_t read_err = esp_wifi_get_channel(&actual, &secondary);
-    bool passed = set_err == ESP_OK && read_err == ESP_OK &&
+    const char *reason = policy == WIFI_CHANNEL_POLICY_UNKNOWN ? "regulatory_unknown" :
+                         policy == WIFI_CHANNEL_POLICY_DISALLOWED ? "country_disallowed" :
+                         policy == WIFI_CHANNEL_POLICY_DFS ? "dfs_required" :
+                         set_err != ESP_OK ? "set_channel" :
+                         read_err != ESP_OK ? "read_channel" :
+                         actual != (uint8_t)requested ? "channel_mismatch" :
+                         secondary != WIFI_SECOND_CHAN_NONE ? "secondary_mismatch" : "none";
+    bool passed = policy == WIFI_CHANNEL_POLICY_NON_DFS &&
+                  set_err == ESP_OK && read_err == ESP_OK &&
                   actual == (uint8_t)requested && secondary == WIFI_SECOND_CHAN_NONE;
-    printf("[RADIO] requested=%ld mode=%s(%d) set=%s read=%s actual=%u secondary=%d result=%s\n",
+    const char *allowed = policy == WIFI_CHANNEL_POLICY_UNKNOWN ? "unknown" :
+                          policy == WIFI_CHANNEL_POLICY_DISALLOWED ? "0" : "1";
+    const char *dfs = policy == WIFI_CHANNEL_POLICY_UNKNOWN ||
+                      policy == WIFI_CHANNEL_POLICY_DISALLOWED ? "unknown" :
+                      policy == WIFI_CHANNEL_POLICY_DFS ? "1" : "0";
+    printf("[RADIO] requested=%ld mode=%s(%d) set=%s read=%s actual=%u secondary=%d result=%s country=%.2s allowed=%s dfs=%s reason=%s\n",
            requested, mode_name, (int)mode, esp_err_to_name(set_err),
-           esp_err_to_name(read_err), actual, (int)secondary, passed ? "PASS" : "FAIL");
+           esp_err_to_name(read_err), actual, (int)secondary, passed ? "PASS" : "FAIL",
+           country.cc, allowed, dfs, reason);
     return passed ? 0 : 1;
 }
 
@@ -26720,14 +26730,14 @@ static void register_commands(void)
 {
     const esp_console_cmd_t test_radio_channel_cmd = {
         .command = "test_radio_channel",
-        .help = "Set and verify a WiFi channel in the current mode: test_radio_channel <integer 1..255>",
+        .help = "Verify a usable non-DFS WiFi channel in APSTA: test_radio_channel <integer 1..255>",
         .func = &cmd_test_radio_channel,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&test_radio_channel_cmd));
 
     const esp_console_cmd_t test_radio_channels_cmd = {
         .command = "test_radio_channels",
-        .help = "Test 28 primary 5GHz channels (36..177) and summarize PASS/FAIL results",
+        .help = "Test 28 primary 5GHz channels in APSTA (36..177); PASS requires driver readback and no DFS",
         .func = &cmd_test_radio_channels,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&test_radio_channels_cmd));

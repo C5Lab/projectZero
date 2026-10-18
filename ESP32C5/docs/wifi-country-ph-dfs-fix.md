@@ -39,8 +39,18 @@ namespace: wifi_country
 key: profile
 ```
 
-When the namespace or key is missing, malformed or unreadable, JanOS falls
-back to `PA`. For `PA`, JanOS applies an explicit `wifi_country_t` record with
+The stored blob contains the three-byte policy payload followed by the running
+image's 32-byte ELF SHA-256. At the first boot of a different image, including
+after UART/USB flashing, OTA or switching back to another image, JanOS replaces
+the previous country with `PA` and saves it with the new identity. Ordinary
+restarts preserve the user's selected profile. Reflashing the identical BIN
+cannot be distinguished from another boot and preserves that choice.
+
+Legacy three-byte records are migrated to a saved `PA` profile once. Missing or
+malformed records are initialized/repaired with `PA`. If storage is unreadable
+or a write fails, JanOS uses `PA` in memory, reports the storage error in
+`record_health`, and can retry on the next boot. No other NVS settings are erased.
+For `PA`, JanOS applies an explicit `wifi_country_t` record with
 `schan=1`, `nchan=14` and `WIFI_COUNTRY_POLICY_MANUAL`. Other supported country
 codes use `esp_wifi_set_country_code()` in manual mode. JanOS accepts all 176
 profiles from the ESP-IDF 6.0 ESP32-C5 regulatory table, including territories,
@@ -51,7 +61,7 @@ profiles from the ESP-IDF 6.0 ESP32-C5 regulatory table, including territories,
 
 `RU` is already one of those 176 profiles; it is not a JanOS extension or an
 alias. JanOS normalizes `ru` to `RU`, stores the three-byte policy record
-`{version, 'R', 'U'}`, and applies it through the ordinary
+`{version, 'R', 'U'}` together with the current firmware identity, and applies it through the ordinary
 `esp_wifi_set_country_code("RU", false)` path after reboot.
 
 For the ESP32-C5 regulatory table shipped by the pinned ESP-IDF 6.0.0 source,
@@ -90,7 +100,8 @@ wifi_country reset
 ```
 
 `set` and `reset` persist the choice in NVS and apply it after reboot. `reset`
-restores `PA`.
+restores `PA`. A profile selected with `set` survives reboots of that firmware;
+the first boot of a different firmware resets it to `PA`.
 
 Example for the existing Russian profile:
 
@@ -138,9 +149,11 @@ DFS remains a target test for the exact guarded image.
 
 - `main/wifi_country_policy.c` and `main/wifi_country_policy.h` — country
   profile validation and serialization;
+- `main/wifi_country_store.c` and `main/wifi_country_store.h` — NVS storage and
+  the one-time PA reset when the firmware image changes;
 - `main/wifi_country_driver.c` and `main/wifi_country_driver.h` — application
   through ESP-IDF plus manual-policy read-back verification;
-- `main/main.c` — NVS storage, CLI, Wi-Fi lifecycle, APSTA setup, D-UCB and
+- `main/main.c` — boot-time policy loading, CLI, Wi-Fi lifecycle, APSTA setup, D-UCB and
   targeted raw TX;
 - `main/handshake_tx_telemetry.c` — atomic per-run deauthentication TX-completion
   counters reported after callback unregistration;
