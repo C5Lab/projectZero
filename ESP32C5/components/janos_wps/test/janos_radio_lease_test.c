@@ -10,6 +10,24 @@ int main(void)
 {
     janos_radio_lease_t lease;
     janos_radio_lease_init(&lease);
+    /* Simulate a preempted startup release after clearing its generation.
+     * Status must remain conservatively busy rather than expose owner+zero. */
+    atomic_store(&lease.owner, JANOS_RADIO_OWNER_LEGACY);
+    atomic_store(&lease.state, JANOS_RADIO_LEASE_PREPARING);
+    atomic_store(&lease.next_generation, 2U);
+    janos_radio_lease_snapshot_t releasing = janos_radio_lease_snapshot(&lease);
+    assert(releasing.owner == JANOS_RADIO_OWNER_LEGACY);
+    assert(releasing.generation != 0U);
+    janos_radio_lease_init(&lease);
+    /* Corrupt idle tuples must not be replaced by a newly valid owner. */
+    atomic_store(&lease.generation, 41U);
+    assert(janos_radio_lease_acquire(&lease, JANOS_RADIO_OWNER_LEGACY, NULL) ==
+           JANOS_RADIO_LEASE_BUSY);
+    janos_radio_lease_init(&lease);
+    atomic_store(&lease.callbacks_open, true);
+    assert(janos_radio_lease_acquire(&lease, JANOS_RADIO_OWNER_WPS, NULL) ==
+           JANOS_RADIO_LEASE_BUSY);
+    janos_radio_lease_init(&lease);
     janos_radio_lease_snapshot_t snapshot = janos_radio_lease_snapshot(&lease);
     assert(snapshot.owner == JANOS_RADIO_OWNER_NONE);
     assert(snapshot.state == JANOS_RADIO_LEASE_IDLE);

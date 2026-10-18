@@ -30,6 +30,8 @@ typedef struct {
 
 typedef bool (*pixie_cancel_fn)(void *context);
 typedef void (*pixie_yield_fn)(void *context);
+typedef void *(*pixie_cache_alloc_fn)(void *context, size_t size);
+typedef void (*pixie_cache_free_fn)(void *context, void *memory, size_t size);
 
 typedef struct {
     uint32_t modes;
@@ -42,6 +44,9 @@ typedef struct {
     pixie_cancel_fn should_cancel;
     pixie_yield_fn yield;
     void *callback_context;
+    pixie_cache_alloc_fn cache_alloc;
+    pixie_cache_free_fn cache_free;
+    void *cache_context;
 } pixie_options_t;
 
 typedef struct {

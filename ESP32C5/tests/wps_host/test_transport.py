@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -27,14 +28,29 @@ class TransportTests(unittest.TestCase):
         cls.addClassCleanup(cls.directory.cleanup)
         cls.core = Path(cls.directory.name) / "core"
         cls.adapter = Path(cls.directory.name) / "adapter"
+        # Compile the host adapter as the newest verified IDF patch. The
+        # separate build-contract test also verifies the lower bound.
+        contract = (COMPONENT / "include" / "janos_wps_build.h").read_text()
+        version = Path(cls.directory.name) / "esp_idf_version.h"
+        version.write_text("".join(
+            f"#define ESP_IDF_VERSION_{part} "
+            f"{re.search(r'JANOS_WPS_IDF_' + part + r' (\d+)', contract)[1]}\n"
+            for part in ("MAJOR", "MINOR")) +
+            "#define ESP_IDF_VERSION_PATCH "
+            f"{re.search(r'JANOS_WPS_IDF_PATCH_MAX (\d+)', contract)[1]}\n")
         common = [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
                   *shlex.split(os.environ.get("CFLAGS", "")),
                   "-I", str(COMPONENT / "include"), "-I", str(TRANSPORT)]
         subprocess.run([*common, str(WPS_TEST / "transport_core_test.c"),
                         str(TRANSPORT / "wps_transport_core.c"), "-o", str(cls.core)], check=True)
-        subprocess.run([*common, "-I", str(ESP_STUBS),
+        subprocess.run([*common, "-I", cls.directory.name, "-I", str(ESP_STUBS),
+                        "-I", str(WPS_PRIVATE / "workflow"), "-I", str(ROOT / "main"),
                         str(WPS_TEST / "transport_esp_test.c"),
                         str(TRANSPORT / "wps_transport_core.c"),
+                        str(WPS_PRIVATE / "workflow" / "lab_radio.c"),
+                        str(WPS_PRIVATE / "workflow" / "lab_platform.c"),
+                        str(ROOT / "main" / "sta_mac_policy_core.c"),
+                        str(ROOT / "main" / "sta_mac_policy_store.c"),
                         str(COMPONENT / "janos_wps_transport.c"),
                         "-o", str(cls.adapter)], check=True)
 
@@ -43,11 +59,32 @@ class TransportTests(unittest.TestCase):
                                 capture_output=True, text=True).stdout
         return [json.loads(line) for line in output.splitlines()]
 
+    def test_public_transport_header_is_self_contained(self):
+        """Consumers must not need janos_wps private include directories."""
+        compiler = shutil.which(os.environ.get("CC", "cc"))
+        self.assertIsNotNone(compiler)
+        source = Path(self.directory.name) / "public_transport_header.c"
+        object_file = Path(self.directory.name) / "public_transport_header.o"
+        source.write_text(
+            '#include "janos_wps_transport.h"\n'
+            'int public_transport_header_compiles(void) { return 0; }\n',
+            encoding="utf-8",
+        )
+        subprocess.run([
+            compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+            "-I", str(COMPONENT / "include"),
+            "-I", str(ESP_STUBS),
+            "-c", str(source), "-o", str(object_file),
+        ], check=True)
+
     def test_core_unwind_and_cleanup_retry(self):
         subprocess.run([str(self.core)], check=True)
 
     def test_adapter_partial_init_and_success_counters(self):
         subprocess.run([str(self.adapter)], check=True)
+
+    def test_exact_idle_sta_snapshot_restore(self):
+        subprocess.run([str(self.adapter), "exact"], check=True)
 
     def test_stress_accepts_clean_cycles(self):
         rows = self.run_stress("stress")

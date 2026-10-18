@@ -14,6 +14,7 @@ typedef enum {
     JANOS_RADIO_OWNER_NONE = 0,
     JANOS_RADIO_OWNER_ANALYZER,
     JANOS_RADIO_OWNER_WPS,
+    JANOS_RADIO_OWNER_LEGACY,
 } janos_radio_owner_t;
 
 typedef enum {
@@ -60,6 +61,11 @@ void janos_radio_lease_init(janos_radio_lease_t *lease);
 janos_radio_lease_result_t janos_radio_lease_acquire(
     janos_radio_lease_t *lease, janos_radio_owner_t owner,
     uint32_t *generation_out);
+/* Release a legacy startup only after its handler publishes state or fails.
+ * Unexpected state/owner/generation remains reserved (fail closed). */
+bool janos_radio_lease_finish_startup(janos_radio_lease_t *lease,
+                                     janos_radio_owner_t owner,
+                                     uint32_t generation);
 bool janos_radio_lease_mark_running(janos_radio_lease_t *lease,
                                     janos_radio_owner_t owner,
                                     uint32_t generation);

@@ -286,6 +286,11 @@ static void execute(lab_workflows_t *workflows, lab_command_t *cmd,
 
 static void sd_is_always_unmounted(void)
 {
+    assert(lab_workflows_cleanup_succeeded("ok"));
+    assert(lab_workflows_cleanup_succeeded("not_required"));
+    assert(!lab_workflows_cleanup_succeeded("failed"));
+    assert(!lab_workflows_cleanup_succeeded(NULL));
+
     fixture_t f = {.mount_ok = true, .cleanup_ok = true};
     lab_platform_t platform;
     lab_platform_init(&platform, &platform_ops, &f, NULL);
@@ -332,6 +337,10 @@ static void campaign_decisions_and_bounds(void)
     cmd.count = 3;
     execute(&workflows, &cmd, &vault, 11, "pin_and_m7_verified", "ok");
     assert(f.verifies == 3);
+    unsigned candidates = 0U, attempts = 0U, resume = 0U;
+    assert(lab_workflows_campaign_progress(&workflows, &candidates, &attempts,
+                                           &resume));
+    assert(candidates == 4U && attempts == 3U && resume == 2U);
     assert(strcmp(f.seen_pins[0], "11111115") == 0);
     assert(strcmp(f.seen_pins[2], "12345670") == 0);
     assert(lab_secret_status(&vault, 1234).state == LAB_SECRET_AVAILABLE);
@@ -345,6 +354,9 @@ static void campaign_decisions_and_bounds(void)
     execute(&workflows, &cmd, &vault, 12, "setup_locked", "ok");
     assert(f.verifies == 1);
     assert(lab_workflows_resume_index(&workflows) == 1);
+    assert(lab_workflows_campaign_progress(&workflows, &candidates, &attempts,
+                                           &resume));
+    assert(candidates == 4U && attempts == 1U && resume == 1U);
 
     f.verify_result_index = 0;
     f.verifies = 0;

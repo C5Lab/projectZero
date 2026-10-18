@@ -28,10 +28,14 @@ class JanosConsoleAdmissionTest(unittest.TestCase):
                                  if shutil.which(item)), None)
 
             sources = [ROOT / "tests" / "janos_console_admission_test.c",
-                       ROOT / "main" / "janos_console_admission.c"]
+                       ROOT / "main" / "janos_console_admission.c",
+                       ROOT / "components" / "janos_wps" / "janos_wps_command.c",
+                       ROOT / "components" / "janos_wps" / "janos_radio_lease.c"]
             includes = [ROOT / "main",
                         ROOT / "components" / "janos_wps" / "include"]
             flags = ["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic"]
+            if os.environ.get("JANOS_TEST_SANITIZERS"):
+                flags += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
             if compiler is not None:
                 command = [compiler, *flags]
                 for include in includes:

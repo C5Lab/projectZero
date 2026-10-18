@@ -12,12 +12,20 @@ Documentation:
 - [Passive sniffer extension](docs/sniffer-extended-uart.md) — opt-in UART metadata, binary SSIDs, RSN/WPA/PMF, WPS, fixtures and manual tests; legacy result lines remain compatible.
 - [JanOS Capture Gateway](docs/janos-capture-gateway.md) — instrumented APSTA/NAPT gateway for authorized traffic analysis.
 - [Wi-Fi Analyzer](docs/wifi-analyzer-design.md) — opt-in PSRAM-backed AP survey, 64 records by default and up to 128, with isolated legacy Flipper results. See the [WFA/1 protocol](docs/wifi-analyzer-protocol.md), [smoke-test commands](docs/wifi-analyzer-smoke-test.md), and [device evidence](docs/wifi-analyzer-device-validation.md).
-- [JanOS known-PIN WPS](docs/janos-wps.md) — production commands, asynchronous schema-v1 results, volatile one-shot secrets and authenticated-M7 SD export.
+- [JanOS WPS laboratory workflows](docs/janos-wps.md) — known-PIN,
+  PixieDust, bounded JWPS campaign and self-test commands, asynchronous
+  schema-v1 results, volatile one-shot secrets and authenticated-M7 SD export.
 - [RF database tooling](tools/rfdb/README.md) — reproducible generation of the
   vendor/OUI and laboratory JWPS databases, including provenance and source
   release bundles.
-- [Shared radio ownership](docs/janos-radio-lease.md) — analyzer/WPS admission, stable busy contract, cancellation, quarantine, OTA exclusion and exact MAC restoration. The [validation runbook](docs/janos-radio-compatibility-validation.md) separates host, build and device evidence.
-- [Wi-Fi country `PA` and DFS handshake fix](docs/wifi-country-ph-dfs-fix.md) — persistent country policy, driver read-back and the hybrid APSTA/STA handshake path.
+- [Shared radio ownership](docs/janos-radio-lease.md) — atomic
+  `LEGACY`/`ANALYZER`/`WPS` admission, stable busy contract, cancellation,
+  quarantine, OTA exclusion and exact idle-STA restoration. The
+  [validation runbook](docs/janos-radio-compatibility-validation.md) separates
+  host, build and device evidence.
+- [Wi-Fi country `PA` and handshake compatibility](docs/wifi-country-ph-dfs-fix.md)
+  — persistent country policy, driver read-back and the single APSTA/AP raw-TX
+  handshake path.
 
 ## Generated RF database artifacts
 
@@ -38,8 +46,9 @@ These are generated artifacts rather than firmware source files. When a
 be distributed through the same release channel. See
 [RF database tooling](tools/rfdb/README.md) for build commands and
 [third-party notices](THIRD_PARTY_NOTICES.md) for licenses and provenance.
-Production JanOS currently accepts an explicitly supplied known WPS PIN; JWPS
-lookup and campaign workflows remain standalone laboratory capabilities.
+Production JanOS consumes these databases through its component-owned offline
+JWPS planner and bounded online campaign. The removed standalone WPS mini-OS
+is not a production dependency.
 
 ## Build Note: exFAT
 This repo auto-patches your local ESP-IDF `ffconf.h` during CMake configure to force:

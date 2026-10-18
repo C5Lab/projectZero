@@ -29,6 +29,8 @@ class PcapSerializerTest(unittest.TestCase):
                 "-I", str(ROOT / "components" / "pcap_serializer" / "include"),
                 str(ROOT / "tests" / "pcap_serializer_test.c"),
                 str(ROOT / "components" / "pcap_serializer" / "pcap_serializer.c"),
+                "-Wl,--wrap=malloc",
+                "-Wl,--wrap=realloc",
                 "-o", str(executable),
             ]
             subprocess.run(command, cwd=ROOT, check=True, capture_output=True,

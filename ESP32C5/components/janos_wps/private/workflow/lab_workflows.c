@@ -24,6 +24,17 @@ static void secure_wipe(void *memory, size_t length)
     while (length--) *bytes++ = 0;
 }
 
+static void *pixie_cache_alloc(void *context, size_t size)
+{
+    return lab_platform_psram_alloc(context, size);
+}
+
+static void pixie_cache_free(void *context, void *memory, size_t size)
+{
+    (void)size;
+    lab_platform_psram_free(context, memory);
+}
+
 static bool explicit_bssid(const uint8_t bssid[6])
 {
     uint8_t any = 0;
@@ -34,6 +45,13 @@ static bool explicit_bssid(const uint8_t bssid[6])
         all_ff &= bssid[index];
     }
     return any != 0 && all_ff != 0xff;
+}
+
+bool lab_workflows_cleanup_succeeded(const char *cleanup_result)
+{
+    return cleanup_result &&
+           (strcmp(cleanup_result, "ok") == 0 ||
+            strcmp(cleanup_result, "not_required") == 0);
 }
 
 static const char *session_result_name(wps_session_result_t result)
@@ -208,6 +226,15 @@ static bool workflow_cancel_callback(void *context)
     return lab_workflows_poll_cancel((lab_workflows_t *)context);
 }
 
+#if defined(ESP_PLATFORM)
+static bool workflow_commit_callback(void *context, uint32_t operation_id)
+{
+    lab_workflows_t *workflows = context;
+    return workflows && lab_platform_commit_gate(workflows->platform,
+                                                  operation_id);
+}
+#endif
+
 static void workflow_yield_callback(void *context)
 {
     (void)context;
@@ -268,6 +295,10 @@ static void persist_success(lab_workflows_t *workflows,
                             const char *source)
 {
     if (!workflows->ops->store_success) return;
+    if (lab_workflows_poll_cancel(workflows)) {
+        workflows->storage_result = "cancelled";
+        return;
+    }
     if (lab_platform_sd_mount(workflows->platform) != LAB_PLATFORM_OK) {
         workflows->storage_result = "mount_error";
         return;
@@ -540,7 +571,7 @@ static bool selftest_db(lab_workflows_t *workflows)
     return ok;
 }
 
-static bool selftest_pixie(void)
+static bool selftest_pixie(lab_workflows_t *workflows)
 {
     pixie_bundle_t bundle;
     pixie_result_t result;
@@ -558,7 +589,10 @@ static bool selftest_pixie(void)
     memcpy(bundle.e_hash1, hash1, sizeof(hash1));
     memcpy(bundle.e_hash2, hash2, sizeof(hash2));
     const pixie_options_t options = {.modes = PIXIE_MODE_NULL_SECRET,
-                                     .yield_every = 128U};
+                                     .yield_every = 128U,
+                                     .cache_alloc = pixie_cache_alloc,
+                                     .cache_free = pixie_cache_free,
+                                     .cache_context = workflows->platform};
     bool ok = pixie_recover(&bundle, &options, &result) && result.found &&
               strcmp(result.pin, "12345670") == 0;
     secure_wipe(&bundle, sizeof(bundle));
@@ -581,7 +615,7 @@ static bool real_selftest(void *context, lab_command_kind_t kind)
     } else if (kind == LAB_COMMAND_SELFTEST_TRANSPORT) {
         ok = selftest_transport(workflows);
     } else if (kind == LAB_COMMAND_SELFTEST_PIXIE) {
-        ok = selftest_pixie();
+        ok = selftest_pixie(workflows);
     }
     return ok;
 }
@@ -589,8 +623,10 @@ static bool real_selftest(void *context, lab_command_kind_t kind)
 static lab_store_status_t real_store_success(
     void *context, const lab_result_record_t *record)
 {
-    (void)context;
-    return lab_result_store_success(LAB_WPS_RESULT_ROOT, record);
+    lab_workflows_t *workflows = context;
+    return lab_result_store_success_gated(
+        LAB_WPS_RESULT_ROOT, record, workflow_commit_callback, workflows,
+        NULL, NULL);
 }
 
 static lab_store_status_t real_store_observation(
@@ -847,6 +883,9 @@ static bool execute_pixie(lab_workflows_t *workflows,
         .yield = workflow_yield_callback,
         .should_cancel = workflow_cancel_callback,
         .callback_context = workflows,
+        .cache_alloc = pixie_cache_alloc,
+        .cache_free = pixie_cache_free,
+        .cache_context = workflows->platform,
     };
     if (command->epoch_set) {
         const uint32_t span = 86400U;
@@ -999,6 +1038,8 @@ bool lab_workflows_execute(lab_workflows_t *workflows,
     workflows->attempt_count = 0;
     workflows->candidate_count = 0;
     workflows->resume_index = command->start_index;
+    workflows->campaign_progress_valid =
+        command->kind == LAB_COMMAND_WPS_CAMPAIGN;
     workflows->storage_result = "not_required";
     memset(&workflows->last_identity, 0, sizeof(workflows->last_identity));
 
@@ -1060,6 +1101,19 @@ bool lab_workflows_execute(lab_workflows_t *workflows,
 unsigned lab_workflows_resume_index(const lab_workflows_t *workflows)
 {
     return workflows ? workflows->resume_index : 0;
+}
+
+bool lab_workflows_campaign_progress(const lab_workflows_t *workflows,
+                                     unsigned *candidate_count,
+                                     unsigned *attempt_count,
+                                     unsigned *resume_index)
+{
+    if (!workflows || !workflows->campaign_progress_valid ||
+        !candidate_count || !attempt_count || !resume_index) return false;
+    *candidate_count = workflows->candidate_count;
+    *attempt_count = workflows->attempt_count;
+    *resume_index = workflows->resume_index;
+    return true;
 }
 
 const char *lab_workflows_storage_result(const lab_workflows_t *workflows)

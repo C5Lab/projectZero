@@ -2,9 +2,12 @@ file(TO_CMAKE_PATH "$ENV{IDF_PATH}" JANOS_WPS_IDF_PATH)
 set(ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
 
 # Compile the component-owned, reviewed WPS engines and workflow closure.
-# Standalone entry points and Pixie/JWPS/campaign command surfaces are excluded.
+# Standalone entry points stay excluded; production routes the component-owned
+# Pixie/JWPS/campaign engines through janos_wps_runtime and the shared service.
 idf_component_register(
     SRCS "janos_wps_memory.c" "janos_radio_lease.c" "janos_wps_service.c"
+        "janos_wps_command.c"
+        "janos_wps_wire.c"
          "janos_wps_transport.c" "janos_wps_runtime.c"
          "private/workflow/lab_secret.c"
          "private/workflow/lab_result_store.c"

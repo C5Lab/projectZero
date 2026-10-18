@@ -130,6 +130,26 @@ int main(void)
     janos_radio_lease_t lease;
     janos_radio_lease_init(&lease);
 
+    /* The startup-release publication must remain coherent for lock-free
+     * observers, including immediate reuse by another generation. */
+    atomic_bool stop_startup_observer = ATOMIC_VAR_INIT(false);
+    atomic_bool invalid_startup_snapshot = ATOMIC_VAR_INIT(false);
+    observer_t startup_observer = {.lease = &lease,
+        .stop = &stop_startup_observer, .invalid_snapshot = &invalid_startup_snapshot};
+    pthread_t startup_observer_thread;
+    assert(pthread_create(&startup_observer_thread, NULL, observe_snapshots,
+                          &startup_observer) == 0);
+    for (unsigned i = 0; i < ITERATIONS * 10U; ++i) {
+        uint32_t generation = 0;
+        assert(janos_radio_lease_acquire(&lease, JANOS_RADIO_OWNER_LEGACY,
+                                         &generation) == JANOS_RADIO_LEASE_OK);
+        assert(janos_radio_lease_finish_startup(&lease, JANOS_RADIO_OWNER_LEGACY,
+                                                generation));
+    }
+    atomic_store_explicit(&stop_startup_observer, true, memory_order_release);
+    assert(pthread_join(startup_observer_thread, NULL) == 0);
+    assert(!atomic_load_explicit(&invalid_startup_snapshot, memory_order_acquire));
+
     for (unsigned iteration = 0; iteration < ITERATIONS; ++iteration) {
         atomic_bool start = ATOMIC_VAR_INIT(false);
         atomic_bool stop_observer = ATOMIC_VAR_INIT(false);
@@ -137,7 +157,7 @@ int main(void)
         atomic_uint ready = ATOMIC_VAR_INIT(0U);
         contender_t analyzer = {
             .lease = &lease,
-            .owner = JANOS_RADIO_OWNER_ANALYZER,
+            .owner = iteration % 2U ? JANOS_RADIO_OWNER_ANALYZER : JANOS_RADIO_OWNER_LEGACY,
             .start = &start,
             .ready = &ready,
         };

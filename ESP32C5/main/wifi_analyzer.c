@@ -26,6 +26,9 @@ static bool s_initialized;
 static wfa_state_t s_state;
 static TaskHandle_t s_worker;
 static bool s_cancel, s_armed, s_done;
+/* Protected by s_lock; announces the acquire/publication window to stop.
+ * Radio ownership remains exclusively in the shared owner+generation lease. */
+static bool s_startup_pending;
 static uint32_t s_driver_status;
 static uint8_t s_driver_scan_id;
 static const char *s_last_error;
@@ -74,7 +77,7 @@ static void set_error(const char *error)
 bool wifi_analyzer_busy(void)
 {
     portENTER_CRITICAL(&s_lock);
-    bool busy = s_state != WFA_IDLE;
+    bool busy = s_state != WFA_IDLE || s_startup_pending;
     portEXIT_CRITICAL(&s_lock);
     return busy;
 }
@@ -151,32 +154,78 @@ void wifi_analyzer_init(const wifi_analyzer_hooks_t *hooks)
     s_initialized = true;
 }
 
-static bool reserve(void)
+uint32_t wifi_analyzer_startup_begin(void)
 {
-    uint32_t generation = 0;
-    if (!s_hooks.lease_acquire || !s_hooks.lease_acquire(&generation) ||
-        generation == 0U) return false;
     portENTER_CRITICAL(&s_lock);
-    bool ok = s_state == WFA_IDLE;
+    bool ok = s_state == WFA_IDLE && !s_startup_pending;
     if (ok) {
-        s_state = WFA_PREPARING;
+        s_startup_pending = true;
         s_cancel = false;
         s_armed = false;
         s_done = false;
         s_last_error = NULL;
     }
     portEXIT_CRITICAL(&s_lock);
-    if (!ok) {
-        (void)s_hooks.lease_release(generation, true);
-        return false;
+    if (!ok) return 0U;
+    /* No local state lock is held while entering the shared coordinator. */
+    uint32_t generation = 0;
+    bool acquired = s_hooks.lease_acquire && s_hooks.lease_acquire(&generation) &&
+        generation != 0U;
+    portENTER_CRITICAL(&s_lock);
+    if (acquired) {
+        s_lease_generation = generation;
+    } else {
+        s_startup_pending = false;
     }
-    s_lease_generation = generation;
+    bool cancel = s_cancel;
+    portEXIT_CRITICAL(&s_lock);
+    if (!acquired)
+        return 0U;
+    if (cancel && s_hooks.lease_cancel)
+        (void)s_hooks.lease_cancel(generation);
+    return generation;
+}
+
+bool wifi_analyzer_startup_end(uint32_t generation)
+{
+    if (generation == 0U) return true;
+    portENTER_CRITICAL(&s_lock);
+    bool pending = s_startup_pending && s_state == WFA_IDLE &&
+        s_lease_generation == generation;
+    portEXIT_CRITICAL(&s_lock);
+    if (!pending) return true; /* Consumed, completed, or a different generation. */
+    bool released = s_hooks.lease_release && s_hooks.lease_release(generation, true);
+    portENTER_CRITICAL(&s_lock);
+    if (s_startup_pending && s_lease_generation == generation) {
+        s_startup_pending = false;
+        if (released) s_lease_generation = 0U;
+        else s_state = WFA_QUARANTINED;
+    }
+    portEXIT_CRITICAL(&s_lock);
+    return released;
+}
+
+static bool reserve(const uint32_t *startup_generation)
+{
+    uint32_t generation = startup_generation ? *startup_generation :
+        wifi_analyzer_startup_begin();
+    if (generation == 0U) return false;
+    portENTER_CRITICAL(&s_lock);
+    bool ok = s_startup_pending && s_state == WFA_IDLE &&
+        s_lease_generation == generation;
+    if (ok) {
+        s_state = WFA_PREPARING;
+        s_startup_pending = false;
+    }
+    portEXIT_CRITICAL(&s_lock);
     return ok;
 }
 
 static void release(bool fault)
 {
+    portENTER_CRITICAL(&s_lock);
     uint32_t generation = s_lease_generation;
+    portEXIT_CRITICAL(&s_lock);
     bool lease_ok = generation != 0U && s_hooks.lease_release &&
         s_hooks.lease_release(generation, !fault);
     if (!lease_ok) fault = true;
@@ -494,14 +543,22 @@ finish:
 bool wifi_analyzer_stop(uint32_t timeout_ms)
 {
     portENTER_CRITICAL(&s_lock);
-    bool busy = s_state != WFA_IDLE;
+    bool busy = s_state != WFA_IDLE || s_startup_pending;
     if (busy) s_cancel = true;
+    uint32_t generation = s_lease_generation;
     portEXIT_CRITICAL(&s_lock);
     if (!busy) return true;
-    if (s_hooks.lease_cancel && s_lease_generation != 0U)
-        (void)s_hooks.lease_cancel(s_lease_generation);
+    if (s_hooks.lease_cancel && generation != 0U)
+        (void)s_hooks.lease_cancel(generation);
     uint64_t deadline = now_ms() + timeout_ms;
-    while (wifi_analyzer_busy() && now_ms() < deadline) vTaskDelay(pdMS_TO_TICKS(20));
+    while (wifi_analyzer_busy() && now_ms() < deadline) {
+        portENTER_CRITICAL(&s_lock);
+        generation = s_lease_generation;
+        portEXIT_CRITICAL(&s_lock);
+        if (s_hooks.lease_cancel && generation != 0U)
+            (void)s_hooks.lease_cancel(generation);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
     return !wifi_analyzer_busy();
 }
 
@@ -532,7 +589,8 @@ static void show_status(void)
     if (n > 0 && (size_t)n < sizeof(line)) (void)emit_line(line, n);
 }
 
-int wifi_analyzer_command(int argc, char **argv)
+int wifi_analyzer_command_with_startup(int argc, char **argv,
+                                       const uint32_t *startup_generation)
 {
     if (!s_initialized) { control_error("wifi_analyzer", "unavailable", NULL); return 1; }
     if (argc < 2) { control_error("wifi_analyzer", "invalid_argument", "expected_subcommand"); return 1; }
@@ -570,11 +628,17 @@ int wifi_analyzer_command(int argc, char **argv)
     if (!wfa_parse_scan_args(argc, argv, &options, &reason)) {
         control_error("scan", "invalid_argument", reason); return 1;
     }
-    if (wifi_analyzer_busy()) { control_error("scan", "busy", "wifi_analyzer"); return 1; }
+    if (!startup_generation && wifi_analyzer_busy()) { control_error("scan", "busy", "wifi_analyzer"); return 1; }
     if (s_scan == UINT32_MAX) { control_error("scan", "radio_fault", "scan_id_exhausted"); return 1; }
+    if (!reserve(startup_generation)) { control_error("scan", "busy", "wifi_analyzer"); return 1; }
+    /* The shared lease excludes legacy startup while host/driver baseline
+     * probes run. No command or lease mutation lock is held here. */
     reason = s_hooks.busy_reason ? s_hooks.busy_reason() : "missing_host_hooks";
-    if (reason) { control_error("scan", "busy", reason); return 1; }
-    if (!reserve()) { control_error("scan", "busy", "wifi_analyzer"); return 1; }
+    if (reason) {
+        release(false);
+        control_error("scan", "busy", reason);
+        return 1;
+    }
     s_options = options;
     s_saved_radio = false;
     const char *error = NULL;
@@ -624,4 +688,9 @@ int wifi_analyzer_command(int argc, char **argv)
     portEXIT_CRITICAL(&s_lock);
     xTaskNotifyGive(worker);
     return 0;
+}
+
+int wifi_analyzer_command(int argc, char **argv)
+{
+    return wifi_analyzer_command_with_startup(argc, argv, NULL);
 }

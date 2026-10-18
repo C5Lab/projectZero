@@ -74,6 +74,15 @@ class WpsLabSuiteHostTest(unittest.TestCase):
                  WORKFLOW / "lab_result_store.c"],
                 "PASS: WPS lab result store", run_args=[store_root])
 
+    def test_result_store_io_faults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store_root = Path(directory) / "wps"
+            self.compile_and_run(
+                "lab_result_store_io_test",
+                [WPS_TEST / "lab_result_store_io_test.c"],
+                "PASS: WPS lab result store I/O faults",
+                run_args=[store_root])
+
     def test_radio_owner(self):
         self.compile_and_run(
             "lab_radio_test",

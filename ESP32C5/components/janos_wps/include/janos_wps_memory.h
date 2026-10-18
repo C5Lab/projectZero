@@ -4,6 +4,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #define JANOS_WPS_CAP_8BIT     (1u << 0)
 #define JANOS_WPS_CAP_SPIRAM   (1u << 1)
@@ -29,9 +30,17 @@ typedef struct {
 } janos_wps_memory_snapshot_t;
 
 typedef struct {
+    atomic_size_t bulk_bytes;
+    atomic_size_t bulk_peak_bytes;
+    atomic_size_t secret_bytes;
+    atomic_size_t secret_peak_bytes;
+    atomic_size_t failed_allocations;
+} janos_wps_memory_counters_t;
+
+typedef struct {
     const janos_wps_memory_ops_t *ops;
     void *ops_context;
-    janos_wps_memory_snapshot_t counters;
+    janos_wps_memory_counters_t counters;
 } janos_wps_memory_t;
 
 void janos_wps_memory_init(janos_wps_memory_t *memory,

@@ -29,6 +29,7 @@ typedef struct {
     uint64_t (*monotonic_ms)(void *context);
     void (*reboot)(void *context);
     bool (*poll_cancel)(void *context);
+    bool (*commit_gate)(void *context, uint32_t operation_id);
 } lab_platform_ops_t;
 
 typedef struct {
@@ -62,5 +63,7 @@ uint64_t lab_platform_now_ms(const lab_platform_t *platform);
 void lab_platform_reboot(lab_platform_t *platform);
 /* Nonblocking. Input other than the foreground cancel key is ignored. */
 bool lab_platform_poll_cancel(lab_platform_t *platform);
+bool lab_platform_commit_gate(lab_platform_t *platform,
+                              uint32_t operation_id);
 
 #endif

@@ -1,37 +1,50 @@
 # JanOS shared radio ownership
 
-The Wi-Fi analyzer and known-PIN WPS runtime share one owner/generation lease.
-The lease prevents two mutating workflows from borrowing the ESP32-C5 Wi-Fi
-driver at the same time while preserving the established WFA/1 and console
-contracts used by existing clients.
+JanOS coordinates legacy radio commands, the Wi-Fi analyzer and WPS through
+one owner/generation lease. The coordinator prevents overlapping mutation of
+the ESP32-C5 Wi-Fi driver while preserving the established WFA/1, console and
+WPS schema-v1 contracts used by existing clients.
 
-## Lifecycle
+## Owners and lifecycle
+
+Owners are `NONE`, `LEGACY`, `ANALYZER` and `WPS`. `QUARANTINED` is a lease
+state, not an owner:
 
 ```text
-IDLE -> PREPARING -> RUNNING -> CLEANUP -> IDLE
-                                  |
-                                  +-> QUARANTINED
+IDLE/NONE -> PREPARING/<owner> -> RUNNING/<owner> -> CLEANUP/<owner> -> IDLE/NONE
+                                                        |
+                                                        +-> QUARANTINED/<owner>
 ```
 
-- Acquisition atomically compares and swaps owner `NONE` to `ANALYZER` or
-  `WPS`. Exactly one contender wins; a loser does not publish partial state.
-- Every successful acquisition receives a nonzero, monotonically increasing
-  generation. Exhaustion fails closed rather than reusing a generation.
-- All generation-sensitive mutators are serialized as one short critical
-  section (a portable atomic gate in host tests). Validation and publication
-  therefore cannot be split by cleanup/reacquire of the same owner; a stale
-  operation cannot mutate the next generation.
-- Callbacks are accepted only for the current owner, current generation and
-  `RUNNING` state while the callback gate is open.
-- Cancellation closes callback admission and cleanup closes it again before
-  releasing resources.
-- Successful restoration publishes `IDLE`, clears generation and releases the
-  owner. Failed restoration retains owner/generation in `QUARANTINED`.
-- Reboot is the recovery path for quarantine. The implementation does not force
-  task deletion or pretend that uncertain callback/radio state is safe.
-- Snapshot reads use bounded retries and then return a conservative busy state
-  during the tiny claim/release publication windows, so a preempted publisher
-  cannot make a single-core ESP32-C5 reader spin indefinitely.
+- Acquisition atomically changes `IDLE/NONE` into `PREPARING/<owner>` and
+  assigns a nonzero monotonically increasing generation. A loser publishes no
+  partial state; generation exhaustion fails closed.
+- `LEGACY` is a short startup transaction for mutating legacy handlers,
+  `test_radio_channel(s)`, analyzer `clear` and manual OTA. It closes only
+  after the handler has either published its subsystem state or failed.
+- Analyzer scan startup is announced before the dispatcher releases its
+  admission lock. The handler consumes the same generation; invalid arguments,
+  initialization failure or scan-ID exhaustion roll it back. A stale token
+  cannot release or cancel a newer owner.
+- WPS and direct analyzer callers acquire their long-lived owner before
+  checking the mutable host baseline, closing the opposite admission race.
+- Callbacks are accepted only for the current owner, generation and `RUNNING`
+  state while the callback gate is open. Cleanup closes callback admission.
+- Successful exact restoration releases owner/generation. Failed or uncertain
+  restoration retains them in `QUARANTINED`; reboot is the recovery path.
+- Snapshot reads are bounded and fail conservatively busy during the tiny
+  publication windows rather than spinning indefinitely.
+
+The dispatcher never holds its admission lock while invoking a handler. The
+lock order for short control-plane sections is:
+
+```text
+command/admission lock -> radio coordinator lock -> subsystem state lock
+```
+
+None of these locks may span handler execution, join/wait, raw TX, delays,
+filesystem I/O or long driver probes. The D-UCB data-plane boundary is
+documented in the [command manual](command-manual.md#attacks).
 
 ## Stable refusal contract
 
@@ -43,97 +56,89 @@ nonzero:
 Command returned non-zero error code: 0x1 (ERROR)
 ```
 
-The reason can also be `command_in_progress` or `wifi_analyzer`. There is no
-positive `type:"busy"` reply, `owner` field, `retryable` field or zero-return
-special case. Existing Tab5/serial consumers may continue treating the generic
-ESP console error line as part of a rejected command.
+The reason may also be `command_in_progress` or `wifi_analyzer`. Active analyzer
+`clear` retains its established `command:"clear"`, `reason:"wifi_analyzer"`
+record. There is no positive `type:"busy"`, `owner`/`retryable` field or
+zero-return special case. Existing ADV Tab5 and serial consumers may continue
+treating the generic console error line as part of a rejection.
 
-## Admission matrix
+## Executable admission matrix
 
-This table is transcribed from `tests/janos_console_admission_test.c`, the
-portable executable policy fixture. `ADMIT` means only that dispatcher-level
-admission passed; the selected service may still return its own idempotent/busy
-or validation result.
+This table summarizes `tests/janos_console_admission_test.c` and the analyzer,
+transaction and OTA fixtures. `ADMIT` means only that dispatcher admission
+passed; the handler can still report validation, duplicate work or idempotent
+stop.
 
-| Owner | Command | Subcommand | In-flight | Analyzer busy | Decision |
-| --- | --- | --- | ---: | --- | --- |
-| none | `wifi_analyzer` | `scan` | 0 | no | ADMIT |
-| none | `wifi_analyzer` | `scan` | 1 | no | busy: `command_in_progress` |
-| analyzer | `wifi_analyzer` | `status` | 0 | yes | ADMIT |
-| analyzer | `wifi_analyzer` | `caps` | 0 | yes | ADMIT |
-| analyzer | `wifi_analyzer` | `stop` | 0 | yes | ADMIT |
-| analyzer | `wifi_analyzer` | `scan` | 0 | yes | ADMIT; analyzer handler decides duplicate-work behavior |
-| analyzer | `wps` | `status` | 0 | yes | ADMIT |
-| analyzer | `secret` | `status` | 0 | yes | ADMIT |
-| analyzer | `show_scan_results` | — | 0 | yes | ADMIT |
-| analyzer | `wps` | `verify` | 0 | yes | busy: `radio_lease` |
-| analyzer | `wps` | `stop` | 0 | yes | busy: `radio_lease` |
-| WPS | `wps` | `status` | 0 | no | ADMIT |
-| WPS | `wps` | `stop` | 0 | no | ADMIT |
-| WPS | `wps` | `verify` | 0 | no | ADMIT; WPS handler refuses a duplicate run |
-| WPS | `secret` | `status` | 0 | no | ADMIT |
-| WPS | `secret` | `reveal` | 0 | no | ADMIT |
-| WPS | `secret` | `erase` | 0 | no | ADMIT |
-| WPS | `wifi_analyzer` | `caps` | 0 | no | ADMIT |
-| WPS | `wifi_analyzer` | `status` | 0 | no | ADMIT |
-| WPS | `wifi_analyzer` | `scan` | 0 | no | busy: `radio_lease` |
-| WPS | `wifi_analyzer` | `stop` | 0 | no | busy: `radio_lease` |
-| WPS | `show_scan_results` | — | 0 | no | ADMIT |
-| WPS | global `stop` | — | 0 | no | ADMIT |
-| WPS | `reboot` | — | 0 | no | ADMIT |
-| WPS | built-in `help` | — | 0 | no | ADMIT |
-| none | `channel_view` | — | 0 | yes | busy: `wifi_analyzer` |
-| none | `show_scan_results` | — | 0 | yes | ADMIT |
-| none | `wps` | `status` | 0 | yes | ADMIT |
-| none | `secret` | `status` | 0 | yes | ADMIT |
+| Current owner/state | Command family | Decision |
+| --- | --- | --- |
+| idle | legacy mutation, `test_radio_channel(s)` | reserve `LEGACY/PREPARING`, then run unlocked |
+| idle | analyzer `scan` | announce `ANALYZER/PREPARING` before dispatcher unlock |
+| idle | analyzer `clear` | short `LEGACY` transaction |
+| idle | `wps verify`, `wps pixie`, `jwps campaign`, `selftest transport` | WPS service acquires `WPS/PREPARING` before baseline validation |
+| any owner | `jwps plan`, `selftest db`, `selftest fragment`, `selftest pixie` | ADMIT; serialized offline WPS service, no radio lease |
+| analyzer | WPS/JWPS operation requiring radio | busy: `radio_lease` |
+| WPS | analyzer scan/clear or other radio mutation | busy: `radio_lease` |
+| legacy preparing | analyzer or radio-using WPS/JWPS | busy: `command_in_progress` |
+| analyzer or WPS | status/read commands, `show_scan_results`, built-in `help`, `reboot`, global `stop` | ADMIT |
+| analyzer or WPS | `wps stop` / `wifi_analyzer stop` | ADMIT; each handler affects only its own subsystem and is otherwise idempotent |
+| any mutation | nonzero console command already in flight | busy: `command_in_progress` where covered by legacy admission |
+| idle with legacy analyzer-busy state | unrelated radio mutation | busy: `wifi_analyzer` |
 
-Null/empty commands and an invalid owner fail closed with `radio_lease`.
+Null/empty commands and invalid owner values fail closed with `radio_lease`.
+`wps status`, `secret status`, analyzer `status/caps` and prior legacy scan
+results remain readable while another owner runs. Analyzer result records never
+become legacy selection indices.
 
-## Stop and status semantics
+Manual `ota_check` may use only the exact `LEGACY` owner/generation token
+reserved for that console invocation. Event-triggered IP OTA supplies no token
+and remains `NONE`-only. An expired token cannot borrow a subsequently idle
+lease.
 
-- `wifi_analyzer stop` is analyzer-specific and cannot stop WPS.
-- `wps stop` is WPS-specific and cannot stop the analyzer.
-- Global `stop` is always admitted. It first joins WPS, then joins analyzer
-  cleanup, before running legacy teardown.
-- `reboot`, built-in `help`, `show_scan_results`, `wifi_analyzer caps/status`,
-  `wps status` and `secret status` remain available while either owner runs.
-- `show_scan_results` is read-only and exposes only the prior legacy scan
-  snapshot. Analyzer records never become legacy selection indices.
+## Stop and handoff semantics
 
-An owner-specific stop may print its own completion/pending/quarantine record.
-A cross-owner stop is a normal dispatcher busy error with nonzero return.
+- `wifi_analyzer stop` cannot stop WPS; `wps stop` cannot stop the analyzer.
+- Global `stop` is admitted and joins WPS, then analyzer cleanup, before legacy
+  teardown. It refuses unsafe teardown while analyzer startup is still only
+  announced; if startup publishes within the bounded wait, cancellation is
+  directed to that generation.
+- Analyzer `end` and WPS `terminal` can precede the final worker handoff by a
+  short interval. Check status and use a bounded retry rather than rebooting for
+  a transient busy result.
+- Owner-specific stop output retains its subsystem contract. WPS can report
+  `stopped`, `stop_pending` or `quarantined`; analyzer retains WFACTL1 records.
 
-## Bounded handoff and isolation
+## Exact idle-STA WPS restore
 
-Analyzer `end` and WPS `terminal` are emitted before or during final worker
-handoff, so an immediate next mutation can briefly be busy. Check the relevant
-status and use a bounded retry; do not reboot merely for a transient busy result.
+The supported WPS baseline is the canonical initialized, running, idle STA
+established by the existing host preparation hook. On a cold boot, preparation
+may initialize/start that STA while WPS already owns the lease. Snapshot occurs
+after preparation and before the transport's first borrowed mutation.
 
-WPS-owned Wi-Fi/IP events are consumed before legacy state-machine side effects.
-Automatic and manual OTA check shared ownership before worker creation. An
-active or quarantined owner prevents OTA start; rejection does not mark OTA as
-started. Legacy analyzer scan snapshots, selections, country policy and NVS
-settings remain in their original domain.
+The internal snapshot captures the tracked Wi-Fi storage policy (`FLASH` or
+`RAM`), mode, complete STA configuration, primary/secondary channel and STA
+MAC. Secret-bearing configuration lives in wiped internal 8-bit RAM, never
+PSRAM, SD or NVS. Stopped STA, AP and APSTA baselines are rejected before any
+transport mutation.
 
-## MAC and memory boundaries
+Restore proceeds through stop, temporary RAM storage, mode/config/MAC, start,
+channel and original storage policy, followed by complete readback of mode,
+configuration, both channel fields and MAC plus tracked lifecycle/storage
+invariants. A failed phase keeps the snapshot and lease for retry. Only exact
+readback sets `restore_verified`, wipes/frees the snapshot and permits release;
+otherwise service cleanup quarantines the owner.
 
-Before a workflow, the JanOS runtime reads the active STA MAC and requires it to
-match the boot baseline supplied to the WPS radio wrapper. The transport records
-that verified baseline, applies a temporary session identity, then restores the
-exact baseline before successful cleanup/release. Host tests cover factory-like,
-fixed and random-per-boot locally administered starting addresses across success,
-cancellation, timeout/failure and consecutive runs. WPS/analyzer do not write
-the standalone STA-MAC policy NVS record.
+This restores the current boot identity but does not implement the unrelated
+persistent `sta_mac` policy or CLI.
 
-Current JanOS does not expose the standalone `sta_mac` CLI or apply its
-persistent factory/random/fixed UI at boot. Therefore the transport restoration
-contract is ready for those starting addresses, but production policy selection
-is not part of this release.
+## Memory boundaries
 
-WPS bulk scratch uses PSRAM. Secret request/vault data stays in internal RAM and
-is wiped. Analyzer snapshots use their own lazy PSRAM buffers. Allocation failure
-does not silently fall back to a different memory class.
+WPS session scratch and the 160000-byte Pixie cache use tracked 8-bit PSRAM
+without an internal-RAM fallback. WPS request/vault data and the Wi-Fi restore
+snapshot stay in internal RAM and are wiped. Analyzer snapshots use their own
+lazy PSRAM buffers. Allocation failures remain explicit in telemetry and fail
+closed.
 
-See [JanOS known-PIN WPS](janos-wps.md), the
-[WFA/1 protocol](wifi-analyzer-protocol.md), and the
+See [JanOS WPS laboratory workflows](janos-wps.md), the
+[WFA/1 protocol](wifi-analyzer-protocol.md), the
+[command manual](command-manual.md) and the
 [integrated validation runbook](janos-radio-compatibility-validation.md).

@@ -38,7 +38,18 @@ typedef struct { int unused; } wifi_ap_record_t;
 typedef struct { int unused; } janos_radio_lease_t;
 typedef struct { unsigned owner, state, generation; bool cancel_requested; }
     janos_radio_lease_snapshot_t;
-enum { JANOS_RADIO_OWNER_NONE = 0, JANOS_RADIO_OWNER_ANALYZER = 1 };
+enum {
+    JANOS_RADIO_OWNER_NONE = 0,
+    JANOS_RADIO_OWNER_ANALYZER = 1,
+    JANOS_RADIO_OWNER_WPS = 2,
+    JANOS_RADIO_OWNER_LEGACY = 3,
+};
+enum {
+    JANOS_RADIO_LEASE_IDLE = 0,
+    JANOS_RADIO_LEASE_PREPARING = 1,
+};
+typedef struct { unsigned owner; uint32_t generation; }
+    janos_console_admission_token_t;
 typedef struct {
     const char *url;
     int timeout_ms, buffer_size, buffer_size_tx;
@@ -78,10 +89,22 @@ static const char *source_profile = "none";
 
 static bool ota_check_in_progress;
 static janos_radio_lease_t janos_radio_lease;
-static unsigned radio_lease_owner;
+/* cmd_ota_check is invoked as if the console admission layer has already
+ * reserved startup for this handler.  Individual scenarios may replace the
+ * owner to exercise rejection of a foreign lease. */
+static unsigned radio_lease_owner = JANOS_RADIO_OWNER_LEGACY;
+static unsigned radio_lease_state = JANOS_RADIO_LEASE_PREPARING;
+static unsigned radio_lease_generation = 1U;
 static janos_radio_lease_snapshot_t janos_radio_lease_snapshot(
     const janos_radio_lease_t *lease)
-{ (void)lease; return (janos_radio_lease_snapshot_t){.owner = radio_lease_owner}; }
+{
+    (void)lease;
+    return (janos_radio_lease_snapshot_t){
+        .owner = radio_lease_owner,
+        .state = radio_lease_state,
+        .generation = radio_lease_generation,
+    };
+}
 static atomic_bool ota_boot_ready = ATOMIC_VAR_INIT(true);
 static char ota_channel[8] = "main";
 static bool associated = true, has_ip = true, has_netif = true, ip_ok = true, mode_ok = true;
@@ -312,6 +335,9 @@ static void run_worker(void) {
 }
 
 int main(int argc, char **argv) {
+    /* Keep the production automatic wrapper covered by compilation even
+     * though this adapter drives the console-token path directly. */
+    (void)ota_start_check;
     if (argc == 4 && !strcmp(argv[1], "compare")) {
         printf("%d\n", ota_is_newer_version(argv[2], argv[3]));
         return 0;

@@ -92,11 +92,37 @@ static void test_persisted_record(void)
     }
 }
 
+static void test_ru_profile_contract(void)
+{
+    size_t ru_count = 0;
+    for (size_t i = 0; i < wifi_country_policy_count(); ++i)
+        if (strcmp(wifi_country_policy_at(i), "RU") == 0) ++ru_count;
+    CHECK(ru_count == 1);
+
+    char normalized[WIFI_COUNTRY_CODE_SIZE] = {0};
+    CHECK(wifi_country_policy_normalize("ru", normalized) == WIFI_COUNTRY_POLICY_OK);
+    CHECK(strcmp(normalized, "RU") == 0);
+
+    const wifi_country_policy_record_t record = {
+        WIFI_COUNTRY_POLICY_VERSION, "RU"
+    };
+    uint8_t bytes[WIFI_COUNTRY_POLICY_RECORD_SIZE] = {0};
+    const uint8_t expected[] = {1, 'R', 'U'};
+    CHECK(wifi_country_policy_encode(&record, bytes, sizeof(bytes)) == WIFI_COUNTRY_POLICY_OK);
+    CHECK(memcmp(bytes, expected, sizeof(expected)) == 0);
+
+    wifi_country_policy_record_t decoded = {0};
+    CHECK(wifi_country_policy_decode(bytes, sizeof(bytes), &decoded) == WIFI_COUNTRY_POLICY_OK);
+    CHECK(decoded.version == WIFI_COUNTRY_POLICY_VERSION);
+    CHECK(strcmp(decoded.cc, "RU") == 0);
+}
+
 int main(void)
 {
     test_default_and_normalization();
     test_supported_profiles();
     test_persisted_record();
+    test_ru_profile_contract();
     puts("PASS: WiFi country policy");
     return 0;
 }

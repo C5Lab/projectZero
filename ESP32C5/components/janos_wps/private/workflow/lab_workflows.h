@@ -58,6 +58,7 @@ typedef struct {
     unsigned resume_index;
     unsigned candidate_count;
     unsigned attempt_count;
+    bool campaign_progress_valid;
     wps_pin_query_stats_t query_stats;
     const char *storage_result;
     lab_wps_identity_t last_identity;
@@ -79,7 +80,14 @@ bool lab_workflows_execute(lab_workflows_t *workflows,
                            const char **operation_result,
                            const char **cleanup_result);
 unsigned lab_workflows_resume_index(const lab_workflows_t *workflows);
+bool lab_workflows_campaign_progress(const lab_workflows_t *workflows,
+                                     unsigned *candidate_count,
+                                     unsigned *attempt_count,
+                                     unsigned *resume_index);
 const char *lab_workflows_storage_result(const lab_workflows_t *workflows);
+/* `not_required` means the workflow failed or completed before acquiring the
+ * adapter radio.  It is a successful no-op cleanup for the outer lease. */
+bool lab_workflows_cleanup_succeeded(const char *cleanup_result);
 /* Polls once and latches cancellation on the active radio owner. */
 bool lab_workflows_poll_cancel(lab_workflows_t *workflows);
 void lab_workflows_deinit(lab_workflows_t *workflows);

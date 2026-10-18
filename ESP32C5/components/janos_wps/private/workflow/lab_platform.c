@@ -153,3 +153,11 @@ bool lab_platform_poll_cancel(lab_platform_t *platform)
     return platform && platform->ops && platform->ops->poll_cancel &&
            platform->ops->poll_cancel(platform->context);
 }
+
+bool lab_platform_commit_gate(lab_platform_t *platform,
+                              uint32_t operation_id)
+{
+    return platform && operation_id != 0U && platform->ops &&
+           platform->ops->commit_gate &&
+           platform->ops->commit_gate(platform->context, operation_id);
+}

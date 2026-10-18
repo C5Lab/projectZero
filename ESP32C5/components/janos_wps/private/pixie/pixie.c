@@ -31,7 +31,10 @@ typedef struct {
     bool failed;
 } oracle_t;
 
-static void *cache_alloc(size_t size) {
+static void scrub(void *data, size_t len);
+
+static void *cache_alloc(const pixie_options_t *options, size_t size) {
+    if (options->cache_alloc) return options->cache_alloc(options->cache_context, size);
 #ifdef WPS_HOST_TEST
     return malloc(size);
 #else
@@ -39,7 +42,15 @@ static void *cache_alloc(size_t size) {
 #endif
 }
 
-static void cache_free(void *memory) {
+static void cache_free(const pixie_options_t *options, void *memory, size_t size) {
+    if (!memory) return;
+    /* Keep allocator callbacks simple and make every exit path, including an
+     * early crypto failure after allocation, release only a scrubbed cache. */
+    scrub(memory, size);
+    if (options->cache_free) {
+        options->cache_free(options->cache_context, memory, size);
+        return;
+    }
 #ifdef WPS_HOST_TEST
     free(memory);
 #else
@@ -220,16 +231,19 @@ static bool try_pair(oracle_t *oracle, pixie_mode_t mode,
 bool pixie_recover(const pixie_bundle_t *bundle, const pixie_options_t *options,
                    pixie_result_t *result) {
     if (!bundle || !options || !result ||
-        (options->static_secret_count && !options->static_secrets)) return false;
+        (options->static_secret_count && !options->static_secrets) ||
+        ((options->cache_alloc == NULL) != (options->cache_free == NULL)))
+        return false;
     memset(result, 0, sizeof(*result));
 #ifndef WPS_HOST_TEST
     if (psa_crypto_init() != PSA_SUCCESS) return false;
 #endif
     oracle_t oracle = {.bundle = bundle, .options = options, .result = result};
-    oracle.psks = cache_alloc(HALF_COUNT * sizeof(*oracle.psks));
+    const size_t cache_size = HALF_COUNT * sizeof(*oracle.psks);
+    oracle.psks = cache_alloc(options, cache_size);
     static const uint8_t empty = 0;
     if (!oracle.psks || !make_psk(&oracle, &empty, 0, oracle.empty_psk)) {
-        cache_free(oracle.psks);
+        cache_free(options, oracle.psks, cache_size);
         return false;
     }
     uint32_t modes = options->modes ? options->modes : PIXIE_MODE_DEFAULT;
@@ -270,6 +284,6 @@ bool pixie_recover(const pixie_bundle_t *bundle, const pixie_options_t *options,
 
     scrub(oracle.empty_psk, sizeof(oracle.empty_psk));
     scrub(oracle.psks, HALF_COUNT * sizeof(*oracle.psks));
-    cache_free(oracle.psks);
+    cache_free(options, oracle.psks, cache_size);
     return !oracle.failed;
 }

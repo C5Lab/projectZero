@@ -1,65 +1,93 @@
 # JanOS radio compatibility validation
 
-This runbook validates the integrated analyzer/WPS lease without confusing
-source checks, host execution, firmware compilation and device evidence.
-Use only explicitly owned laboratory access points. Replace every angle-bracket
-placeholder locally; do not paste PINs or network keys into repository logs.
+This runbook validates the integrated legacy/analyzer/WPS radio coordinator,
+the hardened D-UCB handshaker and the complete production WPS CLI. Use only
+explicitly owned laboratory access points. Replace placeholders locally and do
+not paste PINs, network keys or plaintext result files into repository logs.
 
-## Evidence status
+## Evidence boundary
 
-| Layer | Current evidence | Status |
+Keep four layers separate:
+
+| Layer | What constitutes evidence | Current state |
 | --- | --- | --- |
-| Source/portable policy | Exact WFACTL1 busy fixture, dispatcher ordering, owner/subcommand matrix, legacy analyzer isolation, OTA guards | complete in focused tests |
-| Host C/Python | Task-5 compatibility selection: 124/124 passed; lease race test includes 10,000 acquisitions and the lease suite passed 20 repeated runs | complete before this document |
-| Full repository host suite | 2026-10-16: 275 tests, 0 failures, 0 skips | PASS |
-| ESP-IDF firmware | 2026-10-16: ESP-IDF 6.0.2 Docker build, 40% app partition free | PASS |
-| Device hardening matrix | Contention both directions, stops, handoff, MAC/resource checks | pending user execution |
+| source/contracts | exact command, wire, admission, ownership and provenance checks | verified by focused fixtures and final compatibility replay |
+| host execution | ordinary plus ASan/UBSan fixtures and full discovery | PASS: 327/327 final host tests; focused ASan/UBSan suites pass |
+| firmware build | supported ESP-IDF 6.0.0/6.0.1 root images, size, partition headroom and SHA-256 | PASS: exact 6.0.0 and local 6.0.1 builds, details below |
+| device | target logs for restore, contention, D-UCB, WPS/Pixie/JWPS, storage and ADV Tab5 replay | pending operator execution |
 
-Earlier analyzer and known-PIN device sessions are useful historical evidence,
-but they do not replace the complete matrix below for the final hardening build.
+Final host/build evidence (2026-10-18): full discovery passed 327/327.
+The root JanOS project built with ESP-IDF v6.0.0 at commit
+`662a3be354759d9487bf4b1a629fadb766cb1800`. The generated
+`build-task6-idf600/projectZero.bin` is 2,355,200 bytes (`0x23f000`);
+the smallest app partition is 4,128,768 bytes (`0x3f0000`), leaving
+1,773,568 bytes (`0x1b1000`, 42.96%; IDF reports 43%). The final verification
+rebuild has SHA-256
+`E420B16C7AC6A417FD6E0E70E85A78FAE7F52CCA565E3AE7C171B297A8C4A492`.
+ESP-IDF embeds build-time metadata in the application descriptor, so a separate
+clean relink can retain the same size while changing the digest. Always record
+the SHA-256 of the exact artifact flashed for target validation.
+This is host/build evidence only; the device matrix remains pending.
+
+Compatibility build evidence (2026-10-18): the same tree also built to
+completion with local ESP-IDF v6.0.1 (`8c19b156084a0753687347cca1f5355782893533`).
+`build/projectZero.bin` is 2,369,664 bytes (`0x242880`), with 43% of the
+smallest app partition free, and SHA-256
+`D186E0E09DE7F012AC72DF10F9FCDDF09020D4986D17334B09A4CF84DAC2DD72`.
+The private WPS adapter compile guard accepts only 6.0.0 and 6.0.1.
+
+Historical 2026-10-16 evidence used an older source tree and ESP-IDF 6.0.2:
+275 host tests passed; `build-janos-wps/projectZero.bin` was 2,472,016 bytes
+with reported 40% app-partition headroom and SHA-256
+`C2E7D177124604A0709BD64B86F6F589FD080229374B627CD263CE7AC9E2B808`.
+That dated result remains useful history but is **not** acceptance evidence for
+the current hardening image.
 
 ## Host and build gates
 
-From the repository root:
+From the repository root, run the complete Python discovery in the supported
+host environment, then the focused sanitizer launchers for Tasks 1-5. Record
+the commands, exact count, skips and failures rather than copying old numbers.
+ThreadSanitizer currently compiles but cannot execute in the available WSL
+runtime (`FATAL: ThreadSanitizer: unexpected memory mapping`); record this as an
+environment limitation, not as a pass.
+
+At minimum include these behavior groups:
+
+- immediate WPS worker success/failure/cancel/quarantine/NULL/start rejection;
+- legacy/WPS races in both orders, channel commands, analyzer pre-unlock/global
+  stop, analyzer clear, OTA self-token and stale generations;
+- FLASH and RAM idle-STA snapshot/restore, every fault/readback/retry path,
+  cold host preparation and stopped/AP/APSTA rejection without mutation;
+- D-UCB RX at all burst delays, FIFO reuse, stale generation, allocation/setup
+  retry, immutable target snapshots, slow/failing SD and stop during TX/write;
+- WPS parser/goldens, spaced SSID, deterministic plan, bounded campaign,
+  Pixie retries/cancellation, vault TTL/reveal-once/erase, persistence commit
+  gate and memory stress;
+- legacy console fixtures, analyzer WFA/1, ADV Tab5 compatibility,
+  source-ownership and license/provenance checks.
+
+Also run a relative-link check across current Markdown, then:
 
 ```powershell
-wsl.exe bash -lc 'cd /mnt/c/Users/mati/Documents/GitHub/projectZero/ESP32C5 && python3 -m unittest discover -s tests -p "test_*.py"'
 git diff --check
 docker run --rm -v "${PWD}:/project" -w /project `
-  -e IDF_PY_FLAGS=--preview espressif/idf:v6.0.2 `
-  bash -lc "idf.py -B build-janos-wps build"
-Get-Item build-janos-wps/projectZero.bin | Select-Object Length,FullName
-Get-FileHash build-janos-wps/projectZero.bin -Algorithm SHA256
+  -e IDF_PY_FLAGS=--preview espressif/idf:release-v6.0 `
+  bash -lc "set -e; git -C /opt/esp/idf checkout --detach 662a3be354759d9487bf4b1a629fadb766cb1800; git -C /opt/esp/idf submodule update --init --recursive; idf.py -B build-task6-idf600 build"
+Get-Item build-task6-idf600/projectZero.bin | Select-Object Length,FullName
+Get-FileHash build-task6-idf600/projectZero.bin -Algorithm SHA256
 ```
 
-Record the exact test count/skips, image path, image size, partition headroom and
-SHA-256. The user performs flashing:
+The registry has no `espressif/idf:v6.0.0` manifest, so the command pins the
+signed v6.0 source tag inside the disposable `release-v6.0` container. The
+output directory name does not make this a standalone WPS image: this command
+builds the root JanOS project. Record the linked app size, smallest app
+partition, remaining headroom, BIN/ELF paths and SHA-256. Do not flash as part
+of this gate. A successful link is not device evidence.
 
-```powershell
-idf.py -B build-janos-wps -p COMx flash monitor
-```
+## Device baseline and exact restore
 
-Do not call a device row PASS based only on host tests or a successful link.
-
-Final host/build evidence for the current source tree (2026-10-16):
-
-- full discovery: 275 tests, 0 failures, 0 skips;
-- repeated lease suite: 20/20 passes, including 10,000 acquire/transition/ABA
-  races per run;
-- `build-janos-wps/projectZero.bin`: 2,472,016 bytes;
-- application size: `0x25b850`, smallest app partition `0x3f0000`, 40% free;
-- BIN SHA-256:
-  `C2E7D177124604A0709BD64B86F6F589FD080229374B627CD263CE7AC9E2B808`;
-- matching `projectZero.elf`: 22,236,056 bytes, SHA-256
-  `12B21DE9FE5E99B7BE692B1782A5EB7238A5FE1FF8BBD7AA52B5A9E8CD0BF8D1`.
-
-The configure step reports non-fatal ESP-IDF component-ownership warnings for
-reviewed shared sources compiled by `janos_wps`; the build and partition checks
-still complete successfully. Those warnings are not device-acceptance evidence.
-
-## Baseline
-
-After boot, save the full boot banner and run:
+After boot, save the full banner and run:
 
 ```text
 wps status
@@ -69,151 +97,171 @@ wifi_analyzer caps
 show_scan_results
 ```
 
-Expected: WPS/analyzer idle, no current WPS bulk/secret allocation, no allocation
-failures, and status/caps do not start a scan or allocate analyzer bulk storage.
-Preserve this legacy `show_scan_results` output for the isolation comparison.
+Expected: WPS/analyzer idle, no live WPS bulk/secret allocation, no allocation
+failure, and status/caps do not start work or allocate analyzer bulk storage.
+Save the active Wi-Fi storage policy, mode, complete STA config, primary and
+secondary channel and STA MAC with an approved diagnostic build/procedure.
 
-## Known-PIN success on two owned APs
+For WPS success, timeout and cancellation, compare every field after terminal
+cleanup. Acceptance requires exact equality and `cleanup_result:"restored"`.
+Separately exercise stopped STA, AP and APSTA baselines: they must be rejected
+before mutation. A deliberately injected restore mismatch must retain the WPS
+owner in quarantine; do not induce a destructive hardware failure merely to
+fill that row.
 
-Run separately for both devices:
+## Known-PIN, Pixie and JWPS
+
+On both owned validated APs:
 
 ```text
-wps verify <owned-ap-1-bssid> <owned-ap-1-valid-pin>
+wps verify <owned-bssid> <valid-8-digit-pin>
 wps status
 secret status
 secret reveal
 secret reveal
 
-wps verify <owned-ap-2-bssid> <owned-ap-2-valid-pin>
-wps status
+wps pixie <owned-bssid>
 secret status
+secret reveal
 secret erase
 secret status
 ```
 
-Acceptance:
+Each accepted radio run must emit one `accepted` and exactly one unchanged
+schema-v1 `terminal`. Success requires authenticated M7, restored cleanup,
+released lease, zero live bulk/secret bytes and bounded peaks. First reveal
+returns the expected local value; second reveal returns
+`secret_reveal/result:"empty"` without a generic console error. `secret erase`
+has no acknowledgement and is confirmed with status.
 
-- each accepted run emits one `accepted` and exactly one `terminal`;
-- terminal operation is successful, cleanup is `restored`, lease is `released`;
-- current `bulk_bytes` and `secret_bytes` return to zero, peaks are bounded and
-  `allocation_failures` remains zero;
-- first reveal displays the expected local values, the second returns
-  `secret_reveal/result:"empty"` without a generic console error;
-- erase emits no invented acknowledgement and subsequent status is empty;
-- `/sdcard/lab/wps/results/` contains only complete authenticated-M7 result
-  files; redact secrets before retaining any diagnostic copy.
-
-## Cancellation, failure and quarantine
-
-Start a run and cancel promptly:
+Exercise offline planning with an empty SSID, a quoted spaced SSID and trailing
+word reconstruction:
 
 ```text
-wps verify <owned-ap-bssid> <owned-ap-valid-pin>
-wps stop
-wps status
-secret status
+jwps plan <owned-bssid>
+jwps plan <owned-bssid> "Lab AP With Spaces"
+jwps plan <owned-bssid> Lab AP With Spaces
 ```
 
-Expected: `wps stop` is `stopped` or bounded `stop_pending`; the run eventually
-has one cancelled terminal, cleanup restores/releases, and the secret is empty.
-Repeat with universal `stop`; it must join WPS/analyzer before legacy teardown.
+The two spaced forms must produce the same deterministic deduplicated order.
+Campaign counts `0` and `4` must reject before `accepted`. Run an authorized
+count `1..3`, stop during candidate/retry, and verify `resume_index`: only an
+explicit PIN rejection advances it; timeout, disconnect and setup lock retain
+the candidate.
 
-Safely exercise target-not-found/timeout if the lab can do so without changing
-scope. Failure must not create a success secret, leak allocations or leave a
-false released state. A deliberately induced restoration failure, if available,
-must retain owner/generation in `quarantined`, block mutations and allow status
-and reboot. Do not induce destructive failure merely to fill this row.
+Also exercise early failures which occur before the transport borrows the
+radio: malformed BSSID/PIN, Pixie epoch below/above the documented range and a
+campaign with missing SD/database. These runs must not leave the WPS lease
+quarantined. A subsequent analyzer scan or known-PIN run must start without a
+board/AP reboot.
 
-## Contention in both directions
+Run `selftest db`, `selftest fragment` and `selftest pixie` without disturbing
+the current radio owner. Run `selftest transport` only when WPS can acquire the
+radio, and require exact restore.
 
-### WPS owns the radio
+## Storage and vault matrix
+
+An authenticated-M7 result may create only:
 
 ```text
-wps verify <owned-ap-bssid> <owned-ap-valid-pin>
-wifi_analyzer status
-wifi_analyzer caps
-show_scan_results
-wifi_analyzer scan --band 2.4 --profile passive --limit 1
-wifi_analyzer stop
-wps status
-wps stop
+/sdcard/lab/wps/results/wps_<normalized-bssid>.json
 ```
 
-The three reads remain available. Both analyzer mutations are refused before
-their handlers with the exact old line and nonzero console result:
+No capture-only, no-match, timeout, rejected/partial candidate or cancellation
+may create a success file. A persistence attempt emits additive `wps_storage`
+immediately before the unchanged terminal; protocol, cleanup and storage
+results are independent. Test successful replacement, an existing-file
+preserving cancellation before the commit gate, and missing/read-only/full SD.
+With missing media, authenticated protocol success remains success while
+`wps_storage` reports the storage failure and the vault remains usable.
+
+Confirm the five-minute TTL, reveal-once behavior and second reveal `empty`.
+Confirm explicit erase never cancels an active operation; a later successful
+run may publish a new value. Inspect `unknown_devices.jsonl` only with redacted
+metadata and verify it contains no PIN/candidate/key/session material.
+
+## Contention and startup races
+
+Run each pair in both orders with deterministic timing where the test build
+allows it:
+
+- BOOT-button portal or another legacy startup versus `wps verify`;
+- analyzer scan announcement/preparation versus WPS;
+- `test_radio_channel(s)` versus WPS;
+- manual OTA versus analyzer/WPS;
+- global stop during announced analyzer startup.
+
+Exactly one mutation owns the generation. A loser receives the established
+busy/nonzero contract and does not start a worker. Status/read commands remain
+available. Analyzer and WPS owner-specific stops are admitted but affect only
+their own subsystem. After cleanup, the opposite owner must start without AP
+reboot.
+
+The frozen dispatcher refusal remains:
 
 ```text
 [WFACTL1] {"v":1,"type":"error","command":"console","code":"busy","reason":"radio_lease"}
 Command returned non-zero error code: 0x1 (ERROR)
 ```
 
-No analyzer `begin` may follow a refused scan. `wps stop` remains owner-local.
+## D-UCB and legacy handshaker
 
-### Analyzer owns the radio
+In an isolated authorized RF environment validate:
 
-Start a sufficiently long analyzer scan, then issue:
+1. active-client reconnect/EAPOL reception while all deauth burst delays run;
+2. up to three eligible targets during one D-UCB dwell;
+3. two clients on one AP and two APs with interleaved EAPOL;
+4. FIFO churn during delayed SD writes and stale-generation rejection;
+5. SD removal/full media/delayed `fsync`, then successful retry;
+6. stop during TX, observation, write and publication, followed by second stop;
+7. bounded diagnostic-PCAP allocation/limit rotation recovery;
+8. a multi-hour scan-all soak with final `[HS-DUCB]`, `[HS-PCAP]`, `[HS-TX]`,
+   heap and PSRAM telemetry.
 
-```text
-wifi_analyzer scan --band 2.4 --profile passive --limit 64
-wps status
-secret status
-show_scan_results
-wps verify <owned-ap-bssid> <owned-ap-valid-pin>
-wps stop
-wifi_analyzer status
-wifi_analyzer stop
-```
+A success is valid only when the target-bound HCCAPX and target-only PCAP both
+commit. Confirm `.pcap.part` is not treated as complete. Preserve the existing
+`HANDSHAKE IS COMPLETE AND VALID` and
+`Complete 4-way handshake saved for SSID:` lines for ADV Tab5/CardputerADV/
+FlipperLight replay.
 
-Status/legacy reads remain available. WPS verify and WPS stop receive the same
-busy/nonzero contract and emit no WPS `accepted`. Analyzer stop remains local.
+## Compatibility replay and acceptance record
 
-## Post-release handoff and legacy compatibility
+Replay old `[WFA1]`, `[WFACTL1]`, WPS `accepted`, `wps_status`, `terminal`,
+`wps_stop`, `secret_status` and empty `secret_reveal` fixtures through ADV
+Tab5. Existing records/fields must parse unchanged; unknown additive
+`wps_stage`, `wps_campaign`, `wps_storage`, `[HS-DUCB]` and `[HS-STOP]`
+output may be ignored.
 
-After each owner reaches idle:
+## Remaining target acceptance checklist
 
-```text
-wifi_analyzer scan --band 2.4 --profile passive --limit 1
-wifi_analyzer status
-wps verify <owned-ap-bssid> <owned-ap-valid-pin>
-show_scan_results
-```
+Run these rows on the exact final supported ESP-IDF image. Record the firmware
+SHA-256, cold/warm boot state, owned AP label and redacted UART for every row.
 
-Use a short bounded retry if the next mutation races final worker handoff; no AP
-reboot should be necessary for a transient busy response. Confirm the analyzer
-produces one begin/end transaction, WPS succeeds afterward, and the saved legacy
-snapshot/index mapping is unchanged. Also run the usual legacy scan/selection and
-the existing Tab5/Flipper parsers; WFA/1 remains `v:1` and WPS remains
-`schema_version:1`.
+| Area | Target exercise | Pass evidence |
+| --- | --- | --- |
+| Baseline | Cold boot, warm reboot, SD inserted/absent | WPS/analyzer idle, zero live WPS allocations, expected PSRAM and no retained lease |
+| Known PIN | Correct PIN, wrong PIN, absent AP and AP setup lock | One accepted/terminal pair; only authenticated M7 exposes a secret; exact restore/release |
+| Pixie | Vulnerable AP, nonmatching AP, epoch bounds, stop in capture/search/retry | Ordered stage records; no vault/result for partial/no-match/cancel; exact terminal result |
+| Campaign | Counts 1 and 3; reject, timeout, disconnect, lock and cancellation | Bounded attempts and restart position; only explicit PIN rejection advances the index |
+| Restore | Idle STA with RAM/FLASH storage; stopped STA/AP/APSTA refusal | Complete before/after config equality or deliberate retained quarantine on mismatch |
+| Contention | WPS/analyzer/legacy/button/OTA in both start orders | Exactly one owner; loser uses established busy contract; opposite owner starts after cleanup |
+| Storage | Replace success; missing/full/read-only SD; injected write/sync/close/rename faults | Existing final preserved before commit; storage result independent; residual `.tmp/.bak` inventory inspected locally |
+| Vault | Reveal twice, TTL expiry, explicit erase during an active run | One-shot/expiry semantics and zero live secret bytes after consumption |
+| D-UCB | Interleaved AP/clients, slow SD, stop phases and multi-hour soak | Target-bound HCCAPX/PCAP, no completed `.part`, bounded memory and final HS telemetry |
+| Country RU | `wifi_country set RU`, reboot/status, valid and rejected channel probes, reset | Configured/active `RU`, manual policy and IDF readback; no claim that RU bypasses C5 DFS/SoftAP limits |
+| Client replay | Historical ADV Tab5/CardputerADV/FlipperLight fixtures | Existing records parse unchanged and additive records are ignored safely |
 
-## OTA exclusion
+For the RU row, ESP-IDF 6.0.0 defines channels 1-13, 36-64 and 132-165 for
+that profile; 100-128 are not part of the RU table. Country selection never
+overrides the ESP32-C5 hardware/driver restriction on independently operating a
+SoftAP on DFS channels.
 
-While either owner is active, run the normal manual command appropriate to the
-test environment:
+For every device row record firmware BIN SHA-256, board/AP labels and redacted
+UART. Record live/peak memory, allocation failures, owner/generation, cleanup,
+storage outcome and post-run analyzer state. Do not mark the final image PASS
+until host, build and the applicable target rows all have fresh evidence.
 
-```text
-ota_check [rf] [latest|<tag>]
-```
-
-Acceptance: OTA is refused before its worker/in-progress flag is created. After
-the radio returns idle, a new request must pass the same preconditions it did
-before this integration. Do not perform an actual update merely to prove the
-busy gate.
-
-## MAC and resource acceptance
-
-For each available starting identity (factory, a controlled fixed local-unicast
-address, and one random-per-boot local-unicast address), record the active STA MAC
-before and after WPS success and cancellation. The bytes must match exactly
-within that boot. The production JanOS CLI currently has no `sta_mac` command;
-prepare non-factory identities only with an approved test build/procedure.
-
-For every terminal row record:
-
-- WPS `bulk_bytes=0`, `secret_bytes=0`, bounded peaks and zero allocation failures;
-- lease released after successful cleanup, retained after quarantine;
-- analyzer idle and its PSRAM ownership consistent with `clear`/status;
-- no watchdog trigger, panic, core dump, stale callback output or spontaneous
-  AP reboot.
-
-Store redacted logs with firmware SHA-256 and board/AP labels. Never commit a
-real BSSID, PIN, network key or plaintext result file.
+Related contracts: [WPS workflows](janos-wps.md),
+[shared radio ownership](janos-radio-lease.md),
+[command manual](command-manual.md), and
+[Wi-Fi country/handshake compatibility](wifi-country-ph-dfs-fix.md).

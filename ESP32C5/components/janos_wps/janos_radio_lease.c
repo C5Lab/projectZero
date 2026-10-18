@@ -45,7 +45,8 @@ static void mutation_leave(janos_radio_lease_t *lease)
 static bool matches(const janos_radio_lease_t *lease,
                     janos_radio_owner_t owner, uint32_t generation)
 {
-    return lease && owner != JANOS_RADIO_OWNER_NONE && generation != 0U &&
+    return lease && owner > JANOS_RADIO_OWNER_NONE &&
+        owner <= JANOS_RADIO_OWNER_LEGACY && generation != 0U &&
         atomic_load_explicit(&lease->owner, memory_order_acquire) ==
             (uint32_t)owner &&
         atomic_load_explicit(&lease->generation, memory_order_acquire) ==
@@ -56,8 +57,8 @@ janos_radio_lease_result_t janos_radio_lease_acquire(
     janos_radio_lease_t *lease, janos_radio_owner_t owner,
     uint32_t *generation_out)
 {
-    if (!lease || owner == JANOS_RADIO_OWNER_NONE ||
-        owner > JANOS_RADIO_OWNER_WPS) return JANOS_RADIO_LEASE_INVALID;
+    if (!lease || owner <= JANOS_RADIO_OWNER_NONE ||
+        owner > JANOS_RADIO_OWNER_LEGACY) return JANOS_RADIO_LEASE_INVALID;
     mutation_enter(lease);
     janos_radio_lease_result_t result = JANOS_RADIO_LEASE_BUSY;
     const uint32_t state = atomic_load_explicit(&lease->state, memory_order_acquire);
@@ -66,6 +67,10 @@ janos_radio_lease_result_t janos_radio_lease_acquire(
         goto done;
     }
     if (state != JANOS_RADIO_LEASE_IDLE) goto done;
+    if (atomic_load_explicit(&lease->generation, memory_order_acquire) != 0U ||
+        atomic_load_explicit(&lease->callbacks_open, memory_order_acquire) ||
+        atomic_load_explicit(&lease->cancel_requested, memory_order_acquire))
+        goto done;
     if (atomic_load_explicit(&lease->generation_exhausted,
                              memory_order_acquire) ||
         atomic_load_explicit(&lease->next_generation,
@@ -106,6 +111,26 @@ janos_radio_lease_result_t janos_radio_lease_acquire(
 done:
     mutation_leave(lease);
     return result;
+}
+
+bool janos_radio_lease_finish_startup(janos_radio_lease_t *lease,
+                                     janos_radio_owner_t owner,
+                                     uint32_t generation)
+{
+    if (!lease || owner != JANOS_RADIO_OWNER_LEGACY) return false;
+    mutation_enter(lease);
+    bool valid = matches(lease, owner, generation) &&
+        atomic_load_explicit(&lease->state, memory_order_acquire) ==
+            JANOS_RADIO_LEASE_PREPARING &&
+        !atomic_load_explicit(&lease->callbacks_open, memory_order_acquire);
+    if (valid) {
+        atomic_store_explicit(&lease->cancel_requested, false, memory_order_release);
+        atomic_store_explicit(&lease->state, JANOS_RADIO_LEASE_IDLE, memory_order_release);
+        atomic_store_explicit(&lease->generation, 0U, memory_order_release);
+        atomic_store_explicit(&lease->owner, JANOS_RADIO_OWNER_NONE, memory_order_release);
+    }
+    mutation_leave(lease);
+    return valid;
 }
 
 bool janos_radio_lease_mark_running(janos_radio_lease_t *lease,
@@ -287,15 +312,13 @@ janos_radio_lease_snapshot_t janos_radio_lease_snapshot(
         snapshot.state = JANOS_RADIO_LEASE_IDLE;
         snapshot.generation = 0U;
         snapshot.cancel_requested = false;
+    } else if (snapshot.generation == 0U) {
+        snapshot.state = JANOS_RADIO_LEASE_PREPARING;
+        snapshot.generation = (uint32_t)atomic_load_explicit(
+            &lease->next_generation, memory_order_acquire);
+        if (snapshot.generation == 0U) snapshot.generation = UINT32_MAX;
     } else if (snapshot.state == JANOS_RADIO_LEASE_IDLE) {
-        if (snapshot.generation == 0U) {
-            snapshot.state = JANOS_RADIO_LEASE_PREPARING;
-            snapshot.generation = (uint32_t)atomic_load_explicit(
-                &lease->next_generation, memory_order_acquire);
-            if (snapshot.generation == 0U) snapshot.generation = UINT32_MAX;
-        } else {
-            snapshot.state = JANOS_RADIO_LEASE_CLEANUP;
-        }
+        snapshot.state = JANOS_RADIO_LEASE_CLEANUP;
     }
     return snapshot;
 }

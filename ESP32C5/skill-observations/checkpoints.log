@@ -70,3 +70,23 @@
 2026-10-16 WPS mini-OS Task 2 checkpoint: no new reusable skill observations after focused red tests and hash-verified engine relocation.
 2026-10-17 ESP-IDF 6.0.1 WPS pin checkpoint: no new reusable skill observations after guard diagnosis, red-green contract testing, and full firmware build.
 2026-10-17 handshake TX telemetry checkpoint: no new reusable skill observations after callback lifecycle design, red-green counter tests, and full host regression verification.
+2026-10-17 bounded D-UCB PCAP checkpoint: reusable observation - keep high-rate Wi-Fi callbacks allocation-light by reporting append status only; rotate bounded buffers in the worker, advance capture flags only after committed bytes, and allocate replacement storage before releasing the prior capture.
+2026-10-17 radio/WPS hardening setup checkpoint: no new reusable skill observations after baseline capture, SDD ledger creation, and Task 1 dispatch.
+2026-10-17 WPS lifetime checkpoint: no new reusable skill observations after Task 1 RED/GREEN implementation, sanitizer verification, and independent review approval.
+2026-10-17 radio hardening Tasks 2-3 checkpoint: reusable observation captured separately for testing the earliest unlocked admission boundary; atomic owner publication and exact idle-STA WPS restore passed focused ordinary/sanitized tests and independent review.
+2026-10-18 D-UCB hardening checkpoint: reusable observations include testing executable concurrency seams instead of source regexes, making capture identity include AP plus client plus generations, and using the final PCAP rename as a publication commit marker after durable target-bound HCCAPX validation.
+2026-10-18 Tasks 5-6 completion checkpoint: reusable observations include linearizing cancel versus persistent commit with a shared gate, avoiding preemptible atomic spinlocks on single-core firmware, testing public-header include closure with the exact SDK, and scanning touched tests/docs for real lab credentials before final approval.
+2026-10-17 task4 re-review checkpoint: no new reusable skill observations.
+2026-10-18 WPS Task 5 checkpoint: no new reusable skill observations after parser/service/wire-contract restoration, tracked Pixie PSRAM, and mixed-operation sanitizer coverage.
+2026-10-18 WPS Task 5 race-hardening checkpoint: reusable observation - cancellation and irreversible persistence must share one lifecycle commit gate; repeated polling plus rollback cannot close the final rename race.
+
+2026-10-18 Task 5 final race-review checkpoint: no additional reusable skill observation; accepted-output gating and rejected-start vault preservation are task-specific concurrency contracts.
+2026-10-18 Task 6 documentation checkpoint: no new reusable skill observation after reconciling current command, wire, lease, restore, D-UCB and historical evidence contracts.
+2026-10-18 fix_transport_public_header: observation 0008 recorded after root-cause reproduction, RED/GREEN header-closure test, and focused WPS regression verification.
+2026-10-18 fix_handshake_log_literal: no new observation after RED/GREEN exact-macro compilation, stale declaration audit, and 87-test regression run.
+2026-10-18 result-store I/O fault TDD checkpoint: no new reusable skill observations.
+2026-10-18 RU country-policy checkpoint: no new reusable skill observations after existing-profile audit, RED/GREEN driver-boundary extraction, focused RU persistence coverage, and regulatory documentation correction.
+2026-10-18 WPS pre-radio cleanup checkpoint: no new reusable skill observations after no-op cleanup classification, all-path mutable PIN wiping, and immediate-worker UAF sanitizer verification.
+2026-10-18: secret reveal escaping TDD batch complete; no new reusable skill observation.
+2026-10-18: no new reusable skill observation from D-UCB reservation cleanup; existing concurrency-boundary principles covered the TDD workflow.
+2026-10-18: no observations - JSONL partial-append rollback fix followed existing TDD and systematic-debugging guidance.

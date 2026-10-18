@@ -5,7 +5,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-typedef struct {
+typedef struct wps_transport_ops {
     /* deinit must be safe after a failed/partially completed init. */
     int (*init)(void *context);
     int (*start)(void *context);

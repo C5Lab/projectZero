@@ -7,13 +7,22 @@ typedef int esp_err_t;
 typedef uint8_t u8;
 typedef uint32_t u32;
 typedef struct { int nvs_enable; } wifi_init_config_t;
+typedef int wifi_mode_t;
+typedef int wifi_storage_t;
+typedef int wifi_second_chan_t;
+typedef union {
+    struct { uint8_t ssid[32]; uint8_t password[64]; uint8_t other[96]; } sta;
+    uint8_t bytes[192];
+} wifi_config_t;
 #define WIFI_INIT_CONFIG_DEFAULT() ((wifi_init_config_t){1})
 enum {
     ESP_OK = 0, ESP_FAIL = -1, ESP_ERR_NO_MEM = 1, ESP_ERR_INVALID_STATE = 2,
     ESP_ERR_WIFI_NOT_CONNECT = 3, WIFI_IF_STA = 0, WIFI_STORAGE_RAM = 1,
     WIFI_MODE_STA = 1, WIFI_APPIE_WPS_AR = 1, WPS_TYPE_DISABLE = 0,
     WPS_TYPE_PIN = 1, WPS_STATUS_DISABLE = 0, WPS_STATUS_PENDING = 1,
-    MALLOC_CAP_INTERNAL = 1, ESP_MAC_WIFI_STA = 0,
+    MALLOC_CAP_INTERNAL = 1, MALLOC_CAP_8BIT = 2, ESP_MAC_WIFI_STA = 0,
+    WIFI_STORAGE_FLASH = 0, WIFI_MODE_AP = 2, WIFI_MODE_APSTA = 3,
+    WIFI_SECOND_CHAN_NONE = 0, WIFI_SECOND_CHAN_ABOVE = 1,
 };
 struct wps_scan_ie { int unused; };
 struct wps_funcs {
@@ -25,6 +34,13 @@ struct wps_funcs {
 esp_err_t esp_wifi_init(const wifi_init_config_t *config);
 esp_err_t esp_wifi_set_storage(int storage);
 esp_err_t esp_wifi_set_mode(int mode);
+esp_err_t esp_wifi_get_mode(wifi_mode_t *mode);
+esp_err_t esp_wifi_get_config(int interface, wifi_config_t *config);
+esp_err_t esp_wifi_set_config(int interface, wifi_config_t *config);
+esp_err_t esp_wifi_get_channel(uint8_t *primary, wifi_second_chan_t *secondary);
+esp_err_t esp_wifi_set_channel(uint8_t primary, wifi_second_chan_t secondary);
+void *heap_caps_calloc(size_t count, size_t size, unsigned caps);
+void heap_caps_free(void *memory);
 esp_err_t esp_wifi_start(void);
 esp_err_t esp_wifi_stop(void);
 esp_err_t esp_wifi_deinit(void);

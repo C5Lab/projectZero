@@ -108,6 +108,29 @@ static bool durable_close(FILE *file)
     return ok;
 }
 
+/* Observation records are appended to a shared JSONL file.  Keep the stream
+ * unbuffered and restore the previous durable length if any write/flush/fsync
+ * step fails, otherwise a leading fingerprint can make a later retry look
+ * like a duplicate even though no complete JSON record was stored. */
+static bool durable_append_close(FILE *file, off_t previous_length,
+                                 bool content_ok)
+{
+    int fd = fileno(file);
+    bool durable = content_ok && fd >= 0;
+    if (durable && fflush(file) != 0) durable = false;
+    if (durable && fsync(fd) != 0) durable = false;
+
+    if (!durable) {
+        clearerr(file);
+        if (fd >= 0) {
+            (void)ftruncate(fd, previous_length);
+            (void)fsync(fd);
+        }
+    }
+    if (fclose(file) != 0) durable = false;
+    return durable;
+}
+
 static void bssid_text(const uint8_t bssid[6], char output[18], char dashed[18])
 {
     (void)snprintf(output, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -116,23 +139,112 @@ static void bssid_text(const uint8_t bssid[6], char output[18], char dashed[18])
                    bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
 }
 
-static bool replace_recoverably(const char *temporary, const char *final_path)
+static int default_rename(void *context, const char *from, const char *to)
+{
+    (void)context;
+    return rename(from, to);
+}
+
+static int default_remove(void *context, const char *path)
+{
+    (void)context;
+    return remove(path);
+}
+
+static lab_store_path_state_t default_path_state(void *context,
+                                                 const char *path)
+{
+    (void)context;
+    struct stat info;
+    if (path && stat(path, &info) == 0) return LAB_STORE_PATH_EXISTS;
+    return errno == ENOENT ? LAB_STORE_PATH_MISSING : LAB_STORE_PATH_ERROR;
+}
+
+static const lab_store_file_ops_t default_file_ops = {
+    .rename_path = default_rename,
+    .remove_path = default_remove,
+    .path_state = default_path_state,
+};
+
+static lab_store_path_state_t path_state(const lab_store_file_ops_t *ops,
+                                         void *context, const char *path)
+{
+    return ops->path_state ? ops->path_state(context, path) :
+                             default_path_state(NULL, path);
+}
+
+static bool remove_if_present(const lab_store_file_ops_t *ops, void *context,
+                              const char *path)
+{
+    lab_store_path_state_t state = path_state(ops, context, path);
+    if (state == LAB_STORE_PATH_ERROR) return false;
+    if (state == LAB_STORE_PATH_MISSING) return true;
+    return ops->remove_path(context, path) == 0;
+}
+
+/* A denied or failed commit must not leave a durable credential-bearing temp
+ * file.  Truncate and fsync before unlink so even an unlink failure leaves no
+ * PIN/key payload behind; report failure rather than claiming cancellation. */
+static bool discard_sensitive_temp(const lab_store_file_ops_t *ops,
+                                   void *context, const char *path)
+{
+    FILE *file = fopen(path, "wb");
+    if (!file) return path_state(ops, context, path) == LAB_STORE_PATH_MISSING;
+    if (!durable_close(file)) return false;
+    return remove_if_present(ops, context, path);
+}
+
+static bool recover_interrupted_replace(
+    const char *final_path, const char *backup,
+    const lab_store_file_ops_t *ops, void *context)
+{
+    lab_store_path_state_t backup_state = path_state(ops, context, backup);
+    if (backup_state == LAB_STORE_PATH_ERROR) return false;
+    if (backup_state == LAB_STORE_PATH_MISSING) return true;
+    lab_store_path_state_t final_state = path_state(ops, context, final_path);
+    if (final_state == LAB_STORE_PATH_ERROR) return false;
+    if (final_state == LAB_STORE_PATH_EXISTS)
+        return remove_if_present(ops, context, backup);
+    return ops->rename_path(context, backup, final_path) == 0;
+}
+
+static lab_store_status_t replace_recoverably(
+    const char *temporary, const char *final_path,
+    const lab_store_file_ops_t *ops, void *context)
 {
     char backup[LAB_STORE_PATH_MAX];
-    if (!path_suffix(backup, sizeof(backup), final_path, ".bak")) return false;
-    (void)remove(backup);
-    bool had_previous = rename(final_path, backup) == 0;
-    if (!had_previous && errno != ENOENT) return false;
-    if (rename(temporary, final_path) != 0) {
-        if (had_previous) (void)rename(backup, final_path);
-        return false;
+    if (!path_suffix(backup, sizeof(backup), final_path, ".bak"))
+        return LAB_STORE_IO_ERROR;
+    if (!recover_interrupted_replace(final_path, backup, ops, context) ||
+        !remove_if_present(ops, context, backup))
+        return LAB_STORE_IO_ERROR;
+    lab_store_path_state_t final_state = path_state(ops, context, final_path);
+    if (final_state == LAB_STORE_PATH_ERROR) return LAB_STORE_IO_ERROR;
+    bool had_previous = final_state == LAB_STORE_PATH_EXISTS;
+    if (had_previous && ops->rename_path(context, final_path, backup) != 0)
+        return LAB_STORE_IO_ERROR;
+    if (ops->rename_path(context, temporary, final_path) != 0) {
+        lab_store_path_state_t after_failure =
+            path_state(ops, context, final_path);
+        if (had_previous && after_failure == LAB_STORE_PATH_MISSING)
+            (void)ops->rename_path(context, backup, final_path);
+        return LAB_STORE_IO_ERROR;
     }
-    if (had_previous) (void)remove(backup);
-    return true;
+    if (had_previous && !remove_if_present(ops, context, backup))
+        return LAB_STORE_IO_ERROR;
+    return LAB_STORE_OK;
 }
 
 lab_store_status_t lab_result_store_success(
     const char *root, const lab_result_record_t *record)
+{
+    return lab_result_store_success_gated(root, record, NULL, NULL, NULL, NULL);
+}
+
+lab_store_status_t lab_result_store_success_gated(
+    const char *root, const lab_result_record_t *record,
+    lab_store_commit_gate_fn commit_gate, void *commit_context,
+    const lab_store_file_ops_t *file_ops, void *file_context)
 {
     if (!root || !record || !record->authenticated_m7 ||
         !explicit_bssid(record->bssid) || !valid_pin(record->pin) ||
@@ -157,6 +269,8 @@ lab_store_status_t lab_result_store_success(
         !path_suffix(temp_path, sizeof(temp_path), final_path, ".tmp"))
         return LAB_STORE_IO_ERROR;
 
+    const lab_store_file_ops_t *ops = file_ops ? file_ops : &default_file_ops;
+    if (!ops->rename_path || !ops->remove_path) return LAB_STORE_INVALID;
     FILE *file = fopen(temp_path, "wb");
     if (!file) return LAB_STORE_IO_ERROR;
     bool ok = fprintf(file,
@@ -183,13 +297,20 @@ lab_store_status_t lab_result_store_success(
                                              identity_values[index] : "");
     }
     ok = ok && fputs(",\"authenticated_m7\":true}\n", file) >= 0;
-    if (!ok || !durable_close(file)) {
-        (void)remove(temp_path);
+    bool durable = durable_close(file);
+    if (!ok || !durable) {
+        (void)discard_sensitive_temp(ops, file_context, temp_path);
         return LAB_STORE_IO_ERROR;
     }
-    if (!replace_recoverably(temp_path, final_path)) {
-        (void)remove(temp_path);
-        return LAB_STORE_IO_ERROR;
+    if (commit_gate && !commit_gate(commit_context, record->operation_id)) {
+        return discard_sensitive_temp(ops, file_context, temp_path) ?
+            LAB_STORE_CANCELLED : LAB_STORE_IO_ERROR;
+    }
+    lab_store_status_t promoted = replace_recoverably(
+        temp_path, final_path, ops, file_context);
+    if (promoted != LAB_STORE_OK) {
+        (void)discard_sensitive_temp(ops, file_context, temp_path);
+        return promoted;
     }
     return LAB_STORE_OK;
 }
@@ -228,6 +349,7 @@ lab_store_status_t lab_result_store_observation(
     char marker[32];
     (void)snprintf(marker, sizeof(marker),
                    "\"fingerprint\":\"%08" PRIx32 "\"", id);
+    off_t append_offset = 0;
     FILE *existing = fopen(path, "rb");
     if (existing) {
         if (fseek(existing, 0, SEEK_END) != 0) {
@@ -243,6 +365,11 @@ lab_store_status_t lab_result_store_observation(
             (void)fclose(existing);
             return LAB_STORE_FULL;
         }
+        append_offset = (off_t)size;
+        if ((long)append_offset != size) {
+            (void)fclose(existing);
+            return LAB_STORE_IO_ERROR;
+        }
         rewind(existing);
         char line[768];
         while (fgets(line, sizeof(line), existing)) {
@@ -251,10 +378,16 @@ lab_store_status_t lab_result_store_observation(
                 return LAB_STORE_DUPLICATE;
             }
         }
-        if (ferror(existing) || fclose(existing) != 0) return LAB_STORE_IO_ERROR;
+        bool read_error = ferror(existing) != 0;
+        bool close_error = fclose(existing) != 0;
+        if (read_error || close_error) return LAB_STORE_IO_ERROR;
     }
     FILE *file = fopen(path, "ab");
     if (!file) return LAB_STORE_IO_ERROR;
+    if (setvbuf(file, NULL, _IONBF, 0) != 0) {
+        (void)fclose(file);
+        return LAB_STORE_IO_ERROR;
+    }
     char bssid[18], dashed[18];
     bssid_text(item->bssid, bssid, dashed);
     bool ok = fprintf(file,
@@ -272,7 +405,8 @@ lab_store_status_t lab_result_store_observation(
         ok = ok && write_json_text(file, values[index] ? values[index] : "");
     }
     ok = ok && fputs("}\n", file) >= 0;
-    if (!ok || !durable_close(file)) return LAB_STORE_IO_ERROR;
+    bool durable = durable_append_close(file, append_offset, ok);
+    if (!ok || !durable) return LAB_STORE_IO_ERROR;
     return LAB_STORE_OK;
 }
 
@@ -283,6 +417,7 @@ const char *lab_store_status_name(lab_store_status_t status)
     case LAB_STORE_DUPLICATE: return "duplicate";
     case LAB_STORE_INVALID: return "invalid";
     case LAB_STORE_FULL: return "full";
+    case LAB_STORE_CANCELLED: return "cancelled";
     default: return "io_error";
     }
 }

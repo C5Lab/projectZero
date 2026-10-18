@@ -76,7 +76,7 @@ static void test_complete_verify(void) {
     };
     fake_transport_t fake = {.events = events, .count = sizeof(events) / sizeof(events[0])};
     lab_wps_session_t state = session(&fake);
-    lab_wps_request_t input = request("60980465");
+    lab_wps_request_t input = request("31415927");
     lab_wps_result_t result;
     assert(lab_wps_verify_pin(&state, &input, &result));
     assert(result.session_result == WPS_SESSION_SUCCESS);
@@ -262,7 +262,7 @@ static void test_retransmits_last_response_for_duplicate_wsc_messages(void) {
     };
     fake_transport_t fake = {.events = events, .count = sizeof(events) / sizeof(events[0])};
     lab_wps_session_t state = session(&fake);
-    lab_wps_request_t input = request("60980465");
+    lab_wps_request_t input = request("31415927");
     lab_wps_result_t result;
     const lab_wps_action_t expected[] = {
         LAB_WPS_ACTION_START, LAB_WPS_ACTION_M2, LAB_WPS_ACTION_M2,
@@ -291,7 +291,7 @@ static void test_retries_last_response_after_one_stage_timeout(void) {
     };
     fake_transport_t fake = {.events = events, .count = sizeof(events) / sizeof(events[0])};
     lab_wps_session_t state = session(&fake);
-    lab_wps_request_t input = request("60980465");
+    lab_wps_request_t input = request("31415927");
     lab_wps_result_t result;
     const lab_wps_action_t expected[] = {
         LAB_WPS_ACTION_START, LAB_WPS_ACTION_M2, LAB_WPS_ACTION_M2,
@@ -315,7 +315,7 @@ static lab_wps_result_t run_terminal(lab_wps_event_t event) {
     events[3] = event;
     fake_transport_t fake = {.events = events, .count = 4};
     lab_wps_session_t state = session(&fake);
-    lab_wps_request_t input = request("60980465");
+    lab_wps_request_t input = request("31415927");
     lab_wps_result_t result;
     assert(lab_wps_verify_pin(&state, &input, &result));
     return result;
@@ -342,7 +342,7 @@ static void test_identity_loop_and_cancel(void) {
     for (size_t i = 1; i < 10; ++i) events[i].kind = LAB_WPS_EVENT_IDENTITY;
     fake_transport_t fake = {.events = events, .count = 10};
     lab_wps_session_t state = session(&fake);
-    lab_wps_request_t input = request("60980465");
+    lab_wps_request_t input = request("31415927");
     lab_wps_result_t result;
     assert(lab_wps_verify_pin(&state, &input, &result));
     assert(result.session_result == WPS_SESSION_IDENTITY_LOOP);

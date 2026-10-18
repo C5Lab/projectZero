@@ -141,7 +141,7 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         parser = tokens(function_body(CORE, "wfa_parse_scan_args"))
         self.assertIn("out->limit = WFA_DEFAULT_LIMIT", parser)
         self.assertIn("WFA_MAX_APS", parser)
-        caps_body = function_body(ADAPTER, "wifi_analyzer_command")
+        caps_body = function_body(ADAPTER, "wifi_analyzer_command_with_startup")
         caps_decl = re.search(r"static const char caps\[\]\s*=\s*(.*?);", caps_body, re.DOTALL)
         self.assertIsNotNone(caps_decl)
         pieces = re.findall(r'"(?:\\.|[^"\\])*"', caps_decl.group(1))
@@ -164,7 +164,7 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         self.assertIsNone(reader.last_snapshot)
 
     def test_worker_waits_for_creator_publication_before_scan_start(self):
-        command = tokens(function_body(ADAPTER, "wifi_analyzer_command"))
+        command = tokens(function_body(ADAPTER, "wifi_analyzer_command_with_startup"))
         worker = tokens(function_body(ADAPTER, "analyzer_worker"))
         self.assertLess(command.index("xTaskCreate(analyzer_worker"),
                         command.index("s_worker = worker"))
@@ -218,11 +218,8 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         country_source = function_body(MAIN, "wifi_apply_configured_country")
         country = tokens(country_source)
         self.assertIn("wifi_country_configured", country)
-        self.assertIn("wifi_country_policy_is_pa", country)
-        self.assertIn("esp_wifi_set_country_code", country)
-        self.assertIn("esp_wifi_set_country(&country)", country)
-        self.assertIn("esp_wifi_get_country(&readback)", country)
-        self.assertIn("WIFI_COUNTRY_POLICY_MANUAL", country)
+        self.assertIn("wifi_country_driver_apply_and_verify", country)
+        self.assertIn('"wifi_country_driver.c"', CMAKE)
 
         wrapper = tokens(function_body(MAIN, "wifi_init_with_configured_country"))
         self.assertLess(wrapper.index("esp_wifi_init(config)"),
@@ -250,11 +247,13 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         worker = tokens(function_body(MAIN, "handshake_attack_task_sniffer"))
         prepare = tokens(function_body(MAIN, "handshake_prepare_sniffer_channel"))
         target_prepare = tokens(function_body(MAIN, "handshake_prepare_target_radio"))
-        deauth = tokens(function_body(MAIN, "hs_send_targeted_deauth"))
+        deauth = tokens(function_body(MAIN, "hs_deauth_burst_tx"))
+        deauth_send = tokens(function_body(MAIN, "hs_send_targeted_deauth"))
         callback = tokens(function_body(MAIN, "hs_sniffer_promiscuous_cb"))
         packet = tokens(function_body(MAIN, "hs_sniffer_process_packet"))
         cleanup = tokens(function_body(MAIN, "handshake_cleanup"))
-        stop = tokens(function_body(MAIN, "cmd_stop"))
+        stop_source = function_body(MAIN, "cmd_stop")
+        stop = tokens(stop_source)
         task = tokens(function_body(MAIN, "handshake_attack_task"))
 
         # Handshake capture uses one legacy-compatible radio contract for all
@@ -276,7 +275,7 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
             "if (!handshake_prepare_sniffer_channel(channel))", 1
         )[1].split("vTaskDelay(pdMS_TO_TICKS(HS_DWELL_TIME_MS))", 1)[0])
         compact_worker = re.sub(r"\s+", "", worker)
-        self.assertIn("hs_send_targeted_deauth(client->mac,ap->bssid,ap->channel)",
+        self.assertIn("hs_send_targeted_deauth(target->client,target->bssid,target->channel)",
                       compact_worker)
 
         # D-UCB and explicit-target paths verify APSTA and channel readback;
@@ -294,12 +293,18 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         self.assertNotIn("handshake_radio_path_for_channel", target_prepare)
 
         # Both directions of targeted deauth retain the historical AP TX path.
-        self.assertGreaterEqual(deauth.count("esp_wifi_80211_tx(WIFI_IF_AP"), 2)
+        self.assertEqual(deauth.count("esp_wifi_80211_tx(WIFI_IF_AP"), 1)
+        self.assertIn("ap_to_client ? context->station_mac : context->ap_bssid",
+                      deauth)
+        self.assertIn("ap_to_client ? context->ap_bssid : context->station_mac",
+                      deauth)
         self.assertNotIn("WIFI_IF_STA", deauth)
-        self.assertLess(deauth.index("esp_wifi_get_mode"),
-                        deauth.index("esp_wifi_80211_tx(WIFI_IF_AP"))
-        self.assertLess(deauth.index("esp_wifi_get_channel"),
-                        deauth.index("esp_wifi_80211_tx(WIFI_IF_AP"))
+        self.assertIn("esp_wifi_get_mode", deauth_send)
+        self.assertIn("esp_wifi_get_channel", deauth_send)
+        self.assertLess(deauth_send.index("esp_wifi_get_mode"),
+                        deauth_send.index("hs_ducb_run_burst"))
+        self.assertLess(deauth_send.index("esp_wifi_get_channel"),
+                        deauth_send.index("hs_ducb_run_burst"))
 
         self.assertNotIn('"handshake_radio_policy.c"', CMAKE)
 
@@ -307,31 +312,29 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         # tables and capture serializers.  The callback never blocks the Wi-Fi
         # task when the worker owns the snapshot.
         self.assertIn("SemaphoreHandle_t sniffer_mutex = hs_sniffer_mutex", callback)
-        self.assertIn("xSemaphoreTake(sniffer_mutex, 0)", callback)
-        self.assertIn("xSemaphoreGive(sniffer_mutex)", callback)
+        self.assertIn("hs_sniffer_lock(sniffer_mutex, 0)", callback)
+        self.assertIn("hs_sniffer_unlock(sniffer_mutex)", callback)
         self.assertIn("atomic_fetch_add_explicit(&hs_sniffer_callbacks_inflight", callback)
         self.assertIn("atomic_fetch_sub_explicit(&hs_sniffer_callbacks_inflight", callback)
         self.assertNotIn("check_handshake_file_exists", packet)
         self.assertIn("check_handshake_file_exists", worker)
-        self.assertIn("xSemaphoreTake(hs_sniffer_mutex, portMAX_DELAY)", worker)
-        self.assertIn("xSemaphoreGive(hs_sniffer_mutex)", worker)
-        first_worker_lock = worker.index("xSemaphoreTake(hs_sniffer_mutex, portMAX_DELAY)")
+        self.assertIn("hs_sniffer_lock(hs_sniffer_mutex, portMAX_DELAY)", worker)
+        self.assertIn("hs_sniffer_unlock(hs_sniffer_mutex)", worker)
+        first_worker_lock = worker.index("hs_sniffer_lock(hs_sniffer_mutex, portMAX_DELAY)")
         self.assertLess(first_worker_lock, worker.index("hs_dwell_new_clients = 0"))
-        self.assertIn("xSemaphoreTake(hs_sniffer_mutex, portMAX_DELAY)", cleanup)
-        self.assertIn("xSemaphoreGive(hs_sniffer_mutex)", cleanup)
+        self.assertIn("hs_sniffer_lock(hs_sniffer_mutex, portMAX_DELAY)", cleanup)
+        self.assertIn("hs_sniffer_unlock(hs_sniffer_mutex)", cleanup)
 
-        # Stop disables promiscuous reception before a worker can be force
-        # deleted, and the post-deauth listen is interruptible.
+        # Stop disables promiscuous reception and waits only to a bounded
+        # deadline. The worker remains sole owner of cleanup and self-delete.
         stop_trigger = stop.index("handshake_attack_active = false")
         promisc_off = stop.index("esp_wifi_set_promiscuous(false)", stop_trigger)
-        worker_delete = stop.index("vTaskDelete(handshake_attack_task_handle)", stop_trigger)
         self.assertLess(stop_trigger, promisc_off)
-        self.assertLess(promisc_off, worker_delete)
-        recreated = stop.index("xSemaphoreCreateMutexStatic(&hs_sniffer_mutex_storage)",
-                               worker_delete)
-        self.assertGreater(recreated, worker_delete)
-        self.assertLess(stop.index("handshake_quiesce_sniffer_callbacks", stop_trigger),
-                        worker_delete)
+        self.assertIn("HS_STOP_WAIT_MS", stop[promisc_off:])
+        self.assertIn("stop_pending", stop_source)
+        self.assertNotIn("vTaskDelete(handshake_attack_task_handle)", stop)
+        self.assertGreater(stop.index("handshake_quiesce_sniffer_callbacks",
+                                      stop_trigger), promisc_off)
         self.assertNotIn("handshake_attack_task_handle = NULL", cleanup)
         self.assertLess(task.index("handshake_cleanup()"),
                         task.index("handshake_attack_task_handle = NULL"))
@@ -343,7 +346,8 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         start = tokens(function_body(MAIN, "handshake_tx_telemetry_start"))
         stop_telemetry = tokens(function_body(MAIN, "handshake_tx_telemetry_stop"))
         cleanup = tokens(function_body(MAIN, "handshake_cleanup"))
-        stop = tokens(function_body(MAIN, "cmd_stop"))
+        stop_source = function_body(MAIN, "cmd_stop")
+        stop = tokens(stop_source)
 
         self.assertIn("tx_info == NULL || tx_info->data == NULL", callback)
         self.assertIn("(tx_info->data[0] & 0xfcU) != 0xc0U", callback)
@@ -366,10 +370,63 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
 
         self.assertLess(cleanup.index("attack_handshake_stop()"),
                         cleanup.index("handshake_tx_telemetry_stop"))
-        force_delete = stop.index("vTaskDelete(handshake_attack_task_handle)")
-        self.assertGreater(stop.index("handshake_tx_telemetry_stop", force_delete),
-                           force_delete)
+        self.assertNotIn("vTaskDelete(handshake_attack_task_handle)", stop)
+        self.assertIn("handshake_tx_telemetry_stop", stop)
         self.assertIn('"handshake_tx_telemetry.c"', CMAKE)
+
+    def test_ducb_pcap_is_bounded_rotated_and_cleanup_is_mode_scoped(self):
+        packet_source = function_body(MAIN, "hs_sniffer_process_packet")
+        packet = tokens(packet_source)
+        worker = tokens(function_body(MAIN, "handshake_attack_task_sniffer"))
+        compact_worker = re.sub(r"\s+", "", worker)
+        rotate = tokens(function_body(MAIN, "hs_pcap_rotate_if_pending"))
+        record = tokens(function_body(MAIN, "hs_pcap_record_append_result"))
+        cleanup = tokens(function_body(MAIN, "handshake_cleanup"))
+
+        self.assertIn("HS_PCAP_INITIAL_CAPACITY", MAIN)
+        self.assertIn("HS_PCAP_MAX_BYTES", MAIN)
+        self.assertIn("(512U * 1024U)", MAIN)
+        self.assertIn("pcap_serializer_init_bounded(HS_PCAP_INITIAL_CAPACITY,HS_PCAP_MAX_BYTES,true)",
+                      compact_worker)
+
+        # The callback records only status. Rotation, allocation and logging
+        # remain worker responsibilities.
+        self.assertIn("PCAP_SERIALIZER_APPEND_LIMIT", record)
+        self.assertIn("PCAP_SERIALIZER_APPEND_ALLOC_FAILED", record)
+        self.assertNotIn("MY_LOG", record)
+        self.assertNotIn("printf", record)
+        self.assertNotIn("sdcard", record.lower())
+        self.assertIn("hs_pcap_rotate_if_pending()", worker)
+        self.assertIn("!hs_pcap_rotation_pending", worker)
+        self.assertIn("hs_capture_snapshot_create", worker)
+        self.assertIn("hs_save_handshake_snapshot_to_sd", worker)
+        self.assertIn("hs_capture_snapshot_release", worker)
+        self.assertNotIn("handshake_attack_active = false", worker.split(
+            "hs_pcap_rotate_if_pending()", 1)[1])
+
+        # Capture flags and HCCAPX state can advance only when the same frame
+        # was committed to the PCAP buffer.
+        self.assertIn("pcap_serializer_append_frame_checked", packet)
+        beacon_ok = packet.index("PCAP_SERIALIZER_APPEND_OK")
+        self.assertLess(beacon_ok, packet.index("beacon_captured = true", beacon_ok))
+        eapol_append = packet.rindex("pcap_serializer_append_frame_checked")
+        self.assertLess(eapol_append, packet.index("captured_m1 = true", eapol_append))
+        self.assertLess(eapol_append, packet.index("hccapx_serializer_add_frame", eapol_append))
+
+        # Rotation invalidates every partial capture and starts both serializers
+        # from a clean state. Selected/manual mode retains legacy ownership.
+        for marker in ("beacon_captured = false", "captured_m1 = false",
+                       "captured_m2 = false", "captured_m3 = false",
+                       "captured_m4 = false", "complete = false"):
+            self.assertIn(marker, rotate)
+        self.assertIn("hccapx_serializer_init", rotate)
+        self.assertIn("pcap_serializer_deinit()", cleanup)
+        self.assertIn("!handshake_selected_mode", cleanup)
+
+        stop_source = function_body(MAIN, "cmd_stop")
+        stop = tokens(stop_source)
+        self.assertNotIn("vTaskDelete(handshake_attack_task_handle)", stop)
+        self.assertIn("stop_pending", stop_source)
 
     def test_wifi_country_cli_is_persistent_and_additive(self):
         registration = function_body(MAIN, "register_commands")
@@ -382,14 +439,14 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
 
     def test_legacy_dispatch_releases_lock_while_inflight_blocks_analyzer(self):
         dispatch = tokens(function_body(MAIN, "janos_console_cmd_dispatch"))
-        decision = dispatch.index("janos_console_admission_decide(")
+        decision = dispatch.index("janos_console_admission_begin(")
         self.assertIn("janos_commands_inflight", dispatch[decision:])
         self.assertLess(dispatch.index("++janos_commands_inflight"),
                         dispatch.index("xSemaphoreGiveRecursive(janos_command_mutex)",
                                        dispatch.index("++janos_commands_inflight")))
         unlocked = dispatch.index("xSemaphoreGiveRecursive(janos_command_mutex)",
                                   dispatch.index("++janos_commands_inflight"))
-        handler = dispatch.index("int result = cmd_context->func")
+        handler = dispatch.index("int result =")
         relocked = dispatch.index("xSemaphoreTakeRecursive(janos_command_mutex", handler)
         self.assertLess(unlocked, handler)
         self.assertLess(handler, relocked)
@@ -399,7 +456,7 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         dispatch = function_body(MAIN, "janos_console_cmd_dispatch")
         busy_branch = dispatch.split(
             "if (admission != JANOS_CONSOLE_ADMIT)", 1
-        )[1].split("if (!serialized_command)", 1)[0]
+        )[1].split("++janos_commands_inflight", 1)[0]
         self.assertIn("janos_console_admission_format(", busy_branch)
         self.assertIn("puts(response)", busy_branch)
         self.assertIn("return 1;", busy_branch)
@@ -407,13 +464,13 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
 
     def test_dispatch_uses_portable_admission_before_handler_and_inflight(self):
         dispatch = function_body(MAIN, "janos_console_cmd_dispatch")
-        self.assertIn("janos_console_admission_decide(", dispatch)
+        self.assertIn("janos_console_admission_begin(", dispatch)
         self.assertIn("janos_console_admission_format(", dispatch)
-        decision = dispatch.index("janos_console_admission_decide(")
+        decision = dispatch.index("janos_console_admission_begin(")
         formatted = dispatch.index("janos_console_admission_format(", decision)
         refusal = dispatch.index("return 1;", formatted)
         inflight = dispatch.index("++janos_commands_inflight")
-        handler = dispatch.index("int result = cmd_context->func")
+        handler = dispatch.index("int result =")
         self.assertLess(decision, formatted)
         self.assertLess(formatted, refusal)
         self.assertLess(refusal, inflight)

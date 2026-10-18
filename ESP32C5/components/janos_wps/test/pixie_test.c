@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "pixie.h"
 #include "pixie_prng.h"
@@ -132,6 +133,35 @@ static bool cancel_now(void *context) {
     return true;
 }
 
+typedef struct { unsigned allocs, frees; bool fail; } cache_probe_t;
+static void *probe_alloc(void *context, size_t size) {
+    cache_probe_t *probe = context;
+    ++probe->allocs;
+    return probe->fail ? NULL : malloc(size);
+}
+static void probe_free(void *context, void *memory, size_t size) {
+    cache_probe_t *probe = context;
+    assert(size == 160000U);
+    ++probe->frees;
+    free(memory);
+}
+
+static void test_injected_cache_allocator(void) {
+    pixie_bundle_t bundle = fixture(
+        "b31dec125290ad933c08433ee5448b6b7e9c80bc157457667bbcb6f3b383b8df",
+        "0029888438664899e3470060c53562e93243ddddd4113bca027f5eb97cbfbffe");
+    cache_probe_t probe = {0};
+    pixie_options_t options = {.modes = PIXIE_MODE_NULL_SECRET,
+        .cache_alloc = probe_alloc, .cache_free = probe_free,
+        .cache_context = &probe};
+    pixie_result_t result;
+    assert(pixie_recover(&bundle, &options, &result));
+    assert(result.found && probe.allocs == 1U && probe.frees == 1U);
+    probe.fail = true;
+    assert(!pixie_recover(&bundle, &options, &result));
+    assert(probe.allocs == 2U && probe.frees == 1U);
+}
+
 static void test_cancellation(void) {
     pixie_bundle_t bundle = fixture(
         "52a8b9f0c731552ad1ec9c8f4e4384b03f5e8c669f2815875948f5d415781ecc",
@@ -152,6 +182,7 @@ int main(void) {
     test_static_and_no_match();
     test_ralink_and_rtl();
     test_cancellation();
+    test_injected_cache_allocator();
     puts("PASS: Pixie PRNG and offline recovery fixtures");
     return 0;
 }

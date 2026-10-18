@@ -38,17 +38,27 @@ static void policy_matrix(void)
         {JANOS_RADIO_OWNER_ANALYZER, "secret", "status", 0, true, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_ANALYZER, "show_scan_results", NULL, 0, true, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_ANALYZER, "wps", "verify", 0, true, JANOS_CONSOLE_BUSY_RADIO_LEASE},
-        {JANOS_RADIO_OWNER_ANALYZER, "wps", "stop", 0, true, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_ANALYZER, "jwps", "plan", 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_ANALYZER, "selftest", "db", 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_ANALYZER, "selftest", "fragment", 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_ANALYZER, "selftest", "pixie", 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_ANALYZER, "selftest", "transport", 0, true, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_ANALYZER, "jwps", "campaign", 0, true, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_ANALYZER, "wps", "stop", 0, true, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "wps", "status", 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "wps", "stop", 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "wps", "verify", 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "wps", "pixie", 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "jwps", "campaign", 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "jwps", "plan", 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "selftest", "db", 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "secret", "status", 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "secret", "reveal", 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "secret", "erase", 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "wifi_analyzer", "caps", 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "wifi_analyzer", "status", 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "wifi_analyzer", "scan", 0, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
-        {JANOS_RADIO_OWNER_WPS, "wifi_analyzer", "stop", 0, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_WPS, "wifi_analyzer", "stop", 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "show_scan_results", NULL, 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "stop", NULL, 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "reboot", NULL, 0, false, JANOS_CONSOLE_ADMIT},
@@ -57,6 +67,11 @@ static void policy_matrix(void)
         {JANOS_RADIO_OWNER_NONE, "show_scan_results", NULL, 0, true, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_NONE, "wps", "status", 0, true, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_NONE, "secret", "status", 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_NONE, "wps", "verify", 1, false, JANOS_CONSOLE_BUSY_COMMAND_IN_PROGRESS},
+        {JANOS_RADIO_OWNER_LEGACY, "wps", "verify", 0, false, JANOS_CONSOLE_BUSY_COMMAND_IN_PROGRESS},
+        {JANOS_RADIO_OWNER_LEGACY, "wps", "stop", 1, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_LEGACY, "wifi_analyzer", "stop", 1, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_LEGACY, "start_portal", NULL, 0, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
@@ -111,7 +126,14 @@ static void busy_wire_is_byte_stable(void)
         "\"code\":\"busy\",\"reason\":\"radio_lease\"}") == 0);
     assert(janos_console_admission_format(
         line, sizeof(line), JANOS_CONSOLE_BUSY_COMMAND_IN_PROGRESS));
-    assert(strstr(line, "\"reason\":\"command_in_progress\"") != NULL);
+    assert(strcmp(line,
+        "[WFACTL1] {\"v\":1,\"type\":\"error\",\"command\":\"console\","
+        "\"code\":\"busy\",\"reason\":\"command_in_progress\"}") == 0);
+    assert(janos_console_admission_format(
+        line, sizeof(line), JANOS_CONSOLE_BUSY_WIFI_ANALYZER));
+    assert(strcmp(line,
+        "[WFACTL1] {\"v\":1,\"type\":\"error\",\"command\":\"console\","
+        "\"code\":\"busy\",\"reason\":\"wifi_analyzer\"}") == 0);
     assert(!janos_console_admission_format(
         line, sizeof(line), JANOS_CONSOLE_ADMIT));
     assert(!janos_console_admission_format(
@@ -120,12 +142,44 @@ static void busy_wire_is_byte_stable(void)
         NULL, sizeof(line), JANOS_CONSOLE_BUSY_WIFI_ANALYZER));
 }
 
+static void stale_startup_tokens_cannot_release_or_cancel_new_owners(void)
+{
+    janos_radio_lease_t lease;
+    janos_radio_lease_init(&lease);
+    janos_console_admission_token_t old, current;
+    assert(janos_console_admission_begin(&lease, "start_portal", NULL,
+                                         0, false, &old) == JANOS_CONSOLE_ADMIT);
+    assert(old.owner == JANOS_RADIO_OWNER_LEGACY && old.generation != 0U);
+    assert(janos_console_admission_end(&lease, old));
+    assert(janos_console_admission_begin(&lease, "test_radio_channels", NULL,
+                                         0, false, &current) == JANOS_CONSOLE_ADMIT);
+    assert(current.generation != old.generation);
+    assert(!janos_console_admission_end(&lease, old));
+    assert(!janos_radio_lease_request_cancel(&lease, old.owner, old.generation));
+    janos_console_admission_token_t wrong_owner = current;
+    wrong_owner.owner = JANOS_RADIO_OWNER_WPS;
+    assert(!janos_console_admission_end(&lease, wrong_owner));
+    assert(!janos_radio_lease_request_cancel(&lease, wrong_owner.owner,
+                                             wrong_owner.generation));
+    assert(!janos_radio_lease_cancel_requested(&lease, current.owner,
+                                               current.generation));
+    assert(janos_console_admission_end(&lease, current));
+
+    assert(janos_console_admission_begin(&lease, "start_portal", NULL,
+                                         0, false, &current) == JANOS_CONSOLE_ADMIT);
+    assert(janos_radio_lease_mark_running(&lease, current.owner, current.generation));
+    /* A startup token must never silently release an unexpected running owner. */
+    assert(!janos_console_admission_end(&lease, current));
+    assert(janos_radio_lease_snapshot(&lease).state == JANOS_RADIO_LEASE_RUNNING);
+}
+
 int main(void)
 {
     policy_matrix();
     invalid_inputs_fail_closed();
     reasons_are_stable();
     busy_wire_is_byte_stable();
+    stale_startup_tokens_cannot_release_or_cancel_new_owners();
     puts("PASS: JanOS console admission policy");
     return 0;
 }

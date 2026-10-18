@@ -38,6 +38,11 @@ void janos_wps_memory_init(janos_wps_memory_t *memory,
     memset(memory, 0, sizeof(*memory));
     memory->ops = ops;
     memory->ops_context = ops_context;
+    atomic_init(&memory->counters.bulk_bytes, 0U);
+    atomic_init(&memory->counters.bulk_peak_bytes, 0U);
+    atomic_init(&memory->counters.secret_bytes, 0U);
+    atomic_init(&memory->counters.secret_peak_bytes, 0U);
+    atomic_init(&memory->counters.failed_allocations, 0U);
 }
 
 #ifdef ESP_PLATFORM
@@ -83,22 +88,24 @@ static void *allocate(janos_wps_memory_t *memory, size_t size,
     allocation_header_t *header = memory->ops->alloc(
         memory->ops_context, total, caps);
     if (!header) {
-        memory->counters.failed_allocations++;
+        (void)atomic_fetch_add_explicit(&memory->counters.failed_allocations,
+                                        1U, memory_order_relaxed);
         return NULL;
     }
     header->value.magic = JANOS_WPS_ALLOCATION_MAGIC;
     header->value.memory_class = (uint32_t)memory_class;
     header->value.payload_size = size;
     header->value.allocation_size = total;
-    if (memory_class == JANOS_WPS_MEMORY_BULK) {
-        memory->counters.bulk_bytes += size;
-        if (memory->counters.bulk_bytes > memory->counters.bulk_peak_bytes)
-            memory->counters.bulk_peak_bytes = memory->counters.bulk_bytes;
-    } else {
-        memory->counters.secret_bytes += size;
-        if (memory->counters.secret_bytes > memory->counters.secret_peak_bytes)
-            memory->counters.secret_peak_bytes = memory->counters.secret_bytes;
-    }
+    atomic_size_t *current_counter = memory_class == JANOS_WPS_MEMORY_BULK
+        ? &memory->counters.bulk_bytes : &memory->counters.secret_bytes;
+    atomic_size_t *peak_counter = memory_class == JANOS_WPS_MEMORY_BULK
+        ? &memory->counters.bulk_peak_bytes : &memory->counters.secret_peak_bytes;
+    size_t current = atomic_fetch_add_explicit(current_counter, size,
+                                                memory_order_relaxed) + size;
+    size_t peak = atomic_load_explicit(peak_counter, memory_order_relaxed);
+    while (peak < current && !atomic_compare_exchange_weak_explicit(
+               peak_counter, &peak, current, memory_order_relaxed,
+               memory_order_relaxed)) {}
     return header + 1;
 }
 
@@ -113,11 +120,12 @@ static void release(janos_wps_memory_t *memory, void *pointer,
     const size_t allocation_size = header->value.allocation_size;
     header->value.magic = 0U;
     if (expected_class == JANOS_WPS_MEMORY_SECRET) {
-        if (memory->counters.secret_bytes >= payload_size)
-            memory->counters.secret_bytes -= payload_size;
+        (void)atomic_fetch_sub_explicit(&memory->counters.secret_bytes,
+                                        payload_size, memory_order_relaxed);
         janos_wps_secure_wipe(header, allocation_size);
-    } else if (memory->counters.bulk_bytes >= payload_size) {
-        memory->counters.bulk_bytes -= payload_size;
+    } else {
+        (void)atomic_fetch_sub_explicit(&memory->counters.bulk_bytes,
+                                        payload_size, memory_order_relaxed);
     }
     memory->ops->free(memory->ops_context, header, allocation_size,
                       expected_class);
@@ -148,7 +156,18 @@ void janos_wps_free_secret(janos_wps_memory_t *memory, void *pointer)
 janos_wps_memory_snapshot_t janos_wps_memory_snapshot(
     const janos_wps_memory_t *memory)
 {
-    janos_wps_memory_snapshot_t empty = {0};
-    return memory ? memory->counters : empty;
+    if (!memory) return (janos_wps_memory_snapshot_t){0};
+    return (janos_wps_memory_snapshot_t){
+        .bulk_bytes = atomic_load_explicit(&memory->counters.bulk_bytes,
+                                           memory_order_relaxed),
+        .bulk_peak_bytes = atomic_load_explicit(
+            &memory->counters.bulk_peak_bytes, memory_order_relaxed),
+        .secret_bytes = atomic_load_explicit(&memory->counters.secret_bytes,
+                                             memory_order_relaxed),
+        .secret_peak_bytes = atomic_load_explicit(
+            &memory->counters.secret_peak_bytes, memory_order_relaxed),
+        .failed_allocations = atomic_load_explicit(
+            &memory->counters.failed_allocations, memory_order_relaxed),
+    };
 }
 
