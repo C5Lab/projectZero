@@ -137,6 +137,17 @@ The country selection does not bypass hardware, driver or local regulatory
 restrictions. DFS behavior must be validated on the exact ESP-IDF version and
 hardware used by the firmware.
 
+## Build-time `PA` regulatory patch
+
+The root CMake configuration patches the selected ESP-IDF 6.0.0 or 6.0.1
+checkout by default. It replaces only the `PA` text stanza's `5470 - 5725`
+MHz range with `5470 - 5730` and its `5725 - 5850` MHz range with
+`5725 - 5895`, then runs IDF's `reg2fw.py` to regenerate the C table that
+`esp_wifi` compiles. Set `PROJECTZERO_PATCH_IDF_PA_REGULATORY=OFF` to disable
+this operation. The hook fails on an unfamiliar IDF version or `PA` stanza,
+and restores both IDF files if generation fails. It does not change the
+handshake radio mode or override driver and hardware channel restrictions.
+
 ## Version note
 
 The production WPS transport and current root-firmware validation are pinned to

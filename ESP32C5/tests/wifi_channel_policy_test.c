@@ -4,6 +4,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef TEST_PA_EXTENDED
+#define TEST_PA_EXTENDED 0
+#endif
+
 int main(void)
 {
     const uint8_t channels[] = {
@@ -29,12 +33,13 @@ int main(void)
     non_dfs = 0;
     for (unsigned i = 0; i < sizeof(channels); ++i) {
         wifi_channel_policy_t policy = wifi_channel_policy_classify(&country, channels[i]);
-        bool excluded = channels[i] == 144 || channels[i] >= 169;
+        bool excluded = !TEST_PA_EXTENDED && (channels[i] == 144 || channels[i] >= 169);
         assert(policy == (excluded ? WIFI_CHANNEL_POLICY_DISALLOWED : WIFI_CHANNEL_POLICY_NON_DFS));
         non_dfs += policy == WIFI_CHANNEL_POLICY_NON_DFS;
         disallowed += policy == WIFI_CHANNEL_POLICY_DISALLOWED;
     }
-    assert(non_dfs == 24 && disallowed == 4);
+    assert(non_dfs == (TEST_PA_EXTENDED ? 28U : 24U));
+    assert(disallowed == (TEST_PA_EXTENDED ? 0U : 4U));
     assert(wifi_channel_policy_classify(&country, 14) == WIFI_CHANNEL_POLICY_NON_DFS);
 
     memcpy(country.cc, "US", 3);
@@ -55,10 +60,13 @@ int main(void)
     memcpy(country.cc, "PA", 3);
     country.policy = WIFI_COUNTRY_POLICY_MANUAL;
     country.wifi_5g_channel_mask = CHANNEL_TO_BIT(144);
-    assert(wifi_channel_policy_classify(&country, 144) == WIFI_CHANNEL_POLICY_DISALLOWED);
+    assert(wifi_channel_policy_classify(&country, 144) ==
+           (TEST_PA_EXTENDED ? WIFI_CHANNEL_POLICY_NON_DFS : WIFI_CHANNEL_POLICY_DISALLOWED));
     memcpy(country.cc, "ZZ", 3);
     assert(wifi_channel_policy_classify(&country, 36) == WIFI_CHANNEL_POLICY_UNKNOWN);
     assert(wifi_channel_policy_classify(NULL, 36) == WIFI_CHANNEL_POLICY_UNKNOWN);
-    puts("PASS: US 12 non-DFS/16 DFS; PA 24 non-DFS/4 excluded; masks and unknown countries");
+    puts(TEST_PA_EXTENDED ?
+         "PASS: US 12 non-DFS/16 DFS; PA 28 non-DFS/0 excluded; masks and unknown countries" :
+         "PASS: US 12 non-DFS/16 DFS; PA 24 non-DFS/4 excluded; masks and unknown countries");
     return 0;
 }

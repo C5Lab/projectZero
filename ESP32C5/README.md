@@ -60,6 +60,21 @@ Path patched on each machine:
 Disable this behavior if needed:
 - `-DPROJECTZERO_PATCH_IDF_EXFAT=OFF`
 
+## Build Note: `PA` Wi-Fi regulatory table
+During CMake configure, this repo updates the `country PA` stanza in the
+selected ESP-IDF 6.0.0 or 6.0.1 checkout at
+`$IDF_PATH/components/esp_wifi/regulatory/esp_wifi_regulatory.txt`. It changes
+`5470 - 5725` to `5470 - 5730` MHz and `5725 - 5850` to `5725 - 5895` MHz,
+then runs `reg2fw.py` to update the `esp_wifi_regulatory.c` file compiled by IDF.
+The patch uses IDF's selected Python interpreter, leaves an already patched
+table untouched, and stops configuration if the IDF version or `PA` stanza
+differs from the supported layout. These files are in the shared IDF checkout,
+so the change also affects other projects using that checkout.
+
+Disable this behavior with `-DPROJECTZERO_PATCH_IDF_PA_REGULATORY=OFF`.
+Changing the table does not establish that a channel is accepted by the Wi-Fi
+driver or usable by a particular device mode; those require device testing.
+
 ## OTA Update Flow
 The firmware uses a dual-slot OTA layout (`ota_0`/`ota_1`) with `otadata` and the IDF bootloader rollback feature enabled. OTA updates overwrite the inactive slot and reboot into it.
 
