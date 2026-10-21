@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.16)
 # Add linker flag globally (needed for duplicate symbols in ROM)
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-zmuldefs")
 
-set(JANOS_VERSION "1.6.9")
+set(JANOS_VERSION "1.7.5")
 set(PROJECT_VER "${JANOS_VERSION}")
 
 # Ensure IDF FatFs has exFAT enabled for all developers building this repo.
@@ -17,8 +17,16 @@ if(PROJECTZERO_PATCH_IDF_LINENOISE_UTF8)
   include(${CMAKE_SOURCE_DIR}/tools/patch_idf_linenoise_utf8.cmake)
 endif()
 
+option(PROJECTZERO_PATCH_IDF_PA_REGULATORY "Patch IDF country PA rules and regenerate esp_wifi_regulatory.c" ON)
+
 # Bootstrap ESP-IDF build system
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
+# project.cmake provides the selected IDF Python interpreter. Generate the
+# regulatory C table before project() configures the esp_wifi component.
+if(PROJECTZERO_PATCH_IDF_PA_REGULATORY)
+  include(${CMAKE_SOURCE_DIR}/tools/patch_idf_pa_regulatory.cmake)
+endif()
 
 project(projectZero)
 

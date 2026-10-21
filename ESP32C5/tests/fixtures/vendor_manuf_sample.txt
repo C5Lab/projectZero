@@ -1,0 +1,5 @@
+# Nested longest-prefix lookup fixture.
+00:11:22       Vendor Twenty Four
+00:11:22:3/28  Vendor Twenty Eight
+00:11:22:33:4/36 Vendor Thirty Six
+AA:BB:CC       Another Vendor

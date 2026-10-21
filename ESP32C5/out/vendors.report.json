@@ -1,0 +1,15 @@
+{
+  "counts": {
+    "24": 40099,
+    "28": 6628,
+    "36": 11799
+  },
+  "format": "JVND-3",
+  "lock_sha256": "590910d1e8b4f3ef971e78f06488410f284bfe27ccad0a13d14474c51503f0d2",
+  "sha256": "a8cf019ae7da67861a065f64782415474ae427764979a6e61cf90394635a683a",
+  "size": 1172891,
+  "source_format": "wireshark-manuf-data-c",
+  "source_id": "d1100959",
+  "source_revision": "0451baac5b807b69db16a8d027fb5f199cc0ad5a",
+  "unsupported_prefixes": 0
+}

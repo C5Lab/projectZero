@@ -1,0 +1,92 @@
+2026-09-28 scan data flow analysis: no observations.
+2026-09-28 analyzer design and Python protocol contract delivered: no observations.
+2026-09-28 JanOS analyzer implementation/review/documentation checkpoint: no observations.
+2026-10-05 sniffer parser, UART compatibility and RX integration checkpoint: no observations.
+2026-10-05 sniffer extension delivered, 144 tests and ESP-IDF build verified: no observations.
+2026-10-05 sniffer RX zero-dump regression and diagnostics: 144 tests and build passed; hardware cause pending user output.
+2026-10-08 WPS callback ownership regression and fresh capture retry: no observations.
+2026-10-08 WPS Pixie capture-to-M4 flow, retransmissions and NACK frame verified: no observations.
+2026-10-13 ESP32C5 scoped licensing test, canonical texts, and verification: no observations.
+2026-10-13 ESP32C5 tracked-file license audit and ownership checkpoint: no observations.
+2026-10-13 RF provenance validation and deterministic source bundle tooling: no observations.
+2026-10-13 JVND v3 format, deterministic fixture, and offline vendor builder: no observations.
+2026-10-13 Wireshark source lock, vendor candidate, and standalone C vendor database core: no observations.
+2026-10-13 vendor mini-probe, JWPS source/format builder, and independent PIN algorithms: no observations.
+2026-10-13 JWPS probe, WSC fragmentation, transport adapter/stress test, and Pixie matrix: no reusable skill observations.
+2026-10-13 JWPS v2 literal PIN preservation, fragmented M5/M7 ID hardening, and matching source bundle: no reusable skill observations.
+2026-10-13 standalone transport rollback/stress hardening, cross-parser validation, and pre-build review: no reusable skill observations.
+2026-10-13 WPS interleaved-Identity EAP-ID regression, host test, and ESP-IDF build: no reusable skill observations.
+2026-10-13 WPS pre-M3 fresh-M1 restart policy, regression test, and ESP-IDF build: no reusable skill observations.
+2026-10-13 bounded EAPOL-Start retransmission policy, regression test, and ESP-IDF build: no reusable skill observations.
+2026-10-13 bounded JWPS campaign, conservative rejection policy, dual ESP-IDF build, and review: reusable observation - standalone modules that pass separately need a combined link build because private SDK objects can expose colliding global symbols.
+2026-10-14 first-AP bounded campaign hardware validation: reusable observation - persist progress only after explicit protocol rejection; setup lock must retain the current candidate, and measured lock budgets should remain per-device evidence rather than global assumptions.
+2026-10-14 JanOS NVS STA MAC TODO: reusable observation - distinguish persistent boot identity from temporary feature-specific MAC changes, and restore the effective policy value rather than assuming the factory address.
+2026-10-14 Package A campaign runner, portable STA-MAC policy core, and standalone MAC-policy probe source: reusable observation - UART whole-line validation must account for ESP-IDF VFS CR/LF translation before bytes reach the parser; lock the VFS mode in sdkconfig and guard it at compile time.
+2026-10-14 Package A ESP-IDF build regression: reusable observation - use function-like interception for standard function calls included through third-party headers; object-like aliases can corrupt compiler attribute tokens such as format(printf,...).
+2026-10-14 raw UART CR input regression: reusable observation - when preserving raw line endings, treat a terminal CR as complete only after the input source reports idle; this supports CR-only monitors without accepting queued suffix bytes as part of a valid prefix.
+2026-10-14 STA MAC human-readable status/set summaries, regression test, documentation, and ESP-IDF build: no reusable skill observations.
+2026-10-14 Package A hardware-evidence reconciliation and documentation closure: no additional reusable skill observations.
+2026-10-14 Package B standalone lab-suite design self-review: no additional reusable skill observations.
+2026-10-14 Package B parser, secret-vault, and operation-state TDD slice: no additional reusable skill observations.
+2026-10-15 Package B platform/radio adapter TDD slice: no additional reusable skill observations.
+2026-10-15 Package B ESP-IDF project shell, partition layout, and project-contract TDD slice: no additional reusable skill observations.
+2026-10-15 Package B callable WPS session core and ESP adapter: no additional reusable skill observations.
+2026-10-15 Package B workflow adapters TDD and focused regressions: no additional reusable skill observations.
+2026-10-15 Package B persistent shell and ESP services integration: no additional reusable skill observations.
+2026-10-15 Package B retransmission hardening, final ESP-IDF build, and handoff documentation: no additional reusable skill observations.
+2026-10-15 Package B first-board-run reconciliation and overnight handoff: no additional reusable skill observations.
+2026-10-15 Package B first-board-run handoff and morning test runbook: no additional reusable skill observations.
+2026-10-15 Package B bounded Pixie capture close-handshake fix: no additional reusable skill observations.
+2026-10-15 Package B Wifit3-style M3-to-M4 capture flow: no additional reusable skill observations.
+2026-10-15 Package B same-session Pixie recovery and M4-M7 continuation: no additional reusable skill observations.
+2026-10-15 Package B M3 retransmission coalescing and fatal telemetry: no additional reusable skill observations.
+2026-10-15 Package B TP-Link hardware acceptance and deferred Realtek/MikroTik vendor matrix: no additional reusable skill observations.
+2026-10-15 Package B quoted SSID parser, regression suite, Docker build, and documentation: no additional reusable skill observations.
+2026-10-15 Full-result SD persistence mini-OS, WSC identity diagnostics, host regression, and verified artifact path: no additional reusable skill observations.
+2026-10-15 Adapter-open fatal telemetry diagnosis, red-green regression, ESP build, and hardware handoff: no additional reusable skill observations.
+2026-10-15 Callback-cancellation telemetry diagnosis, red-green regression, ESP build, and no-card hardware evidence: no additional reusable skill observations.
+2026-10-15 Pre-JanOS roadmap reconciliation and hardware-acceptance summary: no additional reusable skill observations.
+2026-10-16 JanOS WPS stages 1-3 build graph, memory policy, and shared radio lease: no additional reusable skill observations.
+2026-10-16 JanOS WPS stage 4 asynchronous known-PIN slice and full regression: no additional reusable skill observations.
+2026-10-16 Mini-OS generated-build cleanup with validated literal targets: no additional reusable skill observations.
+2026-10-16 Secret-reveal empty/expired CLI contract red-green fix and full firmware verification: no additional reusable skill observations.
+2026-10-16 WPS stop pending/completed/quarantined CLI contract red-green fix and full firmware verification: no additional reusable skill observations.
+2026-10-16 Retryable radio-contention CLI polish, protocol documentation, full host regression, and ESP-IDF build: no additional reusable skill observations.
+2026-10-16 Independent backward-compatibility review of radio-contention CLI found admission-policy, protocol-versioning, and lease-atomicity follow-ups; no additional reusable skill observations.
+2026-10-16 Approved radio-compatibility hardening design and no-commit TDD implementation plan, including MAC-policy regression coverage: no additional reusable skill observations.
+2026-10-16 Read-only documentation audit converted into a gated dedicated documentation task with contract-derived examples and independent review: reusable observation - write protocol documentation only after final behavioral tests and runtime format strings stabilize, and derive admission matrices from executable policy tables.
+2026-10-16 Radio compatibility hardening Tasks 1-3: reusable observation - a CAS on ownership is insufficient for a multi-field lease; concurrent tests must also observe publication snapshots and race RUNNING against CLEANUP to catch callback reopening.
+2026-10-16 JanOS radio documentation Task 6: no additional reusable skill observations.
+2026-10-16 JanOS radio hardening final review: reusable observation - owner/generation checks on separate atomics do not prevent ABA across cleanup and reacquire; serialize validation plus mutation and test a stale cancel racing a new generation. On single-core targets, bound snapshot retries so a preempted publisher cannot be starved by a reader spin loop.
+2026-10-16 regression-audit checkpoint: no new reusable skill observations after session scan, baseline suite, and coverage inventory.
+2026-10-16 legacy-regression checkpoint: no new reusable skill observations after executable PCAP, EAPOL/PMKID, and HCCAPX test batches.
+2026-10-16 legacy-regression final checkpoint: no new reusable skill observations after crypto/classifier coverage, compatibility freeze, full host verification, and ESP-IDF build.
+2026-10-16 configurable WiFi country policy checkpoint: no new reusable skill observations after PH-default persistence, CLI, full host regression, and ESP-IDF build verification.
+2026-10-16 hybrid DFS/non-DFS handshake radio path checkpoint: no new reusable skill observations after policy red-green testing, full host regression, and ESP-IDF build verification.
+2026-10-16: no new reusable skill observations from the BSSID protection implementation.
+2026-10-16: no new reusable skill observations from the radio_protect CLI implementation.
+2026-10-16 CLI documentation checkpoint: no new reusable skill observations after command-registry comparison, consolidated manual update, and documentation parity verification.
+2026-10-16 documentation cleanup checkpoint: no new reusable skill observations after separating public reference docs from unfinished Superpowers work, removing completed plans, and validating relative links.
+2026-10-16 WPS mini-OS Task 2 checkpoint: no new reusable skill observations after focused red tests and hash-verified engine relocation.
+2026-10-17 ESP-IDF 6.0.1 WPS pin checkpoint: no new reusable skill observations after guard diagnosis, red-green contract testing, and full firmware build.
+2026-10-17 handshake TX telemetry checkpoint: no new reusable skill observations after callback lifecycle design, red-green counter tests, and full host regression verification.
+2026-10-17 bounded D-UCB PCAP checkpoint: reusable observation - keep high-rate Wi-Fi callbacks allocation-light by reporting append status only; rotate bounded buffers in the worker, advance capture flags only after committed bytes, and allocate replacement storage before releasing the prior capture.
+2026-10-17 radio/WPS hardening setup checkpoint: no new reusable skill observations after baseline capture, SDD ledger creation, and Task 1 dispatch.
+2026-10-17 WPS lifetime checkpoint: no new reusable skill observations after Task 1 RED/GREEN implementation, sanitizer verification, and independent review approval.
+2026-10-17 radio hardening Tasks 2-3 checkpoint: reusable observation captured separately for testing the earliest unlocked admission boundary; atomic owner publication and exact idle-STA WPS restore passed focused ordinary/sanitized tests and independent review.
+2026-10-18 D-UCB hardening checkpoint: reusable observations include testing executable concurrency seams instead of source regexes, making capture identity include AP plus client plus generations, and using the final PCAP rename as a publication commit marker after durable target-bound HCCAPX validation.
+2026-10-18 Tasks 5-6 completion checkpoint: reusable observations include linearizing cancel versus persistent commit with a shared gate, avoiding preemptible atomic spinlocks on single-core firmware, testing public-header include closure with the exact SDK, and scanning touched tests/docs for real lab credentials before final approval.
+2026-10-17 task4 re-review checkpoint: no new reusable skill observations.
+2026-10-18 WPS Task 5 checkpoint: no new reusable skill observations after parser/service/wire-contract restoration, tracked Pixie PSRAM, and mixed-operation sanitizer coverage.
+2026-10-18 WPS Task 5 race-hardening checkpoint: reusable observation - cancellation and irreversible persistence must share one lifecycle commit gate; repeated polling plus rollback cannot close the final rename race.
+
+2026-10-18 Task 5 final race-review checkpoint: no additional reusable skill observation; accepted-output gating and rejected-start vault preservation are task-specific concurrency contracts.
+2026-10-18 Task 6 documentation checkpoint: no new reusable skill observation after reconciling current command, wire, lease, restore, D-UCB and historical evidence contracts.
+2026-10-18 fix_transport_public_header: observation 0008 recorded after root-cause reproduction, RED/GREEN header-closure test, and focused WPS regression verification.
+2026-10-18 fix_handshake_log_literal: no new observation after RED/GREEN exact-macro compilation, stale declaration audit, and 87-test regression run.
+2026-10-18 result-store I/O fault TDD checkpoint: no new reusable skill observations.
+2026-10-18 RU country-policy checkpoint: no new reusable skill observations after existing-profile audit, RED/GREEN driver-boundary extraction, focused RU persistence coverage, and regulatory documentation correction.
+2026-10-18 WPS pre-radio cleanup checkpoint: no new reusable skill observations after no-op cleanup classification, all-path mutable PIN wiping, and immediate-worker UAF sanitizer verification.
+2026-10-18: secret reveal escaping TDD batch complete; no new reusable skill observation.
+2026-10-18: no new reusable skill observation from D-UCB reservation cleanup; existing concurrency-boundary principles covered the TDD workflow.
+2026-10-18: no observations - JSONL partial-append rollback fix followed existing TDD and systematic-debugging guidance.

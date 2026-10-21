@@ -1,2 +1,10 @@
 build/
+build-hw/
+build-sw/
+**/build-*/
 .vscode/
+.cache/rfdb/
+__pycache__/
+*.pyc
+/docs/superpowers/
+/skill-observations/

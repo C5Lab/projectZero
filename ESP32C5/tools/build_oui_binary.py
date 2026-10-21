@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""Convert IEEE oui.txt into the JanOS Wi-Fi vendor binary table.
+
+Two output formats:
+
+  v2 (default) -- compact, string-interned, forward-compatible:
+      [16B header][index: N * (OUI[3] + nameOff u24 LE)]
+      [name table: (len u8 + utf8 bytes) blobs, deduplicated]
+    Header: magic "JVND", version=2, oui_len=3, entry_size=6, reserved,
+            record_count u32 LE, names_offset u32 LE.
+    Many OUIs share one vendor name, so interning shrinks the file massively
+    and lets the firmware cache the whole index in PSRAM.
+
+  v1 (--format v1) -- legacy headerless fixed 64B records (3B OUI + 1B len +
+    60B name, zero padded). Kept for older firmware.
+
+JanOS firmware with v2 support reads BOTH formats (it detects v1 by the
+absence of the magic header), so a v1 file keeps working everywhere.
+"""
 import argparse
 import pathlib
 import struct
@@ -44,9 +62,17 @@ KNOWN_VENDOR_KEYWORDS = [
     "AI-LINK", "RENESAS", "FUGUI",
 ]
 
-# Fixed record size: 3 bytes OUI + 1 byte name length + 60 bytes name (padded)
+# Legacy v1 record: 3 bytes OUI + 1 byte name length + 60 bytes name (padded)
 RECORD_NAME_BYTES = 60
 RECORD_STRUCT = struct.Struct("!3sB{}s".format(RECORD_NAME_BYTES))
+
+# v2 format constants (must match main.c)
+V2_MAGIC = b"JVND"
+V2_VERSION = 2
+V2_HEADER_SIZE = 16
+V2_INDEX_ENTRY_SIZE = 6   # OUI[3] + name offset u24 LE
+# Name length is a u8, and the firmware buffer holds up to 60 chars.
+V2_NAME_MAX = 60
 
 
 def normalize_vendor_name(name: str) -> str:
@@ -82,7 +108,7 @@ def parse_oui_file(path: pathlib.Path):
                 if vendor_name:
                     results.setdefault(current_oui, vendor_name)
             elif "(base 16)" in line:
-                # alternate header, ignore – handled via (hex) section
+                # alternate header, ignore - handled via (hex) section
                 current_oui = None
                 continue
             elif current_oui and line:
@@ -98,38 +124,98 @@ def parse_oui_file(path: pathlib.Path):
     return results
 
 
-def build_records(oui_map):
-    filtered = [
+def select_entries(oui_map, keep_all: bool):
+    entries = [
         (oui, name)
         for (oui, name) in oui_map.items()
-        if should_keep_vendor(name)
+        if keep_all or should_keep_vendor(name)
     ]
-    filtered.sort(key=lambda item: item[0])
-    records = []
-    for oui, name in filtered:
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
+def build_v1(entries) -> bytes:
+    out = bytearray()
+    for oui, name in entries:
         truncated = name.encode("utf-8")[:RECORD_NAME_BYTES]
         length = len(truncated)
         encoded = truncated.ljust(RECORD_NAME_BYTES, b"\x00")
-        records.append(RECORD_STRUCT.pack(oui, length, encoded))
-    return records, filtered
+        out += RECORD_STRUCT.pack(oui, length, encoded)
+    return bytes(out)
+
+
+def build_v2(entries) -> bytes:
+    # Intern names: one copy of each distinct vendor string, shared by every OUI.
+    name_table = bytearray()
+    name_to_off = {}
+
+    def intern(name: str) -> int:
+        encoded = name.encode("utf-8")[:V2_NAME_MAX]
+        key = bytes(encoded)
+        off = name_to_off.get(key)
+        if off is None:
+            off = len(name_table)
+            if off >= (1 << 24):
+                raise ValueError("name table exceeds 16 MB (u24 offset)")
+            name_table.append(len(encoded))
+            name_table.extend(encoded)
+            name_to_off[key] = off
+        return off
+
+    index = bytearray()
+    for oui, name in entries:
+        off = intern(name)
+        index.extend(oui)                          # 3 bytes
+        index.extend(off.to_bytes(3, "little"))    # name offset u24 LE
+
+    record_count = len(entries)
+    names_offset = V2_HEADER_SIZE + len(index)
+
+    header = bytearray(V2_HEADER_SIZE)
+    header[0:4] = V2_MAGIC
+    header[4] = V2_VERSION
+    header[5] = 3                       # oui_len
+    header[6] = V2_INDEX_ENTRY_SIZE     # index entry size
+    header[7] = 0                       # reserved
+    header[8:12] = record_count.to_bytes(4, "little")
+    header[12:16] = names_offset.to_bytes(4, "little")
+
+    return bytes(header) + bytes(index) + bytes(name_table)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert oui.txt to compact Wi-Fi vendor binary table.")
+    parser = argparse.ArgumentParser(
+        description="Convert oui.txt to the JanOS Wi-Fi vendor binary table."
+    )
     parser.add_argument("--input", type=pathlib.Path, default=pathlib.Path("oui.txt"))
     parser.add_argument("--output", type=pathlib.Path, default=pathlib.Path("oui_wifi.bin"))
+    parser.add_argument("--format", choices=["v1", "v2"], default="v2",
+                        help="output format (default v2; firmware reads both)")
+    parser.add_argument("--all", action="store_true",
+                        help="keep every OUI instead of only the Wi-Fi vendor whitelist "
+                             "(recommended with v2; fewer 'missing' lookups)")
     args = parser.parse_args()
 
     oui_map = parse_oui_file(args.input)
-    records, filtered = build_records(oui_map)
+    entries = select_entries(oui_map, keep_all=args.all)
+
+    if args.format == "v1":
+        blob = build_v1(entries)
+    else:
+        blob = build_v2(entries)
 
     with args.output.open("wb") as out_file:
-        for record in records:
-            out_file.write(record)
+        out_file.write(blob)
 
-    print(f"Parsed {len(oui_map)} OUI entries, kept {len(filtered)} Wi-Fi vendor entries.")
-    if filtered:
-        sample = ", ".join(name for _, name in filtered[:10])
+    scope = "all OUIs" if args.all else "Wi-Fi vendor whitelist"
+    print(f"Parsed {len(oui_map)} OUI entries, kept {len(entries)} ({scope}).")
+    print(f"Wrote {args.format} format: {len(blob)} bytes -> {args.output}")
+    if args.format == "v2":
+        unique_names = len({name.encode('utf-8')[:V2_NAME_MAX] for _, name in entries})
+        print(f"  index: {len(entries)} x {V2_INDEX_ENTRY_SIZE}B, "
+              f"unique vendor names: {unique_names}")
+    if entries:
+        sample = ", ".join(name for _, name in entries[:10])
         print(f"Sample vendors: {sample}")
 
 

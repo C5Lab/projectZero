@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+PINDB["00AABB"]="12345670 00000000 12345670 bad"
+PINDB["00ccdd"]="7654321 12345678"
+PINDB["bad"]="12345670"

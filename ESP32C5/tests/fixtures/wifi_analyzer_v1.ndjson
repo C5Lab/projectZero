@@ -1,0 +1,7 @@
+[WFACTL1] {"v":1,"type":"caps","protocol":"WFA/1","default_records":64,"max_records":128,"max_line_bytes":1024,"bands":["2.4","5"],"profiles":["quick","detailed","passive"],"width_metadata":"sdk_unverified","channel_scope":"requested_driver_filtered"}
+[WFA1] {"v":1,"type":"begin","boot":"0123456789abcdef","scan":1,"limit":64,"band":"both","channels":[1,6,36],"profile":"quick","started_ms":1000}
+[WFA1] {"v":1,"type":"ap","boot":"0123456789abcdef","scan":1,"seq":0,"bssid":"02:00:00:00:00:01","ssid_hex":"486f6d65","band":"2.4","primary":6,"rssi":-55,"auth":"WPA2_PSK","phy":["11n"],"bandwidth":null,"secondary":null,"center1_mhz":null,"center2_mhz":null}
+[WFA1] {"v":1,"type":"ap","boot":"0123456789abcdef","scan":1,"seq":1,"bssid":"02:00:00:00:00:02","ssid_hex":"486f6d65","band":"5","primary":36,"rssi":-62,"auth":"WPA2_PSK","phy":["11ac"],"bandwidth":"80","secondary":"above","center1_mhz":5210,"center2_mhz":null}
+[WFA1] {"v":1,"type":"end","boot":"0123456789abcdef","scan":1,"status":"ok","found":2,"returned":2,"truncated":false,"duration_ms":1500}
+[WFA1] {"v":1,"type":"begin","boot":"0123456789abcdef","scan":2,"limit":64,"band":"both","channels":[1,6,36],"profile":"quick","started_ms":5000}
+[WFA1] {"v":1,"type":"end","boot":"0123456789abcdef","scan":2,"status":"timeout","found":null,"returned":0,"truncated":false,"duration_ms":20000,"code":"scan_timeout"}

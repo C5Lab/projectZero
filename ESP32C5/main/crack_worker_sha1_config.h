@@ -1,0 +1,4 @@
+#ifndef CRACK_WORKER_SHA1_CONFIG_H
+#define CRACK_WORKER_SHA1_CONFIG_H
+#define MBEDTLS_SHA1_C
+#endif

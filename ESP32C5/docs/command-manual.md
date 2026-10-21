@@ -198,7 +198,146 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 
 # Part 2 — Full command catalog
 
+## New CLI commands in the WPS/radio update
+
+The following top-level commands are new relative to the preceding passive
+Wi-Fi reporting release. This is the quick reference; the detailed entries
+later in this manual define output, persistence, admission and error behavior.
+
+| Command | Purpose | Detailed documentation |
+| --- | --- | --- |
+| `wps verify <bssid> <8-digit-pin>` | Start asynchronous verification of one known WPS PIN against an explicitly owned AP. | [JanOS WPS laboratory workflows](janos-wps.md) |
+| `wps pixie <bssid> [epoch]` | Run capture, bounded Pixie search and authenticated candidate verification. | [JanOS WPS laboratory commands](janos-wps.md) |
+| `wps status` | Read WPS phase, run/generation, result, cleanup and memory telemetry. | [JanOS WPS laboratory workflows](janos-wps.md#status-stop-and-cancellation) |
+| `wps stop` | Cooperatively cancel WPS and wait for radio cleanup. | [JanOS WPS laboratory workflows](janos-wps.md#status-stop-and-cancellation) |
+| `jwps plan <bssid> [ssid]` | Generate the bounded candidate plan offline. | [JanOS WPS laboratory commands](janos-wps.md#commands) |
+| `jwps campaign <bssid> <start-index> <count:1-3> [ssid]` | Run a bounded online candidate campaign. | [JanOS WPS laboratory commands](janos-wps.md#commands) |
+| `selftest db\|fragment\|transport\|pixie` | Run one deterministic WPS component self-test. | [JanOS WPS laboratory commands](janos-wps.md#commands) |
+| `secret status` | Inspect the volatile credential-vault state without revealing data. | [JanOS WPS laboratory workflows](janos-wps.md#secret-lifecycle-and-memory) |
+| `secret reveal` | Reveal the recovered PIN/key once, then wipe the retained copy. | [JanOS WPS laboratory workflows](janos-wps.md#secret-lifecycle-and-memory) |
+| `secret erase` | Explicitly wipe the volatile WPS result. | [JanOS WPS laboratory workflows](janos-wps.md#secret-lifecycle-and-memory) |
+| `wifi_country status` | Show configured and active Wi-Fi country information. | [Settings](#settings) |
+| `wifi_country list` | List accepted two-character country profiles. | [Settings](#settings) |
+| `wifi_country set <CC>` | Persist a country profile for application after reboot. | [Settings](#settings) |
+| `wifi_country reset` | Restore the default `PA` profile for the next boot. | [Settings](#settings) |
+| `radio_protect add <BSSID>` | Add a protected BSSID to `/sdcard/lab/white.txt`. | [Attacks](#attacks) |
+| `radio_protect remove <BSSID>` | Remove a protected BSSID. | [Attacks](#attacks) |
+| `radio_protect list` | List active protected BSSIDs. | [Attacks](#attacks) |
+| `radio_protect clear` | Clear the persisted and active protection list. | [Attacks](#attacks) |
+
+`wifi_analyzer` is not new in this update. Its shared-radio admission and
+cleanup behavior changed, while its existing `caps`, `scan`, `status`, `stop`
+and `clear` CLI remains compatible. Likewise, `start_handshake` keeps its
+existing syntax while adding protected-BSSID filtering and stricter radio
+cleanup. Pixie and JWPS/campaign are production component commands now; the
+removed standalone mini-OS is not required. Persistent `sta_mac` policy remains
+outside this command family.
+
 ## WiFi scanning
+
+### `test_radio_channel`
+- **Syntax**: `test_radio_channel <integer>` (1..255).
+- **Description**: Initialize Wi-Fi if needed, enable APSTA and verify the mode,
+  then attempt to set the requested primary channel with no secondary channel.
+  Preserve the current band mode and country profile. The driver decides whether
+  the channel is supported under those settings. Also check the active country's
+  rules in the linked ESP-IDF regulatory table, including its DFS flag and any
+  manual 5 GHz channel mask.
+- **Result**: Print the current mode, set/read error names, actual channel and
+  `PASS`/`FAIL`, plus `country`, `allowed`, `dfs` and `reason`. Success requires
+  both API calls to succeed, channel readback to match (including no secondary
+  channel), and the channel to be allowed without DFS. DFS channels fail with
+  `reason=dfs_required` even when setting/readback succeeds. Channels outside the
+  country's rules fail with `reason=country_disallowed`. Unknown rules or a
+  failed country read cannot pass. `dfs=unknown` means the channel is disallowed
+  or its rules are unknown. This checks driver configuration and policy; it does
+  not measure radar activity, interference or successful packet transmission.
+  Return nonzero on invalid input, refusal or failure.
+- **State**: Leave Wi-Fi in APSTA on the resulting channel. Failure to enable or
+  verify APSTA returns `reason=apsta_init` or `reason=apsta_mode` before setting a
+  channel. Refuse while another command
+  is in progress, the radio is in use, or STA is connected; use `stop` first for
+  active operations. BLE/802.15.4 modes are refused.
+- **Example**: `test_radio_channel 52` with active country `US`
+```
+[RADIO] requested=52 mode=APSTA(3) set=ESP_OK read=ESP_OK actual=52 secondary=0 result=FAIL country=US allowed=1 dfs=1 reason=dfs_required
+```
+
+### `test_radio_channels`
+
+- **Syntax**: `test_radio_channels` (no arguments).
+- **Description**: Run `test_radio_channel` for each of the following 28 channels,
+  in this order, continuing after channel failures:
+  `36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165,169,173,177`.
+- **Output**: Individual `[RADIO]` records followed by `[RADIO-SUMMARY]` with
+  `total`, `passed`, `failed` and `result`, then `[RADIO-PASS]` and `[RADIO-FAIL]`
+  channel lists (`none` for an empty list).
+- **State**: Enable and retain APSTA; preserve the current band mode and country profile;
+  leave the radio on the last successfully set channel. The same radio admission
+  restrictions as `test_radio_channel` apply. Return zero only if all 28 tests pass.
+- **Expected policy results** with the current ESP-IDF tables and successful
+  driver/readback checks: `US` has 12 PASS and 16 DFS failures (52–64 and 100–144);
+  `PA` has 24 PASS and 4 disallowed channels (144,169,173,177), with no DFS on its
+  allowed channels. Both summaries therefore return nonzero.
+
+### `wifi_analyzer`
+
+- `wifi_analyzer caps` / `status` — analyzer capabilities and lifecycle status.
+- `wifi_analyzer scan [--band 2.4|5|both] [--channels 1,6,11] [--profile quick|detailed|passive] [--limit 1..128]` — one AP survey, default 64 records, using separate PSRAM buffers and `[WFA1]` JSON lines. Existing scan results and selections are preserved.
+- `wifi_analyzer stop` / `clear` — cancel analyzer work or release its idle buffers. This surveys AP signal/channel overlap; it does not measure percentage airtime or spectrum power.
+
+See the [protocol and admission rules](wifi-analyzer-protocol.md), [shared-radio
+contract](janos-radio-lease.md), [hardware smoke-test runbook](wifi-analyzer-smoke-test.md)
+and [device evidence](wifi-analyzer-device-validation.md).
+
+### `wps`, `jwps`, `selftest` and `secret`
+
+- `wps verify <bssid> <8-digit-pin>` — asynchronously verify one known WPS PIN
+  against an explicitly owned AP. A successful start emits a schema-v1
+  `accepted` record followed later by exactly one `terminal` record. Invalid or
+  refused input returns nonzero. The REPL can visibly echo the supplied PIN.
+- `wps pixie <bssid> [epoch]` — capture Pixie material from one explicit owned
+  BSSID, search using tracked PSRAM, then verify the candidate online. Optional
+  `epoch` is unsigned decimal Unix seconds in `1577836800..4102444800`.
+- `wps status` — safe status read: phase, run/generation, operation/cleanup result
+  and current/peak WPS allocation counters.
+- `wps stop` — cooperatively stop WPS only and wait for cleanup. It does not stop
+  an analyzer-owned radio.
+- `jwps plan <bssid> [ssid]` — offline candidate generation; an SSID with spaces
+  may be quoted or passed as trailing words (joined length at most 32 bytes).
+- `jwps campaign <bssid> <start-index> <count:1-3> [ssid]` — bounded online
+  campaign through the shared WPS lease and exact radio restore.
+- `selftest db`, `selftest fragment`, `selftest pixie` — serialized offline
+  deterministic tests. `selftest transport` borrows and restores the radio.
+- `secret status` — report the volatile WPS result as `empty`, `available` or
+  `expired` without exposing it.
+- `secret reveal` — print and consume the retained PIN/network key once. Empty or
+  expired state is a JSON result, not a generic command error.
+- `secret erase` — wipe the retained result; it prints no dedicated acknowledgement.
+
+Bulk WPS scratch is PSRAM-only; secret allocations/vault are internal RAM and
+wiped. The vault TTL is five minutes. Authenticated-M7 results are also exported
+as sensitive plaintext JSON below `/sdcard/lab/wps/results/`; current production
+terminal records remain unchanged for compatibility. A persistence attempt
+emits a separate additive `wps_storage` record immediately before `terminal`.
+Failed sessions may append a
+secret-free, deduplicated device observation to
+`/sdcard/lab/wps/unknown_devices.jsonl`; this still contains potentially
+sensitive BSSID/SSID and identity metadata, but never PIN candidates, keys or
+cryptographic session material. See [JanOS WPS laboratory workflows](janos-wps.md)
+and the [radio compatibility runbook](janos-radio-compatibility-validation.md).
+
+These commands reuse the production `janos_wps` component engines; no standalone
+mini-OS image is required. `sta_mac ...` remains outside this command family.
+
+Radio-mutating legacy commands, `test_radio_channel(s)`, analyzer startup and
+online WPS/JWPS reserve an owner plus generation before the dispatcher unlocks:
+`LEGACY`, `ANALYZER` or `WPS`. Analyzer `clear` is a short legacy transaction;
+manual OTA may use only its own exact legacy token, while event-triggered OTA
+remains idle-only. Status/read and stop exceptions stay available, and no
+admission lock spans handler execution. Conflicts retain the exact legacy
+WFACTL1 busy line and nonzero console result documented in
+[shared radio ownership](janos-radio-lease.md).
 
 ### `scan_networks`
 - `scan_networks` — background Wi‑Fi scan on all channels. Results auto‑print as CSV; wait for `Scan results printed`. CSV: `"index","SSID","","BSSID","channel","security","RSSI","band"`. Wardrive must be stopped first.
@@ -220,13 +359,14 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 
 ## Sniffing & monitoring
 
-- `start_sniffer` — client sniffer; sniffs selected networks or scans first. Streams `Sniffer packet count: N`.
+- `start_sniffer` — client sniffer; sniffs selected networks or scans first. Passive enrichment collects SSID/security/WPS during capture; packet processing does not log or print from the radio callback.
 - `start_sniffer_noscan` — sniffer using existing scan results (no new scan).
 - `show_sniffer_results` / `show_sniffer_results_vendor` — APs with associated clients (vendor variant adds MAC vendor names).
+- `show_sniffer_results extended` / `show_sniffer_results_vendor extended` — append versioned passive metadata to the same AP/client lines. No extra capture or radio switching. See [exact UART contract and manual test](sniffer-extended-uart.md).
 - `clear_sniffer_results` — clear clients/probes/counters.
 - `show_probes` / `show_probes_vendor` — captured probe requests (SSID + source MAC).
 - `list_probes` / `list_probes_vendor` — probe SSIDs with 1‑based index (for `start_karma`).
-- `sniffer_debug <0|1>` — toggle verbose sniffer logging.
+- `sniffer_debug` — read `[SnifferRX]` packet/rejection counters and last RX metadata. `sniffer_debug <0|1>` retains the debug flag; packet callbacks do not print. The channel task reports `Sniffer packet count` progress.
 - `start_sniffer_dog` — capture AP‑STA pairs and immediately send targeted deauth (`[SnifferDog #N] DEAUTH sent: ...`).
 - `deauth_detector [i1 i2 ...]` — detect deauth frames (all channels, or selected). Output `[DEAUTH] CH: .. | AP: .. (BSSID) | RSSI: ..`.
 - `start_ap_locator` — lock onto one selected AP's channel and print its RSSI once per second (`[AP Locator] ...`). Needs exactly one selected network.
@@ -239,7 +379,11 @@ Randomized (locally‑administered) BLE MACs rotate ~every 15 minutes and can't 
 - `start_deauth` — deauth selected networks. WPA2 stays classic deauth; WPA3 uses Channel Switch Announcement (CSA); WPA2/WPA3 mixed sends both. Prereq `select_networks`. Syntax unchanged.
 - `start_evil_twin` — clone first selected AP + deauth others, captive portal harvests password. Optional `select_html`.
 - `sae_overflow` — WPA3 SAE client‑overflow on exactly one selected AP.
-- `start_handshake` — capture WPA handshakes (targeted with selection, else scan‑and‑attack loop). Saves PCAP/HCCAPX.
+- `start_handshake` — capture WPA handshakes (targeted with selection, else scan-and-attack loop). Saves PCAP/HCCAPX. Before every run it reloads `/sdcard/lab/white.txt`; each non-empty line may contain one BSSID using `:` or `-` separators. Protected BSSIDs are removed from an explicit selection and are neither learned nor deauthenticated by the automatic D-UCB path. A mixed selection continues with its unprotected entries; a selection containing only protected entries is rejected without starting the worker. Both explicit targets and automatic D-UCB use one legacy-compatible radio path: APSTA mode with raw transmission through `WIFI_IF_AP`. APSTA is established once before the worker starts; D-UCB changes only the channel, verifies mode and channel before dwell, and repeats the readback immediately before TX. An arm that cannot be prepared records zero reward and does not transmit. The D-UCB worker copies BSSID, client, slot/session generation, SSID and channel under a short RX-state lock, then releases it before raw TX, burst delays and filesystem work; reconnect EAPOL can therefore arrive during the burst. Commit revalidates the immutable identity, so a stale or reused FIFO slot cannot publish. Each attempt owns a target-only PCAP plus AP/client/ESSID-bound HCCAPX. After RX is quiesced, complete bytes are copied into an immutable snapshot; `.part` files are flushed and synchronized outside the RX lock, HCCAPX is promoted first and PCAP last as the completion marker. PCAP-only or mismatched data is never reported as success. `stop` is cooperative and bounded: synchronous storage can yield additive `[HS-STOP] ... stop_pending`, and a later stop completes after worker exit; the worker is not force-deleted while it owns capture data. The automatic diagnostic PCAP remains PSRAM-backed, grows geometrically from 4 KiB to a hard 512 KiB limit and cannot suppress the independent target EAPOL path. `[HS-PCAP]` reports bounded-buffer rotation/allocation telemetry, `[HS-DUCB]` reports contention/stale-generation/snapshot/lock-hold telemetry, and `[HS-TX] tx_done_success=N tx_done_fail=N ...` reports deauthentication TX completions after callback unregister. `tx_done_success` confirms driver/MAC completion, not client reception. Existing CardputerADV/Tab5/FlipperLight success strings are unchanged and are printed only after both committed files exist. DFS availability depends on the exact ESP-IDF/driver; the handshaker never switches to a separate STA/`WIFI_IF_STA` path.
+- `radio_protect add <BSSID>` — add a protected BSSID to `/sdcard/lab/white.txt`. Accepts `:` or `-` separators, rejects group/broadcast addresses, avoids duplicates and reloads the active list immediately.
+- `radio_protect remove <BSSID>` — remove a protected BSSID and reload the list. Removing an absent entry is an idempotent success with `result:"not_found"`.
+- `radio_protect list` — print the active protected BSSID entries and their count.
+- `radio_protect clear` — clear the protection file and active list.
 - `save_handshake` — manually save a captured complete 4‑way handshake.
 - `start_blackout` — scan all networks every 3 min and deauth everything.
 - `start_beacon_spam "SSID1" "SSID2" ...` — broadcast fake beacons (max 32 SSIDs, 1‑32 chars each).
@@ -277,6 +421,7 @@ All attacks stop with `stop`.
 - `scan_bt` — one‑time 10 s BLE scan (lists devices, AirTag/SmartTag counts).
 - `scan_bt <MAC>` — continuous RSSI tracking of one device. Stop with `stop`.
 - `scan_airtag` — continuous AirTag/SmartTag scan; prints `<airtags>,<smarttags>` every ~30 s. Stop with `stop`.
+- `start_blespam [20|50|100|200|500]` — BLE spam mixing Apple Action Modal (Continuity Nearby Action) and Samsung Watch Pair (EasySetup Watch). Default interval 20 ms. Prints `[BLESPAM] packets=N apple=X samsung=Y delay=M` about once a second. Stop with `stop`.
 
 (See Part 1 for `start_antisurveillance`.)
 
@@ -417,6 +562,49 @@ Cancellation ends with `[FT] cancelled` and `[FT] END`. Validation, SD, open, se
 
 ## Settings
 
+- `wifi_country status` — show the configured profile and, when the Wi-Fi
+  driver is active, its read-back country, channel range and policy.
+- `wifi_country list` — list all 176 profiles from the ESP-IDF 6.0 ESP32-C5
+  regulatory table, including countries/territories, `EU` and world-safe `01`.
+  `PA` remains the JanOS default and fallback.
+- `wifi_country set <CC>` — validate and persist a profile in NVS. Lowercase is
+  normalized to uppercase. The new profile is applied after reboot.
+- `wifi_country reset` — persist the default `PA` profile for the next boot.
+
+At the first boot of a different firmware image (UART/USB flash, OTA or a return
+to another image), JanOS resets and saves `PA` in NVS. The country and the
+running image's full ELF SHA-256 are stored together in `wifi_country/profile`.
+Later boots of the same image preserve a profile selected with `wifi_country set`.
+Reflashing the identical BIN does not trigger a reset. On first upgrading from
+the old three-byte country record, the previous choice is replaced by `PA` once.
+After a firmware-triggered reset, `status` reports
+`record_health="firmware_reset_pa"`; subsequent boots report `valid`. Empty NVS
+is initialized with a saved `PA` profile (`default_pa`). Storage failures use PA
+in memory and report a fallback health value; the reset is retried on a later boot.
+Other NVS settings are preserved.
+
+Country configuration is applied centrally after every Wi-Fi driver
+initialization and read back before the radio is accepted. `PA` uses the JanOS
+manual profile `schan=1`, `nchan=14`; other profiles use the corresponding IDF
+regulatory table in manual mode. Changing a country profile does not bypass
+DFS restrictions or permit SoftAP/APSTA operation on DFS channels.
+
+`RU` is already present in the ESP-IDF 6.0.0 profile list. For that pinned
+version it covers 2.4 GHz channels 1–13 and 5 GHz channels 36–64 plus 132–165;
+channels 100–128 are not part of the profile. The lowercase command is accepted
+and normalized, for example:
+
+```text
+wifi_country set ru
+# reboot
+wifi_country status
+```
+
+After reboot verify `configured_cc="RU"`, `active_cc="RU"` and
+`active_policy="manual"`. This profile does not bypass ESP32-C5 DFS/SoftAP
+hardware or driver restrictions and must only be used where the selected
+regulatory domain is applicable.
+
 - `channel_time set <min|max> <ms>` / `channel_time read <min|max>` — scan dwell per channel (100‑1500 ms, min<max).
 - `vendor set <on|off>` / `vendor read` — MAC vendor lookup in results.
 - `display set <auto|ssd1306|sh1107|sh1106|unit_lcd>` / `display read` — OLED/LCD type.
@@ -425,7 +613,9 @@ Cancellation ends with `[FT] cancelled` and `[FT] END`. Validation, SD, open, se
 
 ## OTA updates
 
-- `ota_check [latest|<tag>]` — check GitHub and apply a firmware update. Prereq WiFi.
+- `ota_check [rf] [latest|<tag>]` — check GitHub and apply a firmware update.
+  `rf` selects the RF-support release path. Prereq WiFi; an active analyzer/WPS
+  lease refuses OTA before worker creation.
 - `ota_list` — list recent releases (`OTA[n]: <tag> (main|dev) <date> <title>`).
 - `ota_channel [main|dev]` — get/set update channel.
 - `ota_info` — partition info (boot/running/next).
