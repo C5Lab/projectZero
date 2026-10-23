@@ -28163,7 +28163,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t crack_worker_cmd = {
         .command = "crack_worker",
-        .help = "Distributed WPA worker: capabilities|probe|receive|reset|start|status|cancel",
+        .help = "Distributed WPA worker: capabilities|probe|receive|reset|diag|start|status|cancel",
         .hint = "<subcommand> [arguments]",
         .func = &crack_worker_command,
         .argtable = NULL
@@ -28299,8 +28299,8 @@ static void register_commands(void)
     // BLE Scanner commands
     const esp_console_cmd_t scan_bt_cmd = {
         .command = "scan_bt",
-        .help = "One-time BLE device scan (10 seconds)",
-        .hint = NULL,
+        .help = "BLE scan (10 seconds); with MAC, track RSSI continuously (stop with 'stop')",
+        .hint = "[MAC]",
         .func = &cmd_scan_bt,
         .argtable = NULL
     };
