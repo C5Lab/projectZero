@@ -208,11 +208,26 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         self.assertLess(prepare.index("esp_netif_new(&netif_config)"),
                         prepare.index("if (netif == NULL) return ESP_ERR_NO_MEM"))
         self.assertIn("esp_netif_destroy_default_wifi(netif)", prepare)
-        self.assertLess(prepare.index("err = esp_wifi_start()"),
+        self.assertLess(prepare.index("err = wifi_start_with_boot_sta_mac()"),
                         prepare.index("current_radio_mode = RADIO_MODE_WIFI"))
+        start = tokens(function_body(MAIN, "wifi_start_with_boot_sta_mac"))
+        self.assertLess(start.index("sta_mac_boot_apply(&sta_mac_boot, &driver)"),
+                        start.index("return esp_wifi_start()"))
+        self.assertIn("status != STA_MAC_BOOT_APPLY_OK", start)
+        self.assertIn("wifi_start_with_boot_sta_mac()",
+                      tokens(function_body(MAIN, "wifi_init_ap_sta")))
+        self.assertEqual(tokens(MAIN).count("esp_wifi_start()"), 1)
         self.assertIn("esp_wifi_deinit() != ESP_OK", prepare)
         self.assertIn("analyzer_legacy_radio_uncertain = true", prepare)
         self.assertRegex(prepare, r"failed\s*:\s*\(void\)esp_wifi_stop\(\)")
+
+    def test_wps_receives_cached_effective_boot_mac(self):
+        boot_init = MAIN.index("sta_mac_boot_init(")
+        wps_init = MAIN.index("bool wps_runtime_ready = janos_wps_runtime_init(")
+        self.assertLess(boot_init, wps_init)
+        self.assertRegex(MAIN[wps_init:wps_init + 180],
+                         r"janos_wps_runtime_init\(\s*&janos_radio_lease,\s*&wps_hooks,"
+                         r"\s*sta_mac_boot\.effective_mac\)")
 
     def test_every_wifi_init_applies_and_verifies_configured_country(self):
         country_source = function_body(MAIN, "wifi_apply_configured_country")

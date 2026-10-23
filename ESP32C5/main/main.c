@@ -54,6 +54,7 @@
 #include "led_strip.h"
 
 #include "esp_random.h"
+#include "bootloader_random.h"
 #include "mbedtls/ecp.h"
 #include "mbedtls/bignum.h"
 #include "mbedtls/base64.h"
@@ -122,6 +123,9 @@
 #include "janos_wps_runtime.h"
 #include "janos_wps_command.h"
 #include "janos_wps_transport.h"
+#include "sta_mac_boot.h"
+#include "sta_mac_command.h"
+#include "sta_mac_policy_nvs.h"
 /* Keep the host-owned lifecycle/storage baseline observable to WPS. */
 #define esp_wifi_init janos_wps_wifi_init
 #define esp_wifi_deinit janos_wps_wifi_deinit
@@ -1038,6 +1042,9 @@ static wifi_country_policy_record_t wifi_country_configured = {
     WIFI_COUNTRY_POLICY_VERSION, "PA"
 };
 static const char *wifi_country_record_health = "default_pa";
+static sta_mac_boot_state_t sta_mac_boot;
+static StaticSemaphore_t sta_mac_state_mutex_storage;
+static SemaphoreHandle_t sta_mac_state_mutex;
 static bool ota_check_started = false;
 static bool ota_check_in_progress = false;
 static janos_radio_lease_t janos_radio_lease;
@@ -2456,6 +2463,7 @@ static int cmd_zig_recon_nodes(int argc, char **argv);
 static int cmd_zig_recon_clear(int argc, char **argv);
 static int cmd_wifi_connect(int argc, char **argv);
 static int cmd_wifi_country(int argc, char **argv);
+static int cmd_sta_mac(int argc, char **argv);
 static int cmd_test_radio_channel(int argc, char **argv);
 static int cmd_test_radio_channels(int argc, char **argv);
 static int cmd_capture_gateway(int argc, char **argv);
@@ -4300,6 +4308,46 @@ static esp_err_t wifi_init_with_configured_country(const wifi_init_config_t *con
     return err;
 }
 
+static bool sta_mac_driver_set(void *context, const uint8_t mac[STA_MAC_SIZE])
+{
+    (void)context;
+    return esp_wifi_set_mac(WIFI_IF_STA, mac) == ESP_OK;
+}
+
+static bool sta_mac_driver_get(void *context, uint8_t mac[STA_MAC_SIZE])
+{
+    (void)context;
+    return esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK;
+}
+
+static bool sta_mac_boot_entropy(void *context, uint8_t out[STA_MAC_SIZE])
+{
+    (void)context;
+    /* Early app boot has not enabled RF yet. Use the C5 ADC entropy source
+     * only for this draw, then release it before RF/ADC initialization. */
+    bootloader_random_enable();
+    esp_fill_random(out, STA_MAC_SIZE);
+    bootloader_random_disable();
+    return true;
+}
+
+/* The host also restarts an initialized driver when switching STA/APSTA.
+ * Verify the cached boot identity before every host-owned start. */
+static esp_err_t wifi_start_with_boot_sta_mac(void)
+{
+    const sta_mac_boot_driver_t driver = {
+        .context = NULL,
+        .set_sta_mac = sta_mac_driver_set,
+        .get_sta_mac = sta_mac_driver_get,
+    };
+    sta_mac_boot_apply_status_t status = sta_mac_boot_apply(&sta_mac_boot, &driver);
+    if (status != STA_MAC_BOOT_APPLY_OK) {
+        MY_LOG_INFO(TAG, "STA MAC apply failed (%d); WiFi start refused", (int)status);
+        return status == STA_MAC_BOOT_APPLY_NOT_READY ? ESP_ERR_INVALID_STATE : ESP_FAIL;
+    }
+    return esp_wifi_start();
+}
+
 static esp_err_t wifi_init_ap_sta(void) {
     // Initialize netif only once (shared between WiFi and BLE modes)
     if (!netif_initialized) {
@@ -4342,7 +4390,11 @@ static esp_err_t wifi_init_ap_sta(void) {
     wifi_config_t wifi_config = { 0 };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_err_t start_err = wifi_start_with_boot_sta_mac();
+    if (start_err != ESP_OK) {
+        (void)esp_wifi_deinit();
+        return start_err;
+    }
 
     uint8_t mac[6];
     esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
@@ -4444,6 +4496,117 @@ static int cmd_wifi_country(int argc, char **argv)
     printf("{\"schema_version\":1,\"record_type\":\"wifi_country_result\","
            "\"result\":\"%s\",\"configured_cc\":\"%s\","
            "\"applies_after_reboot\":true}\n", action, requested.cc);
+    return 0;
+}
+
+static const char *sta_mac_mode_name(sta_mac_policy_mode_t mode)
+{
+    switch (mode) {
+    case STA_MAC_MODE_FACTORY: return "factory";
+    case STA_MAC_MODE_RANDOM_PER_BOOT: return "random";
+    case STA_MAC_MODE_FIXED: return "fixed";
+    default: return "unknown";
+    }
+}
+
+static const char *sta_mac_record_health_name(const sta_mac_boot_state_t *state)
+{
+    switch (state->record_health) {
+    case STA_MAC_BOOT_RECORD_VALID: return "valid";
+    case STA_MAC_BOOT_RECORD_MISSING: return "missing";
+    case STA_MAC_BOOT_RECORD_INVALID:
+        return state->load_result.policy_status == STA_MAC_POLICY_UNSUPPORTED_VERSION
+            ? "unsupported_version" : "invalid_record";
+    case STA_MAC_BOOT_RECORD_READ_ERROR: return "read_error";
+    default: return "read_error";
+    }
+}
+
+static const char *sta_mac_store_error_name(sta_mac_store_status_t status)
+{
+    switch (status) {
+    case STA_MAC_STORE_MISSING_NAMESPACE: return "missing_namespace";
+    case STA_MAC_STORE_OPEN_FAILED: return "open_failed";
+    case STA_MAC_STORE_WRITE_FAILED: return "write_failed";
+    case STA_MAC_STORE_COMMIT_FAILED: return "commit_failed";
+    case STA_MAC_STORE_INVALID_RECORD: return "invalid_record";
+    default: return "store_failed";
+    }
+}
+
+static void sta_mac_print_json_mac(const uint8_t mac[STA_MAC_SIZE])
+{
+    printf("\"%02X:%02X:%02X:%02X:%02X:%02X\"",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static void sta_mac_print_status(void)
+{
+    sta_mac_boot_state_t state;
+    xSemaphoreTake(sta_mac_state_mutex, portMAX_DELAY);
+    state = sta_mac_boot;
+    xSemaphoreGive(sta_mac_state_mutex);
+    uint8_t active_mac[STA_MAC_SIZE];
+    bool have_active = esp_wifi_get_mac(WIFI_IF_STA, active_mac) == ESP_OK;
+    bool configured_known = state.configured_known;
+
+    printf("{\"schema_version\":1,\"record_type\":\"sta_mac_status\","
+           "\"configured_mode\":");
+    if (configured_known) printf("\"%s\"", sta_mac_mode_name(state.configured_policy.mode));
+    else printf("null");
+    printf(",\"boot_mode\":\"%s\",\"configured_mac\":",
+           sta_mac_mode_name(state.boot_policy.mode));
+    if (configured_known && state.configured_policy.mode == STA_MAC_MODE_FIXED)
+        sta_mac_print_json_mac(state.configured_policy.mac);
+    else printf("null");
+    printf(",\"effective_boot_mac\":");
+    sta_mac_print_json_mac(state.effective_mac);
+    printf(",\"active_sta_mac\":");
+    if (have_active) sta_mac_print_json_mac(active_mac);
+    else printf("null");
+    printf(",\"record_health\":\"%s\",\"identity_ready\":%s,"
+           "\"pending_reboot\":%s}\n",
+           sta_mac_record_health_name(&state), state.ready ? "true" : "false",
+           state.pending_reboot ? "true" : "false");
+}
+
+static int cmd_sta_mac(int argc, char **argv)
+{
+    const char *args[4];
+    sta_mac_command_t command;
+    sta_mac_command_status_t parsed = STA_MAC_COMMAND_SYNTAX_ERROR;
+    if (argc >= 0 && argc <= 4 && argv != NULL) {
+        for (int i = 0; i < argc; ++i) args[i] = argv[i];
+        parsed = sta_mac_command_parse(argc, args, &command);
+    }
+    if (parsed != STA_MAC_COMMAND_OK) {
+        printf("{\"schema_version\":1,\"record_type\":\"sta_mac_result\","
+               "\"result\":\"%s\"}\n",
+               parsed == STA_MAC_COMMAND_INVALID_MAC ? "invalid_mac" : "usage");
+        return 1;
+    }
+    if (command.kind == STA_MAC_COMMAND_STATUS) {
+        sta_mac_print_status();
+        return 0;
+    }
+
+    xSemaphoreTake(sta_mac_state_mutex, portMAX_DELAY);
+    sta_mac_store_result_t saved = sta_mac_boot_save(&sta_mac_boot, &command.policy);
+    xSemaphoreGive(sta_mac_state_mutex);
+    if (saved.status != STA_MAC_STORE_OK) {
+        printf("{\"schema_version\":1,\"record_type\":\"sta_mac_result\","
+               "\"result\":\"store_error\",\"error\":\"%s\"}\n",
+               sta_mac_store_error_name(saved.status));
+        return 1;
+    }
+    printf("{\"schema_version\":1,\"record_type\":\"sta_mac_result\","
+           "\"result\":\"set\",\"configured_mode\":\"%s\","
+           "\"configured_mac\":",
+           sta_mac_mode_name(command.policy.mode));
+    if (command.policy.mode == STA_MAC_MODE_FIXED)
+        sta_mac_print_json_mac(command.policy.mac);
+    else printf("null");
+    printf(",\"applies_after_reboot\":true}\n");
     return 0;
 }
 
@@ -4689,10 +4852,10 @@ static esp_netif_t *ensure_ap_mode(void)
         esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
         if (ret != ESP_OK) {
             MY_LOG_INFO(TAG, "Failed to set APSTA mode: %s", esp_err_to_name(ret));
-            esp_wifi_start();
+            wifi_start_with_boot_sta_mac();
             return NULL;
         }
-        ret = esp_wifi_start();
+        ret = wifi_start_with_boot_sta_mac();
         if (ret != ESP_OK) {
             MY_LOG_INFO(TAG, "Failed to restart WiFi: %s", esp_err_to_name(ret));
             return NULL;
@@ -4709,7 +4872,7 @@ static esp_netif_t *ensure_ap_mode(void)
     ap_netif_handle = esp_netif_create_default_wifi_ap();
     if (!ap_netif_handle) {
         MY_LOG_INFO(TAG, "Failed to create AP netif");
-        esp_wifi_start();
+        wifi_start_with_boot_sta_mac();
         return NULL;
     }
     
@@ -4717,7 +4880,7 @@ static esp_netif_t *ensure_ap_mode(void)
     esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to set APSTA mode: %s", esp_err_to_name(ret));
-        esp_wifi_start();
+        wifi_start_with_boot_sta_mac();
         return NULL;
     }
     
@@ -4734,7 +4897,7 @@ static esp_netif_t *ensure_ap_mode(void)
     };
     esp_wifi_set_config(WIFI_IF_AP, &ap_config);
     
-    ret = esp_wifi_start();
+    ret = wifi_start_with_boot_sta_mac();
     if (ret != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to restart WiFi: %s", esp_err_to_name(ret));
         return NULL;
@@ -14287,7 +14450,7 @@ static int start_beacon_spam_internal(void) {
         MY_LOG_INFO(TAG, "Failed to set hidden AP config: %s", esp_err_to_name(ap_err));
     }
 
-    err = esp_wifi_start();
+    err = wifi_start_with_boot_sta_mac();
     if (err != ESP_OK) {
         MY_LOG_INFO(TAG, "Failed to start WiFi: %s", esp_err_to_name(err));
         return 1;
@@ -27023,7 +27186,7 @@ static esp_err_t analyzer_host_prepare_wifi(void)
     if (err != ESP_OK) goto failed;
     err = esp_wifi_set_config(WIFI_IF_STA, &config);
     if (err != ESP_OK) goto failed;
-    err = esp_wifi_start();
+    err = wifi_start_with_boot_sta_mac();
     if (err != ESP_OK) goto failed;
     current_radio_mode = RADIO_MODE_WIFI;
     wifi_initialized = true;
@@ -27065,6 +27228,13 @@ static void register_commands(void)
         .func = &cmd_wifi_country,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_country_cmd));
+
+    const esp_console_cmd_t sta_mac_cmd = {
+        .command = "sta_mac",
+        .help = "STA MAC next boot: status | set factory | set random | set fixed <02:xx:xx:xx:xx:xx>",
+        .func = &cmd_sta_mac,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&sta_mac_cmd));
 
     const esp_console_cmd_t radio_protect_cmd = {
         .command = "radio_protect",
@@ -28217,6 +28387,16 @@ void app_main(void) {
 
     // NVS must be ready before loading persisted display mode.
     ESP_ERROR_CHECK(nvs_flash_init());
+    uint8_t factory_sta_mac[STA_MAC_SIZE];
+    ESP_ERROR_CHECK(esp_read_mac(factory_sta_mac, ESP_MAC_WIFI_STA));
+    sta_mac_boot_status_t sta_mac_init_status = sta_mac_boot_init(
+        &sta_mac_boot, sta_mac_policy_nvs_store(), factory_sta_mac,
+        sta_mac_boot_entropy, NULL);
+    memset(factory_sta_mac, 0, sizeof(factory_sta_mac));
+    if (sta_mac_init_status != STA_MAC_BOOT_OK) {
+        MY_LOG_INFO(TAG, "STA MAC policy unavailable (%d); WiFi start disabled",
+                    (int)sta_mac_init_status);
+    }
     wifi_country_load();
     display_mode_load_from_nvs();
     oled_display_set_forced_type(display_forced_mode);
@@ -28342,6 +28522,8 @@ void app_main(void) {
     ESP_ERROR_CHECK(uart_baud_control_init());
     janos_command_mutex = xSemaphoreCreateRecursiveMutexStatic(&janos_command_mutex_storage);
     assert(janos_command_mutex != NULL);
+    sta_mac_state_mutex = xSemaphoreCreateMutexStatic(&sta_mac_state_mutex_storage);
+    assert(sta_mac_state_mutex != NULL);
     janos_radio_lease_init(&janos_radio_lease);
     const wifi_analyzer_hooks_t analyzer_hooks = {
         .busy_reason = analyzer_host_busy_reason,
@@ -28354,8 +28536,6 @@ void app_main(void) {
         .lease_release = analyzer_host_lease_release,
     };
     wifi_analyzer_init(&analyzer_hooks);
-    uint8_t wps_boot_mac[6];
-    ESP_ERROR_CHECK(esp_read_mac(wps_boot_mac, ESP_MAC_WIFI_STA));
     const janos_wps_runtime_hooks_t wps_hooks = {
         .busy_reason = analyzer_host_busy_reason,
         .prepare_wifi = analyzer_host_prepare_wifi,
@@ -28363,8 +28543,7 @@ void app_main(void) {
         .tx_activity = uart_baud_note_activity,
     };
     bool wps_runtime_ready = janos_wps_runtime_init(
-        &janos_radio_lease, &wps_hooks, wps_boot_mac);
-    memset(wps_boot_mac, 0, sizeof(wps_boot_mac));
+        &janos_radio_lease, &wps_hooks, sta_mac_boot.effective_mac);
     ESP_ERROR_CHECK(wps_runtime_ready ? ESP_OK : ESP_FAIL);
     crack_worker_init(init_sd_card, uart_baud_set_file_transfer_active,
                       uart_baud_current);

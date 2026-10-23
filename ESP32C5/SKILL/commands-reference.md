@@ -1098,6 +1098,21 @@ ADDR      ROLE         PKTS  RSSI  LAST
 
 ## Settings
 
+### `sta_mac`
+- **Syntax** (exact forms; no aliases or extra arguments):
+```
+sta_mac status
+sta_mac set factory
+sta_mac set random
+sta_mac set fixed 02:11:22:33:44:55
+```
+- **Description**: Sets the STA MAC boot policy in NVS. `factory` uses the factory STA address; `random` generates one locally administered unicast address per application boot and retains it through Wi-Fi driver reinitialization; `fixed` uses the specified address. SoftAP, BLE and IEEE 802.15.4 identities are unaffected.
+- **Fixed MAC rule**: Exactly six colon-separated hexadecimal octets, with `first_octet & 3 == 2` (locally administered unicast). Invalid syntax or address returns nonzero and does not change NVS.
+- **Persistence**: A successful `set` checks the NVS commit and reports JSON with `schema_version:1`, `record_type:"sta_mac_result"`, `result:"set"`, and `applies_after_reboot:true`. The new policy takes effect only after an application reboot; `set` does not reboot or change the running MAC. A failed write or commit leaves the configured policy unchanged.
+- **Status**: Read-only JSON with `schema_version:1` and `record_type:"sta_mac_status"` includes `configured_mode`, `boot_mode`, `configured_mac`, `effective_boot_mac`, `active_sta_mac`, `record_health`, `identity_ready` and `pending_reboot`. `configured_mode` is `null` if the saved record is invalid or unreadable; `active_sta_mac` is `null` if the Wi-Fi driver is unavailable; status does not initialize it. Missing NVS selects factory, an invalid/future record falls back to factory without a rewrite, and a read I/O error reports `identity_ready:false` and prevents Wi-Fi startup under an unverified identity.
+- **Admission**: `status` works during active or quarantined radio ownership. `set` is refused busy during either state and uses a short serialized legacy transaction when idle.
+- **WPS**: A temporary WPS session MAC is restored to the effective boot MAC, including the cached random identity. Host tests do not prove on-device radio behavior.
+
 ### `channel_time`
 - **Syntax**: `channel_time set <min|max> <ms>` or `channel_time read <min|max>`
 - **Description**: Sets or reads scan dwell time per channel.

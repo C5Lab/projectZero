@@ -28,7 +28,9 @@ the adapter and the full radio-compatibility matrix are revalidated.
 
 The production component reuses `private/workflow`, campaign, Pixie, session,
 protocol, PIN and transport sources directly. It does not depend on a standalone
-mini-OS entry point. `sta_mac` policy commands remain outside this surface.
+mini-OS entry point. The separate production `sta_mac` command selects the STA
+identity at boot; its four forms and next-boot behavior are in the
+[command manual](command-manual.md#sta-mac-boot-policy).
 
 ## Asynchronous contract
 
@@ -209,7 +211,13 @@ snapshot for retry. Only exact equality permits lease release; otherwise the
 service remains quarantined. The configuration snapshot is allocated in wiped
 internal RAM because it can contain credentials. It is never copied to PSRAM,
 SD or NVS. This transport contract preserves the active boot MAC but does not
-add a persistent `sta_mac` policy.
+change the persistent `sta_mac` policy. The policy is loaded at application
+boot; `sta_mac set` changes only the next boot's choice. WPS may borrow a
+temporary per-session STA MAC, then must restore and read back the effective
+boot MAC before releasing its radio owner. In random mode, that effective MAC
+is generated once per application boot and remains stable through driver
+reinitialization. Failed restoration retains quarantine. Host tests cover the
+identity and restore contracts; they do not establish on-device radio behavior.
 
 ## Secret lifecycle and memory
 

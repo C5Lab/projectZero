@@ -24,6 +24,7 @@ sta_mac_store_result_t sta_mac_policy_load(const sta_mac_policy_store_t *store, 
     sta_mac_store_result_t loaded;
     if (io == STA_MAC_IO_MISSING) loaded = result(STA_MAC_STORE_MISSING_KEY);
     else if (io == STA_MAC_IO_BUFFER_TOO_SMALL) loaded = invalid_record(STA_MAC_POLICY_WRONG_LENGTH);
+    else if (io == STA_MAC_IO_INVALID_RECORD) loaded = invalid_record(STA_MAC_POLICY_INVALID_PAYLOAD);
     else if (io != STA_MAC_IO_OK) loaded = result(STA_MAC_STORE_READ_FAILED);
     else {
         sta_mac_policy_status_t status = sta_mac_policy_decode(bytes, length, out);

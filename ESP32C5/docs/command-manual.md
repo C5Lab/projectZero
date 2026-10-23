@@ -220,6 +220,10 @@ later in this manual define output, persistence, admission and error behavior.
 | `wifi_country list` | List accepted two-character country profiles. | [Settings](#settings) |
 | `wifi_country set <CC>` | Persist a country profile for application after reboot. | [Settings](#settings) |
 | `wifi_country reset` | Restore the default `PA` profile for the next boot. | [Settings](#settings) |
+| `sta_mac status` | Read configured, boot and active STA identities. | [STA MAC boot policy](#sta-mac-boot-policy) |
+| `sta_mac set factory` | Use the factory STA MAC on the next application boot. | [STA MAC boot policy](#sta-mac-boot-policy) |
+| `sta_mac set random` | Generate one STA MAC on the next application boot. | [STA MAC boot policy](#sta-mac-boot-policy) |
+| `sta_mac set fixed <MAC>` | Use a validated local unicast STA MAC on the next application boot. | [STA MAC boot policy](#sta-mac-boot-policy) |
 | `radio_protect add <BSSID>` | Add a protected BSSID to `/sdcard/lab/white.txt`. | [Attacks](#attacks) |
 | `radio_protect remove <BSSID>` | Remove a protected BSSID. | [Attacks](#attacks) |
 | `radio_protect list` | List active protected BSSIDs. | [Attacks](#attacks) |
@@ -230,8 +234,8 @@ cleanup behavior changed, while its existing `caps`, `scan`, `status`, `stop`
 and `clear` CLI remains compatible. Likewise, `start_handshake` keeps its
 existing syntax while adding protected-BSSID filtering and stricter radio
 cleanup. Pixie and JWPS/campaign are production component commands now; the
-removed standalone mini-OS is not required. Persistent `sta_mac` policy remains
-outside this command family.
+removed standalone mini-OS is not required. The production `sta_mac` commands
+are described under [STA MAC boot policy](#sta-mac-boot-policy).
 
 ## WiFi scanning
 
@@ -328,7 +332,8 @@ cryptographic session material. See [JanOS WPS laboratory workflows](janos-wps.m
 and the [radio compatibility runbook](janos-radio-compatibility-validation.md).
 
 These commands reuse the production `janos_wps` component engines; no standalone
-mini-OS image is required. `sta_mac ...` remains outside this command family.
+mini-OS image is required. The separate production `sta_mac` command configures
+the boot STA identity used by WPS; see [STA MAC boot policy](#sta-mac-boot-policy).
 
 Radio-mutating legacy commands, `test_radio_channel(s)`, analyzer startup and
 online WPS/JWPS reserve an owner plus generation before the dispatcher unlocks:
@@ -610,6 +615,57 @@ regulatory domain is applicable.
 - `display set <auto|ssd1306|sh1107|sh1106|unit_lcd>` / `display read` — OLED/LCD type.
 - `led set <on|off>` / `led level <1-100>` / `led read` — status LED.
 - `boot_button read|list|set <short|long> <cmd[,cmd...]>|status <short|long> <on|off>` — map boot‑button presses to commands (comma‑chained).
+
+### STA MAC boot policy
+
+The production STA MAC command accepts exactly these forms, with no aliases or
+extra arguments:
+
+```text
+sta_mac status
+sta_mac set factory
+sta_mac set random
+sta_mac set fixed 02:11:22:33:44:55
+```
+
+`factory` selects the factory STA address. `random` generates one locally
+administered unicast address per application boot and keeps it through Wi-Fi
+driver stop/reinitialization. `fixed` requires exactly six colon-separated
+hexadecimal octets; the first octet must satisfy `first_octet & 3 == 2`
+(locally administered and unicast). The policy affects the STA interface, not
+the SoftAP, BLE or IEEE 802.15.4 identities.
+
+`set` saves the policy to NVS after a checked commit. It takes effect on the
+next application boot: it neither reboots nor changes the running STA MAC.
+Successful set output is JSON with `schema_version:1`,
+`record_type:"sta_mac_result"`, `result:"set"` and
+`applies_after_reboot:true`.
+Missing or extra arguments and an invalid MAC return nonzero without changing
+the saved policy. A failed NVS write or commit also leaves the configured
+policy unchanged. Unlike `wifi_country`, this NVS record is not tied to the
+firmware image.
+
+`status` is read-only, available while another radio owner is active or
+quarantined, and does not initialize Wi-Fi. Its JSON has `schema_version:1`,
+`record_type:"sta_mac_status"`, and the fields
+`configured_mode`, `boot_mode`, `configured_mac`, `effective_boot_mac`,
+`active_sta_mac`, `record_health`, `identity_ready` and `pending_reboot`. `configured_mode` is the
+saved next-boot choice; `boot_mode` and `effective_boot_mac` describe this
+boot. `configured_mode` is `null` when the saved choice is invalid or could not
+be read.
+`active_sta_mac` is `null` when the driver is unavailable. `record_health`
+describes the boot read (`valid`, `missing`, `invalid_record`,
+`unsupported_version`, or `read_error`); `identity_ready:false` blocks Wi-Fi
+startup. A missing NVS
+record selects factory; an invalid or future record reports its health and
+falls back to factory without rewriting the record. An NVS read I/O error is
+reported separately and prevents Wi-Fi startup under an unverified identity.
+
+`set` uses a short serialized radio transaction and is refused while a radio
+owner is active or quarantined; the normal busy result is nonzero. WPS may use
+a temporary session MAC and restores the effective boot STA MAC after an exact
+readback. Host tests exercise parsing, persistence, boot caching and restore
+logic; firmware build and on-device radio behavior require separate validation.
 
 ## OTA updates
 

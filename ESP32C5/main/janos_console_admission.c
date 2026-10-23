@@ -18,7 +18,8 @@ static bool is_status_read(const char *command, const char *subcommand)
     return (equals(command, "wifi_analyzer") &&
             (equals(subcommand, "caps") || equals(subcommand, "status"))) ||
            (equals(command, "wps") && equals(subcommand, "status")) ||
-           (equals(command, "secret") && equals(subcommand, "status"));
+           (equals(command, "secret") && equals(subcommand, "status")) ||
+           (equals(command, "sta_mac") && equals(subcommand, "status"));
 }
 
 static bool is_always_safe(const char *command, const char *subcommand)
@@ -43,6 +44,7 @@ janos_console_admission_result_t janos_console_admission_decide(
     if (is_always_safe(command, subcommand)) return JANOS_CONSOLE_ADMIT;
 
     bool analyzer_command = equals(command, "wifi_analyzer");
+    bool sta_mac_set = equals(command, "sta_mac") && equals(subcommand, "set");
     bool wps_command = janos_wps_command_family_name(command);
     bool wps_uses_radio = janos_wps_named_operation_requires_radio(
         command, subcommand);
@@ -62,7 +64,7 @@ janos_console_admission_result_t janos_console_admission_decide(
         return wps_command ? JANOS_CONSOLE_ADMIT :
                              JANOS_CONSOLE_BUSY_RADIO_LEASE;
     }
-    if ((analyzer_command || wps_uses_radio ||
+    if ((analyzer_command || wps_uses_radio || sta_mac_set ||
          equals(command, "test_radio_channel") ||
          equals(command, "test_radio_channels")) &&
         commands_inflight != 0U) {
