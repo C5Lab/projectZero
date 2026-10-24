@@ -308,6 +308,10 @@ typedef struct {
     int client_count;
     uint32_t last_seen;
     sx_ap_t extended;
+    /* New API identity only: never change legacy ssid/channel or ext output. */
+    uint8_t identity_scan_ssid[32];
+    uint8_t identity_scan_len;
+    uint8_t identity_channel;
     int rx_rssi;
     bool rx_rssi_known;
     uint32_t rx_last_seen;
@@ -2502,6 +2506,12 @@ static esp_err_t quick_channel_scan(void);
 static bool check_channel_changes(void);
 static void update_target_channels(wifi_ap_record_t *scan_results, uint16_t scan_count);
 // Attack task forward declarations
+static atomic_bool sniffer_station_direct_active;
+static uint8_t sniffer_station_direct_mac[6];
+static target_bssid_t sniffer_station_direct_target;
+static void sniffer_station_send(void);
+static void sniffer_station_monitor(void);
+static void sniffer_station_cleanup(void);
 static void deauth_attack_task(void *pvParameters);
 static void blackout_attack_task(void *pvParameters);
 static void sae_attack_task(void *pvParameters);
@@ -6674,39 +6684,44 @@ static void deauth_attack_task(void *pvParameters) {
         if ((applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) &&
             !capture_gateway_is_active() &&
             check_channel_changes()) {
-            // Set flag to suppress logs during periodic re-scan
-            periodic_rescan_in_progress = true;
+            if (sniffer_station_direct_active) {
+                sniffer_station_monitor();
+            } else {
+                // Set flag to suppress logs during periodic re-scan
+                periodic_rescan_in_progress = true;
             
-            if (applicationState == DEAUTH) {
-                oled_display_update_full("> Deauth Attack", "  Re-scanning...", "  Channel check", "  Please wait");
+                if (applicationState == DEAUTH) {
+                    oled_display_update_full("> Deauth Attack", "  Re-scanning...", "  Channel check", "  Please wait");
+                }
+            
+                // Set LED to yellow during re-scan
+                esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
+                if (led_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to set LED for periodic scan: %s", esp_err_to_name(led_err));
+                }
+            
+                // Temporarily pause deauth for scanning
+                esp_err_t scan_result = quick_channel_scan();
+                if (scan_result != ESP_OK) {
+                    MY_LOG_INFO(TAG, "Quick channel re-scan failed: %s", esp_err_to_name(scan_result));
+                }
+            
+                // Clear LED after re-scan (ignore errors if LED is in invalid state)
+                led_err = led_clear();
+                if (led_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to clear LED after periodic scan: %s", esp_err_to_name(led_err));
+                }
+            
+                // Clear flag after re-scan completes
+                periodic_rescan_in_progress = false;
             }
-            
-            // Set LED to yellow during re-scan
-            esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
-            if (led_err != ESP_OK) {
-                ESP_LOGW(TAG, "Failed to set LED for periodic scan: %s", esp_err_to_name(led_err));
-            }
-            
-            // Temporarily pause deauth for scanning
-            esp_err_t scan_result = quick_channel_scan();
-            if (scan_result != ESP_OK) {
-                MY_LOG_INFO(TAG, "Quick channel re-scan failed: %s", esp_err_to_name(scan_result));
-            }
-            
-            // Clear LED after re-scan (ignore errors if LED is in invalid state)
-            led_err = led_clear();
-            if (led_err != ESP_OK) {
-                ESP_LOGW(TAG, "Failed to clear LED after periodic scan: %s", esp_err_to_name(led_err));
-            }
-            
-            // Clear flag after re-scan completes
-            periodic_rescan_in_progress = false;
         }
         
         if (applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) {
             // Send deauth frames (silent mode - no UART spam)
             ESP_ERROR_CHECK(led_set_color(0, 0, 255));
-            wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
+            if (sniffer_station_direct_active) sniffer_station_send();
+            else wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
             ESP_ERROR_CHECK(led_clear());
         }
         
@@ -6715,6 +6730,19 @@ static void deauth_attack_task(void *pvParameters) {
             static int64_t deauth_oled_last_us = 0;
             static int deauth_oled_rotate = 0;
             int64_t now_us = esp_timer_get_time();
+            if (sniffer_station_direct_active && now_us - deauth_oled_last_us > 500000) {
+                char ap[32], sta[32], ch[32];
+                snprintf(ap, sizeof(ap), "AP %02X:%02X:%02X:%02X:%02X:%02X",
+                         sniffer_station_direct_target.bssid[0], sniffer_station_direct_target.bssid[1],
+                         sniffer_station_direct_target.bssid[2], sniffer_station_direct_target.bssid[3],
+                         sniffer_station_direct_target.bssid[4], sniffer_station_direct_target.bssid[5]);
+                snprintf(sta, sizeof(sta), "STA %02X:%02X:%02X:%02X:%02X:%02X",
+                         sniffer_station_direct_mac[0], sniffer_station_direct_mac[1], sniffer_station_direct_mac[2],
+                         sniffer_station_direct_mac[3], sniffer_station_direct_mac[4], sniffer_station_direct_mac[5]);
+                snprintf(ch, sizeof(ch), "Channel %u", sniffer_station_direct_target.channel);
+                oled_display_update_full("> Deauth Station", ap, sta, ch);
+                deauth_oled_last_us = now_us;
+            }
             if (now_us - deauth_oled_last_us > 500000 && target_bssid_count > 0) {
                 deauth_oled_last_us = now_us;
                 if (applicationState == DEAUTH) {
@@ -6766,6 +6794,7 @@ static void deauth_attack_task(void *pvParameters) {
         ESP_LOGW(TAG, "Failed to restore idle LED after deauth task: %s", esp_err_to_name(led_err));
     }
     
+    sniffer_station_cleanup();
     deauth_attack_active = false;
     deauth_attack_task_handle = NULL;
     
@@ -14824,6 +14853,8 @@ static int cmd_stop(int argc, char **argv) {
         memset(target_bssids, 0, MAX_TARGET_BSSIDS * sizeof(target_bssid_t));
     }
     
+    sniffer_station_cleanup();
+
     // Stop SAE overflow attack task if running
     if (sae_attack_active || sae_attack_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Stopping SAE overflow task...");
@@ -19272,6 +19303,8 @@ static sniffer_ap_t *sniffer_take_snapshot(int *count, uint32_t *now) {
     return copy;
 }
 
+#include "sniffer_clients.inc"
+
 static int cmd_show_sniffer_results(int argc, char **argv) {
     const bool extended = argc == 2 && strcmp(argv[1], "extended") == 0;
     int sniffer_ap_count = 0;
@@ -21266,7 +21299,9 @@ static bool build_sd_path(char *dest, size_t dest_size, const char *input_path)
 #define UART_BAUD_CONFIRM_US        (10ULL * 1000ULL * 1000ULL)
 #define UART_BAUD_IDLE_REVERT_US    (60ULL * 1000ULL * 1000ULL)
 #define UART_BAUD_IDLE_CHECK_US     (1ULL * 1000ULL * 1000ULL)
-#define JANOS_CONSOLE_MAX_COMMANDS  128U
+/* Contexts for wrapped commands, independent of the free heap. Keep headroom
+ * for additive APIs; test_janos_console_startup executes the full boot list. */
+#define JANOS_CONSOLE_MAX_COMMANDS  256U
 
 #define FT_BLOCK_SIZE_DEFAULT       4096U
 #define FT_BLOCK_SIZE_MIN           512U
@@ -27345,6 +27380,17 @@ static void register_commands(void)
     ESP_ERROR_CHECK(esp_console_cmd_register(&channel_view_cmd));
 
 
+    const esp_console_cmd_t show_sniffer_clients_cmd = {
+        .command = "show_sniffer_clients", .help = "Versioned AP/client identity snapshot",
+        .hint = NULL, .func = &cmd_show_sniffer_clients,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&show_sniffer_clients_cmd));
+    const esp_console_cmd_t start_deauth_station_cmd = {
+        .command = "start_deauth_station", .help = "Target one sniffer client by BSSID and station MAC",
+        .hint = NULL, .func = &cmd_start_deauth_station,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&start_deauth_station_cmd));
+
     const esp_console_cmd_t show_sniffer_cmd = {
         .command = "show_sniffer_results",
         .help = "Shows sniffer results sorted by client count. Optional: extended",
@@ -29237,6 +29283,12 @@ static void sniffer_process_scan_results_locked(void) {
                 ap_exists = true;
                 // Update info but keep clients
                 sniffer_aps[j].channel = scan_ap->primary;
+                sniffer_aps[j].identity_channel = scan_ap->primary;
+                size_t identity_len = strnlen((const char *)scan_ap->ssid, 32);
+                if (identity_len) {
+                    memcpy(sniffer_aps[j].identity_scan_ssid, scan_ap->ssid, identity_len);
+                    sniffer_aps[j].identity_scan_len = identity_len;
+                }
                 sniffer_aps[j].rssi = scan_ap->rssi;
                 sniffer_aps[j].rx_rssi = scan_ap->rssi;
                 sniffer_aps[j].rx_rssi_known = true;
@@ -29256,6 +29308,12 @@ static void sniffer_process_scan_results_locked(void) {
             strncpy(new_ap->ssid, (char*)scan_ap->ssid, sizeof(new_ap->ssid) - 1);
             new_ap->ssid[sizeof(new_ap->ssid) - 1] = '\0';
             new_ap->channel = scan_ap->primary;
+            new_ap->identity_channel = scan_ap->primary;
+            size_t identity_len = strnlen((const char *)scan_ap->ssid, 32);
+            if (identity_len) {
+                memcpy(new_ap->identity_scan_ssid, scan_ap->ssid, identity_len);
+                new_ap->identity_scan_len = identity_len;
+            }
             new_ap->authmode = scan_ap->authmode;
             new_ap->rssi = scan_ap->rssi;
             new_ap->rx_rssi = scan_ap->rssi;
@@ -29300,6 +29358,12 @@ static void sniffer_merge_scan_results_locked(void) {
             strncpy(sniffer_ap->ssid, (char*)scan_ap->ssid, sizeof(sniffer_ap->ssid) - 1);
             sniffer_ap->ssid[sizeof(sniffer_ap->ssid) - 1] = '\0';
             sniffer_ap->channel = scan_ap->primary;
+            sniffer_ap->identity_channel = scan_ap->primary;
+            size_t identity_len = strnlen((const char *)scan_ap->ssid, 32);
+            if (identity_len) {
+                memcpy(sniffer_ap->identity_scan_ssid, scan_ap->ssid, identity_len);
+                sniffer_ap->identity_scan_len = identity_len;
+            }
             sniffer_ap->authmode = scan_ap->authmode;
             sniffer_ap->rssi = scan_ap->rssi;
             sniffer_ap->rx_rssi = scan_ap->rssi;
@@ -29321,6 +29385,12 @@ static void sniffer_merge_scan_results_locked(void) {
         strncpy(sniffer_ap->ssid, (char*)scan_ap->ssid, sizeof(sniffer_ap->ssid) - 1);
         sniffer_ap->ssid[sizeof(sniffer_ap->ssid) - 1] = '\0';
         sniffer_ap->channel = scan_ap->primary;
+        sniffer_ap->identity_channel = scan_ap->primary;
+        size_t identity_len = strnlen((const char *)scan_ap->ssid, 32);
+        if (identity_len) {
+            memcpy(sniffer_ap->identity_scan_ssid, scan_ap->ssid, identity_len);
+            sniffer_ap->identity_scan_len = identity_len;
+        }
         sniffer_ap->authmode = scan_ap->authmode;
         sniffer_ap->rssi = scan_ap->rssi;
         sniffer_ap->rx_rssi = scan_ap->rssi;
@@ -29381,6 +29451,12 @@ static void sniffer_init_selected_networks_locked(void) {
                 ap_exists = true;
                 // Update info but keep clients
                 sniffer_aps[j].channel = scan_ap->primary;
+                sniffer_aps[j].identity_channel = scan_ap->primary;
+                size_t identity_len = strnlen((const char *)scan_ap->ssid, 32);
+                if (identity_len) {
+                    memcpy(sniffer_aps[j].identity_scan_ssid, scan_ap->ssid, identity_len);
+                    sniffer_aps[j].identity_scan_len = identity_len;
+                }
                 sniffer_aps[j].rssi = scan_ap->rssi;
                 sniffer_aps[j].rx_rssi = scan_ap->rssi;
                 sniffer_aps[j].rx_rssi_known = true;
@@ -29398,6 +29474,12 @@ static void sniffer_init_selected_networks_locked(void) {
             strncpy(new_ap->ssid, (char*)scan_ap->ssid, sizeof(new_ap->ssid) - 1);
             new_ap->ssid[sizeof(new_ap->ssid) - 1] = '\0';
             new_ap->channel = scan_ap->primary;
+            new_ap->identity_channel = scan_ap->primary;
+            size_t identity_len = strnlen((const char *)scan_ap->ssid, 32);
+            if (identity_len) {
+                memcpy(new_ap->identity_scan_ssid, scan_ap->ssid, identity_len);
+                new_ap->identity_scan_len = identity_len;
+            }
             new_ap->authmode = scan_ap->authmode;
             new_ap->rssi = scan_ap->rssi;
             new_ap->rx_rssi = scan_ap->rssi;
@@ -30444,6 +30526,10 @@ static void sniffer_capture_extended_locked(const wifi_promiscuous_pkt_t *pkt,
     }
     ++sniffer_rx_diagnostics.matched;
     sniffer_ap_t *ap = &sniffer_aps[index];
+    if ((pkt->rx_ctrl.channel >= 1 && pkt->rx_ctrl.channel <= 14) ||
+        (pkt->rx_ctrl.channel >= 36 && pkt->rx_ctrl.channel <= 177))
+        ap->identity_channel = pkt->rx_ctrl.channel;
+
     ap->rx_last_seen = (uint32_t)(esp_timer_get_time() / 1000);
     ap->rx_seen = true;
     if (parsed) sx_apply(&ap->extended, &observation);
