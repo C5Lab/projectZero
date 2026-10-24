@@ -13,6 +13,7 @@ typedef struct {
     esp_err_t (*prepare_wifi)(void);
     esp_err_t (*mount_sd)(void);
     void (*tx_activity)(void);
+    void (*verified)(void);
 } janos_wps_runtime_hooks_t;
 
 bool janos_wps_runtime_init(janos_radio_lease_t *lease,

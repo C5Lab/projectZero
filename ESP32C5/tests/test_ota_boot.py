@@ -112,13 +112,13 @@ class OtaBootTest(unittest.TestCase):
     def test_pending_image_confirmed_after_console_ready(self):
         r = self.results["pending"]
         self.assertEqual(r["mark"], "1")
-        self.assertEqual(r["events"], "nvs,boot_info,uart,commands,repl_create,repl_start,gpio,state,mark,sd,")
+        self.assertEqual(r["events"], "nvs,boot_info,uart,led,commands,repl_create,repl_start,gpio,state,mark,sd,")
         self.assertEqual(r["ready"], "1")
 
     def test_valid_image_does_not_repeat_confirmation(self):
         r = self.results["valid"]
         self.assertEqual(r["mark"], "0")
-        self.assertEqual(r["events"], "nvs,boot_info,uart,commands,repl_create,repl_start,gpio,state,sd,")
+        self.assertEqual(r["events"], "nvs,boot_info,uart,led,commands,repl_create,repl_start,gpio,state,sd,")
         self.assertEqual(r["ready"], "1")
 
     def test_required_console_failure_never_confirms(self):

@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "janos_console_admission.h"
 #include "janos_wps_service.h"
+#include "led_cli_activity.h"
 #include <assert.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -27,6 +28,8 @@ static void xSemaphoreGiveRecursive(pthread_mutex_t *mutex)
 static void uart_baud_note_activity(void) {}
 static bool wifi_analyzer_busy(void) { return false; }
 static void linenoiseHistoryFree(void) {}
+static void led_cli_activity_change(led_status_activity_t activity, bool begin)
+{ (void)activity; (void)begin; }
 /* Scan lifecycle itself is exercised by janos_analyzer_admission_test.c. */
 static uint32_t wifi_analyzer_startup_begin(void) { abort(); }
 static bool wifi_analyzer_startup_end(uint32_t generation)

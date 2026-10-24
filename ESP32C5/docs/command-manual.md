@@ -616,6 +616,55 @@ regulatory domain is applicable.
 - `led set <on|off>` / `led level <1-100>` / `led read` — status LED.
 - `boot_button read|list|set <short|long> <cmd[,cmd...]>|status <short|long> <on|off>` — map boot‑button presses to commands (comma‑chained).
 
+### RGB status LED
+
+The single RGB LED shows the **type of active operation**. Commands in the same
+group share a color and pattern; it does not identify an individual command.
+The pattern changes automatically when an operation starts or finishes.
+
+| Operation | Color and pattern | Examples |
+| --- | --- | --- |
+| Idle | Steady green | No active operation after boot or a completed `stop`. |
+| Scan and discovery | Blue, slow 2 s pulse | Wi-Fi/BLE/802.15.4 surveys and network discovery. |
+| Passive monitoring | Cyan, 500 ms blink cycle (250 ms on / 250 ms off) | Sniffers, packet monitor, deauth detector, anti-surveillance. |
+| Capture and recording | Cyan, two short 120 ms flashes every 2 s | Handshake, PCAP, wardrive, Capture Gateway recording. |
+| Active transmission | Red, 150 ms on / 150 ms off | Deauthentication, beacon/BLE spam, blackout, jammer, ARP ban. |
+| AP and portal | Magenta, slow 2 s pulse | Captive/admin portals, Evil Twin, Karma, Rogue AP/GITM. |
+| WPS | Amber, slow 2 s pulse | WPS verify/Pixie/campaign. |
+| Transfer and computation | Amber, 500 ms blink cycle (250 ms on / 250 ms off) | Active uploads, file transfers, `crack_worker start`. |
+| OTA installation | Red, slow 2 s breathing pulse | Firmware installation after an update has been selected. |
+
+If operations overlap, the visible pattern follows this priority: OTA,
+transmission, AP/portal, capture, WPS, monitoring, scan, transfer/computation,
+then idle. Short event flashes temporarily replace the active pattern except
+for OTA installation, then it resumes:
+
+| Event | Flash |
+| --- | --- |
+| Handshake successfully saved to SD | Three white flashes, 100 ms each. |
+| WPS verification succeeds | Two green flashes, 150 ms each. |
+| A `scan_networks` Wi-Fi scan observes a first-seen BSSID, or a BLE scan records a first-seen device | One 100 ms white flash, at most once every 2 s. Wi-Fi emits at most one discovery event per scan. |
+| A deauth or anti-surveillance follower alert is detected | Three 100 ms red flashes, at most one sequence every 2 s. |
+
+The handshake confirmation fires after both PCAP and HCCAPX are saved. In
+selected/manual capture, both files must pass complete write, flush, sync, and
+close checks. Automatic capture reports success only after publishing both
+files.
+
+Wi-Fi discovery remembers up to 128 BSSIDs per boot. Once full, the cache
+suppresses further Wi-Fi discovery flashes; repeated BSSIDs never flash again
+during that boot.
+
+`led set off` suppresses all patterns and discards pending event flashes.
+`led set on` restores the pattern for the current operation, or idle green if
+none is active.
+`led level <1-100>` changes brightness, including while the LED is off;
+enablement and brightness persist in NVS. `led read` reports enablement and
+brightness, not the current operation. `stop` returns the LED to idle only
+after the operation actually ends; a short event flash returns to the
+underlying pattern. Read-only `help`, `list`, `read`, and `status` commands do
+not establish a lasting LED pattern.
+
 ### STA MAC boot policy
 
 The production STA MAC command accepts exactly these forms, with no aliases or

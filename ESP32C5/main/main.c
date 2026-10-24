@@ -118,6 +118,9 @@
 #include "crack_worker.h"
 #include "artifact_inventory_core.h"
 #include "wifi_analyzer.h"
+#include "led_status_core.h"
+#include "led_cli_activity.h"
+#include "led_target_cache.h"
 #include "janos_console_admission.h"
 #include "janos_radio_lease.h"
 #include "janos_wps_runtime.h"
@@ -1055,7 +1058,6 @@ static janos_radio_lease_t janos_radio_lease;
 static atomic_bool ota_boot_ready = ATOMIC_VAR_INIT(false);
 static char ota_channel[OTA_CHANNEL_MAX_LEN] = "main";
 static bool ota_auto_on_ip = false;
-static TaskHandle_t ota_led_task_handle = NULL;
 static volatile bool ota_led_active = false;
 
 // ============================================================================
@@ -2085,6 +2087,26 @@ static led_color_t led_current_color = {0, 0, 0};
 static bool led_initialized = false;
 static bool led_user_enabled = true;
 static uint8_t led_brightness_percent = LED_BRIGHTNESS_DEFAULT;
+static led_status_t led_status_state;
+static led_target_cache_t led_wifi_targets_seen;
+static portMUX_TYPE led_status_lock = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t led_status_task_handle = NULL;
+static uint16_t led_cli_activity_counts[LED_STATUS_ACTIVITY_COUNT];
+
+static void led_status_notify_event(led_status_event_t event) {
+    uint64_t now_ms = (uint64_t)esp_timer_get_time() / 1000U;
+    portENTER_CRITICAL(&led_status_lock);
+    (void)led_status_queue_event(&led_status_state, event, now_ms);
+    portEXIT_CRITICAL(&led_status_lock);
+}
+
+static void led_status_wps_verified(void) {
+    led_status_notify_event(LED_STATUS_EVENT_WPS_VERIFIED);
+}
+
+static void led_status_handshake_saved(void) {
+    led_status_notify_event(LED_STATUS_EVENT_HANDSHAKE_SAVED);
+}
 
 #define LED_NVS_NAMESPACE "ledcfg"
 #define LED_NVS_KEY_ENABLED "enabled"
@@ -2124,23 +2146,21 @@ static esp_err_t led_apply_current(void) {
     return led_commit_color(led_current_color.r, led_current_color.g, led_current_color.b);
 }
 
-static esp_err_t led_set_color(uint8_t r, uint8_t g, uint8_t b) {
-    led_current_color = (led_color_t){r, g, b};
-    return led_commit_color(r, g, b);
-}
-
-static esp_err_t led_clear(void) {
-    led_current_color = (led_color_t){0, 0, 0};
-    return led_commit_color(0, 0, 0);
-}
-
-static esp_err_t led_set_idle(void) {
-    return led_set_color(LED_COLOR_IDLE.r, LED_COLOR_IDLE.g, LED_COLOR_IDLE.b);
+static esp_err_t led_boot_set_idle(void) {
+    led_current_color = LED_COLOR_IDLE;
+    return led_commit_color(LED_COLOR_IDLE.r, LED_COLOR_IDLE.g, LED_COLOR_IDLE.b);
 }
 
 static esp_err_t led_set_enabled(bool enabled) {
     led_user_enabled = enabled;
+    portENTER_CRITICAL(&led_status_lock);
+    led_status_set_enabled(&led_status_state, enabled);
+    portEXIT_CRITICAL(&led_status_lock);
     if (!led_initialized) {
+        return ESP_OK;
+    }
+    if (led_status_task_handle != NULL) {
+        xTaskNotifyGive(led_status_task_handle);
         return ESP_OK;
     }
     return led_apply_current();
@@ -2160,6 +2180,11 @@ static esp_err_t led_set_brightness(uint8_t percent) {
     led_brightness_percent = percent;
 
     if (!led_initialized) {
+        return ESP_OK;
+    }
+
+    if (led_status_task_handle != NULL) {
+        xTaskNotifyGive(led_status_task_handle);
         return ESP_OK;
     }
 
@@ -2241,7 +2266,7 @@ static void led_boot_sequence(void) {
 
     (void)led_commit_color(0, 0, 0);
     vTaskDelay(pdMS_TO_TICKS(50));
-    (void)led_set_idle();
+    (void)led_boot_set_idle();
     vTaskDelay(pdMS_TO_TICKS(100));
 }
 
@@ -2946,7 +2971,20 @@ static void wifi_event_handler(void *event_handler_arg,
             g_last_scan_status = e->status;
             if (e->status == 0) { // Success
                 g_scan_count = MAX_AP_CNT;
-                esp_wifi_scan_get_ap_records(&g_scan_count, g_scan_results);
+                esp_err_t scan_records_err = esp_wifi_scan_get_ap_records(
+                    &g_scan_count, g_scan_results);
+                bool discovered_new_bssid = false;
+                if (scan_records_err == ESP_OK) {
+                    for (uint16_t i = 0; i < g_scan_count; ++i) {
+                        if (led_target_cache_record(&led_wifi_targets_seen,
+                                                    g_scan_results[i].bssid)) {
+                            discovered_new_bssid = true;
+                        }
+                    }
+                }
+                if (discovered_new_bssid && !suppress_scan_logs) {
+                    led_status_notify_event(LED_STATUS_EVENT_NEW_TARGET);
+                }
                 
                 if (!suppress_scan_logs) {
                     if (g_scan_start_time_us > 0) {
@@ -3017,19 +3055,7 @@ static void wifi_event_handler(void *event_handler_arg,
                     MY_LOG_INFO(TAG, "Started sniffer channel hopping task");
                 }
                 
-                // Change LED to green for active sniffing
-                esp_err_t led_err = led_set_color(0, 255, 0); // Green
-                if (led_err != ESP_OK) {
-                    ESP_LOGW(TAG, "Failed to set sniffer LED: %s", esp_err_to_name(led_err));
-                }
-                
                 MY_LOG_INFO(TAG, "Sniffer: Scan complete, now monitoring client traffic with dual-band channel hopping (2.4GHz + 5GHz)...");
-            } else if (!wardrive_active) {
-                // Return LED to idle when normal scan is complete
-                esp_err_t led_err = led_set_idle();
-                if (led_err != ESP_OK) {
-                    ESP_LOGW(TAG, "Failed to restore idle LED after scan: %s", esp_err_to_name(led_err));
-                }
             }
             analyzer_legacy_scan_finished();
             break;
@@ -3078,12 +3104,6 @@ static void wifi_event_handler(void *event_handler_arg,
                     // Resume deauth attack since password was wrong
                     if (!deauth_attack_active && deauth_attack_task_handle == NULL) {
                         MY_LOG_INFO(TAG, "Resuming deauth attack - password was incorrect.");
-                        
-                        // Set LED to red for deauth
-                        esp_err_t led_err = led_set_color(255, 0, 0);
-                        if (led_err != ESP_OK) {
-                            ESP_LOGW(TAG, "Failed to set LED for deauth resume: %s", esp_err_to_name(led_err));
-                        }
                         
                         // Start deauth attack in background task
                         deauth_attack_active = true;
@@ -3590,47 +3610,11 @@ static bool ota_is_connected(void) {
     return ota_has_ip();
 }
 
-static void ota_led_task(void *pvParameters) {
-    (void)pvParameters;
-    if (!led_initialized) {
-        vTaskDelete(NULL);
-        return;
-    }
-
-    const int step = 15;
-    while (ota_led_active) {
-        for (int level = 0; level <= 255 && ota_led_active; level += step) {
-            led_set_color((uint8_t)level, 0, 0);
-            vTaskDelay(pdMS_TO_TICKS(30));
-        }
-        for (int level = 255; level >= 0 && ota_led_active; level -= step) {
-            led_set_color((uint8_t)level, 0, 0);
-            vTaskDelay(pdMS_TO_TICKS(30));
-        }
-    }
-
-    led_set_idle();
-    ota_led_task_handle = NULL;
-    vTaskDelete(NULL);
-}
-
 static void ota_led_start(void) {
-    if (ota_led_task_handle != NULL || !led_initialized) {
-        return;
-    }
-
-    ota_led_active = true;
-    BaseType_t ok = xTaskCreate(ota_led_task, "ota_led", 2048, NULL, 3, &ota_led_task_handle);
-    if (ok != pdPASS) {
-        ota_led_task_handle = NULL;
-        ota_led_active = false;
-    }
+    ota_led_active = led_initialized;
 }
 
 static void ota_led_stop(void) {
-    if (ota_led_task_handle == NULL) {
-        return;
-    }
     ota_led_active = false;
 }
 
@@ -3966,12 +3950,6 @@ static void verify_password(const char* password) {
             vTaskDelete(deauth_attack_task_handle);
             deauth_attack_task_handle = NULL;
             MY_LOG_INFO(TAG, "Deauth attack task forcefully stopped.");
-        }
-        
-        // Restore LED to idle
-        esp_err_t led_err = led_set_idle();
-        if (led_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to restore idle LED after stopping deauth: %s", esp_err_to_name(led_err));
         }
         
         MY_LOG_INFO(TAG, "Deauth attack stopped.");
@@ -6271,21 +6249,9 @@ static int cmd_scan_networks(int argc, char **argv) {
     // Reset stop flag at the beginning of operation
     operation_stop_requested = false;
     
-    // Set LED (ignore errors if LED is in invalid state)
-    esp_err_t led_err = led_set_color(0, 255, 0);
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for scan: %s", esp_err_to_name(led_err));
-    }
-
     esp_err_t err = start_background_scan(g_scan_min_channel_time, g_scan_max_channel_time);
     
     if (err != ESP_OK) {
-        // Return LED to idle when scan failed
-        led_err = led_set_idle();
-        if (led_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to restore idle LED after scan failure: %s", esp_err_to_name(led_err));
-        }
-        
         if (err == ESP_ERR_INVALID_STATE) {
             MY_LOG_INFO(TAG, "Scan already in progress. Use 'show_scan_results' to see current results or 'stop' to cancel.");
         } else {
@@ -6669,12 +6635,6 @@ static void deauth_attack_task(void *pvParameters) {
             deauth_attack_active = false;
             applicationState = IDLE;
             
-            // Clean up after attack (ignore LED errors)
-            esp_err_t led_err = led_set_idle();
-            if (led_err != ESP_OK) {
-                ESP_LOGW(TAG, "Failed to restore idle LED after deauth stop: %s", esp_err_to_name(led_err));
-            }
-            
             break;
         }
         
@@ -6694,22 +6654,10 @@ static void deauth_attack_task(void *pvParameters) {
                     oled_display_update_full("> Deauth Attack", "  Re-scanning...", "  Channel check", "  Please wait");
                 }
             
-                // Set LED to yellow during re-scan
-                esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
-                if (led_err != ESP_OK) {
-                    ESP_LOGW(TAG, "Failed to set LED for periodic scan: %s", esp_err_to_name(led_err));
-                }
-            
                 // Temporarily pause deauth for scanning
                 esp_err_t scan_result = quick_channel_scan();
                 if (scan_result != ESP_OK) {
                     MY_LOG_INFO(TAG, "Quick channel re-scan failed: %s", esp_err_to_name(scan_result));
-                }
-            
-                // Clear LED after re-scan (ignore errors if LED is in invalid state)
-                led_err = led_clear();
-                if (led_err != ESP_OK) {
-                    ESP_LOGW(TAG, "Failed to clear LED after periodic scan: %s", esp_err_to_name(led_err));
                 }
             
                 // Clear flag after re-scan completes
@@ -6719,10 +6667,8 @@ static void deauth_attack_task(void *pvParameters) {
         
         if (applicationState == DEAUTH || applicationState == DEAUTH_EVIL_TWIN) {
             // Send deauth frames (silent mode - no UART spam)
-            ESP_ERROR_CHECK(led_set_color(0, 0, 255));
             if (sniffer_station_direct_active) sniffer_station_send();
             else wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
-            ESP_ERROR_CHECK(led_clear());
         }
         
         // Real-time OLED status update (rate-limited ~500ms)
@@ -6788,12 +6734,6 @@ static void deauth_attack_task(void *pvParameters) {
         taskYIELD(); // Give other tasks (including console) a chance to run
     }
     
-    // Clean up LED after attack finishes naturally (ignore LED errors)
-    esp_err_t led_err = led_set_idle();
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to restore idle LED after deauth task: %s", esp_err_to_name(led_err));
-    }
-    
     sniffer_station_cleanup();
     deauth_attack_active = false;
     deauth_attack_task_handle = NULL;
@@ -6812,12 +6752,6 @@ static void blackout_attack_task(void *pvParameters) {
     (void)pvParameters;
     
     MY_LOG_INFO(TAG, "Blackout attack task started.");
-    
-    // Set LED to orange for blackout attack
-    esp_err_t led_err = led_set_color(255, 165, 0); // Orange
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for blackout attack start: %s", esp_err_to_name(led_err));
-    }
     
     // Main loop: continuously scan and attack for 3 minutes each cycle
     while (blackout_attack_active && !operation_stop_requested) {
@@ -6904,20 +6838,8 @@ static void blackout_attack_task(void *pvParameters) {
         const int MAX_ATTACK_CYCLES = 100;
         
         while (attack_cycles < MAX_ATTACK_CYCLES && blackout_attack_active && !operation_stop_requested) {
-            // Flash LED during attack (orange)
-            esp_err_t led_err = led_set_color(255, 165, 0); // Orange
-            if (led_err != ESP_OK) {
-                ESP_LOGW(TAG, "Failed to set LED during blackout attack: %s", esp_err_to_name(led_err));
-            }
-            
             // Send deauth frames to all networks
             wsl_bypasser_send_deauth_frame_multiple_aps(g_scan_results, g_selected_count);
-            
-            // Clear LED briefly
-            led_err = led_clear();
-            if (led_err != ESP_OK) {
-                ESP_LOGW(TAG, "Failed to clear LED during blackout attack: %s", esp_err_to_name(led_err));
-            }
             
             if (attack_cycles % 5 == 0 && target_bssid_count > 0) {
                 int idx = attack_cycles % target_bssid_count;
@@ -6941,12 +6863,6 @@ static void blackout_attack_task(void *pvParameters) {
         oled_display_update_full("> Blackout Mode", "  Cycle done", "  New scan...", "");
         
         // Immediately start next scan cycle (no waiting)
-    }
-    
-    // Clean up LED after attack finishes
-    led_err = led_set_idle();
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to restore idle LED after blackout attack: %s", esp_err_to_name(led_err));
     }
     
     // Clean up
@@ -7423,11 +7339,6 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     MY_LOG_INFO(TAG, "Wardrive promisc task started.");
     const bool external_feed = gps_module_uses_external_feed(current_gps_module);
-
-    esp_err_t led_err = led_set_color(255, 0, 255); // Magenta
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for wardrive promisc: %s", esp_err_to_name(led_err));
-    }
 
     // Finalize any trace KML left unclosed by a previous power-loss (e.g. dead battery)
     // before this session starts writing a new one, so old traces open in Google Earth.
@@ -7968,11 +7879,6 @@ cleanup:
         vQueueDelete(q);
     }
     wardrive_promisc_trace_path[0] = '\0';
-    led_err = led_set_idle();
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to restore idle LED after wardrive promisc: %s", esp_err_to_name(led_err));
-    }
-
     MY_LOG_INFO(TAG, "Wardrive promisc stopped. Total unique networks: %d, BT devices: %d, distance: %.1fm",
                 wdp_seen_count, bt_device_count, wdp_total_distance_m);
     wardrive_promisc_active = false;
@@ -8167,8 +8073,6 @@ static void antisurv_task(void *pvParameters) {
         return;
     }
 
-    led_set_color(180, 0, 200);   // purple = watching
-
     int min_dur_s, min_dist_m; bool include_random;
     antisurv_thresholds(g_wd_cfg.antisurv_sensitivity, &min_dur_s, &min_dist_m, &include_random);
     const char *sens_str = (g_wd_cfg.antisurv_sensitivity == WD_AS_LOW)  ? "low" :
@@ -8201,7 +8105,7 @@ static void antisurv_task(void *pvParameters) {
             if (antisurv_evaluate_and_alert() > 0) {
                 oled_display_update_full("> Anti-Surveil", "  ! FOLLOWER !",
                                          "  Check serial", "  Use 'stop'");
-                led_set_color(255, 0, 0);            // red flash on detection
+                led_status_notify_event(LED_STATUS_EVENT_THREAT);
             }
         }
 
@@ -8217,7 +8121,6 @@ static void antisurv_task(void *pvParameters) {
     }
 
     bt_stop_scan();
-    led_set_idle();
     MY_LOG_INFO(TAG, "Anti-surveillance stopped. Devices seen: %d, followers flagged: %d",
                 bt_device_count, antisurv_total_alerted());
     antisurv_active = false;
@@ -9235,12 +9138,6 @@ static void handshake_cleanup(void) {
         pcap_serializer_deinit();
     }
     
-    // Restore idle LED
-    esp_err_t led_err = led_set_idle();
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to restore idle LED: %s", esp_err_to_name(led_err));
-    }
-    
     MY_LOG_INFO(TAG, "Handshake attack cleanup complete.");
 }
 
@@ -9970,6 +9867,7 @@ static void handshake_attack_task_sniffer(void) {
 
             if (saved) {
                 if (published) {
+                    led_status_notify_event(LED_STATUS_EVENT_HANDSHAKE_SAVED);
                     hs_publish_saved_handshake(&pending_targets[pending_i],
                                                &pending_captures[pending_i],
                                                saved_timestamp);
@@ -10056,12 +9954,6 @@ static void handshake_attack_task(void *pvParameters) {
     
     MY_LOG_INFO(TAG, "Handshake attack task started.");
     MY_LOG_INFO(TAG, "Mode: %s", handshake_selected_mode ? "Selected networks" : "Sniffer + D-UCB");
-    
-    // Set LED to cyan for handshake attack
-    esp_err_t led_err = led_set_color(0, 255, 255); // Cyan
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for handshake attack: %s", esp_err_to_name(led_err));
-    }
     
     if (handshake_selected_mode) {
         handshake_attack_task_selected();
@@ -14027,12 +13919,6 @@ static int cmd_start_sae_overflow(int argc, char **argv) {
         int idx = g_selected_indices[0];
         const wifi_ap_record_t *ap = &g_scan_results[idx];
         
-        // Set LED
-        esp_err_t led_err = led_set_color(255, 0, 0);
-        if (led_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to set LED for SAE overflow: %s", esp_err_to_name(led_err));
-        }
-        
         MY_LOG_INFO(TAG,"WPA3 SAE Overflow Attack");
         MY_LOG_INFO(TAG,"Target: SSID='%s' Ch=%d Auth=%d", (const char*)ap->ssid, ap->primary, ap->authmode);
         MY_LOG_INFO(TAG,"SAE attack started. Use 'stop' to stop.");
@@ -15021,12 +14907,6 @@ static int cmd_stop(int argc, char **argv) {
         deauth_detector_selected_channels_count = 0;
         memset(deauth_detector_selected_channels, 0, sizeof(deauth_detector_selected_channels));
         
-        // Return LED to idle
-        esp_err_t led_err = led_set_idle();
-        if (led_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to restore idle LED after Deauth Detector stop: %s", esp_err_to_name(led_err));
-        }
-        
         MY_LOG_INFO(TAG, "Deauth Detector stopped.");
     }
     
@@ -15258,11 +15138,13 @@ static int cmd_stop(int argc, char **argv) {
     
     oled_display_update_full("> STOPPED", "  All ops halted", "", "  > Idle");
 
-    // Restore LED to idle (ignore errors if LED is in invalid state)
-    esp_err_t led_err = led_set_idle();
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to restore idle LED after stop (state: %s), ignoring...", esp_err_to_name(led_err));
+    portENTER_CRITICAL(&led_status_lock);
+    for (led_status_activity_t activity = LED_STATUS_SCAN;
+         activity < LED_STATUS_ACTIVITY_COUNT; ++activity) {
+        (void)led_status_set_activity(&led_status_state, activity, false, 0);
     }
+    portEXIT_CRITICAL(&led_status_lock);
+    if (led_status_task_handle != NULL) xTaskNotifyGive(led_status_task_handle);
     
     MY_LOG_INFO(TAG, "All operations stopped.");
     // Deterministic and idempotent: printed on every stop, including one that found
@@ -16875,10 +16757,6 @@ static int cmd_start_rogue_gitm(int argc, char **argv)
     MY_LOG_INFO(TAG, "Rogue GITM started successfully!");
     MY_LOG_INFO(TAG, "Mirror SoftAP: %s (WPA2) via Capture Gateway; use 'capture_gateway status' / 'stop'",
                 ssid);
-    esp_err_t led_err = led_set_color(255, 165, 0);
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for Rogue GITM: %s", esp_err_to_name(led_err));
-    }
     return 0;
 }
 
@@ -18326,11 +18204,6 @@ static int cmd_packet_monitor(int argc, char **argv) {
     }
 
     MY_LOG_INFO(TAG, "Packet monitor started on channel %ld. Type 'stop' to stop.", channel);
-
-    esp_err_t led_err = led_set_color(255, 255, 255); // White for packet monitor
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for packet monitor: %s", esp_err_to_name(led_err));
-    }
     return 0;
 }
 
@@ -18498,11 +18371,6 @@ static int cmd_start_ap_locator(int argc, char **argv) {
         return 1;
     }
 
-    esp_err_t led_err = led_set_color(0, 255, 0);
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for AP locator: %s", esp_err_to_name(led_err));
-    }
-
     MY_LOG_INFO(TAG, "AP locator started for '%s' on channel %u. Type 'stop' to stop.",
                 ap_locator_target_ssid[0] != '\0' ? ap_locator_target_ssid : "<hidden>",
                 ap_locator_target_channel);
@@ -18603,10 +18471,6 @@ static void channel_view_task(void *pvParameters) {
     channel_view_scan_mode = false;
     channel_view_active = false;
     channel_view_task_handle = NULL;
-    esp_err_t led_err = led_set_idle();
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to restore LED after channel view: %s", esp_err_to_name(led_err));
-    }
     MY_LOG_INFO(TAG, "Channel view monitor stopped.");
     vTaskDelete(NULL);
 }
@@ -18694,11 +18558,6 @@ static int cmd_channel_view(int argc, char **argv) {
         return 1;
     }
 
-    esp_err_t led_err = led_set_color(128, 0, 255); // purple-ish to indicate analyzer
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for channel view: %s", esp_err_to_name(led_err));
-    }
-
     MY_LOG_INFO(TAG, "Channel view started. Type 'stop' to stop it.");
     return 0;
 }
@@ -18751,12 +18610,6 @@ static int cmd_start_sniffer(int argc, char **argv) {
             return 1;
         }
         
-        // Set LED to green for active sniffing
-        esp_err_t led_err = led_set_color(0, 255, 0); // Green
-        if (led_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to set LED for sniffer: %s", esp_err_to_name(led_err));
-        }
-        
         // Set promiscuous filter
         esp_wifi_set_promiscuous_filter(&sniffer_filter);
         
@@ -18787,23 +18640,11 @@ static int cmd_start_sniffer(int argc, char **argv) {
         sniffer_scan_phase = true;
         sniffer_selected_mode = false;
         
-        // Set LED (ignore errors if LED is in invalid state)
-        esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
-        if (led_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to set LED for sniffer: %s", esp_err_to_name(led_err));
-        }
-        
         esp_err_t err = start_background_scan(FAST_SCAN_MIN_TIME, FAST_SCAN_MAX_TIME);
         if (err != ESP_OK) {
             sniffer_active = false;
             sniffer_scan_phase = false;
             sniffer_selected_mode = false;
-            
-            // Return LED to idle (ignore errors if LED is in invalid state)
-            led_err = led_set_idle();
-            if (led_err != ESP_OK) {
-                ESP_LOGW(TAG, "Failed to restore idle LED after sniffer failure: %s", esp_err_to_name(led_err));
-            }
             
             MY_LOG_INFO(TAG, "Failed to start scan for sniffer: %s", esp_err_to_name(err));
             return 1;
@@ -19279,12 +19120,6 @@ static int cmd_start_sniffer_noscan(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Started sniffer channel hopping task");
     }
     
-    // Set LED to green for active sniffing
-    esp_err_t led_err = led_set_color(0, 255, 0);
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for sniffer: %s", esp_err_to_name(led_err));
-    }
-    
     MY_LOG_INFO(TAG, "Sniffer: Now monitoring %d networks (no scan performed)", sniffer_ap_count);
     MY_LOG_INFO(TAG, "Use 'show_sniffer_results' to see captured clients or 'stop' to stop.");
     
@@ -19710,12 +19545,6 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
     // Activate sniffer_dog
     sniffer_dog_active = true;
     
-    // Set LED to red (aggressive mode)
-    esp_err_t led_err = led_set_color(255, 0, 0); // Red
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for Sniffer Dog: %s", esp_err_to_name(led_err));
-    }
-    
     // Set promiscuous filter
     esp_wifi_set_promiscuous_filter(&sniffer_filter);
     
@@ -19743,12 +19572,6 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Failed to create Sniffer Dog channel hopping task");
         sniffer_dog_active = false;
         esp_wifi_set_promiscuous(false);
-        
-        // Return LED to idle
-        led_err = led_set_idle();
-        if (led_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to restore idle LED after Sniffer Dog failure: %s", esp_err_to_name(led_err));
-        }
         
         return 1;
     }
@@ -19896,12 +19719,6 @@ static int cmd_deauth_detector(int argc, char **argv) {
     // Activate deauth_detector
     deauth_detector_active = true;
     
-    // Set LED to yellow (monitoring mode)
-    esp_err_t led_err = led_set_color(255, 255, 0); // Yellow
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for Deauth Detector: %s", esp_err_to_name(led_err));
-    }
-    
     // Set promiscuous filter for MGMT frames only (deauth is a management frame)
     wifi_promiscuous_filter_t mgmt_filter = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
@@ -19936,12 +19753,6 @@ static int cmd_deauth_detector(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Failed to create Deauth Detector channel hopping task");
         deauth_detector_active = false;
         esp_wifi_set_promiscuous(false);
-        
-        // Return LED to idle
-        led_err = led_set_idle();
-        if (led_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to restore idle LED after Deauth Detector failure: %s", esp_err_to_name(led_err));
-        }
         
         return 1;
     }
@@ -20038,11 +19849,6 @@ static int cmd_led(int argc, char **argv) {
             esp_err_t err = led_set_enabled(true);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "Failed to enable LED: %s", esp_err_to_name(err));
-                return 1;
-            }
-            err = led_set_idle();
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "Failed to set LED idle color: %s", esp_err_to_name(err));
                 return 1;
             }
             led_persist_state();
@@ -21343,6 +21149,98 @@ static uint32_t uart_current_baud = JANOS_UART_DEFAULT_BAUD;
 static bool uart_baud_confirmation_pending;
 static bool uart_file_transfer_active;
 static int64_t uart_last_command_us;
+static bool artifact_inventory_is_busy(void);
+
+static void led_cli_activity_change(led_status_activity_t activity, bool begin)
+{
+    if (activity <= LED_STATUS_IDLE || activity >= LED_STATUS_ACTIVITY_COUNT) return;
+    portENTER_CRITICAL(&led_status_lock);
+    if (begin) {
+        if (led_cli_activity_counts[activity] < UINT16_MAX)
+            ++led_cli_activity_counts[activity];
+    } else if (led_cli_activity_counts[activity] != 0) {
+        --led_cli_activity_counts[activity];
+    }
+    portEXIT_CRITICAL(&led_status_lock);
+}
+
+static void led_status_render_task(void *argument)
+{
+    (void)argument;
+    led_status_rgb_t previous = {0};
+    uint8_t previous_brightness = 0;
+    bool have_previous = false;
+    uint64_t last_error_ms = 0;
+
+    for (;;) {
+        const uint64_t now_ms = (uint64_t)esp_timer_get_time() / 1000U;
+        const bool portal = portal_active || karma_mode_active || rogueap_mode_active ||
+                            rogue_gitm_mode_active || darksword_active;
+        const bool sources[LED_STATUS_ACTIVITY_COUNT] = {
+            [LED_STATUS_SCAN] = g_scan_in_progress || wifi_analyzer_busy() ||
+                                bt_scan_active || bt_airtag_scan_active ||
+                                zig_recon_is_active(),
+            [LED_STATUS_MONITOR] = sniffer_active || packet_monitor_active ||
+                                   ap_locator_active || channel_view_active ||
+                                   deauth_detector_active || antisurv_active,
+            [LED_STATUS_CAPTURE] = handshake_attack_active || pcap_capture_active ||
+                                   capture_gateway_is_active() || wardrive_active ||
+                                   wardrive_promisc_active || gps_raw_active,
+            [LED_STATUS_TRANSMIT] = deauth_attack_active || pcap_arp_active ||
+                                    blackout_attack_active || sae_attack_active ||
+                                    sniffer_dog_active || beacon_spam_active ||
+                                    bt_blespam_active || nrf24_jammer_is_running() ||
+                                    arp_ban_active,
+            [LED_STATUS_PORTAL] = portal,
+            [LED_STATUS_WPS] = janos_wps_runtime_busy(),
+            [LED_STATUS_OTA] = ota_led_active,
+        };
+        bool transfer = crack_worker_is_running() || artifact_inventory_is_busy();
+        if (uart_baud_mutex != NULL &&
+            xSemaphoreTake(uart_baud_mutex, 0) == pdTRUE) {
+            transfer = transfer || uart_file_transfer_active;
+            xSemaphoreGive(uart_baud_mutex);
+        }
+
+        portENTER_CRITICAL(&led_status_lock);
+        for (led_status_activity_t activity = LED_STATUS_SCAN;
+             activity < LED_STATUS_ACTIVITY_COUNT; ++activity) {
+            bool active = sources[activity] || led_cli_activity_counts[activity] != 0;
+            if (activity == LED_STATUS_TRANSFER) active = active || transfer;
+            (void)led_status_set_activity(&led_status_state, activity, active, now_ms);
+        }
+        led_status_rgb_t frame = led_status_render(&led_status_state, now_ms);
+        portEXIT_CRITICAL(&led_status_lock);
+
+        uint8_t brightness = led_brightness_percent;
+        if (!have_previous || frame.r != previous.r || frame.g != previous.g ||
+            frame.b != previous.b || brightness != previous_brightness) {
+            esp_err_t err = led_commit_color(frame.r, frame.g, frame.b);
+            if (err == ESP_OK) {
+                led_current_color = (led_color_t){frame.r, frame.g, frame.b};
+                previous = frame;
+                previous_brightness = brightness;
+                have_previous = true;
+            } else if (now_ms - last_error_ms >= 5000U) {
+                ESP_LOGW(TAG, "LED status render failed: %s", esp_err_to_name(err));
+                last_error_ms = now_ms;
+            }
+        }
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(25));
+    }
+}
+
+static void led_status_start_renderer(void)
+{
+    if (!led_initialized || led_status_task_handle != NULL) return;
+    led_status_init(&led_status_state);
+    led_status_set_enabled(&led_status_state, led_user_enabled);
+    if (xTaskCreate(led_status_render_task, "led_status", 4096, NULL, 3,
+                    &led_status_task_handle) != pdPASS) {
+        led_status_task_handle = NULL;
+        ESP_LOGE(TAG, "LED status render task could not start");
+    }
+}
 
 typedef struct {
     esp_console_cmd_func_t func;
@@ -21508,10 +21406,14 @@ static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
     uint32_t analyzer_startup = analyzer_scan ? wifi_analyzer_startup_begin() : 0U;
     ++janos_commands_inflight;
     xSemaphoreGiveRecursive(janos_command_mutex);
+    led_status_activity_t cli_activity = led_cli_activity(
+        cmd_context->command, argc > 1 ? argv[1] : NULL);
+    led_cli_activity_change(cli_activity, true);
     int result = analyzer_scan ?
         wifi_analyzer_command_with_startup(argc, argv, &analyzer_startup) :
         cmd_context->func != NULL ? cmd_context->func(argc, argv) :
         cmd_context->func_w_context(cmd_context->context, argc, argv);
+    led_cli_activity_change(cli_activity, false);
     bool analyzer_released = !analyzer_scan ||
         wifi_analyzer_startup_end(analyzer_startup);
     if (wps_command && argc >= 2 && strcmp(argv[1], "verify") == 0) {
@@ -22506,12 +22408,6 @@ static void wardrive_task(void *pvParameters) {
     
     MY_LOG_INFO(TAG, "Wardrive task started.");
     
-    // Set LED to indicate wardrive mode
-    esp_err_t led_err = led_set_color(0, 255, 255); // Cyan
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for wardrive: %s", esp_err_to_name(led_err));
-    }
-    
     // Find the next file number by scanning existing files
     wardrive_file_counter = find_next_wardrive_file_number();
     MY_LOG_INFO(TAG, "Next wardrive file will be: w%d.log", wardrive_file_counter);
@@ -22747,12 +22643,6 @@ static void wardrive_task(void *pvParameters) {
         taskYIELD();
         
         vTaskDelay(pdMS_TO_TICKS(5000)); // Wait 5 seconds between scans
-    }
-    
-    // Clear LED after wardrive finishes
-    led_err = led_set_idle();
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to restore idle LED after wardrive: %s", esp_err_to_name(led_err));
     }
     
     wardrive_active = false;
@@ -23970,8 +23860,6 @@ static int cmd_start_darksword(int argc, char **argv) {
         MY_LOG_INFO(TAG, "DS: exfil task creation failed — port 80 /stats still available");
     }
 
-    led_set_color(255, 0, 0); // Red for DarkSword
-
     MY_LOG_INFO(TAG, "DarkSword portal active!");
     MY_LOG_INFO(TAG, "  AP: %s  IP: 172.0.0.1", ssid);
     MY_LOG_INFO(TAG, "  HTTP :80   Exfil :8080");
@@ -24232,11 +24120,6 @@ static int cmd_start_portal(int argc, char **argv) {
     MY_LOG_INFO(TAG, "AP Name: %s", ssid);
     MY_LOG_INFO(TAG, "Connect to '%s' WiFi network to access the portal", ssid);
 
-    esp_err_t led_err = led_set_color(255, 0, 255); // Purple for portal mode
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for portal mode: %s", esp_err_to_name(led_err));
-    }
-    
     return 0;
 }
 
@@ -24946,11 +24829,6 @@ static int cmd_start_admin_portal(int argc, char **argv) {
 
     MY_LOG_INFO(TAG, "Admin portal started. Connect to '%s' (WPA2) and open http://172.0.0.1", ssid);
 
-    esp_err_t led_err = led_set_color(0, 255, 255); // Cyan for admin portal mode
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for admin portal mode: %s", esp_err_to_name(led_err));
-    }
-
     return 0;
 }
 
@@ -25286,11 +25164,6 @@ static int cmd_start_rogueap(int argc, char **argv) {
     MY_LOG_INFO(TAG, "Password: %s", password);
     MY_LOG_INFO(TAG, "Custom HTML loaded (%zu bytes)", strlen(custom_portal_html));
     MY_LOG_INFO(TAG, "Connect to '%s' WiFi network to access the captive portal", ssid);
-    
-    esp_err_t led_err = led_set_color(255, 165, 0); // Orange for rogue AP mode
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set LED for rogue AP mode: %s", esp_err_to_name(led_err));
-    }
     
     return 0;
 }
@@ -25965,6 +25838,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     }
     
     bt_device_count++;
+    led_status_notify_event(LED_STATUS_EVENT_NEW_TARGET);
     
     return 0;
 }
@@ -26165,18 +26039,7 @@ static void bt_scan_task(void *pvParameters)
         return;
     }
     
-    // Scan for 10 seconds with light blue LED blinking
-    bool led_on = false;
     for (int i = 0; i < 100 && bt_scan_active; i++) {
-        // Toggle LED every 500ms (every 5 iterations)
-        if (i % 5 == 0) {
-            led_on = !led_on;
-            if (led_on) {
-                led_set_color(100, 200, 255); // Light blue
-            } else {
-                led_clear();
-            }
-        }
         if (i % 10 == 0) {
             char ble_l2[64], ble_l3[64], ble_l4[64];
             snprintf(ble_l2, sizeof(ble_l2), "  Scanning %d/10s", i / 10);
@@ -26186,9 +26049,6 @@ static void bt_scan_task(void *pvParameters)
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    
-    // Restore idle LED
-    led_set_idle();
     
     bt_stop_scan();
     bt_scan_active = false;
@@ -26257,18 +26117,7 @@ static void bt_airtag_scan_task(void *pvParameters)
             break;
         }
         
-        // Scan for 10 seconds with light blue LED blinking
-        bool led_on = false;
         for (int i = 0; i < 100 && bt_airtag_scan_active && !operation_stop_requested; i++) {
-            // Toggle LED every 500ms (every 5 iterations)
-            if (i % 5 == 0) {
-                led_on = !led_on;
-                if (led_on) {
-                    led_set_color(100, 200, 255); // Light blue
-                } else {
-                    led_clear();
-                }
-            }
             if (i % 20 == 0) {
                 char at_l2[64], at_l4[64];
                 snprintf(at_l2, sizeof(at_l2), "  Cycle #%d", at_cycle);
@@ -26295,9 +26144,6 @@ static void bt_airtag_scan_task(void *pvParameters)
         
         // Immediately start next scan cycle (no wait)
     }
-    
-    // Restore idle LED
-    led_set_idle();
     
     bt_airtag_scan_active = false;
     bt_scan_task_handle = NULL;
@@ -26329,18 +26175,7 @@ static void bt_tracking_task(void *pvParameters)
             break;
         }
         
-        // Scan for 10 seconds with light blue LED blinking
-        bool led_on = false;
         for (int i = 0; i < 100 && bt_scan_active && !operation_stop_requested; i++) {
-            // Toggle LED every 500ms (every 5 iterations)
-            if (i % 5 == 0) {
-                led_on = !led_on;
-                if (led_on) {
-                    led_set_color(100, 200, 255); // Light blue
-                } else {
-                    led_clear();
-                }
-            }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         
@@ -26361,9 +26196,6 @@ static void bt_tracking_task(void *pvParameters)
             printf("%s  not found\n", mac_str);
         }
     }
-    
-    // Restore idle LED
-    led_set_idle();
     
     bt_tracking_mode = false;
     bt_scan_active = false;
@@ -26954,6 +26786,14 @@ static int cmd_artifact_inventory(int argc, char **argv)
 }
 /* ARTIFACT INVENTORY CONSOLE END */
 
+static bool artifact_inventory_is_busy(void)
+{
+    portENTER_CRITICAL(&art_lock);
+    bool busy = art_busy;
+    portEXIT_CRITICAL(&art_lock);
+    return busy;
+}
+
 /* Call only after reserving the shared lease for a radio startup. No admission
  * lock is held here: the baseline probes may enter the driver or wait. */
 static const char *analyzer_host_busy_reason(void)
@@ -26987,7 +26827,7 @@ static const char *analyzer_host_busy_reason(void)
     if (portal_server || karma_mode_active || rogueap_mode_active || rogue_gitm_mode_active ||
         darksword_exfil_task_handle || dns_server_task_handle) return "portal";
     if (arp_ban_active || arp_ban_task_handle) return "arp_ban";
-    if (ota_check_in_progress || ota_led_task_handle) return "ota";
+    if (ota_check_in_progress || ota_led_active) return "ota";
     if (gps_raw_active || gps_raw_task_handle) return "gps_raw";
     portENTER_CRITICAL(&art_lock);
     bool artifact_active = art_busy;
@@ -28587,12 +28427,15 @@ void app_main(void) {
         .prepare_wifi = analyzer_host_prepare_wifi,
         .mount_sd = init_sd_card,
         .tx_activity = uart_baud_note_activity,
+        .verified = led_status_wps_verified,
     };
     bool wps_runtime_ready = janos_wps_runtime_init(
         &janos_radio_lease, &wps_hooks, sta_mac_boot.effective_mac);
     ESP_ERROR_CHECK(wps_runtime_ready ? ESP_OK : ESP_FAIL);
     crack_worker_init(init_sd_card, uart_baud_set_file_transfer_active,
                       uart_baud_current);
+    led_status_start_renderer();
+    attack_handshake_set_saved_hook(led_status_handshake_saved);
     esp_console_register_help_command();
     register_commands();
 
@@ -28933,12 +28776,6 @@ static void sae_attack_task(void *pvParameters) {
                 // Clean up after attack
                 esp_wifi_set_promiscuous(false);
                 
-                // Restore LED to idle (ignore errors if LED is in invalid state)
-                esp_err_t led_err = led_set_idle();
-                if (led_err != ESP_OK) {
-                    ESP_LOGW(TAG, "Failed to restore idle LED after SAE stop: %s", esp_err_to_name(led_err));
-                }
-                
                 break;
             }
             
@@ -28958,12 +28795,6 @@ static void sae_attack_task(void *pvParameters) {
         // Delay to allow UART console processing (50ms gives better responsiveness)
         vTaskDelay(pdMS_TO_TICKS(50));
         frame_count_check++;
-    }
-    
-    // Clean up LED after attack finishes naturally (ignore LED errors)
-    esp_err_t led_err = led_set_idle();
-    if (led_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to restore idle LED after SAE task: %s", esp_err_to_name(led_err));
     }
     
     // Clean up after attack
@@ -30742,9 +30573,6 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
     
     // Send deauth frame for more effective disconnection
 
-    // Blue LED flash to indicate deauth sent
-    (void)led_set_color(0, 0, 255); // Blue
-
     wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
     deauth_sent_count++;
     
@@ -30757,8 +30585,6 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
     sd_oled_rssi = pkt->rx_ctrl.rssi;
     sd_oled_count = deauth_sent_count;
     sd_oled_dirty = true;
-    
-    (void)led_set_color(255, 0, 0); // Back to red
     
     // Log statistics for this AP-STA pair
     MY_LOG_INFO(TAG, "[SnifferDog #%lu] DEAUTH sent: AP=%02X:%02X:%02X:%02X:%02X:%02X -> STA=%02X:%02X:%02X:%02X:%02X:%02X (Ch=%d, RSSI=%d)",
@@ -30828,8 +30654,6 @@ static void deauth_detector_task(void *pvParameters) {
         
         if (time_expired) {
             deauth_detector_channel_hop();
-            // Reset LED to yellow after channel hop (in case it was red from deauth detection)
-            (void)led_set_color(255, 255, 0);
         }
         
         // OLED update (~500ms)
@@ -30895,15 +30719,7 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
     const char *ssid = deauth_detector_find_ssid_by_bssid(bssid_mac);
     const char *ap_name = (ssid && ssid[0] != '\0') ? ssid : "<Unknown>";
     
-    // Throttle LED flash - only flash red if 100ms passed since last flash
-    // This prevents RMT channel conflicts when deauth frames come rapidly
-    static int64_t last_led_flash_time = 0;
-    int64_t now = esp_timer_get_time() / 1000; // ms
-    
-    if (now - last_led_flash_time >= 100) {
-        (void)led_set_color(255, 0, 0); // Red flash
-        last_led_flash_time = now;
-    }
+    led_status_notify_event(LED_STATUS_EVENT_THREAT);
     
     // Update shared OLED state for task to render
     snprintf((char *)dd_oled_ssid, sizeof(dd_oled_ssid), "%s", ap_name);
@@ -30921,7 +30737,6 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
                bssid_mac[0], bssid_mac[1], bssid_mac[2], bssid_mac[3], bssid_mac[4], bssid_mac[5],
                rssi);
     
-    // Note: LED reset to yellow is handled by the task after channel hop
 }
 
 // === WARDRIVE HELPER FUNCTIONS ===

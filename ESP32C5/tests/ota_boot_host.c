@@ -33,6 +33,7 @@ typedef struct {
     esp_err_t (*prepare_wifi)(void);
     esp_err_t (*mount_sd)(void);
     void (*tx_activity)(void);
+    void (*verified)(void);
 } janos_wps_runtime_hooks_t;
 
 enum { ESP_OK = 0, ESP_FAIL = -1, ESP_OTA_IMG_UNDEFINED = 0,
@@ -54,6 +55,9 @@ static jmp_buf abort_jump;
 static esp_partition_t running = { "ota_1" };
 static void *janos_command_mutex;
 static int janos_command_mutex_storage;
+static void *sta_mac_state_mutex;
+static int sta_mac_state_mutex_storage;
+static struct { uint8_t effective_mac[6]; } sta_mac_boot;
 typedef struct {
     unsigned long long pin_bit_mask;
     int mode, pull_up_en, pull_down_en, intr_type;
@@ -97,6 +101,7 @@ static esp_err_t uart_baud_control_init(void) {
     return fail_at == 1 ? ESP_FAIL : ESP_OK;
 }
 static void *xSemaphoreCreateRecursiveMutexStatic(void *storage) { return storage; }
+static void *xSemaphoreCreateMutexStatic(void *storage) { return storage; }
 static const char *analyzer_host_busy_reason(void) { return NULL; }
 static esp_err_t analyzer_host_prepare_wifi(void) { return ESP_OK; }
 static bool analyzer_host_lease_acquire(uint32_t *generation)
@@ -109,12 +114,15 @@ static bool analyzer_host_lease_release(uint32_t generation, bool restored)
 { (void)generation; return restored; }
 static janos_radio_lease_t janos_radio_lease;
 static void janos_radio_lease_init(janos_radio_lease_t *lease) { (void)lease; }
-static esp_err_t esp_read_mac(uint8_t mac[6], int type)
-{ (void)type; memset(mac, 0x42, 6); return ESP_OK; }
+static void led_status_wps_verified(void) {}
+static void led_status_handshake_saved(void) {}
+static void led_status_start_renderer(void) { event("led"); }
+static void attack_handshake_set_saved_hook(void (*hook)(void))
+{ assert(hook == led_status_handshake_saved); }
 static bool janos_wps_runtime_init(janos_radio_lease_t *lease,
                                    const janos_wps_runtime_hooks_t *hooks,
                                    const uint8_t mac[6])
-{ (void)lease; (void)hooks; (void)mac; return true; }
+{ (void)lease; (void)mac; assert(hooks->verified == led_status_wps_verified); return true; }
 static int uart_baud_current(void) { return JANOS_UART_DEFAULT_BAUD; }
 static void uart_baud_note_activity(void) {}
 static esp_err_t init_sd_card(void) { event("sd"); return ESP_FAIL; }

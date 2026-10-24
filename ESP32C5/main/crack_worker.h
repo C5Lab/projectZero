@@ -15,5 +15,6 @@ void crack_worker_init(crack_worker_ensure_sd_fn ensure_sd,
                        crack_worker_current_baud_fn current_baud);
 int crack_worker_command(int argc, char **argv);
 void crack_worker_cancel_all(void);
+bool crack_worker_is_running(void);
 
 #endif

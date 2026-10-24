@@ -38,6 +38,7 @@ class JanosConsoleTransactionTest(unittest.TestCase):
                 extra += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
             output = compile_and_run(
                 self, "transaction", [fixture, ROOT / "main/janos_console_admission.c",
+                    ROOT / "main/led_cli_activity.c",
                     COMPONENT / "janos_radio_lease.c",
                     COMPONENT / "janos_wps_service.c",
                     COMPONENT / "janos_wps_command.c",
