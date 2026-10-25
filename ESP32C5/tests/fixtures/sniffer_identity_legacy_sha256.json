@@ -1,0 +1,13 @@
+{
+  "cmd_show_sniffer_results": "2ee5593728cd6ec5b9132f94fe77e88e8cfd9cbf4c667d23891982cf0c402b7e",
+  "cmd_show_sniffer_results_vendor": "1a7a9440681e73ca3e8ec7291fca228caaa0dac9305eff930b30c01caa5b25a2",
+  "cmd_show_scan_results": "3e79210b5892981fba010aa74620874ad31356ebfcc9ced31a6bb80c1e7a5121",
+  "cmd_select_networks": "79a61cdd6586a7d61239b44d0cf071323f6f6ca05ab2a66f50a09f234ba7ca9b",
+  "cmd_select_stations": "94aa3b8fac0e6526ee81cf39474d6e3bb86de9b1bddc6666e87a515ac52507ab",
+  "cmd_unselect_networks": "7d03a53f78632b555784c30b3eb2049ca182db6ccf9c1ef393b539d320624013",
+  "cmd_unselect_stations": "4427083551ba41ac02b6664e8ecd763dcaaf2d0a5e8202d11b5cc0af3ff68988",
+  "cmd_start_deauth": "867ab4b55f1f5e95860b7fe3edae0c93fa66490d8bda6969955b4064e0262db6",
+  "cmd_stop": "31a52825e42deec269694dcff90b23b873feec9354d97c1aa311f8b4e26ee61b",
+  "sniffer_capture_legacy_locked": "1ea3f74153ff697265ec346890cc2b7d7eb66cc901c0f47d4547510afa0be926",
+  "wsl_bypasser_send_deauth_frame_multiple_aps": "fc136540bfde0e8ecfd6aba62befc620d4f607bc1501f4fdea167b38d9fe9d7a"
+}

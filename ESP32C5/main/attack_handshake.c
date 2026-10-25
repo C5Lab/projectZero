@@ -38,6 +38,11 @@ static attack_handshake_methods_t method = -1;
 static wifi_ap_record_t current_ap_record;
 static esp_timer_handle_t deauth_timer_handle = NULL;
 static bool attack_running = false;
+static void (*saved_hook)(void);
+
+void attack_handshake_set_saved_hook(void (*hook)(void)) {
+    saved_hook = hook;
+}
 
 /**
  * @brief Calculates actual SSID length from wifi_ap_record_t
@@ -791,11 +796,18 @@ bool attack_handshake_save_to_sd() {
     }
     
     size_t written = fwrite(pcap_buf, 1, pcap_size, f);
-    fclose(f);
+    int flush_result = fflush(f);
+    int sync_result = flush_result == 0 ? fsync(fileno(f)) : -1;
+    int close_result = fclose(f);
     sd_sync();
     
     if (written != pcap_size) {
         printf("✗ Failed to write complete PCAP (%zu/%u bytes)\n", written, pcap_size);
+        return false;
+    }
+    if (flush_result != 0 || sync_result != 0 || close_result != 0) {
+        printf("✗ Failed to finalize PCAP (flush=%d sync=%d close=%d)\n",
+               flush_result, sync_result, close_result);
         return false;
     }
     
@@ -830,18 +842,26 @@ bool attack_handshake_save_to_sd() {
     }
     
     written = fwrite(hccapx, 1, sizeof(hccapx_t), f);
-    fclose(f);
+    flush_result = fflush(f);
+    sync_result = flush_result == 0 ? fsync(fileno(f)) : -1;
+    close_result = fclose(f);
     sd_sync();
     
     if (written != sizeof(hccapx_t)) {
         printf("✗ Failed to write complete HCCAPX\n");
         return false;
     }
+    if (flush_result != 0 || sync_result != 0 || close_result != 0) {
+        printf("✗ Failed to finalize HCCAPX (flush=%d sync=%d close=%d)\n",
+               flush_result, sync_result, close_result);
+        return false;
+    }
     
     printf("✓ HCCAPX saved: %s (%zu bytes)\n", filename, sizeof(hccapx_t));
     printf("✓ Complete 4-way handshake saved for SSID: %s (MAC: %s, message_pair: %d)\n", 
              ssid_safe, mac_suffix, hccapx->message_pair);
-    
+
+    if (saved_hook) saved_hook();
     return true;
 }
 

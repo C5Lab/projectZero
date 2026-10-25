@@ -56,6 +56,21 @@
       letter-spacing: 0.06em;
       text-transform: uppercase;
     }
+    .header-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .help-link {
+      color: var(--accent);
+      font-weight: 600;
+      text-decoration: none;
+      border-bottom: 1px solid currentColor;
+    }
+    .help-link:hover { color: var(--text); }
+    .help-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
     h1 {
       margin: 12px 0 10px;
       font-size: clamp(32px, 4vw, 44px);
@@ -88,6 +103,40 @@
       margin: 0;
       color: var(--muted);
       line-height: 1.55;
+    }
+    .disclosure { padding: 0; overflow: hidden; }
+    .disclosure > summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px;
+      cursor: pointer;
+      list-style: none;
+    }
+    .disclosure > summary::-webkit-details-marker { display: none; }
+    .disclosure > summary::after {
+      content: "";
+      flex: none;
+      width: 9px;
+      height: 9px;
+      border-right: 2px solid var(--accent);
+      border-bottom: 2px solid var(--accent);
+      transform: rotate(45deg);
+      transition: transform 0.18s ease;
+    }
+    .disclosure[open] > summary::after { transform: rotate(225deg); }
+    .disclosure > summary:hover { background: rgba(255,255,255,0.035); }
+    .disclosure > summary:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: -3px;
+      border-radius: 14px;
+    }
+    .disclosure > summary h2 { margin: 0; }
+    .disclosure[open] > summary { border-bottom: 1px solid var(--border); }
+    .disclosure-body { padding: 18px; }
+    @media (prefers-reduced-motion: reduce) {
+      .disclosure > summary::after { transition: none; }
     }
     .controls {
       display: flex;
@@ -237,6 +286,82 @@
       background: linear-gradient(90deg, var(--accent), var(--accent-2));
       transition: width 0.12s ease;
     }
+    .sd-transfer-stats {
+      min-height: 18px;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.4;
+      overflow-wrap: anywhere;
+    }
+    .sd-path { color: var(--text); overflow-wrap: anywhere; }
+    .sd-list {
+      display: grid;
+      gap: 6px;
+      min-height: 60px;
+      margin-top: 2px;
+    }
+    .sd-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      align-items: center;
+      gap: 10px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: rgba(255,255,255,0.025);
+    }
+    .sd-name { min-width: 0; overflow-wrap: anywhere; }
+    .sd-size { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+    .sd-row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+    .sd-row button { padding: 7px 10px; font-size: 12px; box-shadow: none; }
+    .sd-row .sd-delete { color: var(--error); background: rgba(255,107,107,0.08); box-shadow: inset 0 0 0 1px rgba(255,107,107,0.28); }
+    .sd-empty { color: var(--muted); font-size: 13px; padding: 12px; }
+    .sd-selected-file { align-self: center; min-width: 0; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+    .sd-list button:focus-visible, .sd-choose-file:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .sd-viewer {
+      display: grid;
+      gap: 12px;
+      min-width: 0;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: rgba(0,0,0,0.2);
+    }
+    .sd-viewer[hidden], .sd-viewer [hidden] { display: none !important; }
+    .sd-viewer-header { display: flex; justify-content: space-between; align-items: start; gap: 12px; }
+    .sd-viewer-header > div { min-width: 0; }
+    .sd-viewer-header > button { flex: none; }
+    .sd-viewer-header h3 { margin: 0 0 4px; font-size: 15px; }
+    .sd-viewer-path { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .sd-viewer-note { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .sd-text-editor {
+      display: block;
+      width: 100%;
+      min-height: 280px;
+      padding: 12px;
+      resize: vertical;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      background: var(--bg);
+      font: 13px/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      tab-size: 2;
+    }
+    .sd-text-editor:focus-visible, .sd-viewer button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .sd-new-file label { font-size: 13px; font-weight: 600; }
+    .sd-new-file .text-input { width: 100%; min-width: 0; }
+    .sd-new-file .sd-text-editor { min-height: 180px; }
+    .sd-csv-scroll { max-height: 380px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; }
+    .sd-csv-table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 12px; table-layout: auto; }
+    .sd-csv-table th, .sd-csv-table td { padding: 7px 9px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; min-width: 10ch; max-width: 32ch; overflow-wrap: break-word; }
+    .sd-csv-table th:first-child { min-width: 4ch; }
+    .sd-csv-table th { position: sticky; top: 0; color: var(--text); background: var(--card); font-variant-numeric: tabular-nums; }
+    .sd-csv-table td { color: var(--muted); white-space: pre-wrap; }
     .split {
       display: grid;
       grid-template-columns: 1.3fr 1fr;
@@ -284,15 +409,22 @@
       body { padding: 20px 14px 60px; }
       .split { grid-template-columns: 1fr; }
     }
+    @media (max-width: 540px) {
+      .sd-row { grid-template-columns: minmax(0, 1fr) auto; }
+      .sd-row-actions { grid-column: 1 / -1; justify-content: flex-start; }
+    }
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
 </head>
 <body>
   <div class="container">
     <header>
-      <div class="eyebrow">projectZero  ESP32-C5</div>
+      <div class="header-top">
+        <div class="eyebrow">projectZero  ESP32-C5</div>
+        <a class="help-link" href="janos_flash_help.html" target="_blank" rel="noopener noreferrer">Help &amp; user guide ↗</a>
+      </div>
       <h1>Flash projectZero straight from your browser</h1>
-      <p>WebSerial flasher powered by esptool-js. On a running JanOS Monster, Connect automatically switches the device to download mode and starts flashing. Other devices still use Connect + Flash.</p>
+      <p>Web Serial flasher powered by esptool-js. On a running JanOS Monster, Connect automatically switches the device to download mode and starts flashing. Other devices still use Connect + Flash.</p>
     </header>
 
     <div class="split">
@@ -303,6 +435,7 @@
             <div class="actions">
               <button id="connectBtn">Connect</button>
               <button id="flashBtn" class="ghost" disabled>Flash</button>
+              <button id="verifyBtn" class="ghost" disabled>Select port + Verify boot</button>
               <label class="check" title="Recommended for OTA partitions and clean flashing">
                 <input id="eraseAll" type="checkbox">
                 Erase
@@ -336,29 +469,83 @@
           </div>
         </div>
 
-        <div class="card">
-          <h2>Serial monitor</h2>
-          <p>Independent UART terminal mode. You can read and write serial data directly from browser.</p>
-          <div class="controls" style="margin-top:12px;">
-            <div class="actions">
-              <button id="monitorBtn" class="ghost">Monitor</button>
-              <select id="monitorBaudSelect" aria-label="Monitor baud rate">
-                <option value="115200">115200 baud</option>
-                <option value="460800">460800 baud</option>
-                <option value="921600">921600 baud</option>
-              </select>
-              <button id="clearMonitorBtn" class="ghost">Clear</button>
-            </div>
-            <div class="status-line">
-              <span id="monitorStatusText">Monitor disconnected.</span>
-            </div>
-            <div class="log" id="monitorLog"></div>
-            <div class="actions">
-              <input id="monitorInput" class="text-input" type="text" placeholder="Type text to send over UART">
-              <button id="monitorSendBtn" class="ghost" disabled>Send</button>
+        <details class="card disclosure" id="monitorPanel">
+          <summary><h2>Serial monitor</h2></summary>
+          <div class="disclosure-body">
+            <p>Independent UART terminal mode. Read and write serial data directly from your browser.</p>
+            <div class="controls" style="margin-top:12px;">
+              <div class="actions">
+                <button id="monitorBtn" class="ghost">Monitor</button>
+                <select id="monitorBaudSelect" aria-label="Monitor baud rate">
+                  <option value="115200">115200 baud</option>
+                  <option value="460800">460800 baud</option>
+                  <option value="921600">921600 baud</option>
+                </select>
+                <button id="clearMonitorBtn" class="ghost">Clear</button>
+              </div>
+              <div class="status-line">
+                <span id="monitorStatusText">Monitor disconnected.</span>
+              </div>
+              <div class="log" id="monitorLog"></div>
+              <div class="actions">
+                <input id="monitorInput" class="text-input" type="text" placeholder="Type text to send over UART">
+                <button id="monitorSendBtn" class="ghost" disabled>Send</button>
+              </div>
             </div>
           </div>
-        </div>
+        </details>
+        <details class="card disclosure" id="sdPanel">
+          <summary><h2>SD file manager</h2></summary>
+          <div class="disclosure-body">
+            <p>Browse and transfer files in <span class="mono">/sdcard/lab</span> on a running JanOS device. This requires firmware with FS/1 support and an available UART port at 115200 baud. Only one serial session can use the port at a time.</p>
+            <div class="controls" style="margin-top:12px;">
+              <div class="hint">Upload names must fit the CP437 SD code page. Delete removes one file or one empty folder after confirmation. Clean failed upload removes a leftover <span class="mono">.fs-part</span> file when JanOS supports it. Edit small UTF-8 TXT files or preview CSV files without leaving this page.</div>
+              <div class="actions">
+                <button id="sdConnectBtn" class="ghost">Connect to running JanOS</button>
+                <button id="sdRefreshBtn" class="ghost" disabled>Refresh</button>
+                <button id="sdNewFileBtn" class="ghost" type="button" disabled>New file</button>
+              </div>
+              <div class="status-line" role="status" aria-live="polite"><span id="sdStatusText">SD files disconnected.</span></div>
+              <div class="actions">
+                <button id="sdRootBtn" class="ghost" disabled>Root</button>
+                <button id="sdBackBtn" class="ghost" disabled>Up one folder</button>
+                <span id="sdPathText" class="pill sd-path">/sdcard/lab</span>
+              </div>
+              <form id="sdNewFile" class="sd-viewer sd-new-file" aria-label="Create a text file" hidden>
+                <div class="sd-viewer-header">
+                  <div><h3>New text file</h3><div id="sdNewFilePath" class="sd-viewer-path mono"></div></div>
+                  <button id="sdCancelNewFileBtn" class="ghost" type="button">Cancel</button>
+                </div>
+                <p class="sd-viewer-note">Save UTF-8 text up to 128 KiB. For binary files, use Upload to this folder.</p>
+                <label for="sdNewFileName">Filename</label>
+                <input id="sdNewFileName" class="text-input" type="text" placeholder="notes.txt" autocomplete="off" spellcheck="false" required>
+                <label for="sdNewFileContent">Content</label>
+                <textarea id="sdNewFileContent" class="sd-text-editor" aria-label="New file content" spellcheck="false"></textarea>
+                <div class="actions"><button id="sdCreateFileBtn" type="submit" disabled>Create file</button></div>
+              </form>
+              <div id="sdList" class="sd-list" aria-label="SD directory contents"><div class="sd-empty">Connect to view files.</div></div>
+              <section id="sdViewer" class="sd-viewer" aria-label="SD file viewer" hidden>
+                <div class="sd-viewer-header">
+                  <div><h3 id="sdViewerTitle">File</h3><div id="sdViewerPath" class="sd-viewer-path mono"></div></div>
+                  <button id="sdViewerCloseBtn" class="ghost" type="button">Close</button>
+                </div>
+                <p id="sdViewerNotice" class="sd-viewer-note"></p>
+                <label id="sdTextLabel" for="sdTextEditor">Text content</label>
+                <textarea id="sdTextEditor" class="sd-text-editor" aria-label="TXT file content" spellcheck="false" hidden></textarea>
+                <div id="sdCsvScroll" class="sd-csv-scroll" hidden><table id="sdCsvTable" class="sd-csv-table" aria-label="CSV preview"></table></div>
+                <div class="actions"><button id="sdSaveBtn" type="button" disabled hidden>Save to SD</button></div>
+              </section>
+              <div class="actions">
+                <input id="sdFileInput" type="file" aria-label="Choose a file to upload" disabled hidden>
+                <button id="sdChooseFileBtn" class="ghost sd-choose-file" type="button" aria-describedby="sdSelectedFileName" disabled>Choose file</button>
+                <span id="sdSelectedFileName" class="sd-selected-file" role="status" aria-live="polite">No file selected</span>
+                <button id="sdUploadBtn" class="ghost" disabled>Upload to this folder</button>
+              </div>
+              <div id="sdProgressTrack" class="progress" role="progressbar" aria-label="SD transfer progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="sdProgressBar"></span></div>
+              <div id="sdTransferStats" class="sd-transfer-stats" aria-live="off">Select a file or download an SD item to measure transfer speed.</div>
+            </div>
+          </div>
+        </details>
       </div>
 
       <div class="stack">
@@ -368,9 +555,9 @@
           <div class="steps">
             <li><strong>JanOS Monster:</strong> with JanOS running, click Connect and allow serial access. The flasher sends <code>ping</code>, then automatically enters download mode and flashes.</li>
             <li><strong>ROM mode:</strong> For a blank or unresponsive board, hold BOOT on the LAB C5, plug the board in, then release.</li>
-            <li><strong>Close serial hogs:</strong> quit qFlipper/monitors or anything holding the COM port.</li>
-            <li><strong>Stuck-</strong> Unplug, re-run Connect, plug again with BOOT held, then Flash.</li>
-            <li><strong>Reset:</strong> after flashing, press RESET on the board if it does not auto-reboot.</li>
+            <li><strong>Close other serial apps:</strong> quit qFlipper, serial monitors, or anything holding the COM port.</li>
+            <li><strong>Connection stuck?</strong> Unplug the board, click Connect again, plug it in with BOOT held, then click Flash.</li>
+            <li><strong>Reset:</strong> after the write, the flasher resets the ESP32-C5 and checks <code>ping</code> and <code>version</code>. If boot remains unconfirmed, press RESET and use Select port + Verify boot.</li>
           </div>
         </div>
         <div class="card">
@@ -378,12 +565,12 @@
           <p>Using esptool-js directly: enter stub, set baud, then flash each image at the offsets from <code>manifest.json</code>. Progress and MD5 checks mirror the Python esptool flow.</p>
         </div>
         <div class="card">
-          <h2>Need offline-</h2>
+          <h2>Flash offline</h2>
           <p>Grab the same assets from Releases and run <code>flash_board.py</code> in <code>ESP32C5/binaries-esp32c5</code> if your browser blocks Web Serial.</p>
         </div>
         <div class="card">
           <h2>Browser support</h2>
-          <p>Chrome or Edge on desktop over HTTPS. Web Serial is required. If you see Web Serial not available, switch browsers.</p>
+          <p>Chrome or Edge on desktop over HTTPS or localhost. Web Serial is required. If you see Web Serial not available, switch browsers.</p>
         </div>
       </div>
     </div>
@@ -395,6 +582,10 @@
 
   <script type="module">
     import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.6.1/bundle.js";
+    import { resetWithWatchdog, verifyJanosBoot } from "./postflash.mjs";
+    import { SdFilesClient, encodePath } from "./sd-files.mjs";
+    import { TransferMeter } from "./sd-transfer-stats.mjs";
+    import { decodeEditableText, encodeEditableText, decodeUtf8Preview, parseCsvPreview } from "./sd-text.mjs";
 
     const ui = {
       status: document.getElementById("statusText"),
@@ -404,6 +595,7 @@
       progress: document.getElementById("progressBar"),
       connectBtn: document.getElementById("connectBtn"),
       flashBtn: document.getElementById("flashBtn"),
+      verifyBtn: document.getElementById("verifyBtn"),
       eraseAll: document.getElementById("eraseAll"),
       baud: document.getElementById("baudSelect"),
       branch: document.getElementById("branchSelect"),
@@ -416,11 +608,43 @@
       monitorLog: document.getElementById("monitorLog"),
       monitorInput: document.getElementById("monitorInput"),
       monitorSendBtn: document.getElementById("monitorSendBtn"),
+      sdConnectBtn: document.getElementById("sdConnectBtn"),
+      sdRefreshBtn: document.getElementById("sdRefreshBtn"),
+      sdStatus: document.getElementById("sdStatusText"),
+      sdRootBtn: document.getElementById("sdRootBtn"),
+      sdBackBtn: document.getElementById("sdBackBtn"),
+      sdPath: document.getElementById("sdPathText"),
+      sdList: document.getElementById("sdList"),
+      sdFileInput: document.getElementById("sdFileInput"),
+      sdChooseFileBtn: document.getElementById("sdChooseFileBtn"),
+      sdSelectedFileName: document.getElementById("sdSelectedFileName"),
+      sdUploadBtn: document.getElementById("sdUploadBtn"),
+      sdNewFileBtn: document.getElementById("sdNewFileBtn"),
+      sdNewFile: document.getElementById("sdNewFile"),
+      sdNewFilePath: document.getElementById("sdNewFilePath"),
+      sdNewFileName: document.getElementById("sdNewFileName"),
+      sdNewFileContent: document.getElementById("sdNewFileContent"),
+      sdCreateFileBtn: document.getElementById("sdCreateFileBtn"),
+      sdCancelNewFileBtn: document.getElementById("sdCancelNewFileBtn"),
+      sdProgressTrack: document.getElementById("sdProgressTrack"),
+      sdProgress: document.getElementById("sdProgressBar"),
+      sdTransferStats: document.getElementById("sdTransferStats"),
+      sdViewer: document.getElementById("sdViewer"),
+      sdViewerTitle: document.getElementById("sdViewerTitle"),
+      sdViewerPath: document.getElementById("sdViewerPath"),
+      sdViewerNotice: document.getElementById("sdViewerNotice"),
+      sdViewerCloseBtn: document.getElementById("sdViewerCloseBtn"),
+      sdTextLabel: document.getElementById("sdTextLabel"),
+      sdTextEditor: document.getElementById("sdTextEditor"),
+      sdCsvScroll: document.getElementById("sdCsvScroll"),
+      sdCsvTable: document.getElementById("sdCsvTable"),
+      sdSaveBtn: document.getElementById("sdSaveBtn"),
     };
 
     const state = {
       manifest: null,
       manifestUrl: null,
+      manifestLoadId: 0,
       latestRelease: null,
       files: [],
       port: null,
@@ -429,7 +653,11 @@
       esploader: null,
       chip: null,
       connected: false,
+      isConnecting: false,
       isFlashing: false,
+      postFlashChecking: false,
+      flashVerified: false,
+      flashedVersion: null,
       autoFlash: false,
       autoFlashTriggered: false,
       monitorPort: null,
@@ -438,9 +666,24 @@
       monitorOnDisconnect: null,
       monitorPipe: null,
       monitorConnected: false,
+      monitorConnecting: false,
+      sdPort: null,
+      sdClient: null,
+      sdOnDisconnect: null,
+      sdConnected: false,
+      sdBusy: false,
+      sdPath: "",
+      sdItems: [],
+      sdViewer: null,
+      sdNewFileOpen: false,
+      sdNewFileFolder: "",
+      sdLastRate: { upload: null, download: null },
     };
 
     const PAGE_VERSION = "1.0.9";
+    const TXT_EDIT_MAX_BYTES = 128 * 1024;
+    const NEW_FILE_MAX_BYTES = 128 * 1024;
+    const CSV_PREVIEW_MAX_BYTES = 256 * 1024;
     const monitorEncoder = new TextEncoder();
     const commandEncoder = new TextEncoder();
 
@@ -624,7 +867,9 @@
     };
 
     const loadManifest = async () => {
+      const loadId = ++state.manifestLoadId;
       try {
+        state.latestRelease = null;
         const branch = getBranch();
         const primary = getManifestUrl();
         const candidates = branch === "main"
@@ -651,29 +896,33 @@
             lastErr = err;
           }
         }
+        if (loadId !== state.manifestLoadId) return;
         if (!manifestRaw) throw lastErr || new Error("Manifest fetch failed");
         if (usedManifestUrl) log(`Manifest: ${usedManifestUrl}`);
-        const manifest = rewritePartsForBranch(manifestRaw, getBranch());
+        const manifest = rewritePartsForBranch(manifestRaw, branch);
         state.manifest = manifest;
         state.manifestUrl = usedManifestUrl || primary;
         let releaseLabel = manifest.version || "n/a";
-        if (getBranch() === "main") {
+        if (branch === "main") {
           try {
             const release = await fetchLatestRelease();
+            if (loadId !== state.manifestLoadId) return;
             state.latestRelease = release;
             releaseLabel = release.tag_name || release.name || releaseLabel;
           } catch (err) {
             console.warn(err);
           }
         }
+        if (loadId !== state.manifestLoadId) return;
         ui.manifest.style.display = "inline-flex";
         ui.manifest.textContent = `Build ${manifest.build || "n/a"} - ${releaseLabel} - ${getBranch()}`;
         setFooterVersion({ ...manifest, version: releaseLabel });
         const files = (manifest.parts || []).length;
         const releaseText = state.latestRelease ? ` - latest ${releaseLabel}` : "";
-        ui.releaseInfo.innerHTML = `<span class="badge">Manifest</span> ${manifest.name || "projectZero"}${releaseText} - ${files} file(s) - chip ${manifest.chipFamily || "ESP32-C5"} - ${getBranch()}`;
+        ui.releaseInfo.innerHTML = `<span class="badge">Manifest</span> ${manifest.name || "projectZero"}${releaseText} - ${files} ${files === 1 ? "file" : "files"} - chip ${manifest.chipFamily || "ESP32-C5"} - ${getBranch()}`;
         setStatus("Manifest loaded.");
       } catch (err) {
+        if (loadId !== state.manifestLoadId) return;
         setStatus("Manifest not found. Publish a release first.", "error");
         ui.releaseInfo.textContent = "No manifest available.";
         setFooterVersion(null);
@@ -790,6 +1039,11 @@
 
     const connect = async () => {
       ensureSupport();
+      if (state.sdBusy) throw new Error("Wait for the SD transfer to finish.");
+      if (state.isFlashing || state.postFlashChecking || state.isConnecting || state.monitorConnecting) {
+        throw new Error("Wait for the current serial operation to finish.");
+      }
+      if (state.sdConnected) await disconnectSd();
       if (state.connected) {
         await disconnect();
         return;
@@ -799,13 +1053,22 @@
         await disconnectMonitor();
       }
       ui.connectBtn.disabled = true;
+      state.isConnecting = true;
+      syncSdControls();
       ui.flashBtn.disabled = true;
+      state.flashVerified = false;
+      state.flashedVersion = null;
+      ui.verifyBtn.disabled = true;
       state.autoFlashTriggered = false;
       setStatus("Requesting serial port");
       log("Requesting port access");
       try {
         state.port = await navigator.serial.requestPort({});
         state.onDisconnect = () => {
+          if (state.postFlashChecking) {
+            log("Device disconnected during expected reset; waiting for JanOS.");
+            return;
+          }
           log("Device disconnected.");
           disconnect().catch(() => {});
           setStatus("Device disconnected. Reconnect to flash.", "error");
@@ -877,7 +1140,9 @@
         await disconnect();
         throw err;
       } finally {
+        state.isConnecting = false;
         ui.connectBtn.disabled = false;
+        syncSdControls();
       }
     };
 
@@ -934,16 +1199,86 @@
       return files;
     };
 
-const flash = async () => {
+    const releaseFlasherTransport = async () => {
+      if (state.port && state.onDisconnect) {
+        try { state.port.removeEventListener("disconnect", state.onDisconnect); } catch {}
+      }
+      state.onDisconnect = null;
+      try { if (state.transport) await state.transport.disconnect(); }
+      catch (err) {
+        log(`Transport close during reset: ${err?.message || err}`);
+        try { await state.port?.close(); } catch {}
+      }
+      state.transport = null;
+      state.esploader = null;
+      state.chip = null;
+      state.connected = false;
+      ui.chip.style.display = "none";
+      ui.flashBtn.disabled = true;
+      ui.connectBtn.textContent = "Connect";
+    };
+
+    const refreshAuthorizedPort = async () => {
+      const selectedInfo = state.port?.getInfo?.();
+      if (!selectedInfo) return;
+      const ports = await navigator.serial.getPorts();
+      if (ports.includes(state.port)) return;
+      const matching = ports.filter((port) => {
+        const info = port.getInfo();
+        return info.usbVendorId === selectedInfo.usbVendorId
+          && info.usbProductId === selectedInfo.usbProductId;
+      });
+      if (matching.length === 1) state.port = matching[0];
+    };
+
+    const verifyAfterReset = async () => {
+      setStatus("Flash verified. Waiting for JanOS ping and version...");
+      const runProbe = async (command, matcher, timeoutMs) => {
+        try { return await runJanosCommand(command, matcher, timeoutMs); }
+        catch (err) {
+          try { await refreshAuthorizedPort(); } catch {}
+          throw err;
+        }
+      };
+      const result = await verifyJanosBoot(runProbe, {
+        expectedVersion: state.flashedVersion,
+        attempts: 10,
+      });
+      if (result.ok) {
+        setStatus(`Flash verified. JanOS ${result.version} responds to ping and version.`);
+        log(`JanOS responsive: version ${result.version}, pong received. Firmware image identity is not established by this check.`);
+      } else if (result.reason === "version_mismatch") {
+        setStatus(`Flash verified, but JanOS reports ${result.version} instead of ${state.flashedVersion}.`, "error");
+        log(`JanOS responded with unexpected version ${result.version}.`);
+      } else {
+        setStatus("Flash verified, but JanOS boot is unconfirmed. Press RESET, then Select port + Verify boot.", "error");
+        log("No confirmed JanOS ping/version after watchdog reset.");
+      }
+      return result;
+    };
+
+    const flash = async () => {
       ensureSupport();
       if (!state.esploader) {
         await connect();
       }
+      // Connect may already have auto-flashed a running JanOS device.
+      if (!state.esploader) return;
       ui.flashBtn.disabled = true;
+      ui.verifyBtn.disabled = true;
       ui.connectBtn.disabled = true;
+      ui.branch.disabled = true;
       state.isFlashing = true;
+      syncSdControls();
+      state.flashVerified = false;
+      state.flashedVersion = null;
       ui.progress.style.width = "0%";
       try {
+        if (state.esploader?.chip?.CHIP_NAME !== "ESP32-C5") {
+          throw new Error("This flasher reset flow requires an ESP32-C5 chip.");
+        }
+        if (!state.manifest) await loadManifest();
+        const flashedManifest = state.manifest;
         const files = await fetchFiles();
         setStatus("Uploading stub and flashing");
         log("Preparing flash writes");
@@ -963,18 +1298,65 @@ const flash = async () => {
           calculateMD5Hash: (image) => CryptoJS.MD5(CryptoJS.enc.Latin1.parse(bytesToBinaryString(image))).toString(),
         };
         await state.esploader.writeFlash(flashOptions);
-        await state.esploader.after();
+        state.flashVerified = true;
+        state.flashedVersion = flashedManifest?.version || null;
         ui.progress.style.width = "100%";
-        setStatus("Flash complete. Press RESET if the board doesn't reboot.");
-        log("Flash complete.");
+        log("Flash writes and MD5 verification complete.");
+        state.postFlashChecking = true;
+        setStatus("Flash verified. Resetting ESP32-C5 with watchdog...");
+        const reset = await resetWithWatchdog(state.esploader);
+        if (reset.acknowledgement === "uncertain") {
+          log(`Watchdog write ${reset.failedStep} lost its ACK during reset; checking JanOS boot.`);
+        } else {
+          log("Watchdog reset sequence acknowledged.");
+        }
+        await releaseFlasherTransport();
+        await verifyAfterReset();
       } catch (err) {
         console.error(err);
-        setStatus(err.message || "Flash failed", "error");
+        if (state.flashVerified) {
+          state.postFlashChecking = true;
+          await releaseFlasherTransport();
+          setStatus("Flash verified, but reset or boot is unconfirmed. Press RESET, then Select port + Verify boot.", "error");
+        } else {
+          await releaseFlasherTransport();
+          setStatus(`${err.message || "Flash failed"} Reconnect before retrying.`, "error");
+        }
         log(`Error: ${err.message || err}`);
       } finally {
+        state.postFlashChecking = false;
         state.isFlashing = false;
-        ui.flashBtn.disabled = false;
+        ui.branch.disabled = false;
+        ui.flashBtn.disabled = !state.connected;
+        ui.verifyBtn.disabled = !state.flashVerified || state.sdConnected || state.monitorConnected;
         ui.connectBtn.disabled = false;
+        syncSdControls();
+      }
+    };
+
+    const retryBootVerification = async () => {
+      if (!state.flashVerified) return;
+      if (state.sdConnected || state.sdBusy) {
+        setStatus("Disconnect SD files before verifying boot.", "error");
+        return;
+      }
+      if (state.monitorConnected) {
+        setStatus("Stop the serial monitor before verifying boot.", "error");
+        return;
+      }
+      ui.verifyBtn.disabled = true;
+      ui.connectBtn.disabled = true;
+      state.postFlashChecking = true;
+      syncSdControls();
+      try {
+        state.port = await navigator.serial.requestPort({});
+        await verifyAfterReset();
+      }
+      finally {
+        state.postFlashChecking = false;
+        ui.verifyBtn.disabled = false;
+        ui.connectBtn.disabled = false;
+        syncSdControls();
       }
     };
 
@@ -1007,16 +1389,21 @@ const flash = async () => {
       state.monitorConnected = false;
       ui.monitorBtn.textContent = "Monitor";
       ui.monitorSendBtn.disabled = true;
+      ui.verifyBtn.disabled = !state.flashVerified;
       setMonitorStatus("Monitor disconnected.");
+      syncSdControls();
     };
 
     const connectMonitor = async () => {
       ensureSupport();
+      if (state.sdBusy) throw new Error("Wait for the SD transfer to finish.");
+      if (state.monitorConnecting) throw new Error("Wait for the monitor connection to finish.");
+      if (state.sdConnected) await disconnectSd();
       if (state.monitorConnected) {
         await disconnectMonitor();
         return;
       }
-      if (state.isFlashing) {
+      if (state.isFlashing || state.postFlashChecking || state.isConnecting) {
         throw new Error("Cannot start monitor while flashing is in progress.");
       }
       if (state.connected) {
@@ -1024,6 +1411,8 @@ const flash = async () => {
         await disconnect();
       }
       ui.monitorBtn.disabled = true;
+      state.monitorConnecting = true;
+      syncSdControls();
       setMonitorStatus("Requesting serial port...");
       try {
         state.monitorPort = await navigator.serial.requestPort({});
@@ -1044,6 +1433,7 @@ const flash = async () => {
         state.monitorConnected = true;
         ui.monitorBtn.textContent = "Stop monitor";
         ui.monitorSendBtn.disabled = false;
+        ui.verifyBtn.disabled = true;
         setMonitorStatus(`Monitor connected @ ${baud} baud.`);
         monitorLine(`Monitor connected @ ${baud} baud.`);
         monitorReadLoop().catch(() => {});
@@ -1053,7 +1443,9 @@ const flash = async () => {
         monitorLine(`Error: ${err?.message || err}`);
         throw err;
       } finally {
+        state.monitorConnecting = false;
         ui.monitorBtn.disabled = false;
+        syncSdControls();
       }
     };
 
@@ -1090,8 +1482,707 @@ const flash = async () => {
       setStatus("Disconnected.");
     };
 
+    const setSdStatus = (message, level = "info") => {
+      ui.sdStatus.textContent = message;
+      ui.sdStatus.classList.toggle("error", level === "error");
+    };
+
+    const sdErrorText = (error) => {
+      if (error?.code === "recovered_retry") {
+        return "JanOS restored or cleaned a previous upload. Refresh the folder, then retry manually.";
+      }
+      if (error?.code === "exists") {
+        return "A file with this name already exists on SD. Refresh the folder or choose another name.";
+      }
+      if (error?.code === "dir_not_empty") {
+        return "This folder is not empty. Delete its contents first.";
+      }
+      if (error?.code === "not_found") {
+        return "This SD item no longer exists. Refresh the folder.";
+      }
+      return `SD operation failed: ${error.message || error}`;
+    };
+
+    const sdPathLabel = (path) => `/sdcard/lab${path ? `/${path}` : ""}`;
+    const sdJoin = (name) => state.sdPath ? `${state.sdPath}/${name}` : name;
+    const sdSize = (size) => size < 1024 ? `${size} B`
+      : size < 1024 * 1024 ? `${(size / 1024).toFixed(1)} KiB`
+      : `${(size / (1024 * 1024)).toFixed(1)} MiB`;
+
+    const sdRate = (bytesPerSecond) => {
+      const kib = bytesPerSecond / 1024;
+      return `${kib.toFixed(kib < 1 ? 2 : 1)} KiB/s`;
+    };
+    const sdDuration = (seconds) => {
+      const rounded = Math.max(0, Math.ceil(seconds));
+      if (rounded < 60) return `${rounded}s`;
+      if (rounded < 3600) return `${Math.floor(rounded / 60)}m ${rounded % 60}s`;
+      return `${Math.floor(rounded / 3600)}h ${Math.floor(rounded % 3600 / 60)}m`;
+    };
+    const setSdProgress = (done, total, verified = false) => {
+      const percent = total > 0 ? done >= total ? 100 : Math.min(99, Math.round(done / total * 100))
+        : verified ? 100 : 0;
+      ui.sdProgress.style.width = `${percent}%`;
+      ui.sdProgressTrack.setAttribute("aria-valuenow", String(percent));
+      ui.sdProgressTrack.setAttribute("aria-valuetext", percent === 100 && !verified
+        ? "Payload transferred; waiting for final verification"
+        : `${percent}% of file transfer`);
+    };
+    const showSelectedSdEstimate = () => {
+      if (state.sdBusy) return;
+      const file = ui.sdFileInput.files?.[0];
+      if (!file) {
+        ui.sdTransferStats.textContent = "Select a file or download an SD item to measure transfer speed.";
+        return;
+      }
+      const priorRate = state.sdLastRate.upload;
+      ui.sdTransferStats.textContent = priorRate && file.size
+        ? `${sdSize(file.size)} selected · estimated upload ${sdDuration(file.size / priorRate)} from last measured average (${sdRate(priorRate)}).`
+        : `${sdSize(file.size)} selected · upload speed will be measured during transfer.`;
+      setSdProgress(0, file.size);
+    };
+    const startSdMeter = (direction, name, total) => {
+      const meter = new TransferMeter(total);
+      const priorRate = state.sdLastRate[direction];
+      let lastPaint = -Infinity;
+      const paint = (force = false) => {
+        if (!state.sdConnected || !state.sdClient?.connected) return;
+        const now = performance.now();
+        if (!force && now - lastPaint < 400) return;
+        lastPaint = now;
+        const sample = meter.snapshot();
+        setSdProgress(sample.done, sample.total, sample.finished);
+        const parts = [`${sdSize(sample.done)} / ${sdSize(sample.total)}`];
+        if (sample.finished) {
+          parts.push("Verified");
+        } else if (sample.waiting) {
+          parts.push(sample.finalizing ? "Waiting for final confirmation" : "Waiting for SD or serial");
+        } else if (sample.finalizing) {
+          parts.push(direction === "download" ? "Verifying size and CRC" : "Finalizing and verifying on JanOS");
+        } else if (!sample.done && priorRate && sample.total) {
+          parts.push(`Estimated ${sdDuration(sample.total / priorRate)} from last ${direction}`);
+        }
+        if (!sample.finalizing && !sample.finished && sample.currentBytesPerSecond) {
+          parts.push(`Now ${sdRate(sample.currentBytesPerSecond)}`);
+        }
+        if (sample.averageBytesPerSecond) parts.push(`Avg ${sdRate(sample.averageBytesPerSecond)}`);
+        if (sample.etaSeconds !== null) parts.push(`ETA ~${sdDuration(sample.etaSeconds)}`);
+        else if (!sample.done && !priorRate && !sample.finalizing) parts.push("Measuring speed");
+        ui.sdTransferStats.textContent = `${name}: ${parts.join(" · ")}`;
+      };
+      paint(true);
+      const timer = setInterval(() => paint(), 500);
+      return {
+        progress(done, actualTotal) {
+          meter.progress(done, actualTotal);
+          paint();
+        },
+        complete() {
+          const result = meter.finish();
+          if (result.done >= 4096 && result.elapsedMs >= 1000 && result.averageBytesPerSecond) {
+            state.sdLastRate[direction] = result.averageBytesPerSecond;
+          }
+          paint(true);
+        },
+        stop() { clearInterval(timer); },
+      };
+    };
+
+    const syncSdControls = () => {
+      const editorOpen = !!state.sdViewer || state.sdNewFileOpen;
+      const ready = state.sdConnected && state.sdClient?.connected && !state.sdBusy && !editorOpen;
+      ui.sdConnectBtn.disabled = state.sdBusy || state.isFlashing || state.postFlashChecking
+        || state.isConnecting || state.monitorConnecting || (editorOpen && state.sdConnected);
+      ui.sdConnectBtn.textContent = state.sdConnected ? "Disconnect SD files" : "Connect to running JanOS";
+      ui.sdRefreshBtn.disabled = !ready;
+      ui.sdRootBtn.disabled = !ready || !state.sdPath;
+      ui.sdBackBtn.disabled = !ready || !state.sdPath;
+      ui.sdFileInput.disabled = !ready;
+      ui.sdChooseFileBtn.disabled = !ready;
+      ui.sdSelectedFileName.textContent = ui.sdFileInput.files?.[0]?.name || "No file selected";
+      ui.sdUploadBtn.disabled = !ready || !ui.sdFileInput.files?.length;
+      ui.sdNewFileBtn.disabled = !ready;
+      ui.sdNewFile.hidden = !state.sdNewFileOpen;
+      ui.sdNewFilePath.textContent = sdPathLabel(state.sdNewFileFolder);
+      ui.sdNewFileName.disabled = state.sdBusy;
+      ui.sdNewFileContent.disabled = state.sdBusy;
+      ui.sdCreateFileBtn.disabled = !state.sdNewFileOpen || !state.sdConnected
+        || !state.sdClient?.connected || state.sdBusy || !ui.sdNewFileName.value;
+      ui.sdCancelNewFileBtn.disabled = state.sdBusy;
+      ui.sdPath.textContent = sdPathLabel(state.sdPath);
+      ui.connectBtn.disabled = state.sdBusy || state.isFlashing || state.postFlashChecking
+        || state.isConnecting || state.monitorConnecting || editorOpen;
+      ui.monitorBtn.disabled = state.sdBusy || state.monitorConnecting || state.isFlashing
+        || state.postFlashChecking || state.isConnecting || editorOpen;
+      ui.verifyBtn.disabled = !state.flashVerified || state.sdConnected || state.sdBusy
+        || state.monitorConnected || state.isFlashing || state.postFlashChecking || state.isConnecting || editorOpen;
+      if (ui.sdViewerCloseBtn) ui.sdViewerCloseBtn.disabled = state.sdBusy;
+      if (ui.sdTextEditor) ui.sdTextEditor.disabled = state.sdBusy;
+      if (ui.sdSaveBtn) ui.sdSaveBtn.disabled = !state.sdViewer || state.sdViewer.kind !== "txt"
+        || !state.sdConnected || !state.sdClient?.connected || state.sdBusy
+        || ui.sdTextEditor.value === state.sdViewer.savedText;
+    };
+
+    const renderSdViewer = () => {
+      if (!ui.sdViewer) return;
+      const viewer = state.sdViewer;
+      ui.sdViewer.hidden = !viewer;
+      if (!viewer) return;
+      const editable = viewer.kind === "txt";
+      ui.sdViewerTitle.textContent = editable ? "Edit TXT" : "CSV preview";
+      ui.sdViewerPath.textContent = sdPathLabel(viewer.path);
+      ui.sdViewerNotice.textContent = editable && !state.sdConnected
+        ? "Connection lost. Your text remains here; reconnect to JanOS before saving. The file will be checked again."
+        : editable && ui.sdTextEditor.value !== viewer.savedText
+          ? "Unsaved changes. Save to SD or Close to discard them." : viewer.notice || "";
+      ui.sdTextLabel.hidden = !editable;
+      ui.sdTextEditor.hidden = !editable;
+      ui.sdCsvScroll.hidden = editable;
+      ui.sdSaveBtn.hidden = !editable;
+      syncSdControls();
+    };
+
+    const canReplaceTxtPath = (path) => {
+      try {
+        // The base64 path makes PUT longer than GET. Reserve six size digits
+        // for the 128 KiB editor cap so every edit that fits can be saved.
+        return `fs put ${encodePath(path)} ${TXT_EDIT_MAX_BYTES} FFFFFFFF replace`.length <= 254;
+      } catch {
+        return false;
+      }
+    };
+
+    const renderSdList = () => {
+      ui.sdList.replaceChildren();
+      if (!state.sdConnected) {
+        const empty = document.createElement("div");
+        empty.className = "sd-empty";
+        empty.textContent = "Connect to view files.";
+        ui.sdList.append(empty);
+        return;
+      }
+      if (!state.sdItems.length) {
+        const empty = document.createElement("div");
+        empty.className = "sd-empty";
+        empty.textContent = "This folder is empty.";
+        ui.sdList.append(empty);
+        return;
+      }
+      const sorted = [...state.sdItems].sort((a, b) =>
+        (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "d" ? -1 : 1));
+      const actionsLocked = state.sdBusy || !!state.sdViewer || state.sdNewFileOpen;
+      for (const item of sorted) {
+        const row = document.createElement("div");
+        row.className = "sd-row";
+        const name = document.createElement("span");
+        name.className = "sd-name";
+        name.textContent = item.name;
+        const size = document.createElement("span");
+        size.className = "sd-size";
+        size.textContent = item.type === "d" ? "Folder" : sdSize(item.size);
+        const action = document.createElement("button");
+        action.className = "ghost";
+        action.textContent = item.type === "d" ? "Open" : "Download";
+        action.disabled = actionsLocked;
+        action.setAttribute("aria-label", `${action.textContent} ${item.name}`);
+        action.addEventListener("click", () => {
+          if (item.type === "d") goSdPath(sdJoin(item.name)).catch(() => {});
+          else downloadSd(item).catch(() => {});
+        });
+        const actions = document.createElement("div");
+        actions.className = "sd-row-actions";
+        actions.append(action);
+        if (item.type === "f" && /\.txt$/i.test(item.name)) {
+          const editButton = document.createElement("button");
+          editButton.className = "ghost";
+          editButton.textContent = "Edit";
+          const editPath = sdJoin(item.name);
+          const unsafeEditPath = editPath.includes("~");
+          const editPathFits = canReplaceTxtPath(editPath);
+          editButton.disabled = actionsLocked || item.size > TXT_EDIT_MAX_BYTES
+            || unsafeEditPath || !editPathFits;
+          editButton.title = unsafeEditPath ? "FAT alias paths can be read but not safely replaced"
+            : !editPathFits ? "FS/1 path is too long to save; download and use a shorter name"
+              : item.size > TXT_EDIT_MAX_BYTES ? "TXT editor limit: 128 KiB; download this file instead" : "";
+          editButton.setAttribute("aria-label", `Edit ${item.name}`);
+          editButton.addEventListener("click", () => openSdText(item).catch(() => {}));
+          actions.append(editButton);
+        }
+        if (item.type === "f" && /\.csv$/i.test(item.name)) {
+          const previewButton = document.createElement("button");
+          previewButton.className = "ghost";
+          previewButton.textContent = "Preview";
+          previewButton.disabled = actionsLocked || item.size > CSV_PREVIEW_MAX_BYTES;
+          previewButton.title = item.size > CSV_PREVIEW_MAX_BYTES ? "CSV preview limit: 256 KiB; download this file instead" : "";
+          previewButton.setAttribute("aria-label", `Preview ${item.name}`);
+          previewButton.addEventListener("click", () => previewSdCsv(item).catch(() => {}));
+          actions.append(previewButton);
+        }
+        const deleteButton = document.createElement("button");
+        deleteButton.className = "sd-delete";
+        deleteButton.textContent = "Delete";
+        const path = sdJoin(item.name);
+        const protectedPath = path.includes("~") || /\.fs-(?:part|backup)$/i.test(path);
+        deleteButton.disabled = actionsLocked || !state.sdClient?.canRemove || protectedPath;
+        deleteButton.title = !state.sdClient?.canRemove ? "Requires JanOS firmware with FS/1 delete"
+          : protectedPath ? "Reserved JanOS transfer recovery path" : "";
+        deleteButton.setAttribute("aria-label", `Delete ${item.type === "d" ? "folder" : "file"} ${item.name}`);
+        deleteButton.addEventListener("click", () => deleteSd(item).catch(() => {}));
+        actions.append(deleteButton);
+        if (item.type === "f" && /\.fs-part$/i.test(item.name)) {
+          const cleanupButton = document.createElement("button");
+          cleanupButton.className = "ghost";
+          cleanupButton.textContent = "Clean failed upload";
+          const missingTargetName = /^\.fs-part$/i.test(item.name);
+          cleanupButton.disabled = actionsLocked || !state.sdClient?.canCleanupPartial
+            || path.includes("~") || missingTargetName;
+          cleanupButton.title = path.includes("~") ? "FAT alias paths cannot be safely cleaned"
+            : missingTargetName ? "No destination filename for this partial upload"
+              : !state.sdClient?.canCleanupPartial ? "Requires JanOS firmware with FS/1 partial upload cleanup" : "";
+          cleanupButton.setAttribute("aria-label", `Clean failed upload ${item.name}`);
+          cleanupButton.addEventListener("click", () => cleanupSd(item).catch(() => {}));
+          actions.append(cleanupButton);
+        }
+        row.append(name, size, actions);
+        ui.sdList.append(row);
+      }
+    };
+
+    const disconnectSd = async ({ preserveStatus = false } = {}) => {
+      if (state.sdPort && state.sdOnDisconnect) {
+        try { state.sdPort.removeEventListener("disconnect", state.sdOnDisconnect); } catch {}
+      }
+      try { await state.sdClient?.close(); } catch {}
+      state.sdPort = null;
+      state.sdClient = null;
+      state.sdOnDisconnect = null;
+      state.sdConnected = false;
+      state.sdPath = "";
+      state.sdItems = [];
+      setSdProgress(0, 0);
+      ui.sdTransferStats.textContent = "SD files disconnected.";
+      renderSdList();
+      renderSdViewer();
+      syncSdControls();
+      if (!preserveStatus) setSdStatus("SD files disconnected.");
+    };
+
+    const connectSd = async () => {
+      ensureSupport();
+      if (state.sdBusy) return;
+      if (state.sdConnected) {
+        await disconnectSd();
+        return;
+      }
+      if (state.isFlashing || state.postFlashChecking || state.isConnecting || state.monitorConnecting) {
+        throw new Error("Wait for the current serial operation to finish.");
+      }
+      state.sdBusy = true;
+      syncSdControls();
+      setSdStatus("Choose the port of a running JanOS device.");
+      try {
+        if (state.monitorConnected) await disconnectMonitor();
+        if (state.connected) await disconnect();
+        const port = await navigator.serial.requestPort({});
+        state.sdPort = port;
+        state.sdClient = new SdFilesClient(port, {
+          onFault(error) {
+            if (state.sdPort !== port) return;
+            disconnectSd({ preserveStatus: true }).catch(() => {});
+            setSdStatus(`SD serial session stopped: ${error.message || error}`, "error");
+          },
+        });
+        setSdStatus("Checking FS/1 support at 115200 baud...");
+        await state.sdClient.connect();
+        state.sdOnDisconnect = () => {
+          disconnectSd({ preserveStatus: true }).catch(() => {});
+          setSdStatus("SD device disconnected. Reconnect to continue.", "error");
+        };
+        try { port.addEventListener("disconnect", state.sdOnDisconnect); } catch {}
+        state.sdItems = await state.sdClient.list("");
+        state.sdPath = "";
+        state.sdConnected = true;
+        setSdStatus(`Connected to JanOS FS/1. ${state.sdItems.length} ${state.sdItems.length === 1 ? "item" : "items"}.${
+          state.sdClient.canRemove ? "" : " Delete requires updated JanOS firmware."}`);
+      } catch (error) {
+        await disconnectSd({ preserveStatus: true });
+        setSdStatus(`SD connection failed: ${error.message || error}`, "error");
+        throw error;
+      } finally {
+        state.sdBusy = false;
+        syncSdControls();
+        renderSdList();
+        renderSdViewer();
+      }
+    };
+
+    const sdOperation = async (workingText, action) => {
+      if (!state.sdConnected || !state.sdClient?.connected || state.sdBusy) return;
+      state.sdBusy = true;
+      syncSdControls();
+      renderSdList();
+      setSdStatus(workingText);
+      try {
+        await action();
+      } catch (error) {
+        if (!state.sdClient?.connected) await disconnectSd({ preserveStatus: true });
+        setSdStatus(sdErrorText(error), "error");
+        throw error;
+      } finally {
+        state.sdBusy = false;
+        syncSdControls();
+        renderSdList();
+      }
+    };
+
+    const goSdPath = async (path) => sdOperation(`Opening ${sdPathLabel(path)}...`, async () => {
+      const items = await state.sdClient.list(path);
+      state.sdPath = path;
+      state.sdItems = items;
+      setSdStatus(`${items.length} ${items.length === 1 ? "item" : "items"} in ${sdPathLabel(path)}.`);
+    });
+
+    const deleteSd = async (item) => {
+      const path = sdJoin(item.name);
+      const target = sdPathLabel(path);
+      const description = item.type === "d" ? "empty folder" : "file";
+      if (!window.confirm(`Delete ${description} ${target}? This cannot be undone.`)) return;
+      await sdOperation(`Deleting ${target}...`, async () => {
+        const result = await state.sdClient.remove(path);
+        state.sdItems = state.sdItems.filter(entry => entry.name !== item.name);
+        const confirmed = `Deleted ${result.type === "d" ? "folder" : "file"} ${target}.`;
+        try {
+          state.sdItems = await state.sdClient.list(state.sdPath);
+          setSdStatus(confirmed);
+        } catch (error) {
+          if (!state.sdClient?.connected) await disconnectSd({ preserveStatus: true });
+          setSdStatus(`${confirmed} Folder refresh failed: ${error.message || error}`, "error");
+        }
+      });
+    };
+
+    const cleanupSd = async (item) => {
+      const path = sdJoin(item.name);
+      const target = sdPathLabel(path);
+      if (!window.confirm(`Clean failed upload ${target}? Only this .fs-part file will be removed; the destination file will stay untouched.`)) return;
+      await sdOperation(`Cleaning failed upload ${target}...`, async () => {
+        await state.sdClient.cleanupPartial(path);
+        state.sdItems = state.sdItems.filter(entry => entry.name !== item.name);
+        const confirmed = `Removed incomplete upload ${target}.`;
+        try {
+          state.sdItems = await state.sdClient.list(state.sdPath);
+          setSdStatus(confirmed);
+        } catch (error) {
+          if (!state.sdClient?.connected) await disconnectSd({ preserveStatus: true });
+          setSdStatus(`${confirmed} Folder refresh failed: ${error.message || error}`, "error");
+        }
+      });
+    };
+
+    const downloadSd = async (item) => sdOperation(`Downloading ${item.name}...`, async () => {
+      const meter = startSdMeter("download", item.name, item.size);
+      let bytes;
+      try {
+        bytes = await state.sdClient.download(sdJoin(item.name), {
+          onProgress(done, total) { meter.progress(done, total); },
+        });
+        if (bytes.length === 0) meter.progress(0, 0);
+        meter.complete(); // download() has checked the final size and CRC.
+      } finally {
+        meter.stop();
+      }
+      const url = URL.createObjectURL(new Blob([bytes]));
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = item.name;
+      document.body.append(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      setSdStatus(`Downloaded ${item.name}; size and CRC checked.`);
+    });
+
+    const uploadSd = async () => {
+      const file = ui.sdFileInput.files?.[0];
+      if (!file) return;
+      const existing = state.sdItems.find(item => item.name === file.name);
+      if (existing?.type === "d") {
+        setSdStatus(`A folder named ${file.name} already exists. Choose another file name.`, "error");
+        return;
+      }
+      const replace = !!existing;
+      if (replace && !window.confirm(`Replace ${file.name} in ${sdPathLabel(state.sdPath)}?`)) return;
+      await sdOperation(`Uploading ${file.name}...`, async () => {
+        const meter = startSdMeter("upload", file.name, file.size);
+        let result;
+        try {
+          result = await state.sdClient.upload(sdJoin(file.name), file, {
+            replace,
+            onProgress(done, total) { meter.progress(done, total); },
+          });
+          meter.complete(); // upload() has received JanOS DONE and END.
+        } finally {
+          meter.stop();
+        }
+        ui.sdFileInput.value = "";
+        const confirmed = result.backupPending
+          ? `Uploaded ${file.name}; JanOS confirmed size and CRC, but an older backup remains on SD. Check the folder before another replace.`
+          : `Uploaded ${file.name}; JanOS confirmed size and CRC.`;
+        try {
+          state.sdItems = await state.sdClient.list(state.sdPath);
+          setSdStatus(confirmed);
+        } catch (error) {
+          if (!state.sdClient?.connected) await disconnectSd({ preserveStatus: true });
+          setSdStatus(`${confirmed} Folder refresh failed: ${error.message || error}`, "error");
+        }
+      });
+    };
+
+    const openSdNewFile = () => {
+      if (!state.sdConnected || !state.sdClient?.connected || state.sdBusy
+          || state.sdViewer || state.sdNewFileOpen) return;
+      state.sdNewFileFolder = state.sdPath;
+      state.sdNewFileOpen = true;
+      ui.sdNewFileName.value = "";
+      ui.sdNewFileContent.value = "";
+      syncSdControls();
+      renderSdList();
+      ui.sdNewFileName.focus();
+    };
+
+    const resetSdNewFile = () => {
+      state.sdNewFileOpen = false;
+      state.sdNewFileFolder = "";
+      ui.sdNewFileName.value = "";
+      ui.sdNewFileContent.value = "";
+      syncSdControls();
+      renderSdList();
+    };
+
+    const cancelSdNewFile = () => {
+      if (!state.sdNewFileOpen || state.sdBusy) return;
+      if ((ui.sdNewFileName.value || ui.sdNewFileContent.value)
+          && !window.confirm("Discard the new file draft?")) return;
+      resetSdNewFile();
+    };
+
+    const prepareSdNewFile = () => {
+      const name = ui.sdNewFileName.value;
+      if (!name || name.trim() !== name || name === "." || name === ".."
+          || name.endsWith(".") || /[\\/<>:"|?*\x00-\x1f\x7f]/.test(name)) {
+        throw new Error("Enter a filename without slashes, leading or trailing spaces, or FAT-reserved characters.");
+      }
+      if (name.includes("~") || /\.fs-(?:part|backup)$/i.test(name)
+          || state.sdNewFileFolder.includes("~")) {
+        throw new Error("This name is reserved for JanOS transfer recovery. Choose another filename.");
+      }
+      const path = state.sdNewFileFolder ? `${state.sdNewFileFolder}/${name}` : name;
+      const path64 = encodePath(path);
+      if (atob(path64).length > 169) {
+        throw new Error("This SD path is too long for JanOS. Use a shorter name or a folder closer to /sdcard/lab.");
+      }
+      const bytes = new TextEncoder().encode(ui.sdNewFileContent.value);
+      if (bytes.length > NEW_FILE_MAX_BYTES) {
+        throw new Error("New text files are limited to 128 KiB of UTF-8 data. Use Upload for a larger file.");
+      }
+      if (`fs put ${path64} ${bytes.length} FFFFFFFF`.length > 254) {
+        throw new Error("This SD path is too long for the JanOS serial command. Use a shorter filename.");
+      }
+      return { name, path, bytes };
+    };
+
+    const createSdNewFile = async () => {
+      if (!state.sdNewFileOpen || !state.sdConnected || !state.sdClient?.connected || state.sdBusy) return;
+      let prepared;
+      try {
+        prepared = prepareSdNewFile();
+      } catch (error) {
+        setSdStatus(error.message || String(error), "error");
+        return;
+      }
+      const { name, path, bytes } = prepared;
+      const folder = state.sdNewFileFolder;
+      if (state.sdPath === folder && state.sdItems.some(item => item.name.toLowerCase() === name.toLowerCase())) {
+        setSdStatus(`An SD item named ${name} already exists here. Choose another filename.`, "error");
+        return;
+      }
+      await sdOperation(`Creating ${sdPathLabel(path)}...`, async () => {
+        const meter = startSdMeter("upload", name, bytes.length);
+        try {
+          await state.sdClient.upload(path, new Blob([bytes], { type: "text/plain;charset=utf-8" }), {
+            replace: false,
+            onProgress(done, total) { meter.progress(done, total); },
+          });
+          meter.complete();
+        } finally {
+          meter.stop();
+        }
+        resetSdNewFile();
+        const confirmed = `Created ${sdPathLabel(path)}; JanOS confirmed size and CRC.`;
+        try {
+          state.sdItems = await state.sdClient.list(folder);
+          state.sdPath = folder;
+          setSdStatus(confirmed);
+        } catch (error) {
+          if (!state.sdClient?.connected) await disconnectSd({ preserveStatus: true });
+          setSdStatus(`${confirmed} Folder refresh failed: ${error.message || error}`, "error");
+        }
+      });
+    };
+
+    const sameSdBytes = (left, right) => left.length === right.length
+      && left.every((byte, index) => byte === right[index]);
+
+    const readSmallSdFile = async (path, name, listedSize, maxBytes) => {
+      const meter = startSdMeter("download", name, listedSize);
+      try {
+        const bytes = await state.sdClient.download(path, {
+          maxBytes,
+          onProgress(done, total) { meter.progress(done, total); },
+        });
+        if (bytes.length === 0) meter.progress(0, 0);
+        meter.complete();
+        return bytes;
+      } finally {
+        meter.stop();
+      }
+    };
+
+    const openSdText = async (item) => {
+      if (state.sdViewer) return;
+      const path = sdJoin(item.name);
+      await sdOperation(`Opening ${item.name} for editing...`, async () => {
+        if (item.size > TXT_EDIT_MAX_BYTES) throw new Error("TXT editor limit is 128 KiB. Download this file instead.");
+        const bytes = await readSmallSdFile(path, item.name, item.size, TXT_EDIT_MAX_BYTES);
+        const decoded = decodeEditableText(bytes);
+        state.sdViewer = {
+          kind: "txt", path, originalBytes: bytes, savedText: decoded.text,
+          metadata: { bom: decoded.bom, newline: decoded.newline },
+          notice: "UTF-8 text. Changes stay in this browser until you choose Save to SD.",
+        };
+        ui.sdTextEditor.value = decoded.text;
+        ui.sdCsvTable.replaceChildren();
+        renderSdViewer();
+        setSdStatus(`Editing ${sdPathLabel(path)}. Save to SD when ready.`);
+      });
+      if (state.sdViewer?.path === path) ui.sdTextEditor.focus();
+    };
+
+    const previewSdCsv = async (item) => {
+      if (state.sdViewer) return;
+      const path = sdJoin(item.name);
+      await sdOperation(`Previewing ${item.name}...`, async () => {
+        if (item.size > CSV_PREVIEW_MAX_BYTES) throw new Error("CSV preview limit is 256 KiB. Download this file instead.");
+        const bytes = await readSmallSdFile(path, item.name, item.size, CSV_PREVIEW_MAX_BYTES);
+        const text = decodeUtf8Preview(bytes);
+        const preview = parseCsvPreview(text, { maxRows: 200, maxColumns: 32, maxCellChars: 512 });
+        ui.sdCsvTable.replaceChildren();
+        if (preview.rows.length) {
+          const columns = Math.max(...preview.rows.map(row => row.length));
+          const head = document.createElement("thead");
+          const headRow = document.createElement("tr");
+          const corner = document.createElement("th");
+          corner.textContent = "#";
+          headRow.append(corner);
+          for (let index = 0; index < columns; index++) {
+            const heading = document.createElement("th");
+            heading.scope = "col";
+            heading.textContent = String(index + 1);
+            headRow.append(heading);
+          }
+          head.append(headRow);
+          const body = document.createElement("tbody");
+          preview.rows.forEach((row, index) => {
+            const tr = document.createElement("tr");
+            const number = document.createElement("th");
+            number.scope = "row";
+            number.textContent = String(index + 1);
+            tr.append(number);
+            for (const value of row) {
+              const cell = document.createElement("td");
+              cell.textContent = value;
+              tr.append(cell);
+            }
+            body.append(tr);
+          });
+          ui.sdCsvTable.append(head, body);
+        }
+        state.sdViewer = {
+          kind: "csv", path,
+          notice: preview.truncated
+            ? "Read-only preview: showing up to 200 rows, 32 columns and 512 characters per cell. Download for the full file."
+            : "Read-only UTF-8 CSV preview. Download to keep the full file.",
+        };
+        renderSdViewer();
+        setSdStatus(`Previewing ${sdPathLabel(path)}${preview.truncated ? " (truncated)" : ""}.`);
+      });
+    };
+
+    const saveSdText = async () => {
+      const viewer = state.sdViewer;
+      if (viewer?.kind !== "txt" || !state.sdConnected || !state.sdClient?.connected || state.sdBusy) return;
+      const edited = ui.sdTextEditor.value;
+      if (edited === viewer.savedText) return;
+      let bytes;
+      try {
+        bytes = encodeEditableText(edited, viewer.metadata);
+        if (bytes.length > TXT_EDIT_MAX_BYTES) throw new Error("Edited TXT exceeds 128 KiB. Shorten it before saving.");
+      } catch (error) {
+        setSdStatus(error.message || String(error), "error");
+        return;
+      }
+      await sdOperation(`Checking ${sdPathLabel(viewer.path)} before saving...`, async () => {
+        const current = await readSmallSdFile(viewer.path, viewer.path, viewer.originalBytes.length,
+          TXT_EDIT_MAX_BYTES);
+        if (!sameSdBytes(current, viewer.originalBytes)) {
+          throw new Error("The file changed on SD after you opened it. Copy your edits, close the editor and reopen the file before saving.");
+        }
+        const meter = startSdMeter("upload", viewer.path, bytes.length);
+        let result;
+        try {
+          result = await state.sdClient.upload(viewer.path,
+            new Blob([bytes], { type: "text/plain;charset=utf-8" }), {
+              replace: true,
+              onProgress(done, total) { meter.progress(done, total); },
+            });
+          meter.complete();
+        } finally {
+          meter.stop();
+        }
+        viewer.originalBytes = bytes;
+        viewer.savedText = edited;
+        viewer.notice = result.backupPending
+          ? "Saved, but JanOS retained an older backup on SD. Check this folder before another edit."
+          : "Saved to SD. A JanOS feature using this file may need to reopen it or restart.";
+        renderSdViewer();
+        try {
+          state.sdItems = await state.sdClient.list(state.sdPath);
+          setSdStatus(`Saved ${sdPathLabel(viewer.path)}; JanOS confirmed size and CRC.`);
+        } catch (error) {
+          setSdStatus(`Saved ${sdPathLabel(viewer.path)}, but folder refresh failed: ${error.message || error}`, "error");
+        }
+      });
+    };
+
+    const closeSdViewer = () => {
+      const viewer = state.sdViewer;
+      if (!viewer || state.sdBusy) return;
+      if (viewer.kind === "txt" && ui.sdTextEditor.value !== viewer.savedText
+          && !window.confirm(`Discard unsaved changes to ${sdPathLabel(viewer.path)}?`)) return;
+      state.sdViewer = null;
+      ui.sdTextEditor.value = "";
+      ui.sdCsvTable.replaceChildren();
+      renderSdViewer();
+      syncSdControls();
+      renderSdList();
+    };
+
     ui.connectBtn.addEventListener("click", () => connect().catch(() => {}));
     ui.flashBtn.addEventListener("click", () => flash().catch(() => {}));
+    ui.verifyBtn.addEventListener("click", () => retryBootVerification().catch((err) => {
+      setStatus(err.message || "Boot verification failed", "error");
+      log(`Boot check error: ${err?.message || err}`);
+    }));
     ui.monitorBtn.addEventListener("click", () => connectMonitor().catch(() => {}));
     ui.clearMonitorBtn.addEventListener("click", () => {
       ui.monitorLog.textContent = "";
@@ -1108,15 +2199,50 @@ const flash = async () => {
         monitorLine(`Error: ${err?.message || err}`);
       });
     });
+    ui.sdConnectBtn.addEventListener("click", () => connectSd().catch((error) => {
+      setSdStatus(`SD connection failed: ${error.message || error}`, "error");
+    }));
+    ui.sdRefreshBtn.addEventListener("click", () => goSdPath(state.sdPath).catch(() => {}));
+    ui.sdRootBtn.addEventListener("click", () => goSdPath("").catch(() => {}));
+    ui.sdBackBtn.addEventListener("click", () => {
+      const parts = state.sdPath.split("/");
+      parts.pop();
+      goSdPath(parts.join("/")).catch(() => {});
+    });
+    ui.sdFileInput.addEventListener("change", () => {
+      syncSdControls();
+      showSelectedSdEstimate();
+    });
+    ui.sdChooseFileBtn.addEventListener("click", () => ui.sdFileInput.click());
+    ui.sdUploadBtn.addEventListener("click", () => uploadSd().catch(() => {}));
+    ui.sdNewFileBtn.addEventListener("click", openSdNewFile);
+    ui.sdNewFileName.addEventListener("input", syncSdControls);
+    ui.sdCancelNewFileBtn.addEventListener("click", cancelSdNewFile);
+    ui.sdNewFile.addEventListener("submit", event => {
+      event.preventDefault();
+      createSdNewFile().catch(() => {});
+    });
+    ui.sdTextEditor.addEventListener("input", renderSdViewer);
+    ui.sdSaveBtn.addEventListener("click", () => saveSdText().catch(() => {}));
+    ui.sdViewerCloseBtn.addEventListener("click", closeSdViewer);
+    window.addEventListener("beforeunload", event => {
+      if ((state.sdViewer?.kind === "txt" && ui.sdTextEditor.value !== state.sdViewer.savedText)
+          || (state.sdNewFileOpen && (ui.sdNewFileName.value || ui.sdNewFileContent.value))) {
+        event.preventDefault();
+        event.returnValue = "";
+      }
+    });
     ui.branch.addEventListener("change", () => {
       state.manifest = null;
       state.manifestUrl = null;
+      state.latestRelease = null;
       ui.manifest.style.display = "none";
       ui.manifest.textContent = "";
       ui.releaseInfo.textContent = "Loading manifest";
       loadManifest().catch(() => {});
     });
 
+    syncSdControls();
     applyQueryParams();
     loadManifest().catch(() => {});
   </script>

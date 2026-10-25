@@ -72,6 +72,7 @@ stop.
 | Current owner/state | Command family | Decision |
 | --- | --- | --- |
 | idle | legacy mutation, `test_radio_channel(s)` | reserve `LEGACY/PREPARING`, then run unlocked |
+| idle | `sta_mac set factory`, `set random`, `set fixed <MAC>` | reserve short `LEGACY/PREPARING` transaction to persist the next-boot choice |
 | idle | analyzer `scan` | announce `ANALYZER/PREPARING` before dispatcher unlock |
 | idle | analyzer `clear` | short `LEGACY` transaction |
 | idle | `wps verify`, `wps pixie`, `jwps campaign`, `selftest transport` | WPS service acquires `WPS/PREPARING` before baseline validation |
@@ -80,6 +81,8 @@ stop.
 | WPS | analyzer scan/clear or other radio mutation | busy: `radio_lease` |
 | legacy preparing | analyzer or radio-using WPS/JWPS | busy: `command_in_progress` |
 | analyzer or WPS | status/read commands, `show_scan_results`, built-in `help`, `reboot`, global `stop` | ADMIT |
+| any owner, including quarantine | `sta_mac status` | ADMIT; read-only, no Wi-Fi initialization |
+| active or quarantined owner | `sta_mac set ...` | busy: `radio_lease`; no NVS change |
 | analyzer or WPS | `wps stop` / `wifi_analyzer stop` | ADMIT; each handler affects only its own subsystem and is otherwise idempotent |
 | any mutation | nonzero console command already in flight | busy: `command_in_progress` where covered by legacy admission |
 | idle with legacy analyzer-busy state | unrelated radio mutation | busy: `wifi_analyzer` |
@@ -127,8 +130,14 @@ invariants. A failed phase keeps the snapshot and lease for retry. Only exact
 readback sets `restore_verified`, wipes/frees the snapshot and permits release;
 otherwise service cleanup quarantines the owner.
 
-This restores the current boot identity but does not implement the unrelated
-persistent `sta_mac` policy or CLI.
+The separate production `sta_mac` policy selects the effective STA identity
+once per application boot: factory, one cached random address, or a fixed
+locally administered unicast address. WPS may use a temporary session MAC; exact
+restore targets the effective boot MAC, even after a next-boot policy change
+has been saved. `sta_mac set` commits that change to NVS without rebooting or
+mutating the active radio, and is busy while an owner is active or quarantined.
+`sta_mac status` remains a read-only exception. Host tests cover admission and
+restore paths; device radio behavior needs separate validation.
 
 ## Memory boundaries
 

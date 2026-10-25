@@ -7,7 +7,8 @@ typedef enum {
     STA_MAC_IO_OK = 0,
     STA_MAC_IO_MISSING,
     STA_MAC_IO_ERROR,
-    STA_MAC_IO_BUFFER_TOO_SMALL
+    STA_MAC_IO_BUFFER_TOO_SMALL,
+    STA_MAC_IO_INVALID_RECORD
 } sta_mac_io_status_t;
 
 typedef enum {

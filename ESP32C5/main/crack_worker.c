@@ -386,6 +386,14 @@ static bool cw_job_running(void)
     return running;
 }
 
+bool crack_worker_is_running(void)
+{
+    if (cw_mutex == NULL) {
+        return false;
+    }
+    return cw_job_running();
+}
+
 static int cw_probe(int argc, char **argv)
 {
     uint64_t size;

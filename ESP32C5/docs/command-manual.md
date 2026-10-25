@@ -220,6 +220,10 @@ later in this manual define output, persistence, admission and error behavior.
 | `wifi_country list` | List accepted two-character country profiles. | [Settings](#settings) |
 | `wifi_country set <CC>` | Persist a country profile for application after reboot. | [Settings](#settings) |
 | `wifi_country reset` | Restore the default `PA` profile for the next boot. | [Settings](#settings) |
+| `sta_mac status` | Read configured, boot and active STA identities. | [STA MAC boot policy](#sta-mac-boot-policy) |
+| `sta_mac set factory` | Use the factory STA MAC on the next application boot. | [STA MAC boot policy](#sta-mac-boot-policy) |
+| `sta_mac set random` | Generate one STA MAC on the next application boot. | [STA MAC boot policy](#sta-mac-boot-policy) |
+| `sta_mac set fixed <MAC>` | Use a validated local unicast STA MAC on the next application boot. | [STA MAC boot policy](#sta-mac-boot-policy) |
 | `radio_protect add <BSSID>` | Add a protected BSSID to `/sdcard/lab/white.txt`. | [Attacks](#attacks) |
 | `radio_protect remove <BSSID>` | Remove a protected BSSID. | [Attacks](#attacks) |
 | `radio_protect list` | List active protected BSSIDs. | [Attacks](#attacks) |
@@ -230,8 +234,8 @@ cleanup behavior changed, while its existing `caps`, `scan`, `status`, `stop`
 and `clear` CLI remains compatible. Likewise, `start_handshake` keeps its
 existing syntax while adding protected-BSSID filtering and stricter radio
 cleanup. Pixie and JWPS/campaign are production component commands now; the
-removed standalone mini-OS is not required. Persistent `sta_mac` policy remains
-outside this command family.
+removed standalone mini-OS is not required. The production `sta_mac` commands
+are described under [STA MAC boot policy](#sta-mac-boot-policy).
 
 ## WiFi scanning
 
@@ -328,7 +332,8 @@ cryptographic session material. See [JanOS WPS laboratory workflows](janos-wps.m
 and the [radio compatibility runbook](janos-radio-compatibility-validation.md).
 
 These commands reuse the production `janos_wps` component engines; no standalone
-mini-OS image is required. `sta_mac ...` remains outside this command family.
+mini-OS image is required. The separate production `sta_mac` command configures
+the boot STA identity used by WPS; see [STA MAC boot policy](#sta-mac-boot-policy).
 
 Radio-mutating legacy commands, `test_radio_channel(s)`, analyzer startup and
 online WPS/JWPS reserve an owner plus generation before the dispatcher unlocks:
@@ -535,6 +540,14 @@ Cancellation ends with `[FT] cancelled` and `[FT] END`. Validation, SD, open, se
 
 ## SD card
 
+The USB file manager uses `fs hello`, `fs ls`, `fs get`, `fs put`, `fs rm` and
+`fs cleanup` on UART0.
+Paths are Base64-encoded OEM CP437 bytes relative to `/sdcard/lab`; uploads use
+an ACK32 binary stream. `fs rm <path64>` removes one regular file or empty
+directory and never deletes recursively. `fs cleanup <path64>` removes only an
+abandoned `.fs-part` upload staging file. See the [FS/1 protocol](fs-protocol.md)
+for the exact wire format, error responses and recovery safeguards.
+
 - `sd_status` — fast presence check; `SD_OK` or `SD_NONE` (~200 ms, no mount).
 - `sd_benchmark [size_mb]` — destructive only to JanOS's own temporary file `/sdcard/lab/.janos_sd_benchmark.tmp`; measures sequential SD writes using the same 64 KiB chunk/buffer size as the PCAP path, then deletes the file. Size range is 1-256 MiB, default 32 MiB. Reports durable average KiB/s and kbps, `p50/p95/p99/max` `fwrite` latency, final `fflush`/`fsync` latency and a heuristic `conservative_50pct_kbps`. It refuses to run while PCAP, Capture Gateway or wardrive is active. Run `stop` first. The 50% number is a starting point for gateway tests, not a lossless guarantee.
 - `list_sd` — list HTML portal files (`N filename.html`). Header `HTML files found`.
@@ -610,6 +623,106 @@ regulatory domain is applicable.
 - `display set <auto|ssd1306|sh1107|sh1106|unit_lcd>` / `display read` — OLED/LCD type.
 - `led set <on|off>` / `led level <1-100>` / `led read` — status LED.
 - `boot_button read|list|set <short|long> <cmd[,cmd...]>|status <short|long> <on|off>` — map boot‑button presses to commands (comma‑chained).
+
+### RGB status LED
+
+The single RGB LED shows the **type of active operation**. Commands in the same
+group share a color and pattern; it does not identify an individual command.
+The pattern changes automatically when an operation starts or finishes.
+
+| Operation | Color and pattern | Examples |
+| --- | --- | --- |
+| Idle | Steady green | No active operation after boot or a completed `stop`. |
+| Scan and discovery | Blue, slow 2 s pulse | Wi-Fi/BLE/802.15.4 surveys and network discovery. |
+| Passive monitoring | Cyan, 500 ms blink cycle (250 ms on / 250 ms off) | Sniffers, packet monitor, deauth detector, anti-surveillance. |
+| Capture and recording | Cyan, two short 120 ms flashes every 2 s | Handshake, PCAP, wardrive, Capture Gateway recording. |
+| Active transmission | Red, 150 ms on / 150 ms off | Deauthentication, beacon/BLE spam, blackout, jammer, ARP ban. |
+| AP and portal | Magenta, slow 2 s pulse | Captive/admin portals, Evil Twin, Karma, Rogue AP/GITM. |
+| WPS | Amber, slow 2 s pulse | WPS verify/Pixie/campaign. |
+| Transfer and computation | Amber, 500 ms blink cycle (250 ms on / 250 ms off) | Active uploads, file transfers, `crack_worker start`. |
+| OTA installation | Red, slow 2 s breathing pulse | Firmware installation after an update has been selected. |
+
+If operations overlap, the visible pattern follows this priority: OTA,
+transmission, AP/portal, capture, WPS, monitoring, scan, transfer/computation,
+then idle. Short event flashes temporarily replace the active pattern except
+for OTA installation, then it resumes:
+
+| Event | Flash |
+| --- | --- |
+| Handshake successfully saved to SD | Three white flashes, 100 ms each. |
+| WPS verification succeeds | Two green flashes, 150 ms each. |
+| A `scan_networks` Wi-Fi scan observes a first-seen BSSID, or a BLE scan records a first-seen device | One 100 ms white flash, at most once every 2 s. Wi-Fi emits at most one discovery event per scan. |
+| A deauth or anti-surveillance follower alert is detected | Three 100 ms red flashes, at most one sequence every 2 s. |
+
+The handshake confirmation fires after both PCAP and HCCAPX are saved. In
+selected/manual capture, both files must pass complete write, flush, sync, and
+close checks. Automatic capture reports success only after publishing both
+files.
+
+Wi-Fi discovery remembers up to 128 BSSIDs per boot. Once full, the cache
+suppresses further Wi-Fi discovery flashes; repeated BSSIDs never flash again
+during that boot.
+
+`led set off` suppresses all patterns and discards pending event flashes.
+`led set on` restores the pattern for the current operation, or idle green if
+none is active.
+`led level <1-100>` changes brightness, including while the LED is off;
+enablement and brightness persist in NVS. `led read` reports enablement and
+brightness, not the current operation. `stop` returns the LED to idle only
+after the operation actually ends; a short event flash returns to the
+underlying pattern. Read-only `help`, `list`, `read`, and `status` commands do
+not establish a lasting LED pattern.
+
+### STA MAC boot policy
+
+The production STA MAC command accepts exactly these forms, with no aliases or
+extra arguments:
+
+```text
+sta_mac status
+sta_mac set factory
+sta_mac set random
+sta_mac set fixed 02:11:22:33:44:55
+```
+
+`factory` selects the factory STA address. `random` generates one locally
+administered unicast address per application boot and keeps it through Wi-Fi
+driver stop/reinitialization. `fixed` requires exactly six colon-separated
+hexadecimal octets; the first octet must satisfy `first_octet & 3 == 2`
+(locally administered and unicast). The policy affects the STA interface, not
+the SoftAP, BLE or IEEE 802.15.4 identities.
+
+`set` saves the policy to NVS after a checked commit. It takes effect on the
+next application boot: it neither reboots nor changes the running STA MAC.
+Successful set output is JSON with `schema_version:1`,
+`record_type:"sta_mac_result"`, `result:"set"` and
+`applies_after_reboot:true`.
+Missing or extra arguments and an invalid MAC return nonzero without changing
+the saved policy. A failed NVS write or commit also leaves the configured
+policy unchanged. Unlike `wifi_country`, this NVS record is not tied to the
+firmware image.
+
+`status` is read-only, available while another radio owner is active or
+quarantined, and does not initialize Wi-Fi. Its JSON has `schema_version:1`,
+`record_type:"sta_mac_status"`, and the fields
+`configured_mode`, `boot_mode`, `configured_mac`, `effective_boot_mac`,
+`active_sta_mac`, `record_health`, `identity_ready` and `pending_reboot`. `configured_mode` is the
+saved next-boot choice; `boot_mode` and `effective_boot_mac` describe this
+boot. `configured_mode` is `null` when the saved choice is invalid or could not
+be read.
+`active_sta_mac` is `null` when the driver is unavailable. `record_health`
+describes the boot read (`valid`, `missing`, `invalid_record`,
+`unsupported_version`, or `read_error`); `identity_ready:false` blocks Wi-Fi
+startup. A missing NVS
+record selects factory; an invalid or future record reports its health and
+falls back to factory without rewriting the record. An NVS read I/O error is
+reported separately and prevents Wi-Fi startup under an unverified identity.
+
+`set` uses a short serialized radio transaction and is refused while a radio
+owner is active or quarantined; the normal busy result is nonzero. WPS may use
+a temporary session MAC and restores the effective boot STA MAC after an exact
+readback. Host tests exercise parsing, persistence, boot caching and restore
+logic; firmware build and on-device radio behavior require separate validation.
 
 ## OTA updates
 

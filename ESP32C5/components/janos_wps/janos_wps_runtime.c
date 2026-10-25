@@ -12,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "janos_wps_memory.h"
+#include "janos_wps_runtime_result.h"
 #include "janos_wps_service.h"
 #include "janos_wps_transport.h"
 #include "janos_wps_wire.h"
@@ -181,6 +182,8 @@ static void runtime_worker(void *argument)
     if (janos_wps_format_terminal(line, sizeof(line), &status, &memory))
         emit_line(line);
     janos_wps_secure_wipe(line, sizeof(line));
+    if (state->hooks.verified && janos_wps_runtime_result_verified(&status))
+        state->hooks.verified();
     state->pending_worker = NULL;
     state->pending_argument = NULL;
     /* Release publishes completion only after terminal output and all shared

@@ -69,6 +69,9 @@ void *attack_handshake_get_hccapx();
  */
 bool attack_handshake_save_to_sd();
 
+/** Called after both handshake files have been saved successfully. */
+void attack_handshake_set_saved_hook(void (*hook)(void));
+
 /**
  * @brief Checks if all 4 handshake messages have been captured
  * 

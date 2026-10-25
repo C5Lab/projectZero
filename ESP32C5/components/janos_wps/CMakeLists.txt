@@ -9,6 +9,7 @@ idf_component_register(
         "janos_wps_command.c"
         "janos_wps_wire.c"
          "janos_wps_transport.c" "janos_wps_runtime.c"
+         "janos_wps_runtime_result.c"
          "private/workflow/lab_secret.c"
          "private/workflow/lab_result_store.c"
          "private/workflow/lab_platform.c"
