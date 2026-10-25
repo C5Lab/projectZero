@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>Web Flasher help · projectZero</title>
+  <style>
+    :root {
+      --bg: #0a0f1c;
+      --card: #10182a;
+      --text: #e8f1ff;
+      --muted: #9db2d4;
+      --accent: #40f0ff;
+      --border: rgba(255,255,255,.11);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      padding: 28px 18px 64px;
+      min-height: 100vh;
+      color: var(--text);
+      background: radial-gradient(circle at 18% 0, rgba(64,240,255,.07), transparent 34%),
+                  radial-gradient(circle at 85% 10%, rgba(255,123,212,.07), transparent 30%), var(--bg);
+      font: 16px/1.6 "Space Grotesk", system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    .wrap { max-width: 1000px; margin: auto; }
+    a { color: var(--accent); text-underline-offset: .2em; }
+    a:hover { color: #a1f8ff; }
+    a:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 2px; }
+    .back { display: inline-block; margin-bottom: 18px; font-weight: 600; }
+    header, section, nav {
+      border: 1px solid var(--border);
+      background: var(--card);
+      border-radius: 18px;
+    }
+    header { padding: clamp(22px, 4vw, 38px); background: linear-gradient(135deg, rgba(64,240,255,.08), rgba(255,123,212,.05)); }
+    .eyebrow { margin: 0 0 8px; color: var(--accent); font-size: .76rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+    h1 { margin: 0 0 12px; font-size: clamp(2rem, 5vw, 3rem); line-height: 1.1; }
+    header p:last-child { max-width: 70ch; margin: 0; color: var(--muted); }
+    nav { margin: 18px 0; padding: 14px 20px; }
+    nav strong { display: block; margin-bottom: 6px; }
+    nav ul { display: flex; flex-wrap: wrap; gap: 5px 22px; padding: 0; margin: 0; list-style: none; }
+    main { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    section { padding: 22px 24px; scroll-margin-top: 18px; }
+    section.wide { grid-column: 1 / -1; }
+    h2 { margin: 0 0 12px; font-size: 1.3rem; line-height: 1.3; }
+    h3 { margin: 18px 0 5px; font-size: 1rem; }
+    p { margin: 0 0 10px; }
+    p:last-child, ul:last-child, ol:last-child { margin-bottom: 0; }
+    ul, ol { margin: 8px 0 12px; padding-left: 1.4em; }
+    li + li { margin-top: 6px; }
+    .muted { color: var(--muted); }
+    code { overflow-wrap: anywhere; padding: .08em .28em; border-radius: 4px; color: #b6f9ff; background: rgba(64,240,255,.1); font: .92em Consolas, "Liberation Mono", monospace; }
+    .note { margin: 14px 0 0; padding: 12px 15px; border-left: 3px solid var(--accent); background: rgba(64,240,255,.06); border-radius: 0 8px 8px 0; }
+    footer { margin-top: 24px; color: var(--muted); }
+    @media (max-width: 700px) { main { grid-template-columns: 1fr; } section.wide { grid-column: auto; } }
+    @media (max-width: 480px) { body { padding: 18px 12px 40px; } section { padding: 19px; } nav ul { display: block; } nav li + li { margin-top: 3px; } }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <a class="back" href="janos_flash.html">← Back to Web Flasher</a>
+    <header>
+      <p class="eyebrow">projectZero · ESP32-C5</p>
+      <h1>Web Flasher help</h1>
+      <p>Flash JanOS, check that it answers over serial, and manage files on its SD card through the same browser page.</p>
+    </header>
+    <nav aria-label="On this page">
+      <strong>On this page</strong>
+      <ul>
+        <li><a href="#before">Before you connect</a></li>
+        <li><a href="#flash">Flash and verify</a></li>
+        <li><a href="#monitor">Serial monitor</a></li>
+        <li><a href="#sd">SD file manager</a></li>
+        <li><a href="#troubleshoot">Troubleshooting</a></li>
+      </ul>
+    </nav>
+    <main>
+      <section id="before">
+        <h2>Before you connect</h2>
+        <p>Use desktop Chrome or Edge with Web Serial. Open the page from <code>https://</code> or <code>http://localhost</code>, then grant access to the board’s COM port. Close other serial terminals first.</p>
+        <p><strong>Main</strong> loads the manifest beside this page, with a fallback to GitHub Main. <strong>Development</strong> loads its manifest and firmware from the remote GitHub Development branch. Serving an updated page locally does not put new firmware in that branch or on your board. Check the displayed release and manifest before flashing.</p>
+      </section>
+      <section id="flash">
+        <h2>Flash and verify</h2>
+        <ol>
+          <li>Choose Main or Development and the flash baud rate.</li>
+          <li>With JanOS running, click <strong>Connect</strong> and select its port. The page can ask JanOS to enter download mode. If the board is blank or unresponsive, enter its ROM download mode, then use <strong>Connect</strong> and <strong>Flash</strong>.</li>
+          <li>Wait for flash write and MD5 verification. The page then tries a watchdog reset and checks for <code>ping</code> → <code>pong</code> and a <code>version</code> response.</li>
+        </ol>
+        <p>If the flash is verified but boot remains unconfirmed, press the board’s RESET button and use <strong>Select port + Verify boot</strong>. A JanOS reply confirms a responding application at that moment; it does not validate SD, radio, or other peripherals.</p>
+        <p class="note"><strong>Erase</strong> clears the whole flash before writing, including stored NVS settings such as Wi-Fi configuration. The flasher writes the app into both OTA slots. Use Erase deliberately when resolving old partition or boot issues.</p>
+      </section>
+      <section id="monitor">
+        <h2>Serial monitor</h2>
+        <p>Expand <strong>Serial monitor</strong> and click <strong>Monitor</strong> to read or send UART text. Running JanOS uses 115200 baud for its console. The monitor, flasher, SD manager, and any other serial app cannot own the same COM port at once. Disconnect the current session before switching tools.</p>
+      </section>
+      <section id="sd">
+        <h2>SD file manager</h2>
+        <p>Expand <strong>SD file manager</strong> and click <strong>Connect to running JanOS</strong>. This uses UART at 115200 baud and requires firmware that answers <code>fs hello</code> with FS/1 capabilities. Files are managed under <code>/sdcard/lab</code>. Use <strong>Open</strong>, <strong>Up one folder</strong>, and <strong>Root</strong> to browse.</p>
+        <ul>
+          <li><strong>Download</strong> saves a file to your computer. <strong>Choose file</strong> and <strong>Upload to this folder</strong> send a local file; replacing an existing name requires confirmation. Transfers check size and CRC.</li>
+          <li><strong>New file</strong> creates UTF-8 text up to 128 KiB, including an empty file. It never overwrites an existing SD item. Use Upload for binary files.</li>
+          <li><strong>Edit</strong> opens a UTF-8 <code>.txt</code> file up to 128 KiB. Save checks for an external change before replacing it.</li>
+          <li><strong>Preview</strong> shows a read-only UTF-8 <code>.csv</code> file up to 256 KiB. The view is limited to 200 rows, 32 columns, and 512 characters per cell; download the file for all data.</li>
+          <li><strong>Delete</strong> removes one file or one empty folder after confirmation. It is never recursive and requires <code>rm=file_empty_dir</code> in the FS/1 greeting.</li>
+          <li><strong>Clean failed upload</strong> removes one leftover <code>.fs-part</code> staging file only when <code>fs hello</code> advertises <code>cleanup=part_only</code>. It does not remove the destination file or its <code>.fs-backup</code> recovery copy.</li>
+        </ul>
+        <p>Names must fit the SD card’s CP437 encoding. Upload and download speed, plus ETA, are estimates from measured transfer progress; final completion and integrity checks can take longer.</p>
+      </section>
+      <section id="troubleshoot" class="wide">
+        <h2>Troubleshooting</h2>
+        <ul>
+          <li><strong>Clean failed upload is disabled:</strong> the connected firmware may lack <code>cleanup=part_only</code>. A newer local page alone cannot add that command. After flashing compatible firmware, disconnect and reconnect SD files so the page probes <code>fs hello</code> again.</li>
+          <li><strong>COM port unavailable:</strong> close the monitor, SD manager, flashing session, or another serial app that owns it, then reconnect.</li>
+          <li><strong>Flash ID: 0 or MD5 mismatch:</strong> reconnect in ROM download mode and retry at 115200 baud. Treat a mismatch as an unsuccessful flash.</li>
+          <li><strong>Flash verified, boot unconfirmed:</strong> press RESET and use <strong>Select port + Verify boot</strong>. If JanOS still does not answer <code>ping</code> and <code>version</code>, inspect the serial log before relying on that image.</li>
+        </ul>
+      </section>
+    </main>
+    <footer><a href="janos_flash.html">Return to Web Flasher</a></footer>
+  </div>
+</body>
+</html>

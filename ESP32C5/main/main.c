@@ -116,6 +116,7 @@
 #include "zig_recon.h"
 #include "capture_gateway.h"
 #include "crack_worker.h"
+#include "fs_command.h"
 #include "artifact_inventory_core.h"
 #include "wifi_analyzer.h"
 #include "led_status_core.h"
@@ -15627,6 +15628,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "save_pass", " \"<SSID>\" \"<password>\"" },
     { "list_dir", " [path] [-s]" },
     { "send_file", " <path> [offset] [bsize]" },
+    { "fs", " hello | ls <path64|-> | get <path64> | put <path64> <size> <crc32> [replace] | rm <path64>" },
     { "uart_baud", " <115200|230400|460800|921600|1000000|1500000|2000000|3000000|4000000>" },
     { "uart_baud_confirm", "" },
     { "uart_baud_status", "" },
@@ -21892,6 +21894,12 @@ cleanup:
     uart_baud_set_file_transfer_active(false);
     funlockfile(stdout);
     return 0;
+}
+
+static int fs_send_file_callback(const char *absolute_path)
+{
+    char *args[] = {"send_file", (char *)absolute_path, "0", "1024"};
+    return cmd_send_file(4, args);
 }
 
 // Command: list_dir [path] [-s] - Lists files inside a directory on SD card
@@ -28210,6 +28218,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&start_blespam_cmd));
 
+    const esp_console_cmd_t fs_cmd = {
+        .command = "fs",
+        .help = "USB file manager: fs hello|ls|get|put|rm (paths are base64 relative to /sdcard/lab)",
+        .hint = "<hello|ls|get|put|rm> [arguments]",
+        .func = &fs_command_handle,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&fs_cmd));
+
     const esp_console_cmd_t version_cmd = {
         .command = "version",
         .help = "Prints JanOS firmware version",
@@ -28434,6 +28451,14 @@ void app_main(void) {
     ESP_ERROR_CHECK(wps_runtime_ready ? ESP_OK : ESP_FAIL);
     crack_worker_init(init_sd_card, uart_baud_set_file_transfer_active,
                       uart_baud_current);
+    const fs_command_hooks_t fs_hooks = {
+        .mount_sd = init_sd_card,
+        .send_file = fs_send_file_callback,
+        .transfer_active = uart_baud_set_file_transfer_active,
+        .current_baud = uart_baud_current,
+        .sync_sd = sd_sync,
+    };
+    fs_command_init(&fs_hooks);
     led_status_start_renderer();
     attack_handshake_set_saved_hook(led_status_handshake_saved);
     esp_console_register_help_command();

@@ -540,6 +540,14 @@ Cancellation ends with `[FT] cancelled` and `[FT] END`. Validation, SD, open, se
 
 ## SD card
 
+The USB file manager uses `fs hello`, `fs ls`, `fs get`, `fs put`, `fs rm` and
+`fs cleanup` on UART0.
+Paths are Base64-encoded OEM CP437 bytes relative to `/sdcard/lab`; uploads use
+an ACK32 binary stream. `fs rm <path64>` removes one regular file or empty
+directory and never deletes recursively. `fs cleanup <path64>` removes only an
+abandoned `.fs-part` upload staging file. See the [FS/1 protocol](fs-protocol.md)
+for the exact wire format, error responses and recovery safeguards.
+
 - `sd_status` — fast presence check; `SD_OK` or `SD_NONE` (~200 ms, no mount).
 - `sd_benchmark [size_mb]` — destructive only to JanOS's own temporary file `/sdcard/lab/.janos_sd_benchmark.tmp`; measures sequential SD writes using the same 64 KiB chunk/buffer size as the PCAP path, then deletes the file. Size range is 1-256 MiB, default 32 MiB. Reports durable average KiB/s and kbps, `p50/p95/p99/max` `fwrite` latency, final `fflush`/`fsync` latency and a heuristic `conservative_50pct_kbps`. It refuses to run while PCAP, Capture Gateway or wardrive is active. Run `stop` first. The 50% number is a starting point for gateway tests, not a lossless guarantee.
 - `list_sd` — list HTML portal files (`N filename.html`). Header `HTML files found`.

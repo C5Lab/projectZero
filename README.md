@@ -48,6 +48,7 @@ Built for all who want full control over their WiFi environment.
 
  - [projectZero Wiki](https://github.com/C5Lab/projectZero/wiki)
  - [WEB flasher](https://c5lab.github.io/projectZero/)
+ - [Web Flasher help](https://c5lab.github.io/projectZero/janos_flash_help.html)
  - [Main Shop](https://lab5.eu.com)
  - [Backup Tindie shop](https://www.tindie.com/stores/lab/)
  - [Discord community & support](https://discord.gg/szyM2mzrcE)
