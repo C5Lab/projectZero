@@ -747,7 +747,7 @@ Requires an nRF24L01+ wired to SPI2 (SCK=6, MOSI=7, MISO=2, CSN=3, CE=4).
 - `reboot` — reboot the device.
 - `ping` — connectivity test; replies `pong` even while another operation owns the radio.
 - `version` — print firmware version (`JanOS version: X.Y.Z`) even while another operation owns the radio.
-- `download` — reboot into ROM download (UART flashing) mode.
+- `download` — reboot into ROM download (UART flashing) mode. Also admitted after a WPS cleanup failure retains a quarantined radio lease, once the WPS worker has finished; it resets directly to ROM without claiming in-place radio recovery.
 - `help [command]` — list all commands or show help for one.
 
 ---

@@ -171,6 +171,32 @@ static void emit_simple_stage(lab_workflows_t *workflows,
     secure_wipe(line, sizeof(line));
 }
 
+static void emit_cleanup_failure(lab_workflows_t *workflows,
+                                 uint32_t operation_id)
+{
+    if (!workflows->emit) return;
+    const lab_radio_cleanup_diag_t *diag = workflows->radio ?
+        &workflows->radio->cleanup_diag : NULL;
+    bool radio_failure = diag && diag->step;
+    char line[320];
+    int length = snprintf(line, sizeof(line),
+                          "{\"schema\":1,\"operation_id\":%u,"
+                          "\"type\":\"wps_stage\",\"stage\":\"cleanup_failure\","
+                          "\"source\":\"%s\",\"step\":\"%s\","
+                          "\"detail\":\"%s\",\"error_domain\":\"%s\","
+                          "\"error\":%d}",
+                          (unsigned)operation_id,
+                          radio_failure ? "radio_cleanup" : "unknown",
+                          radio_failure ? diag->step : "unknown",
+                          radio_failure && diag->detail ? diag->detail : "none",
+                          radio_failure && diag->error_domain ?
+                              diag->error_domain : "none",
+                          radio_failure ? diag->error : 0);
+    if (length > 0 && (size_t)length < sizeof(line))
+        workflows->emit(workflows->emit_context, line);
+    secure_wipe(line, sizeof(line));
+}
+
 static const char *candidate_source_name(wps_pin_source_t source)
 {
     static const char *const names[] = {
@@ -1079,6 +1105,8 @@ bool lab_workflows_execute(lab_workflows_t *workflows,
     if (command->kind == LAB_COMMAND_WPS_VERIFY ||
         command->kind == LAB_COMMAND_WPS_CAMPAIGN ||
         command->kind == LAB_COMMAND_WPS_PIXIE) {
+        if (strcmp(*cleanup_result, "failed") == 0)
+            emit_cleanup_failure(workflows, operation_id);
         bool success_result =
             strcmp(*operation_result, "pin_and_m7_verified") == 0 ||
             strcmp(*operation_result, "pixie_pin_and_m7_verified") == 0;
@@ -1093,6 +1121,8 @@ bool lab_workflows_execute(lab_workflows_t *workflows,
         *operation_result = ok ? "selftest_verified" : "selftest_failed";
         if (command->kind == LAB_COMMAND_SELFTEST_TRANSPORT)
             *cleanup_result = ok ? "ok" : "failed";
+        if (command->kind == LAB_COMMAND_SELFTEST_TRANSPORT && !ok)
+            emit_cleanup_failure(workflows, operation_id);
         return true;
     }
     return false;

@@ -86,6 +86,14 @@ janos_console_admission_result_t janos_console_admission_begin(
     if (!lease || !token) return JANOS_CONSOLE_BUSY_RADIO_LEASE;
     *token = (janos_console_admission_token_t){0};
     janos_radio_lease_snapshot_t snapshot = janos_radio_lease_snapshot(lease);
+    /* ROM reset is allowed after a failed WPS restore, but only for this
+     * retained owner. The handler must still wait for its worker epilogue. */
+    if (equals(command, "download") && subcommand == NULL &&
+        snapshot.owner == JANOS_RADIO_OWNER_WPS &&
+        snapshot.state == JANOS_RADIO_LEASE_QUARANTINED &&
+        snapshot.generation != 0U && commands_inflight == 0U &&
+        !analyzer_busy)
+        return JANOS_CONSOLE_ADMIT;
     janos_console_admission_result_t result = janos_console_admission_decide(
         snapshot.owner, command, subcommand, commands_inflight, analyzer_busy);
     if (result != JANOS_CONSOLE_ADMIT) return result;

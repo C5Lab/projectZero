@@ -551,6 +551,28 @@ bool janos_wps_runtime_stop(uint32_t timeout_ms)
     return runtime_stop_attempt(timeout_ms).joined;
 }
 
+bool janos_wps_runtime_wait_quarantined_download(uint32_t timeout_ms)
+{
+    if (!runtime.initialized) return false;
+    uint64_t deadline = platform_now(&runtime) + timeout_ms;
+    for (;;) {
+        janos_wps_service_status_t status =
+            janos_wps_service_status(&runtime.service);
+        if (status.phase != JANOS_WPS_SERVICE_QUARANTINED ||
+            status.generation == 0U ||
+            status.lease.owner != JANOS_RADIO_OWNER_WPS ||
+            status.lease.state != JANOS_RADIO_LEASE_QUARANTINED ||
+            status.lease.generation != status.generation)
+            return false;
+        if (janos_wps_runtime_download_quiescent(
+                true, janos_wps_worker_state_active(&runtime.worker_state),
+                status.generation, status.lease))
+            return true;
+        if (platform_now(&runtime) >= deadline) return false;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
 bool janos_wps_runtime_busy(void)
 {
     if (!runtime.initialized) return false;

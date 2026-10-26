@@ -26,3 +26,19 @@ int janos_wps_secret_command(int argc, char **argv);
 bool janos_wps_runtime_stop(uint32_t timeout_ms);
 bool janos_wps_runtime_busy(void);
 
+/* A ROM reset may discard a quarantined lease only after the runtime worker
+ * has finished terminal output and its shared epilogue. This does not restore
+ * Wi-Fi, release the lease, or make another radio command safe. */
+static inline bool janos_wps_runtime_download_quiescent(
+    bool service_quarantined, bool worker_active, uint32_t service_generation,
+    janos_radio_lease_snapshot_t lease)
+{
+    return service_quarantined && !worker_active &&
+           service_generation != 0U &&
+           lease.owner == JANOS_RADIO_OWNER_WPS &&
+           lease.state == JANOS_RADIO_LEASE_QUARANTINED &&
+           lease.generation == service_generation && !lease.callbacks_open;
+}
+
+bool janos_wps_runtime_wait_quarantined_download(uint32_t timeout_ms);
+

@@ -24,8 +24,32 @@ void lab_radio_init(lab_radio_t *radio, lab_platform_t *platform,
 static bool restored_exactly(lab_radio_t *radio)
 {
     uint8_t readback[STA_MAC_SIZE] = {0};
-    return lab_platform_read_sta_mac(radio->platform, readback) == LAB_PLATFORM_OK &&
-           memcmp(readback, radio->effective_boot_mac, STA_MAC_SIZE) == 0;
+    lab_platform_status_t status = lab_platform_read_sta_mac(radio->platform, readback);
+    if (status != LAB_PLATFORM_OK) {
+        radio->cleanup_diag = (lab_radio_cleanup_diag_t){
+            .step = "boot_mac_readback", .error_domain = "platform",
+            .error = status,
+        };
+        return false;
+    }
+    if (memcmp(readback, radio->effective_boot_mac, STA_MAC_SIZE) != 0) {
+        radio->cleanup_diag = (lab_radio_cleanup_diag_t){
+            .step = "boot_mac_mismatch", .error_domain = "none",
+        };
+        return false;
+    }
+    return true;
+}
+
+static void record_transport_failure(lab_radio_t *radio)
+{
+    radio->cleanup_diag = (lab_radio_cleanup_diag_t){
+        .step = radio->transport.cleanup_step ?
+            radio->transport.cleanup_step : "transport_pending",
+        .detail = radio->transport.cleanup_detail,
+        .error_domain = radio->transport.cleanup_step ? "esp" : "none",
+        .error = radio->transport.cleanup_error,
+    };
 }
 
 static void release_scratch(lab_radio_t *radio)
@@ -50,6 +74,7 @@ bool lab_radio_acquire(lab_radio_t *radio,
     radio->owner_token = token;
     radio->phase = LAB_RADIO_PREPARING;
     radio->cancel_requested = false;
+    radio->cleanup_diag = (lab_radio_cleanup_diag_t){0};
     atomic_store_explicit(&radio->callback_token, token, memory_order_release);
     atomic_store_explicit(&radio->callbacks_open, false, memory_order_release);
 
@@ -67,6 +92,7 @@ bool lab_radio_acquire(lab_radio_t *radio,
 failed:
     atomic_store_explicit(&radio->callbacks_open, false, memory_order_release);
     bool cleanup_ok = !wps_transport_cleanup_pending(&radio->transport);
+    if (!cleanup_ok) record_transport_failure(radio);
     if (cleanup_ok) cleanup_ok = restored_exactly(radio);
     if (cleanup_ok) {
         release_scratch(radio);
@@ -120,8 +146,11 @@ lab_radio_result_t lab_radio_release(lab_radio_t *radio, int workflow_result)
     if (!radio || radio->owner_token == 0) return result;
 
     atomic_store_explicit(&radio->callbacks_open, false, memory_order_release);
+    radio->cleanup_diag = (lab_radio_cleanup_diag_t){0};
     bool cleanup_ok = wps_transport_cancel(&radio->transport);
+    if (!cleanup_ok) record_transport_failure(radio);
     if (cleanup_ok) cleanup_ok = !wps_transport_cleanup_pending(&radio->transport);
+    if (!cleanup_ok && !radio->cleanup_diag.step) record_transport_failure(radio);
     if (cleanup_ok) cleanup_ok = restored_exactly(radio);
     if (!cleanup_ok) {
         radio->phase = LAB_RADIO_QUARANTINED;

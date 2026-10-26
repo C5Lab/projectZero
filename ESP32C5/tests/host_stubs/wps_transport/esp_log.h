@@ -14,3 +14,6 @@ static inline void esp_log_level_set(const char *tag, esp_log_level_t level)
     (void)tag;
     (void)level;
 }
+
+void test_esp_log_error(const char *tag, const char *format, ...);
+#define ESP_LOGE(tag, ...) test_esp_log_error(tag, __VA_ARGS__)

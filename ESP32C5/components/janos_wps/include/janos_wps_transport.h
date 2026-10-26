@@ -20,6 +20,7 @@ typedef struct {
     unsigned restore_phase;
     bool rejected_baseline;
     bool terminal_failure;
+    const char *failure_detail;
 } janos_wps_transport_context_t;
 
 /* JanOS owns driver lifecycle/storage. All host changes must use these wrappers.

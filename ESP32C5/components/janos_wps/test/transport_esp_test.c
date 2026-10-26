@@ -1,6 +1,7 @@
 /* SPDX-FileCopyrightText: 2026 JanOS contributors */
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <assert.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,10 @@ static size_t leak_per_cycle;
 static wifi_storage_t storage = WIFI_STORAGE_FLASH;
 static wifi_mode_t mode = WIFI_MODE_STA;
 static wifi_config_t station_config;
+_Static_assert(offsetof(wifi_config_t, sta.bssid) == 101U,
+               "host BSSID layout must match IDF 6.0.1");
+_Static_assert(sizeof(wifi_config_t) == 184U,
+               "host config size must match IDF 6.0.1");
 static uint8_t primary = 11;
 static wifi_second_chan_t secondary = WIFI_SECOND_CHAN_ABOVE;
 static char trace[8192];
@@ -29,7 +34,20 @@ static bool allocation_failure;
 static size_t snapshot_size;
 static unsigned snapshot_allocations, snapshot_wipes;
 static bool canonical_prepare;
+static bool preserve_disabled_bssid;
 static wifi_config_t *last_config_output;
+static char last_esp_error_log[200];
+
+void test_esp_log_error(const char *tag, const char *format, ...)
+{
+    assert(strcmp(tag, "WPS_RESTORE") == 0);
+    va_list arguments;
+    va_start(arguments, format);
+    int written = vsnprintf(last_esp_error_log, sizeof(last_esp_error_log),
+                            format, arguments);
+    va_end(arguments);
+    assert(written > 0 && (size_t)written < sizeof(last_esp_error_log));
+}
 
 static int operation(char code)
 {
@@ -59,13 +77,27 @@ esp_err_t esp_wifi_get_config(int interface, wifi_config_t *out)
 { assert(interface == WIFI_IF_STA); int result = operation('g');
   if (!result) *out = station_config;
   last_config_output = out;
-  if (!result && wrong_field == 'g') out->sta.password[0] ^= 1;
-  if (!result && wrong_field == 'b') out->bytes[191] ^= 1;
+  if (!result && (wrong_field == 'g' || wrong_field == 'm'))
+      out->sta.password[0] ^= 1;
+  if (!result && wrong_field == 's') out->sta.ssid[0] ^= 1;
+  if (!result && wrong_field == 'B') out->sta.bssid[0] ^= 1;
+  if (!result && wrong_field == 'f') out->sta.bssid_set = !out->sta.bssid_set;
+  if (!result && (wrong_field == 'b' || wrong_field == 'm'))
+      out->bytes[183] ^= 1;
   return result; }
 esp_err_t esp_wifi_set_config(int interface, wifi_config_t *value)
 { assert(interface == WIFI_IF_STA && !started &&
          (storage == WIFI_STORAGE_RAM || canonical_prepare));
-  int result = operation('K'); if (!result) station_config = *value; return result; }
+  int result = operation('K');
+  if (!result) {
+      uint8_t previous_bssid[6];
+      memcpy(previous_bssid, station_config.sta.bssid, sizeof(previous_bssid));
+      station_config = *value;
+      if (preserve_disabled_bssid && !station_config.sta.bssid_set)
+          memcpy(station_config.sta.bssid, previous_bssid,
+                 sizeof(previous_bssid));
+  }
+  return result; }
 esp_err_t esp_wifi_get_channel(uint8_t *out, wifi_second_chan_t *second)
 { assert(started); int result = operation('h');
   if (!result) { *out = primary; *second = secondary;
@@ -270,11 +302,15 @@ static void readback_failure_preserves_pending_ownership(void)
     assert(wps_transport_begin(&transport, session, original));
     failure = 'G';
     assert(!wps_transport_cancel(&transport));
+    assert(strcmp(transport.cleanup_step, "snapshot_restore") == 0);
+    assert(transport.cleanup_error == ESP_FAIL);
+    assert(strcmp(transport.cleanup_detail, "verify_get_mac") == 0);
     assert(wps_transport_cleanup_pending(&transport));
     assert(context.borrowed && context.driver_running && !context.restore_verified);
     assert(!installed && init_calls == 0 && deinit_calls == 0);
     failure = 0;
     assert(wps_transport_cancel(&transport));
+    assert(transport.cleanup_detail == NULL);
 }
 
 /* Retained stress verdict, now a host fixture over the production adapter. */
@@ -359,7 +395,7 @@ static void exact_baseline_restore(void)
 static void reset_baseline(void)
 {
     failure = second_failure = fail_once = wrong_field = 0;
-    allocation_failure = ignore_restore_write = false;
+    allocation_failure = ignore_restore_write = preserve_disabled_bssid = false;
     assert(started);
     assert(janos_wps_wifi_set_storage(WIFI_STORAGE_FLASH) == ESP_OK);
     mode = WIFI_MODE_STA;
@@ -369,6 +405,28 @@ static void reset_baseline(void)
     memcpy(current_mac, original, 6);
     trace_length = 0;
     trace[0] = 0;
+    last_esp_error_log[0] = 0;
+}
+
+static void wps_disable_failure_identifies_private_call(void)
+{
+    const char failures[] = "tpq";
+    const char *details[] = {"wps_start_flag", "wps_type", "wps_status"};
+    for (size_t i = 0; i < sizeof(failures) - 1U; ++i) {
+        reset_baseline();
+        janos_wps_transport_context_t context = {0};
+        wps_transport_t transport;
+        wps_transport_init(&transport, &janos_wps_transport_ops, &context);
+        assert(wps_transport_begin(&transport, session, original));
+        failure = failures[i];
+        assert(!wps_transport_cancel(&transport));
+        assert(strcmp(transport.cleanup_step, "wps_disable") == 0);
+        assert(strcmp(transport.cleanup_detail, details[i]) == 0);
+        assert(transport.cleanup_error == ESP_FAIL);
+        failure = 0;
+        assert(wps_transport_cancel(&transport));
+        assert(transport.cleanup_step == NULL && transport.cleanup_detail == NULL);
+    }
 }
 
 static void snapshot_fault_matrix(void)
@@ -423,7 +481,7 @@ static void restore_fault_and_readback_matrix(void)
         assert(storage == WIFI_STORAGE_FLASH && started);
         assert(primary == 11 && station_config.sta.password[0] == 0x5a);
     }
-    const char wrong[] = "ogbhjG";
+    const char wrong[] = "ogbhjGsm";
     for (size_t i = 0; i < sizeof(wrong) - 1U; ++i) {
         reset_baseline();
         janos_wps_transport_context_t context = {0};
@@ -432,6 +490,26 @@ static void restore_fault_and_readback_matrix(void)
         assert(wps_transport_begin(&transport, session, original));
         wrong_field = wrong[i];
         assert(!wps_transport_cancel(&transport));
+        if (wrong[i] == 'g')
+            assert(strcmp(last_esp_error_log,
+                           "verify_config ssid_changed=0 password_changed=1 other_count=0 size=184") == 0);
+        else if (wrong[i] == 'b')
+            assert(strcmp(last_esp_error_log,
+                           "verify_config ssid_changed=0 password_changed=0 other_first=183 other_last=183 other_count=1 size=184") == 0);
+        else if (wrong[i] == 's')
+            assert(strcmp(last_esp_error_log,
+                           "verify_config ssid_changed=1 password_changed=0 other_count=0 size=184") == 0);
+        else if (wrong[i] == 'm')
+            assert(strcmp(last_esp_error_log,
+                           "verify_config ssid_changed=0 password_changed=1 other_first=183 other_last=183 other_count=1 size=184") == 0);
+        else
+            assert(last_esp_error_log[0] == 0);
+        assert(strcmp(transport.cleanup_step, "snapshot_restore") == 0);
+        assert(strcmp(transport.cleanup_detail,
+                      wrong[i] == 'o' ? "verify_mode" :
+                      wrong[i] == 'G' ? "verify_mac" :
+                      wrong[i] == 'h' || wrong[i] == 'j' ?
+                          "verify_channel" : "verify_config") == 0);
         assert(wps_transport_cleanup_pending(&transport) && !context.restore_verified);
         assert(context.snapshot && context.driver_running);
         const unsigned char *readback = (const unsigned char *)last_config_output;
@@ -441,6 +519,119 @@ static void restore_fault_and_readback_matrix(void)
         assert(wps_transport_cancel(&transport));
         assert(context.restore_verified && !context.snapshot);
     }
+}
+
+static void inactive_bssid_payload_does_not_hold_radio(void)
+{
+    static const uint8_t target[6] = {0x68, 0xff, 0x7b, 0xcd, 0xfc, 0x40};
+    reset_baseline();
+    memset(&station_config, 0, sizeof(station_config));
+    janos_wps_transport_context_t context = {0};
+    wps_transport_t transport;
+    wps_transport_init(&transport, &janos_wps_transport_ops, &context);
+    assert(wps_transport_begin(&transport, session, original));
+    station_config.sta.bssid_set = true;
+    memcpy(station_config.sta.bssid, target, sizeof(target));
+    preserve_disabled_bssid = true;
+    assert(wps_transport_cancel(&transport));
+    assert(context.restore_verified && !context.snapshot);
+    assert(!wps_transport_cleanup_pending(&transport));
+    assert(!station_config.sta.bssid_set);
+    assert(memcmp(station_config.sta.bssid, target, sizeof(target)) == 0);
+    assert(last_esp_error_log[0] == 0);
+}
+
+static void inactive_bssid_does_not_mask_another_restore_mismatch(void)
+{
+    static const uint8_t target[6] = {0x68, 0xff, 0x7b, 0xcd, 0xfc, 0x40};
+    reset_baseline();
+    memset(&station_config, 0, sizeof(station_config));
+    janos_wps_transport_context_t context = {0};
+    wps_transport_t transport;
+    wps_transport_init(&transport, &janos_wps_transport_ops, &context);
+    assert(wps_transport_begin(&transport, session, original));
+    station_config.sta.bssid_set = true;
+    memcpy(station_config.sta.bssid, target, sizeof(target));
+    preserve_disabled_bssid = true;
+    wrong_field = 'b';
+    assert(!wps_transport_cancel(&transport));
+    assert(strcmp(transport.cleanup_detail, "verify_config") == 0);
+    assert(wps_transport_cleanup_pending(&transport) && !context.restore_verified);
+    assert(strcmp(last_esp_error_log,
+                  "verify_config ssid_changed=0 password_changed=0 "
+                  "other_first=183 other_last=183 other_count=1 size=184") == 0);
+    wrong_field = 0;
+    assert(wps_transport_cancel(&transport));
+    assert(context.restore_verified && !context.snapshot);
+}
+
+static void active_bssid_restores_exactly(void)
+{
+    static const uint8_t target[6] = {0x68, 0xff, 0x7b, 0xcd, 0xfc, 0x40};
+    reset_baseline();
+    memset(&station_config, 0, sizeof(station_config));
+    station_config.sta.bssid_set = true;
+    memcpy(station_config.sta.bssid, target, sizeof(target));
+    janos_wps_transport_context_t context = {0};
+    wps_transport_t transport;
+    wps_transport_init(&transport, &janos_wps_transport_ops, &context);
+    assert(wps_transport_begin(&transport, session, original));
+    memset(station_config.sta.bssid, 0xee, sizeof(target));
+    assert(wps_transport_cancel(&transport));
+    assert(context.restore_verified && !context.snapshot);
+    assert(station_config.sta.bssid_set);
+    assert(memcmp(station_config.sta.bssid, target, sizeof(target)) == 0);
+}
+
+static void active_bssid_mismatch_holds_radio(void)
+{
+    static const uint8_t target[6] = {0x68, 0xff, 0x7b, 0xcd, 0xfc, 0x40};
+    reset_baseline();
+    memset(&station_config, 0, sizeof(station_config));
+    station_config.sta.bssid_set = true;
+    memcpy(station_config.sta.bssid, target, sizeof(target));
+    janos_wps_transport_context_t context = {0};
+    wps_transport_t transport;
+    wps_transport_init(&transport, &janos_wps_transport_ops, &context);
+    assert(wps_transport_begin(&transport, session, original));
+    wrong_field = 'B';
+    assert(!wps_transport_cancel(&transport));
+    assert(strcmp(transport.cleanup_detail, "verify_config") == 0);
+    assert(wps_transport_cleanup_pending(&transport) && !context.restore_verified);
+    wrong_field = 0;
+    assert(wps_transport_cancel(&transport));
+}
+
+static void bssid_selector_change_holds_radio(void)
+{
+    reset_baseline();
+    memset(&station_config, 0, sizeof(station_config));
+    janos_wps_transport_context_t context = {0};
+    wps_transport_t transport;
+    wps_transport_init(&transport, &janos_wps_transport_ops, &context);
+    assert(wps_transport_begin(&transport, session, original));
+    wrong_field = 'f';
+    assert(!wps_transport_cancel(&transport));
+    assert(strcmp(transport.cleanup_detail, "verify_config") == 0);
+    assert(wps_transport_cleanup_pending(&transport) && !context.restore_verified);
+    wrong_field = 0;
+    assert(wps_transport_cancel(&transport));
+}
+
+static void inactive_bssid_other_mismatch_holds_radio(void)
+{
+    reset_baseline();
+    memset(&station_config, 0, sizeof(station_config));
+    janos_wps_transport_context_t context = {0};
+    wps_transport_t transport;
+    wps_transport_init(&transport, &janos_wps_transport_ops, &context);
+    assert(wps_transport_begin(&transport, session, original));
+    wrong_field = 'b';
+    assert(!wps_transport_cancel(&transport));
+    assert(strcmp(transport.cleanup_detail, "verify_config") == 0);
+    assert(wps_transport_cleanup_pending(&transport) && !context.restore_verified);
+    wrong_field = 0;
+    assert(wps_transport_cancel(&transport));
 }
 
 static void terminal_reset_wipes_without_releasing(void)
@@ -591,6 +782,13 @@ int main(int argc, char **argv)
         exact_baseline_restore();
         snapshot_fault_matrix();
         restore_fault_and_readback_matrix();
+        inactive_bssid_payload_does_not_hold_radio();
+        inactive_bssid_does_not_mask_another_restore_mismatch();
+        active_bssid_restores_exactly();
+        active_bssid_mismatch_holds_radio();
+        bssid_selector_change_holds_radio();
+        inactive_bssid_other_mismatch_holds_radio();
+        wps_disable_failure_identifies_private_call();
         terminal_reset_wipes_without_releasing();
         unsupported_baselines_are_rejected_before_mutation();
         full_restore_gates_radio_owner_release();

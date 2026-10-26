@@ -22,6 +22,13 @@ typedef struct {
 } lab_radio_result_t;
 
 typedef struct {
+    const char *step;
+    const char *detail;
+    const char *error_domain;
+    int error;
+} lab_radio_cleanup_diag_t;
+
+typedef struct {
     lab_platform_t *platform;
     wps_transport_t transport;
     uint8_t effective_boot_mac[STA_MAC_SIZE];
@@ -33,6 +40,7 @@ typedef struct {
     atomic_bool callbacks_open;
     lab_radio_phase_t phase;
     bool cancel_requested;
+    lab_radio_cleanup_diag_t cleanup_diag;
 } lab_radio_t;
 
 void lab_radio_init(lab_radio_t *radio, lab_platform_t *platform,

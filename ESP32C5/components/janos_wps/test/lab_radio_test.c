@@ -23,6 +23,7 @@ typedef struct {
     uint8_t stored[STA_MAC_POLICY_RECORD_SIZE];
     bool stored_present;
     bool wrong_readback;
+    bool mac_read_error;
     bool cancel_pending;
     unsigned cancel_polls;
 } fixture_t;
@@ -61,6 +62,7 @@ static int read_mac(void *context, uint8_t out[6])
 {
     fixture_t *fixture = context;
     fixture->mac_reads++;
+    if (fixture->mac_read_error) return -1;
     memcpy(out, fixture->current_mac, 6);
     if (fixture->wrong_readback) out[5] ^= 1;
     return 0;
@@ -209,7 +211,7 @@ static int transport_disconnect(void *context) { return event(context, 'D'); }
 static const wps_transport_ops_t transport_ops = {
     transport_init, transport_start, transport_stop, transport_deinit,
     transport_mac, transport_callbacks, transport_appie, transport_wps,
-    transport_disconnect,
+    transport_disconnect, NULL,
 };
 
 static void radio_clean_cycle_and_late_callbacks(void)
@@ -265,6 +267,10 @@ static void acquire_failures_cleanup_or_quarantine(void)
 static void cleanup_failures_quarantine_and_retry(void)
 {
     const char failures[] = "wDacsmi";
+    const char *steps[] = {
+        "wps_disable", "disconnect", "appie_unset", "callbacks_clear",
+        "wifi_stop", "mac_restore", "snapshot_restore",
+    };
     const uint8_t session[6] = {0x02, 6, 7, 8, 9, 10};
     const uint8_t boot_mac[6] = {0x3c, 0xdc, 0x75, 0x85, 0xfd, 0x80};
     for (size_t index = 0; index < sizeof(failures) - 1; index++) {
@@ -280,11 +286,14 @@ static void cleanup_failures_quarantine_and_retry(void)
         fixture.fail_code = failures[index];
         lab_radio_result_t result = lab_radio_release(&radio, 13);
         assert(result.workflow_result == 13 && !result.cleanup_ok && result.quarantined);
+        assert(strcmp(radio.cleanup_diag.step, steps[index]) == 0);
+        assert(radio.cleanup_diag.error == -1);
         assert(lab_radio_is_quarantined(&radio));
         assert(!lab_radio_acquire(&radio, session, 0, &token));
         fixture.fail_code = 0;
         result = lab_radio_release(&radio, 13);
         assert(result.cleanup_ok && !result.quarantined);
+        assert(radio.cleanup_diag.step == NULL);
         assert(!lab_radio_is_quarantined(&radio));
     }
 }
@@ -303,7 +312,27 @@ static void wrong_mac_readback_quarantines(void)
     assert(lab_radio_acquire(&radio, session, 8, &token));
     lab_radio_result_t result = lab_radio_release(&radio, 0);
     assert(!result.cleanup_ok && result.quarantined);
+    assert(strcmp(radio.cleanup_diag.step, "boot_mac_mismatch") == 0);
+    assert(radio.cleanup_diag.error == 0);
     assert(!wps_transport_cleanup_pending(&radio.transport));
+}
+
+static void mac_read_error_has_distinct_cleanup_diagnostic(void)
+{
+    fixture_t fixture = {.mac_read_error = true};
+    const uint8_t boot_mac[6] = {0x3c, 0xdc, 0x75, 0x85, 0xfd, 0x80};
+    memcpy(fixture.current_mac, boot_mac, 6);
+    lab_platform_t platform;
+    lab_platform_init(&platform, &platform_ops, &fixture, NULL);
+    lab_radio_t radio;
+    lab_radio_init(&radio, &platform, &transport_ops, &fixture, boot_mac);
+    const uint8_t session[6] = {0x02, 6, 7, 8, 9, 10};
+    uint32_t token = 0;
+    assert(lab_radio_acquire(&radio, session, 8, &token));
+    lab_radio_result_t result = lab_radio_release(&radio, 0);
+    assert(!result.cleanup_ok && result.quarantined);
+    assert(strcmp(radio.cleanup_diag.step, "boot_mac_readback") == 0);
+    assert(radio.cleanup_diag.error == LAB_PLATFORM_IO_ERROR);
 }
 
 static void adapter_cleanup_failure_forces_quarantine(void)
@@ -324,6 +353,7 @@ int main(void)
     acquire_failures_cleanup_or_quarantine();
     cleanup_failures_quarantine_and_retry();
     wrong_mac_readback_quarantines();
+    mac_read_error_has_distinct_cleanup_diagnostic();
     adapter_cleanup_failure_forces_quarantine();
     puts("PASS: WPS lab radio owner");
     return 0;

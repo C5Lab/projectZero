@@ -16,6 +16,8 @@ typedef struct wps_transport_ops {
     int (*appie)(void *context, bool enabled);
     int (*wps)(void *context, bool enabled);
     int (*disconnect)(void *context);
+    /* Optional adapter-specific name for a failed composite cleanup step. */
+    const char *(*failure_detail)(void *context);
 } wps_transport_ops_t;
 
 typedef struct {
@@ -30,6 +32,9 @@ typedef struct {
     bool appie_set;
     bool wps_enabled;
     bool active;
+    const char *cleanup_step;
+    const char *cleanup_detail;
+    int cleanup_error;
 } wps_transport_t;
 
 void wps_transport_init(wps_transport_t *transport,

@@ -71,8 +71,13 @@ it does not by itself prove cleanup. The secret vault is made available only
 when that operation succeeded **and** cleanup restored/released the lease. A
 failed restoration can therefore pair an operation success with
 `cleanup_result:"failed"` and `lease_state:"retained"`; it quarantines the
-shared lease and blocks new radio mutations until reboot recovery. `wps status`
-remains available.
+shared lease and blocks new radio mutations. `wps status` remains available.
+After the terminal record, `download` may reboot directly into ROM flashing
+mode once the WPS worker has finished and callbacks are closed. This path does
+not claim the Wi-Fi state was restored or release the lease in the running
+application. `wps stop` and the global `stop` still report quarantine; a
+normal reboot is the other recovery path. If the worker guard fails,
+`download` returns an error without setting the ROM boot flag.
 
 Example with redacted laboratory values:
 
@@ -107,9 +112,29 @@ window only after exact unsigned parsing and range/overflow validation.
 
 Progress uses additive `wps_stage` records such as `pixie_capture_start`,
 `pixie_capture`, `pixie_done`, `pixie_verify_attempt`, `pixie_verify` and
-`pixie_verify_retry`. These workflow records currently use their established
+`pixie_verify_retry`. When the workflow reports failed cleanup, one additional
+record identifies the first failed radio transport step, optional adapter
+detail and numeric error when available:
+
+```text
+{"schema":1,"operation_id":7,"type":"wps_stage","stage":"cleanup_failure","source":"radio_cleanup","step":"snapshot_restore","detail":"verify_config","error_domain":"esp","error":259}
+```
+
+`error_domain` is `esp` for an ESP-IDF operation, `platform` for the final STA
+MAC readback, or `none` when no API error code exists. `source:"unknown"`
+means the workflow reported failed cleanup without a radio diagnostic. The
+record contains no PIN, key or Wi-Fi configuration values. These workflow
+records currently use their established
 `schema:1`/`operation_id` envelope and do not replace the production
-`schema_version:1` accepted/status/terminal contract. Capture success, an
+`schema_version:1` accepted/status/terminal contract. A `verify_config`
+failure also prints one `WPS_RESTORE` ESP error log with flags for differences
+in the SSID and password fields. For differences outside those fields, it
+prints the first and last byte offsets and the difference count. It also
+prints the `wifi_config_t` size. It prints no configuration bytes or credential
+values, and no offsets within SSID or password. The offsets diagnose a readback
+mismatch; they do not establish which side changed or whether the difference
+affects connection.
+Capture success, an
 offline match or a partial match is not credential recovery. Only a fresh
 authenticated M7 publishes the vault/result. The terminal operation result is
 `pixie_pin_and_m7_verified`; unlike known-PIN `wps verify`, it is not normalized
@@ -212,10 +237,12 @@ needed. Before the transport mutates the driver it snapshots the tracked
 storage policy, mode, complete STA configuration, primary/secondary channel and
 STA MAC. Stopped STA, AP and APSTA baselines are rejected before mutation.
 
-Cleanup restores every saved field and verifies complete readback plus tracked
-running/storage invariants. A transient restore error retains the internal
-snapshot for retry. Only exact equality permits lease release; otherwise the
-service remains quarantined. The configuration snapshot is allocated in wiped
+Cleanup restores every saved field and verifies readback plus tracked
+running/storage invariants. STA configuration must match byte for byte except
+for the six BSSID payload bytes when `bssid_set` is false in both the snapshot
+and readback. An active BSSID, a changed `bssid_set` flag, or any other mismatch
+retains quarantine. A transient restore error retains the internal snapshot
+for retry. The configuration snapshot is allocated in wiped
 internal RAM because it can contain credentials. It is never copied to PSRAM,
 SD or NVS. This transport contract preserves the active boot MAC but does not
 change the persistent `sta_mac` policy. The policy is loaded at application

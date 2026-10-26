@@ -30,7 +30,7 @@ static int wps(void *c, bool enabled) { return event(c, enabled ? 'W' : 'w'); }
 static int disconnect(void *c) { return event(c, 'D'); }
 
 static const wps_transport_ops_t ops = {
-    init, start, stop, deinit, set_mac, callbacks, appie, wps, disconnect,
+    init, start, stop, deinit, set_mac, callbacks, appie, wps, disconnect, NULL,
 };
 
 static void clean_cycle(void)
@@ -80,6 +80,10 @@ static void cleanup_failure_can_be_retried(void)
     const uint8_t session[6] = {0x02, 1, 2, 3, 4, 5};
     const uint8_t original[6] = {0x3c, 1, 2, 3, 4, 5};
     const char failures[] = "wDacsmi";
+    const char *steps[] = {
+        "wps_disable", "disconnect", "appie_unset", "callbacks_clear",
+        "wifi_stop", "mac_restore", "snapshot_restore",
+    };
     const char *failed_traces[] = {
         "IMSCAWw", "IMSCAWwD", "IMSCAWwDa", "IMSCAWwDac",
         "IMSCAWwDacs", "IMSCAWwDacsm", "IMSCAWwDacsmi",
@@ -96,6 +100,9 @@ static void cleanup_failure_can_be_retried(void)
         assert(wps_transport_begin(&transport, session, original));
         mock.fail_cleanup = failures[index];
         assert(!wps_transport_cancel(&transport));
+        assert(transport.cleanup_step != NULL);
+        assert(strcmp(transport.cleanup_step, steps[index]) == 0);
+        assert(transport.cleanup_error == -1);
         assert(transport.initialized);
         assert(wps_transport_cleanup_pending(&transport));
         assert(!wps_transport_active(&transport));
@@ -105,6 +112,7 @@ static void cleanup_failure_can_be_retried(void)
         assert(mock.call == calls);
         mock.fail_cleanup = 0;
         assert(wps_transport_cancel(&transport));
+        assert(transport.cleanup_step == NULL && transport.cleanup_error == 0);
         assert(!transport.initialized);
         assert(!wps_transport_cleanup_pending(&transport));
         assert(strcmp(mock.trace, retried_traces[index]) == 0);

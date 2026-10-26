@@ -11,8 +11,16 @@ typedef int wifi_mode_t;
 typedef int wifi_storage_t;
 typedef int wifi_second_chan_t;
 typedef union {
-    struct { uint8_t ssid[32]; uint8_t password[64]; uint8_t other[96]; } sta;
-    uint8_t bytes[192];
+    struct {
+        uint8_t ssid[32];
+        uint8_t password[64];
+        uint32_t scan_method;
+        bool bssid_set;
+        uint8_t bssid[6];
+        uint8_t channel;
+        uint8_t other[76];
+    } sta;
+    uint8_t bytes[184];
 } wifi_config_t;
 #define WIFI_INIT_CONFIG_DEFAULT() ((wifi_init_config_t){1})
 enum {

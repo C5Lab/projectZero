@@ -188,6 +188,52 @@ static void stale_startup_tokens_cannot_release_or_cancel_new_owners(void)
     assert(janos_radio_lease_snapshot(&lease).state == JANOS_RADIO_LEASE_RUNNING);
 }
 
+static void only_quarantined_wps_can_enter_download_without_releasing_lease(void)
+{
+    janos_radio_lease_t lease;
+    janos_radio_lease_init(&lease);
+    janos_console_admission_token_t token = {0};
+    uint32_t generation = 0U;
+    assert(janos_radio_lease_acquire(&lease, JANOS_RADIO_OWNER_WPS,
+                                     &generation) == JANOS_RADIO_LEASE_OK);
+    assert(janos_radio_lease_mark_running(&lease, JANOS_RADIO_OWNER_WPS,
+                                          generation));
+    assert(janos_console_admission_begin(&lease, "download", NULL, 0, false,
+                                         &token) == JANOS_CONSOLE_BUSY_RADIO_LEASE);
+    assert(janos_radio_lease_begin_cleanup(&lease, JANOS_RADIO_OWNER_WPS,
+                                            generation));
+    assert(!janos_radio_lease_finish_cleanup(&lease, JANOS_RADIO_OWNER_WPS,
+                                              generation, false));
+
+    assert(janos_console_admission_begin(&lease, "download", NULL, 0, false,
+                                         &token) == JANOS_CONSOLE_ADMIT);
+    assert(token.owner == JANOS_RADIO_OWNER_NONE && token.generation == 0U);
+    assert(janos_console_admission_end(&lease, token));
+    janos_radio_lease_snapshot_t snapshot = janos_radio_lease_snapshot(&lease);
+    assert(snapshot.owner == JANOS_RADIO_OWNER_WPS);
+    assert(snapshot.state == JANOS_RADIO_LEASE_QUARANTINED);
+    assert(snapshot.generation == generation);
+    assert(janos_console_admission_begin(&lease, "download", NULL, 1, false,
+                                         &token) == JANOS_CONSOLE_BUSY_RADIO_LEASE);
+    assert(janos_console_admission_begin(&lease, "download", NULL, 0, true,
+                                         &token) == JANOS_CONSOLE_BUSY_RADIO_LEASE);
+    assert(janos_console_admission_begin(&lease, "download", "extra", 0, false,
+                                         &token) == JANOS_CONSOLE_BUSY_RADIO_LEASE);
+
+    janos_radio_lease_t analyzer;
+    janos_radio_lease_init(&analyzer);
+    assert(janos_radio_lease_acquire(&analyzer, JANOS_RADIO_OWNER_ANALYZER,
+                                     NULL) == JANOS_RADIO_LEASE_OK);
+    assert(janos_console_admission_begin(&analyzer, "download", NULL, 0, false,
+                                         &token) == JANOS_CONSOLE_BUSY_RADIO_LEASE);
+    janos_radio_lease_t legacy;
+    janos_radio_lease_init(&legacy);
+    assert(janos_radio_lease_acquire(&legacy, JANOS_RADIO_OWNER_LEGACY,
+                                     NULL) == JANOS_RADIO_LEASE_OK);
+    assert(janos_console_admission_begin(&legacy, "download", NULL, 0, false,
+                                         &token) == JANOS_CONSOLE_BUSY_RADIO_LEASE);
+}
+
 int main(void)
 {
     policy_matrix();
@@ -195,6 +241,7 @@ int main(void)
     reasons_are_stable();
     busy_wire_is_byte_stable();
     stale_startup_tokens_cannot_release_or_cancel_new_owners();
+    only_quarantined_wps_can_enter_download_without_releasing_lease();
     puts("PASS: JanOS console admission policy");
     return 0;
 }

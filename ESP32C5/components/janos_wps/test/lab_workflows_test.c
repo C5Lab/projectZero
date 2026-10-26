@@ -529,9 +529,11 @@ static void pixie_stops_after_capture_lock_or_cleanup_failure(void)
     };
     lab_platform_t platform;
     lab_platform_init(&platform, &platform_ops, &f, NULL);
+    lab_radio_t radio = {0};
     lab_workflows_t workflows;
-    assert(lab_workflows_init_with_ops(&workflows, &platform, NULL,
+    assert(lab_workflows_init_with_ops(&workflows, &platform, &radio,
                                        &workflow_ops, &f));
+    lab_workflows_set_emitter(&workflows, capture_output, &f);
     lab_secret_vault_t vault;
     lab_secret_init(&vault, observed_wipe);
     lab_command_t cmd = command(LAB_COMMAND_WPS_PIXIE);
@@ -541,8 +543,19 @@ static void pixie_stops_after_capture_lock_or_cleanup_failure(void)
 
     f.capture_result = WPS_SESSION_SUCCESS;
     f.cleanup_ok = false;
+    radio.cleanup_diag = (lab_radio_cleanup_diag_t){
+        .step = "snapshot_restore", .detail = "verify_config",
+        .error_domain = "esp", .error = 259,
+    };
     execute(&workflows, &cmd, &vault, 29, "pixie_capture_failed", "failed");
     assert(f.captures == 2 && f.searches == 0 && f.verifies == 0);
+    assert(strstr(f.emitted,
+                  "\"operation_id\":29,\"type\":\"wps_stage\","
+                  "\"stage\":\"cleanup_failure\","
+                  "\"source\":\"radio_cleanup\","
+                  "\"step\":\"snapshot_restore\","
+                  "\"detail\":\"verify_config\","
+                  "\"error_domain\":\"esp\",\"error\":259") != NULL);
 
     lab_workflows_deinit(&workflows);
 }

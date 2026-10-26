@@ -19774,40 +19774,55 @@ static int cmd_download(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
+#if (HAS_RTC_CNTL_REG && defined(RTC_CNTL_OPTION1_REG) && defined(RTC_CNTL_FORCE_DOWNLOAD_BOOT)) || \
+    (HAS_LP_AON_REG && defined(LP_AON_SYS_CFG_REG) && defined(LP_AON_FORCE_DOWNLOAD_BOOT) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_S) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_M))
+    janos_radio_lease_snapshot_t lease = janos_radio_lease_snapshot(&janos_radio_lease);
+    bool wps_quarantined = lease.owner == JANOS_RADIO_OWNER_WPS &&
+                           lease.state == JANOS_RADIO_LEASE_QUARANTINED;
+    if (wps_quarantined) {
+        /* The WPS worker may still be emitting its terminal record. It owns
+         * the failed-restore radio until reset, so do not run generic teardown. */
+        if (!janos_wps_runtime_wait_quarantined_download(5000U)) {
+            MY_LOG_INFO(TAG, "Download refused: quarantined WPS worker not quiescent");
+            return 1;
+        }
+    } else {
+        if (cmd_stop(0, NULL) != 0) return 1;
+        /* Preserve the normal download path after a successful global stop. */
+        (void)esp_wifi_stop();
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+#endif
+
 #if HAS_RTC_CNTL_REG && defined(RTC_CNTL_OPTION1_REG) && defined(RTC_CNTL_FORCE_DOWNLOAD_BOOT)
-    MY_LOG_INFO(TAG, "Preparing to enter UART download mode. Stopping tasks...");
-    (void)cmd_stop(0, NULL);
-
-    // Give Wi-Fi stack a moment to settle before rebooting
-    esp_wifi_stop();
+    MY_LOG_INFO(TAG, "Rebooting into download mode. Connect via UART/USB-UART bridge to flash.");
+    fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(50));
-
     // Force next boot into the ROM download (serial flashing) mode
+    uint32_t original_option = REG_READ(RTC_CNTL_OPTION1_REG);
     REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
 #if defined(RTC_CNTL_SW_CPU_STALL_REG)
     REG_WRITE(RTC_CNTL_SW_CPU_STALL_REG, 0);
 #endif
-    MY_LOG_INFO(TAG, "Rebooting into download mode. Connect via UART/USB-UART bridge to flash.");
     esp_rom_software_reset_system();
 
-    // Should never reach here
-    return 0;
+    REG_WRITE(RTC_CNTL_OPTION1_REG, original_option);
+    MY_LOG_INFO(TAG, "Download reset returned unexpectedly");
+    return 1;
 #elif HAS_LP_AON_REG && defined(LP_AON_SYS_CFG_REG) && defined(LP_AON_FORCE_DOWNLOAD_BOOT) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_S) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_M)
-    MY_LOG_INFO(TAG, "Preparing to enter UART/USB download mode (LP AON). Stopping tasks...");
-    (void)cmd_stop(0, NULL);
-
-    esp_wifi_stop();
+    MY_LOG_INFO(TAG, "Rebooting into download mode (LP AON). Connect via UART/USB-UART bridge to flash.");
+    fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(50));
-
     // Set LP_AON_FORCE_DOWNLOAD_BOOT to 01 (boot0 download)
     uint32_t cfg = REG_READ(LP_AON_SYS_CFG_REG);
-    cfg &= ~LP_AON_FORCE_DOWNLOAD_BOOT_M;
-    cfg |= (1U << LP_AON_FORCE_DOWNLOAD_BOOT_S);
-    REG_WRITE(LP_AON_SYS_CFG_REG, cfg);
+    uint32_t download_cfg = (cfg & ~LP_AON_FORCE_DOWNLOAD_BOOT_M) |
+                            (1U << LP_AON_FORCE_DOWNLOAD_BOOT_S);
+    REG_WRITE(LP_AON_SYS_CFG_REG, download_cfg);
 
-    MY_LOG_INFO(TAG, "Rebooting into download mode (LP AON). Connect via UART/USB-UART bridge to flash.");
     esp_rom_software_reset_system();
-    return 0;
+    REG_WRITE(LP_AON_SYS_CFG_REG, cfg);
+    MY_LOG_INFO(TAG, "Download reset returned unexpectedly");
+    return 1;
 #else
     MY_LOG_INFO(TAG, "Download mode forcing not supported on this target/SDK.");
     return 1;

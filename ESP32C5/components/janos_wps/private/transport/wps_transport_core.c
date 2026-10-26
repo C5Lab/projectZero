@@ -32,33 +32,76 @@ bool wps_transport_cancel(wps_transport_t *transport)
 {
     if (transport == NULL || !valid_ops(transport->ops)) return false;
     const wps_transport_ops_t *ops = transport->ops;
+    int error = 0;
+    transport->cleanup_step = NULL;
+    transport->cleanup_detail = NULL;
+    transport->cleanup_error = 0;
     transport->active = false;
     if (transport->wps_enabled) {
-        if (ops->wps(transport->context, false) != 0) return false;
+        error = ops->wps(transport->context, false);
+        if (error != 0) {
+            transport->cleanup_step = "wps_disable";
+            if (ops->failure_detail)
+                transport->cleanup_detail = ops->failure_detail(transport->context);
+            transport->cleanup_error = error;
+            return false;
+        }
         transport->wps_enabled = false;
     }
     if (transport->disconnect_pending) {
-        if (ops->disconnect(transport->context) != 0) return false;
+        error = ops->disconnect(transport->context);
+        if (error != 0) {
+            transport->cleanup_step = "disconnect";
+            transport->cleanup_error = error;
+            return false;
+        }
         transport->disconnect_pending = false;
     }
     if (transport->appie_set) {
-        if (ops->appie(transport->context, false) != 0) return false;
+        error = ops->appie(transport->context, false);
+        if (error != 0) {
+            transport->cleanup_step = "appie_unset";
+            transport->cleanup_error = error;
+            return false;
+        }
         transport->appie_set = false;
     }
     if (transport->callbacks_set) {
-        if (ops->callbacks(transport->context, false) != 0) return false;
+        error = ops->callbacks(transport->context, false);
+        if (error != 0) {
+            transport->cleanup_step = "callbacks_clear";
+            transport->cleanup_error = error;
+            return false;
+        }
         transport->callbacks_set = false;
     }
     if (transport->started) {
-        if (ops->stop(transport->context) != 0) return false;
+        error = ops->stop(transport->context);
+        if (error != 0) {
+            transport->cleanup_step = "wifi_stop";
+            transport->cleanup_error = error;
+            return false;
+        }
         transport->started = false;
     }
     if (transport->mac_changed) {
-        if (ops->set_mac(transport->context, transport->original_mac) != 0) return false;
+        error = ops->set_mac(transport->context, transport->original_mac);
+        if (error != 0) {
+            transport->cleanup_step = "mac_restore";
+            transport->cleanup_error = error;
+            return false;
+        }
         transport->mac_changed = false;
     }
     if (transport->initialized) {
-        if (ops->deinit(transport->context) != 0) return false;
+        error = ops->deinit(transport->context);
+        if (error != 0) {
+            transport->cleanup_step = "snapshot_restore";
+            if (ops->failure_detail)
+                transport->cleanup_detail = ops->failure_detail(transport->context);
+            transport->cleanup_error = error;
+            return false;
+        }
         transport->initialized = false;
     }
     return true;

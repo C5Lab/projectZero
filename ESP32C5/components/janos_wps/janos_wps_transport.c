@@ -4,10 +4,12 @@
 #include "janos_wps_build.h"
 #include "private/transport/wps_transport_core.h"
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "esp_idf_version.h"
+#include "esp_log.h"
 #include "esp_private/wifi.h"
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
@@ -176,18 +178,90 @@ static int borrowed_stop(void *opaque)
     return error;
 }
 
+static void log_config_difference(const wifi_config_t *expected,
+                                  const wifi_config_t *actual)
+{
+    const uint8_t *left = (const uint8_t *)expected;
+    const uint8_t *right = (const uint8_t *)actual;
+    const size_t ssid_end = sizeof(expected->sta.ssid);
+    const size_t password_end = ssid_end + sizeof(expected->sta.password);
+    const size_t bssid_begin = offsetof(wifi_config_t, sta.bssid);
+    const size_t bssid_end = bssid_begin + sizeof(expected->sta.bssid);
+    const bool bssid_inactive = !expected->sta.bssid_set &&
+                                !actual->sta.bssid_set;
+    bool ssid_changed = false;
+    bool password_changed = false;
+    size_t other_first = sizeof(*expected);
+    size_t other_last = 0;
+    size_t other_count = 0;
+    for (size_t index = 0; index < sizeof(*expected); ++index) {
+        if (bssid_inactive && index >= bssid_begin && index < bssid_end)
+            continue;
+        if (left[index] == right[index]) continue;
+        if (index < ssid_end) ssid_changed = true;
+        else if (index < password_end) password_changed = true;
+        else {
+            if (other_first == sizeof(*expected)) other_first = index;
+            other_last = index;
+            ++other_count;
+        }
+    }
+    if (other_count != 0) {
+        ESP_LOGE("WPS_RESTORE",
+                 "verify_config ssid_changed=%u password_changed=%u "
+                 "other_first=%u other_last=%u other_count=%u size=%u",
+                 (unsigned)ssid_changed, (unsigned)password_changed,
+                 (unsigned)other_first, (unsigned)other_last,
+                 (unsigned)other_count, (unsigned)sizeof(*expected));
+    } else {
+        ESP_LOGE("WPS_RESTORE",
+                 "verify_config ssid_changed=%u password_changed=%u "
+                 "other_count=0 size=%u",
+                 (unsigned)ssid_changed, (unsigned)password_changed,
+                 (unsigned)sizeof(*expected));
+    }
+}
+
+static bool restored_config_matches(const wifi_config_t *expected,
+                                    const wifi_config_t *actual)
+{
+    const size_t bssid_offset = offsetof(wifi_config_t, sta.bssid);
+    const size_t after_bssid = bssid_offset + sizeof(expected->sta.bssid);
+    const uint8_t *left = (const uint8_t *)expected;
+    const uint8_t *right = (const uint8_t *)actual;
+    /* An inactive BSSID selector makes the stored BSSID bytes irrelevant.
+     * The selector and all other configuration bytes still have to match. */
+    return memcmp(left, right, bssid_offset) == 0 &&
+           memcmp(left + after_bssid, right + after_bssid,
+                  sizeof(*expected) - after_bssid) == 0 &&
+           (!expected->sta.bssid_set ||
+            memcmp(expected->sta.bssid, actual->sta.bssid,
+                   sizeof(expected->sta.bssid)) == 0);
+}
+
 /* A failed phase is retried without losing baseline credentials. Configuration
  * writes always use RAM; FLASH policy is reinstated only after all writes.
  * Readback failures restart restoration, including stopping a running driver. */
 static int borrowed_restore(void *opaque)
 {
     janos_wps_transport_context_t *context = opaque;
-    if (!context || context->terminal_failure) return ESP_ERR_INVALID_STATE;
-    if (context->rejected_baseline) return ESP_OK;
-    if (!context->borrowed || !context->snapshot)
+    if (!context) return ESP_ERR_INVALID_STATE;
+    context->failure_detail = NULL;
+    if (context->terminal_failure) {
+        context->failure_detail = "restore_precondition";
         return ESP_ERR_INVALID_STATE;
+    }
+    if (context->rejected_baseline) return ESP_OK;
+    if (!context->borrowed || !context->snapshot) {
+        context->failure_detail = "restore_precondition";
+        return ESP_ERR_INVALID_STATE;
+    }
     struct janos_wps_wifi_snapshot *snapshot = context->snapshot;
     esp_err_t error = ESP_OK;
+    static const char *const phase_names[] = {
+        "restore_stop", "restore_ram", "restore_mode", "restore_config",
+        "restore_mac", "restore_start", "restore_channel", "restore_storage",
+    };
     while (context->restore_phase < RESTORE_VERIFY) {
         switch (context->restore_phase) {
         case RESTORE_STOP:
@@ -201,23 +275,48 @@ static int borrowed_restore(void *opaque)
         case RESTORE_CHANNEL: error = esp_wifi_set_channel(snapshot->primary, snapshot->secondary); break;
         case RESTORE_STORAGE: error = janos_wps_wifi_set_storage(snapshot->storage); break;
         }
-        if (error != ESP_OK) return error;
+        if (error != ESP_OK) {
+            context->failure_detail = phase_names[context->restore_phase];
+            return error;
+        }
         context->restore_phase++;
     }
     wifi_mode_t mode = 0;
     uint8_t primary = 0;
     wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
+    const char *getter = "verify_get_mode";
     error = esp_wifi_get_mode(&mode);
-    if (error == ESP_OK) error = esp_wifi_get_config(WIFI_IF_STA, &snapshot->readback);
-    if (error == ESP_OK) error = esp_wifi_get_channel(&primary, &secondary);
-    if (error == ESP_OK) error = esp_wifi_get_mac(WIFI_IF_STA, context->restored_mac);
-    bool equal = error == ESP_OK && mode == snapshot->mode &&
-        memcmp(&snapshot->config, &snapshot->readback, sizeof(snapshot->config)) == 0 &&
-        primary == snapshot->primary && secondary == snapshot->secondary &&
-        memcmp(context->restored_mac, snapshot->mac, 6U) == 0 &&
-        host_wifi.known && host_wifi.running && host_wifi.storage == snapshot->storage;
+    if (error == ESP_OK) {
+        getter = "verify_get_config";
+        error = esp_wifi_get_config(WIFI_IF_STA, &snapshot->readback);
+    }
+    if (error == ESP_OK) {
+        getter = "verify_get_channel";
+        error = esp_wifi_get_channel(&primary, &secondary);
+    }
+    if (error == ESP_OK) {
+        getter = "verify_get_mac";
+        error = esp_wifi_get_mac(WIFI_IF_STA, context->restored_mac);
+    }
+    if (error != ESP_OK)
+        context->failure_detail = getter;
+    else if (mode != snapshot->mode)
+        context->failure_detail = "verify_mode";
+    else if (!restored_config_matches(&snapshot->config,
+                                      &snapshot->readback)) {
+        context->failure_detail = "verify_config";
+        log_config_difference(&snapshot->config, &snapshot->readback);
+    }
+    else if (primary != snapshot->primary || secondary != snapshot->secondary)
+        context->failure_detail = "verify_channel";
+    else if (memcmp(context->restored_mac, snapshot->mac, 6U) != 0)
+        context->failure_detail = "verify_mac";
+    else if (!host_wifi.known || !host_wifi.running)
+        context->failure_detail = "verify_host_running";
+    else if (host_wifi.storage != snapshot->storage)
+        context->failure_detail = "verify_storage";
     wipe(&snapshot->readback, sizeof(snapshot->readback));
-    if (!equal) {
+    if (context->failure_detail) {
         context->restore_phase = RESTORE_STOP;
         return error == ESP_OK ? ESP_ERR_INVALID_STATE : error;
     }
@@ -266,17 +365,29 @@ static int borrowed_appie(void *opaque, bool enabled)
 
 static int borrowed_wps(void *opaque, bool enabled)
 {
-    (void)opaque;
+    janos_wps_transport_context_t *context = opaque;
     if (!enabled) {
+        if (context) context->failure_detail = NULL;
         esp_err_t first = esp_wifi_set_wps_start_flag_internal(false);
         esp_err_t second = esp_wifi_set_wps_type_internal(WPS_TYPE_DISABLE);
         esp_err_t third = esp_wifi_set_wps_status_internal(WPS_STATUS_DISABLE);
+        if (context) {
+            if (first != ESP_OK) context->failure_detail = "wps_start_flag";
+            else if (second != ESP_OK) context->failure_detail = "wps_type";
+            else if (third != ESP_OK) context->failure_detail = "wps_status";
+        }
         return first != ESP_OK ? first : (second != ESP_OK ? second : third);
     }
     esp_err_t error = esp_wifi_set_wps_type_internal(WPS_TYPE_PIN);
     if (error == ESP_OK) error = esp_wifi_set_wps_status_internal(WPS_STATUS_PENDING);
     if (error == ESP_OK) error = esp_wifi_set_wps_start_flag_internal(true);
     return error;
+}
+
+static const char *borrowed_failure_detail(void *opaque)
+{
+    const janos_wps_transport_context_t *context = opaque;
+    return context ? context->failure_detail : NULL;
 }
 
 static int borrowed_disconnect(void *opaque)
@@ -289,6 +400,6 @@ static int borrowed_disconnect(void *opaque)
 const wps_transport_ops_t janos_wps_transport_ops = {
     borrowed_init, borrowed_start, borrowed_stop, borrowed_restore,
     borrowed_set_mac, borrowed_callbacks, borrowed_appie, borrowed_wps,
-    borrowed_disconnect,
+    borrowed_disconnect, borrowed_failure_detail,
 };
 

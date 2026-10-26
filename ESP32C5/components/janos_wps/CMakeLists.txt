@@ -44,4 +44,5 @@ idf_component_register(
                       "${JANOS_WPS_IDF_PATH}/components/wpa_supplicant/src"
                       "${JANOS_WPS_IDF_PATH}/components/mbedtls/mbedtls/include"
     REQUIRES esp_wifi esp_event esp_timer esp_hw_support heap nvs_flash
-             wpa_supplicant mbedtls fatfs sdmmc esp_driver_spi)
+             wpa_supplicant mbedtls fatfs sdmmc esp_driver_spi
+    PRIV_REQUIRES log)
