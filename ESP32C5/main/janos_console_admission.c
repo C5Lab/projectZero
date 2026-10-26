@@ -25,6 +25,7 @@ static bool is_status_read(const char *command, const char *subcommand)
 static bool is_always_safe(const char *command, const char *subcommand)
 {
     return equals(command, "stop") || equals(command, "reboot") ||
+           equals(command, "ping") || equals(command, "version") ||
            equals(command, "help") || equals(command, "show_scan_results") ||
            ((equals(command, "wps") || equals(command, "wifi_analyzer")) &&
             equals(subcommand, "stop")) || is_status_read(command, subcommand);

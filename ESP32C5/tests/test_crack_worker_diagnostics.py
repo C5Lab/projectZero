@@ -7,11 +7,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CrackWorkerDiagnosticsContractTest(unittest.TestCase):
-    def test_janos_version_is_1_7_5_everywhere(self):
+    def test_janos_version_matches_between_cmake_and_main(self):
         cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
         main = (ROOT / "main/main.c").read_text(encoding="utf-8")
-        self.assertIn('set(JANOS_VERSION "1.7.5")', cmake)
-        self.assertIn('#define JANOS_VERSION "1.7.5"', main)
+        cmake_version = re.search(r'(?m)^set\(JANOS_VERSION "(\d+\.\d+\.\d+)"\)$', cmake)
+        main_version = re.search(r'(?m)^#define JANOS_VERSION "(\d+\.\d+\.\d+)"$', main)
+        self.assertIsNotNone(cmake_version)
+        self.assertIsNotNone(main_version)
+        self.assertEqual(cmake_version.group(1), main_version.group(1))
 
     def test_ack32_receiver_records_live_component_boundaries(self):
         source = (ROOT / "main/crack_worker.c").read_text(encoding="utf-8")

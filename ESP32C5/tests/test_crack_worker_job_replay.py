@@ -59,8 +59,13 @@ def test_protocol_and_janos_version_remain_compatible():
     assert "protocol=4" in CORE
     assert "start=idempotent" in CORE
     assert "health=phase,progress_age_ms" in CORE
-    assert 'set(JANOS_VERSION "1.7.5")' in (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
-    assert '#define JANOS_VERSION "1.7.5"' in (ROOT / "main" / "main.c").read_text(encoding="utf-8")
+    cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+    main = (ROOT / "main" / "main.c").read_text(encoding="utf-8")
+    cmake_version = re.search(r'(?m)^set\(JANOS_VERSION "(\d+\.\d+\.\d+)"\)$', cmake)
+    main_version = re.search(r'(?m)^#define JANOS_VERSION "(\d+\.\d+\.\d+)"$', main)
+    assert cmake_version, "missing CMake JANOS_VERSION"
+    assert main_version, "missing main JANOS_VERSION"
+    assert cmake_version.group(1) == main_version.group(1)
 
 
 if __name__ == "__main__":

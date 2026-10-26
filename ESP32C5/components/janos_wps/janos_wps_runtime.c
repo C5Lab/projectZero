@@ -354,18 +354,16 @@ int janos_wps_command(int argc, char **argv)
     }
     if (argc == 2 && strcmp(argv[1], "stop") == 0) {
         runtime_stop_attempt_t attempt = runtime_stop_attempt(5000U);
-        /* A worker which already crossed the commit gate owns completion.
-         * Waiting for it is still required for safe global teardown, but the
-         * CLI must not claim that this late stop caused the completion. */
-        bool stopped_by_request = attempt.cancellation_accepted &&
-                                  attempt.joined;
+        /* Report the worker's actual quiescence.  A late stop need not have
+         * caused completion, but "stopped" must never precede the worker's
+         * terminal output and epilogue. */
         janos_wps_service_phase_t response_phase =
             !attempt.cancellation_accepted &&
             attempt.decision_phase != JANOS_WPS_SERVICE_IDLE &&
             attempt.final_phase != JANOS_WPS_SERVICE_QUARANTINED
                 ? attempt.decision_phase : attempt.final_phase;
         char response[160] = {0};
-        int result = janos_wps_stop_response(stopped_by_request,
+        int result = janos_wps_stop_response(attempt.joined,
                                              response_phase,
                                              response, sizeof(response));
         if (response[0] != '\0') printf("%s\n", response);

@@ -363,6 +363,15 @@ int main(int argc, char **argv)
                   "{\"schema_version\":1,\"record_type\":\"wps_stop\","
                   "\"result\":\"stop_pending\",\"phase\":\"cleanup\"}") == 0);
     memset(stop_response, 0, sizeof(stop_response));
+    /* The service can already be idle while its runtime worker epilogue is
+     * still live.  A stop response must not claim the worker was joined. */
+    assert(janos_wps_stop_response(
+               false, JANOS_WPS_SERVICE_IDLE, stop_response,
+               sizeof(stop_response)) == 0);
+    assert(strcmp(stop_response,
+                  "{\"schema_version\":1,\"record_type\":\"wps_stop\","
+                  "\"result\":\"stop_pending\",\"phase\":\"idle\"}") == 0);
+    memset(stop_response, 0, sizeof(stop_response));
     assert(janos_wps_stop_response(
                false, JANOS_WPS_SERVICE_QUARANTINED, stop_response,
                sizeof(stop_response)) != 0);

@@ -175,8 +175,9 @@ self-tests never publish a recovered credential.
 Phases are `idle`, `preparing`, `running`, `cleanup` and `quarantined`.
 
 `wps stop` cooperatively requests cancellation and waits up to five seconds for
-cleanup. Its response is one of these shapes (a pending phase can also be
-`preparing` or `running`):
+cleanup and the worker epilogue. Its response is one of these shapes (a
+pending phase can also be `preparing`, `running` or `idle` when the service is
+idle but the worker epilogue has not completed):
 
 ```text
 {"schema_version":1,"record_type":"wps_stop","result":"stopped","phase":"idle"}
@@ -184,13 +185,19 @@ cleanup. Its response is one of these shapes (a pending phase can also be
 {"schema_version":1,"record_type":"wps_stop","result":"quarantined","phase":"quarantined"}
 ```
 
-`stopped` and `stop_pending` return success. `quarantined` returns nonzero.
+`stopped` confirms that terminal output and the shared worker epilogue have
+completed, and returns success. The worker completion flag clears just before
+`vTaskDelete`, so this does not assert literal FreeRTOS task exit or that this
+particular stop request caused the operation to finish.
+`stop_pending` means that epilogue has not yet completed and also returns success.
+`quarantined` returns nonzero.
 Cancellation produces one terminal record with `operation_result:"cancelled"`,
 wipes the result vault and restores/releases the lease when cleanup succeeds.
 An operation that already crossed its irreversible success-file commit gate
-owns bounded completion: a late `wps stop` waits for safe teardown but reports
-`stop_pending` rather than falsely claiming `stopped`.
-The universal `stop` also joins WPS before legacy radio teardown.
+owns bounded completion: a late `wps stop` waits for safe teardown and reports
+`stop_pending` until the shared epilogue completes. A later stop reports
+`stopped` after terminal output and epilogue completion.
+The universal `stop` also waits for WPS completion before legacy radio teardown.
 
 Cancellation is polled during Pixie capture, offline search, verification
 delay/retry, campaign execution and M1-M7 processing. It also participates in

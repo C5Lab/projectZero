@@ -745,8 +745,8 @@ Requires an nRF24L01+ wired to SPI2 (SCK=6, MOSI=7, MISO=2, CSN=3, CE=4).
 
 - `stop` — stop ALL running operations. The universal cancel. Always acknowledges with `[WARDRIVE] STOPPED running=0|1`, including when nothing was running, so a host can wait for a known idle state instead of flushing the UART and assuming; `running=1` means a wardrive was active when the stop arrived. The human-readable "Wardrive promisc stopped ..." line is unchanged and still comes from the task itself.
 - `reboot` — reboot the device.
-- `ping` — connectivity test; replies `pong`.
-- `version` — print firmware version (`JanOS version: X.Y.Z`).
+- `ping` — connectivity test; replies `pong` even while another operation owns the radio.
+- `version` — print firmware version (`JanOS version: X.Y.Z`) even while another operation owns the radio.
 - `download` — reboot into ROM download (UART flashing) mode.
 - `help [command]` — list all commands or show help for one.
 

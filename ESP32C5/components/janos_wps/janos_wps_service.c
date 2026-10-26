@@ -89,7 +89,7 @@ int janos_wps_stop_response(bool joined,
     if (phase == JANOS_WPS_SERVICE_QUARANTINED) {
         result = "quarantined";
         command_result = 1;
-    } else if (joined || phase == JANOS_WPS_SERVICE_IDLE) {
+    } else if (joined) {
         result = "stopped";
         phase_name = "idle";
     }

@@ -47,6 +47,8 @@ static void policy_matrix(void)
         {JANOS_RADIO_OWNER_ANALYZER, "selftest", "transport", 0, true, JANOS_CONSOLE_BUSY_RADIO_LEASE},
         {JANOS_RADIO_OWNER_ANALYZER, "jwps", "campaign", 0, true, JANOS_CONSOLE_BUSY_RADIO_LEASE},
         {JANOS_RADIO_OWNER_ANALYZER, "wps", "stop", 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_ANALYZER, "ping", NULL, 0, true, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_ANALYZER, "version", NULL, 0, true, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "wps", "status", 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "wps", "stop", 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "wps", "verify", 0, false, JANOS_CONSOLE_ADMIT},
@@ -67,6 +69,8 @@ static void policy_matrix(void)
         {JANOS_RADIO_OWNER_WPS, "stop", NULL, 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "reboot", NULL, 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_WPS, "help", NULL, 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "ping", NULL, 0, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_WPS, "version", NULL, 0, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_NONE, "channel_view", NULL, 0, true, JANOS_CONSOLE_BUSY_WIFI_ANALYZER},
         {JANOS_RADIO_OWNER_NONE, "show_scan_results", NULL, 0, true, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_NONE, "wps", "status", 0, true, JANOS_CONSOLE_ADMIT},
@@ -81,6 +85,8 @@ static void policy_matrix(void)
         {JANOS_RADIO_OWNER_LEGACY, "wps", "stop", 1, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_LEGACY, "wifi_analyzer", "stop", 1, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_LEGACY, "start_portal", NULL, 0, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_LEGACY, "ping", NULL, 1, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_LEGACY, "version", NULL, 1, false, JANOS_CONSOLE_ADMIT},
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
