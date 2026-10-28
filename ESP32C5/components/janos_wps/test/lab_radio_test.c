@@ -26,6 +26,8 @@ typedef struct {
     bool mac_read_error;
     bool cancel_pending;
     unsigned cancel_polls;
+    unsigned terminal_resets;
+    uint8_t retained_snapshot[16];
 } fixture_t;
 
 static int event(fixture_t *fixture, char code)
@@ -207,6 +209,12 @@ static int transport_appie(void *context, bool enabled)
 static int transport_wps(void *context, bool enabled)
 { return event(context, enabled ? 'W' : 'w'); }
 static int transport_disconnect(void *context) { return event(context, 'D'); }
+static void transport_terminal_reset(void *context)
+{
+    fixture_t *fixture = context;
+    fixture->terminal_resets++;
+    memset(fixture->retained_snapshot, 0, sizeof(fixture->retained_snapshot));
+}
 
 static const wps_transport_ops_t transport_ops = {
     transport_init, transport_start, transport_stop, transport_deinit,
@@ -315,6 +323,19 @@ static void wrong_mac_readback_quarantines(void)
     assert(strcmp(radio.cleanup_diag.step, "boot_mac_mismatch") == 0);
     assert(radio.cleanup_diag.error == 0);
     assert(!wps_transport_cleanup_pending(&radio.transport));
+    memset(radio.scratch, 0xa5, radio.scratch_size);
+    memset(fixture.retained_snapshot, 0xa5, sizeof(fixture.retained_snapshot));
+    void *const scratch = radio.scratch;
+    assert(lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    assert(fixture.terminal_resets == 1);
+    for (size_t index = 0; index < sizeof(fixture.retained_snapshot); index++)
+        assert(fixture.retained_snapshot[index] == 0);
+    for (size_t index = 0; index < radio.scratch_size; index++)
+        assert(((const uint8_t *)scratch)[index] == 0);
+    assert(radio.scratch == scratch && radio.owner_token == token);
+    assert(lab_radio_is_quarantined(&radio));
+    assert(!lab_radio_release(&radio, 0).cleanup_ok);
+    free(scratch);
 }
 
 static void mac_read_error_has_distinct_cleanup_diagnostic(void)
@@ -346,6 +367,118 @@ static void adapter_cleanup_failure_forces_quarantine(void)
     assert(lab_radio_is_quarantined(&radio));
 }
 
+static void terminal_wipe_preserves_quarantined_owner(void)
+{
+    fixture_t fixture = {0};
+    const uint8_t boot_mac[6] = {0x3c, 0xdc, 0x75, 0x85, 0xfd, 0x80};
+    const uint8_t session[6] = {0x02, 6, 7, 8, 9, 10};
+    memcpy(fixture.current_mac, boot_mac, sizeof(boot_mac));
+    memset(fixture.retained_snapshot, 0xa5, sizeof(fixture.retained_snapshot));
+    lab_platform_t platform;
+    lab_platform_init(&platform, &platform_ops, &fixture, NULL);
+    lab_radio_t radio;
+    lab_radio_init(&radio, &platform, &transport_ops, &fixture, boot_mac);
+    uint32_t token = 0;
+    assert(lab_radio_acquire(&radio, session, 48, &token));
+    void *const scratch = radio.scratch;
+    memset(scratch, 0xa5, radio.scratch_size);
+    assert(!lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    assert(((const uint8_t *)scratch)[0] == 0xa5);
+    assert(fixture.terminal_resets == 0);
+    assert(lab_radio_mark_running(&radio, token));
+    assert(!lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    fixture.fail_code = 'i';
+    lab_radio_result_t released = lab_radio_release(&radio, 0);
+    assert(!released.cleanup_ok && released.quarantined);
+    assert(lab_radio_is_quarantined(&radio));
+    assert(wps_transport_cleanup_pending(&radio.transport));
+    assert(!lab_radio_terminal_wipe(&radio, NULL));
+    assert(((const uint8_t *)scratch)[0] == 0xa5);
+    assert(fixture.terminal_resets == 0);
+
+    const size_t trace_length = fixture.trace_length;
+    assert(lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    for (size_t index = 0; index < radio.scratch_size; index++)
+        assert(((const uint8_t *)scratch)[index] == 0);
+    for (size_t index = 0; index < sizeof(fixture.retained_snapshot); index++)
+        assert(fixture.retained_snapshot[index] == 0);
+    assert(fixture.terminal_resets == 1);
+    assert(fixture.allocations == 1 && fixture.frees == 0);
+    assert(radio.scratch == scratch && radio.owner_token == token);
+    assert(lab_radio_is_quarantined(&radio));
+    assert(wps_transport_cleanup_pending(&radio.transport));
+    assert(!lab_radio_accept_callback(&radio, token));
+    assert(fixture.trace_length == trace_length);
+    assert(lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    assert(fixture.terminal_resets == 1 && fixture.trace_length == trace_length);
+    fixture.fail_code = 0;
+    released = lab_radio_release(&radio, 0);
+    assert(!released.cleanup_ok && released.quarantined);
+    assert(lab_radio_is_quarantined(&radio));
+    assert(radio.owner_token == token && radio.scratch == scratch);
+    assert(fixture.trace_length == trace_length);
+
+    free(scratch);
+}
+
+static void terminal_wipe_accepts_only_empty_idle(void)
+{
+    fixture_t fixture = {0};
+    const uint8_t boot_mac[6] = {0x3c, 0xdc, 0x75, 0x85, 0xfd, 0x80};
+    lab_platform_t platform;
+    lab_platform_init(&platform, &platform_ops, &fixture, NULL);
+    lab_radio_t radio;
+    lab_radio_init(&radio, &platform, &transport_ops, &fixture, boot_mac);
+    assert(radio.phase == LAB_RADIO_IDLE);
+    assert(radio.owner_token == 0 && radio.scratch == NULL);
+    assert(!wps_transport_cleanup_pending(&radio.transport));
+    memset(fixture.retained_snapshot, 0xa5, sizeof(fixture.retained_snapshot));
+
+    assert(!lab_radio_terminal_wipe(&radio, NULL));
+    radio.owner_token = 7;
+    assert(!lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    radio.owner_token = 0;
+
+    uint8_t fake_scratch[4] = {0xa5, 0xa5, 0xa5, 0xa5};
+    radio.scratch = fake_scratch;
+    assert(!lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    radio.scratch = NULL;
+    radio.scratch_size = sizeof(fake_scratch);
+    assert(!lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    radio.scratch_size = 0;
+
+    radio.transport.initialized = true;
+    assert(!lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    radio.transport.initialized = false;
+    radio.transport.active = true;
+    assert(!lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    radio.transport.active = false;
+
+    atomic_store(&radio.callback_token, 9);
+    assert(!lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    atomic_store(&radio.callback_token, 0);
+    atomic_store(&radio.callbacks_open, true);
+    assert(!lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    atomic_store(&radio.callbacks_open, false);
+    radio.cancel_requested = true;
+    assert(!lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    radio.cancel_requested = false;
+
+    assert(fixture.terminal_resets == 0 && !radio.terminal_wiped);
+    assert(fixture.retained_snapshot[0] == 0xa5);
+    assert(lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    assert(fixture.terminal_resets == 1 && radio.terminal_wiped);
+    for (size_t index = 0; index < sizeof(fixture.retained_snapshot); index++)
+        assert(fixture.retained_snapshot[index] == 0);
+    assert(radio.phase == LAB_RADIO_IDLE && radio.owner_token == 0);
+    assert(radio.scratch == NULL && radio.scratch_size == 0);
+    assert(atomic_load(&radio.callback_token) == 0);
+    assert(!atomic_load(&radio.callbacks_open));
+    assert(fixture.trace_length == 0);
+    assert(lab_radio_terminal_wipe(&radio, transport_terminal_reset));
+    assert(fixture.terminal_resets == 1);
+}
+
 int main(void)
 {
     platform_contract();
@@ -355,6 +488,8 @@ int main(void)
     wrong_mac_readback_quarantines();
     mac_read_error_has_distinct_cleanup_diagnostic();
     adapter_cleanup_failure_forces_quarantine();
+    terminal_wipe_preserves_quarantined_owner();
+    terminal_wipe_accepts_only_empty_idle();
     puts("PASS: WPS lab radio owner");
     return 0;
 }

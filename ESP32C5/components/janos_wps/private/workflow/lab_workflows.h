@@ -88,6 +88,11 @@ const char *lab_workflows_storage_result(const lab_workflows_t *workflows);
 /* `not_required` means the workflow failed or completed before acquiring the
  * adapter radio.  It is a successful no-op cleanup for the outer lease. */
 bool lab_workflows_cleanup_succeeded(const char *cleanup_result);
+/* Applies the adapter-close result after callbacks have been cancelled and
+ * the adapter has closed; releases the radio and records quarantine. */
+void lab_workflows_finish_session_cleanup(
+    lab_radio_t *radio, bool adapter_cleanup_ok,
+    lab_workflow_session_outcome_t *outcome);
 /* Polls once and latches cancellation on the active radio owner. */
 bool lab_workflows_poll_cancel(lab_workflows_t *workflows);
 void lab_workflows_deinit(lab_workflows_t *workflows);

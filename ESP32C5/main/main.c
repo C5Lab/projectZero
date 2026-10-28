@@ -123,6 +123,7 @@
 #include "led_cli_activity.h"
 #include "led_target_cache.h"
 #include "janos_console_admission.h"
+#include "janos_download_flow.h"
 #include "janos_radio_lease.h"
 #include "janos_wps_runtime.h"
 #include "janos_wps_command.h"
@@ -19770,63 +19771,138 @@ static int cmd_deauth_detector(int argc, char **argv) {
     return 0;
 }
 
-static int cmd_download(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
+typedef struct {
+    uint32_t original_boot_option;
+} download_rom_context_t;
 
-#if (HAS_RTC_CNTL_REG && defined(RTC_CNTL_OPTION1_REG) && defined(RTC_CNTL_FORCE_DOWNLOAD_BOOT)) || \
-    (HAS_LP_AON_REG && defined(LP_AON_SYS_CFG_REG) && defined(LP_AON_FORCE_DOWNLOAD_BOOT) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_S) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_M))
-    janos_radio_lease_snapshot_t lease = janos_radio_lease_snapshot(&janos_radio_lease);
-    bool wps_quarantined = lease.owner == JANOS_RADIO_OWNER_WPS &&
-                           lease.state == JANOS_RADIO_LEASE_QUARANTINED;
-    if (wps_quarantined) {
-        /* The WPS worker may still be emitting its terminal record. It owns
-         * the failed-restore radio until reset, so do not run generic teardown. */
-        if (!janos_wps_runtime_wait_quarantined_download(5000U)) {
-            MY_LOG_INFO(TAG, "Download refused: quarantined WPS worker not quiescent");
-            return 1;
-        }
-    } else {
-        if (cmd_stop(0, NULL) != 0) return 1;
-        /* Preserve the normal download path after a successful global stop. */
-        (void)esp_wifi_stop();
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-#endif
+static bool download_wait_wps(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    return janos_wps_runtime_wait_quarantined_download(timeout_ms);
+}
 
+static int download_stop_all(void *context)
+{
+    (void)context;
+    return cmd_stop(0, NULL);
+}
+
+static void download_stop_wifi(void *context)
+{
+    (void)context;
+    (void)esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(50));
+}
+
+static void download_drain_uart(void *context)
+{
+    (void)context;
 #if HAS_RTC_CNTL_REG && defined(RTC_CNTL_OPTION1_REG) && defined(RTC_CNTL_FORCE_DOWNLOAD_BOOT)
     MY_LOG_INFO(TAG, "Rebooting into download mode. Connect via UART/USB-UART bridge to flash.");
+#elif HAS_LP_AON_REG && defined(LP_AON_SYS_CFG_REG) && defined(LP_AON_FORCE_DOWNLOAD_BOOT) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_S) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_M)
+    MY_LOG_INFO(TAG, "Rebooting into download mode (LP AON). Connect via UART/USB-UART bridge to flash.");
+#else
+    return;
+#endif
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(50));
-    // Force next boot into the ROM download (serial flashing) mode
-    uint32_t original_option = REG_READ(RTC_CNTL_OPTION1_REG);
+}
+
+static bool download_arm_rom(void *context)
+{
+    download_rom_context_t *rom = context;
+#if HAS_RTC_CNTL_REG && defined(RTC_CNTL_OPTION1_REG) && defined(RTC_CNTL_FORCE_DOWNLOAD_BOOT)
+    rom->original_boot_option = REG_READ(RTC_CNTL_OPTION1_REG);
     REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
 #if defined(RTC_CNTL_SW_CPU_STALL_REG)
     REG_WRITE(RTC_CNTL_SW_CPU_STALL_REG, 0);
 #endif
-    esp_rom_software_reset_system();
-
-    REG_WRITE(RTC_CNTL_OPTION1_REG, original_option);
-    MY_LOG_INFO(TAG, "Download reset returned unexpectedly");
-    return 1;
+    return true;
 #elif HAS_LP_AON_REG && defined(LP_AON_SYS_CFG_REG) && defined(LP_AON_FORCE_DOWNLOAD_BOOT) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_S) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_M)
-    MY_LOG_INFO(TAG, "Rebooting into download mode (LP AON). Connect via UART/USB-UART bridge to flash.");
-    fflush(stdout);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    // Set LP_AON_FORCE_DOWNLOAD_BOOT to 01 (boot0 download)
-    uint32_t cfg = REG_READ(LP_AON_SYS_CFG_REG);
-    uint32_t download_cfg = (cfg & ~LP_AON_FORCE_DOWNLOAD_BOOT_M) |
-                            (1U << LP_AON_FORCE_DOWNLOAD_BOOT_S);
+    rom->original_boot_option = REG_READ(LP_AON_SYS_CFG_REG);
+    uint32_t download_cfg =
+        (rom->original_boot_option & ~LP_AON_FORCE_DOWNLOAD_BOOT_M) |
+        (1U << LP_AON_FORCE_DOWNLOAD_BOOT_S);
     REG_WRITE(LP_AON_SYS_CFG_REG, download_cfg);
-
-    esp_rom_software_reset_system();
-    REG_WRITE(LP_AON_SYS_CFG_REG, cfg);
-    MY_LOG_INFO(TAG, "Download reset returned unexpectedly");
-    return 1;
+    return true;
 #else
-    MY_LOG_INFO(TAG, "Download mode forcing not supported on this target/SDK.");
-    return 1;
+    (void)rom;
+    return false;
 #endif
+}
+
+static void download_restore_rom(void *context)
+{
+    download_rom_context_t *rom = context;
+#if HAS_RTC_CNTL_REG && defined(RTC_CNTL_OPTION1_REG) && defined(RTC_CNTL_FORCE_DOWNLOAD_BOOT)
+    REG_WRITE(RTC_CNTL_OPTION1_REG, rom->original_boot_option);
+#elif HAS_LP_AON_REG && defined(LP_AON_SYS_CFG_REG) && defined(LP_AON_FORCE_DOWNLOAD_BOOT) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_S) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_M)
+    REG_WRITE(LP_AON_SYS_CFG_REG, rom->original_boot_option);
+#else
+    (void)rom;
+#endif
+}
+
+static bool download_terminal_wipe(void *context)
+{
+    (void)context;
+    return janos_wps_runtime_terminal_wipe_quarantined();
+}
+
+static void download_reset_rom(void *context)
+{
+    (void)context;
+    esp_rom_software_reset_system();
+}
+
+static int cmd_download(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    download_rom_context_t rom = {0};
+    const janos_download_flow_ops_t ops = {
+        .context = &rom,
+#if (HAS_RTC_CNTL_REG && defined(RTC_CNTL_OPTION1_REG) && defined(RTC_CNTL_FORCE_DOWNLOAD_BOOT)) || \
+    (HAS_LP_AON_REG && defined(LP_AON_SYS_CFG_REG) && defined(LP_AON_FORCE_DOWNLOAD_BOOT) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_S) && defined(LP_AON_FORCE_DOWNLOAD_BOOT_M))
+        .rom_supported = true,
+#else
+        .rom_supported = false,
+#endif
+        .wait_wps_quarantined = download_wait_wps,
+        .stop_all = download_stop_all,
+        .stop_wifi = download_stop_wifi,
+        .drain_uart = download_drain_uart,
+        .arm_rom = download_arm_rom,
+        .restore_rom = download_restore_rom,
+        .terminal_wipe = download_terminal_wipe,
+        .reset_rom = download_reset_rom,
+    };
+    janos_download_result_t result = janos_download_flow_run(
+        janos_radio_lease_snapshot(&janos_radio_lease), &ops, 5000U);
+    switch (result) {
+    case JANOS_DOWNLOAD_UNSUPPORTED:
+        MY_LOG_INFO(TAG, "Download mode forcing not supported on this target/SDK.");
+        break;
+    case JANOS_DOWNLOAD_WPS_NOT_QUIESCENT:
+        MY_LOG_INFO(TAG, "Download refused: quarantined WPS worker not quiescent");
+        break;
+    case JANOS_DOWNLOAD_WIPE_FAILED:
+        MY_LOG_INFO(TAG, "Download refused: quarantined WPS buffers not safely wiped");
+        break;
+    case JANOS_DOWNLOAD_RESET_RETURNED:
+        MY_LOG_INFO(TAG, "Download reset returned unexpectedly");
+        break;
+    case JANOS_DOWNLOAD_REFUSED_OWNER:
+        MY_LOG_INFO(TAG, "Download refused: radio owner changed");
+        break;
+    case JANOS_DOWNLOAD_INVALID_HOOKS:
+    case JANOS_DOWNLOAD_ARM_FAILED:
+        MY_LOG_INFO(TAG, "Download refused: ROM reset preparation failed");
+        break;
+    case JANOS_DOWNLOAD_STOP_FAILED:
+        break; /* cmd_stop already reported the reason. */
+    }
+    return 1;
 }
 
 static int cmd_reboot(int argc, char **argv)

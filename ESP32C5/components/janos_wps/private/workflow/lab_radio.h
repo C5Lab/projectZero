@@ -40,6 +40,7 @@ typedef struct {
     atomic_bool callbacks_open;
     lab_radio_phase_t phase;
     bool cancel_requested;
+    bool terminal_wiped;
     lab_radio_cleanup_diag_t cleanup_diag;
 } lab_radio_t;
 
@@ -57,5 +58,10 @@ bool lab_radio_accept_callback(const lab_radio_t *radio, uint32_t owner_token);
 lab_radio_result_t lab_radio_release(lab_radio_t *radio, int workflow_result);
 void lab_radio_quarantine(lab_radio_t *radio);
 bool lab_radio_is_quarantined(const lab_radio_t *radio);
+/* Caller must first join the WPS worker and verify outer service/lease
+ * quarantine. Empty IDLE is allowed when quarantine preceded radio acquisition.
+ * Wipes retained scratch and resets transport without releasing radio ownership. */
+bool lab_radio_terminal_wipe(lab_radio_t *radio,
+                             void (*transport_reset)(void *context));
 
 #endif

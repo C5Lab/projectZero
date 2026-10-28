@@ -376,6 +376,24 @@ static void persist_observation(lab_workflows_t *workflows,
         workflows->storage_result = "unmount_error";
 }
 
+void lab_workflows_finish_session_cleanup(
+    lab_radio_t *radio, bool adapter_cleanup_ok,
+    lab_workflow_session_outcome_t *outcome)
+{
+    if (radio && lab_radio_is_quarantined(radio))
+        adapter_cleanup_ok = false;
+    if (radio && radio->owner_token != 0) {
+        lab_radio_result_t released = lab_radio_release(
+            radio, (int)outcome->result.session_result);
+        outcome->cleanup_ok = adapter_cleanup_ok && released.cleanup_ok;
+        outcome->quarantined = released.quarantined || !adapter_cleanup_ok;
+        if (!adapter_cleanup_ok) lab_radio_quarantine(radio);
+    } else {
+        outcome->cleanup_ok = adapter_cleanup_ok;
+        outcome->quarantined = radio && lab_radio_is_quarantined(radio);
+    }
+}
+
 #if defined(ESP_PLATFORM)
 static void *db_alloc(size_t bytes, void *context)
 {
@@ -477,19 +495,8 @@ cleanup:
     if (workflows->radio && workflows->radio->owner_token != 0)
         lab_radio_cancel(workflows->radio, workflows->radio->owner_token);
     bool adapter_cleanup_ok = lab_wps_esp_session_close(adapter);
-    if (workflows->radio && lab_radio_is_quarantined(workflows->radio))
-        adapter_cleanup_ok = false;
-    if (workflows->radio && workflows->radio->owner_token != 0) {
-        lab_radio_result_t released = lab_radio_release(
-            workflows->radio, (int)outcome.result.session_result);
-        outcome.cleanup_ok = adapter_cleanup_ok && released.cleanup_ok;
-        outcome.quarantined = released.quarantined || !adapter_cleanup_ok;
-        if (!adapter_cleanup_ok) lab_radio_quarantine(workflows->radio);
-    } else {
-        outcome.cleanup_ok = adapter_cleanup_ok;
-        outcome.quarantined = workflows->radio &&
-                              lab_radio_is_quarantined(workflows->radio);
-    }
+    lab_workflows_finish_session_cleanup(workflows->radio, adapter_cleanup_ok,
+                                         &outcome);
     secure_wipe(session_mac, sizeof(session_mac));
     return outcome;
 }

@@ -74,6 +74,7 @@ bool lab_radio_acquire(lab_radio_t *radio,
     radio->owner_token = token;
     radio->phase = LAB_RADIO_PREPARING;
     radio->cancel_requested = false;
+    radio->terminal_wiped = false;
     radio->cleanup_diag = (lab_radio_cleanup_diag_t){0};
     atomic_store_explicit(&radio->callback_token, token, memory_order_release);
     atomic_store_explicit(&radio->callbacks_open, false, memory_order_release);
@@ -143,7 +144,8 @@ lab_radio_result_t lab_radio_release(lab_radio_t *radio, int workflow_result)
         .cleanup_ok = false,
         .quarantined = true,
     };
-    if (!radio || radio->owner_token == 0) return result;
+    if (!radio || radio->owner_token == 0 || radio->terminal_wiped)
+        return result;
 
     atomic_store_explicit(&radio->callbacks_open, false, memory_order_release);
     radio->cleanup_diag = (lab_radio_cleanup_diag_t){0};
@@ -170,6 +172,34 @@ lab_radio_result_t lab_radio_release(lab_radio_t *radio, int workflow_result)
 bool lab_radio_is_quarantined(const lab_radio_t *radio)
 {
     return radio && radio->phase == LAB_RADIO_QUARANTINED;
+}
+
+bool lab_radio_terminal_wipe(lab_radio_t *radio,
+                             void (*transport_reset)(void *context))
+{
+    if (!radio || !transport_reset || radio->transport.active ||
+        atomic_load_explicit(&radio->callbacks_open, memory_order_acquire))
+        return false;
+    if (radio->phase == LAB_RADIO_IDLE) {
+        if (radio->owner_token != 0 || radio->scratch != NULL ||
+            radio->scratch_size != 0 || radio->cancel_requested ||
+            atomic_load_explicit(&radio->callback_token, memory_order_acquire) != 0 ||
+            wps_transport_cleanup_pending(&radio->transport))
+            return false;
+    } else if (radio->phase == LAB_RADIO_QUARANTINED) {
+        if ((radio->scratch == NULL) != (radio->scratch_size == 0U))
+            return false;
+    } else {
+        return false;
+    }
+    if (radio->terminal_wiped) return true;
+    if (!radio->transport.context) return false;
+    volatile unsigned char *bytes = radio->scratch;
+    for (size_t index = 0; index < radio->scratch_size; index++)
+        bytes[index] = 0;
+    transport_reset(radio->transport.context);
+    radio->terminal_wiped = true;
+    return true;
 }
 
 void lab_radio_quarantine(lab_radio_t *radio)

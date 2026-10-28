@@ -44,7 +44,51 @@ typedef struct {
     size_t flow_length;
     char emitted[4096];
     size_t emitted_length;
+    lab_radio_t *radio_for_cleanup;
+    bool exercise_radio_cleanup;
+    bool fail_transport_selftest;
+    bool exercise_adapter_cleanup;
+    bool adapter_close_ok;
+    bool adapter_outcome_cleanup_ok;
+    bool adapter_outcome_quarantined;
+    uint8_t current_mac[6];
 } fixture_t;
+
+static int diagnostic_transport_ok(void *opaque)
+{ (void)opaque; return 0; }
+static int diagnostic_transport_restore_fail(void *opaque)
+{ (void)opaque; return 259; }
+static int diagnostic_transport_set_mac(void *opaque, const uint8_t mac[6])
+{ (void)opaque; (void)mac; return 0; }
+static int diagnostic_transport_toggle(void *opaque, bool enabled)
+{ (void)opaque; (void)enabled; return 0; }
+static const char *diagnostic_transport_detail(void *opaque)
+{ (void)opaque; return "verify_config"; }
+static const wps_transport_ops_t diagnostic_transport_ops = {
+    .init = diagnostic_transport_ok,
+    .start = diagnostic_transport_ok,
+    .stop = diagnostic_transport_ok,
+    .deinit = diagnostic_transport_restore_fail,
+    .set_mac = diagnostic_transport_set_mac,
+    .callbacks = diagnostic_transport_toggle,
+    .appie = diagnostic_transport_toggle,
+    .wps = diagnostic_transport_toggle,
+    .disconnect = diagnostic_transport_ok,
+    .failure_detail = diagnostic_transport_detail,
+};
+static int clean_transport_set_mac(void *opaque, const uint8_t mac[6])
+{ memcpy(((fixture_t *)opaque)->current_mac, mac, 6); return 0; }
+static const wps_transport_ops_t clean_transport_ops = {
+    .init = diagnostic_transport_ok,
+    .start = diagnostic_transport_ok,
+    .stop = diagnostic_transport_ok,
+    .deinit = diagnostic_transport_ok,
+    .set_mac = clean_transport_set_mac,
+    .callbacks = diagnostic_transport_toggle,
+    .appie = diagnostic_transport_toggle,
+    .wps = diagnostic_transport_toggle,
+    .disconnect = diagnostic_transport_ok,
+};
 
 static void capture_output(void *opaque, const char *line)
 {
@@ -97,6 +141,12 @@ static uint64_t now_ms(void *opaque)
     return 1234;
 }
 
+static int read_sta_mac(void *opaque, uint8_t mac[6])
+{
+    memcpy(mac, ((fixture_t *)opaque)->current_mac, 6);
+    return 0;
+}
+
 static bool poll_cancel(void *opaque)
 {
     return ((fixture_t *)opaque)->cancel_pending;
@@ -108,6 +158,7 @@ static const lab_platform_ops_t platform_ops = {
     .psram_alloc = alloc_psram,
     .psram_free = free_psram,
     .monotonic_ms = now_ms,
+    .read_sta_mac = read_sta_mac,
     .poll_cancel = poll_cancel,
 };
 
@@ -179,6 +230,30 @@ static lab_workflow_session_outcome_t capture_pixie(
     };
     out.result.session_result = f->capture_result;
     out.result.fatal_reason = f->capture_fatal_reason;
+    if (f->exercise_radio_cleanup) {
+        static const uint8_t session_mac[6] = {0x02, 6, 7, 8, 9, 10};
+        uint32_t owner = 0;
+        assert(f->radio_for_cleanup);
+        assert(lab_radio_acquire(f->radio_for_cleanup, session_mac, 0, &owner));
+        assert(lab_radio_mark_running(f->radio_for_cleanup, owner));
+        lab_radio_result_t released =
+            lab_radio_release(f->radio_for_cleanup, (int)f->capture_result);
+        out.cleanup_ok = released.cleanup_ok;
+        out.quarantined = released.quarantined;
+    }
+    if (f->exercise_adapter_cleanup) {
+        static const uint8_t session_mac[6] = {0x02, 6, 7, 8, 9, 10};
+        uint32_t owner = 0;
+        assert(f->radio_for_cleanup);
+        assert(lab_radio_acquire(f->radio_for_cleanup, session_mac, 32, &owner));
+        assert(f->radio_for_cleanup->scratch != NULL);
+        assert(lab_radio_mark_running(f->radio_for_cleanup, owner));
+        lab_radio_cancel(f->radio_for_cleanup, owner);
+        lab_workflows_finish_session_cleanup(f->radio_for_cleanup,
+                                             f->adapter_close_ok, &out);
+        f->adapter_outcome_cleanup_ok = out.cleanup_ok;
+        f->adapter_outcome_quarantined = out.quarantined;
+    }
     memcpy(out.result.identity.manufacturer, "LabVendor", 10);
     memcpy(out.result.identity.model_name, "LabModel", 9);
     memcpy(out.result.identity.device_name, "LabDevice", 10);
@@ -215,7 +290,8 @@ static bool selftest(void *opaque, lab_command_kind_t kind)
     unsigned index = (unsigned)kind - (unsigned)LAB_COMMAND_SELFTEST_DB;
     assert(index < 4);
     ++f->selftests[index];
-    return true;
+    return !(f->fail_transport_selftest &&
+             kind == LAB_COMMAND_SELFTEST_TRANSPORT);
 }
 
 static lab_store_status_t store_success(void *opaque,
@@ -529,7 +605,10 @@ static void pixie_stops_after_capture_lock_or_cleanup_failure(void)
     };
     lab_platform_t platform;
     lab_platform_init(&platform, &platform_ops, &f, NULL);
-    lab_radio_t radio = {0};
+    const uint8_t boot_mac[6] = {0x02, 1, 2, 3, 4, 5};
+    lab_radio_t radio;
+    lab_radio_init(&radio, &platform, &diagnostic_transport_ops, &f, boot_mac);
+    f.radio_for_cleanup = &radio;
     lab_workflows_t workflows;
     assert(lab_workflows_init_with_ops(&workflows, &platform, &radio,
                                        &workflow_ops, &f));
@@ -542,13 +621,11 @@ static void pixie_stops_after_capture_lock_or_cleanup_failure(void)
     assert(f.captures == 1 && f.searches == 0 && f.verifies == 0);
 
     f.capture_result = WPS_SESSION_SUCCESS;
-    f.cleanup_ok = false;
-    radio.cleanup_diag = (lab_radio_cleanup_diag_t){
-        .step = "snapshot_restore", .detail = "verify_config",
-        .error_domain = "esp", .error = 259,
-    };
+    f.exercise_radio_cleanup = true;
     execute(&workflows, &cmd, &vault, 29, "pixie_capture_failed", "failed");
     assert(f.captures == 2 && f.searches == 0 && f.verifies == 0);
+    assert(lab_radio_is_quarantined(&radio));
+    assert(radio.owner_token != 0);
     assert(strstr(f.emitted,
                   "\"operation_id\":29,\"type\":\"wps_stage\","
                   "\"stage\":\"cleanup_failure\","
@@ -556,6 +633,10 @@ static void pixie_stops_after_capture_lock_or_cleanup_failure(void)
                   "\"step\":\"snapshot_restore\","
                   "\"detail\":\"verify_config\","
                   "\"error_domain\":\"esp\",\"error\":259") != NULL);
+    const char *cleanup_stage = strstr(f.emitted, "\"stage\":\"cleanup_failure\"");
+    assert(cleanup_stage);
+    assert(strstr(cleanup_stage + 1, "\"stage\":\"cleanup_failure\"") == NULL);
+    assert(strstr(cleanup_stage, "12345670") == NULL);
 
     lab_workflows_deinit(&workflows);
 }
@@ -583,7 +664,11 @@ static void known_pin_and_selftests(void)
     lab_secret_erase(&vault);
     f.verify_result_index = 0;
     f.cleanup_ok = false;
+    lab_workflows_set_emitter(&workflows, capture_output, &f);
     execute(&workflows, &cmd, &vault, 311, "pin_and_m7_verified", "failed");
+    assert(strstr(f.emitted, "\"stage\":\"cleanup_failure\"") != NULL);
+    assert(strstr(f.emitted, "lab-network-key") == NULL);
+    assert(strstr(f.emitted, "12345670") == NULL);
     assert(lab_secret_status(&vault, 1234).state == LAB_SECRET_EMPTY);
     assert(f.stored_successes == 1);
     assert(f.stored_observations == 1);
@@ -602,6 +687,88 @@ static void known_pin_and_selftests(void)
         assert(f.selftests[i] == 1);
     }
     lab_workflows_deinit(&workflows);
+}
+
+static void failed_transport_selftest_reports_unknown_cleanup_source(void)
+{
+    fixture_t f = {.fail_transport_selftest = true};
+    lab_platform_t platform;
+    lab_platform_init(&platform, &platform_ops, &f, NULL);
+    lab_workflows_t workflows;
+    assert(lab_workflows_init_with_ops(&workflows, &platform, NULL,
+                                       &workflow_ops, &f));
+    lab_workflows_set_emitter(&workflows, capture_output, &f);
+    lab_secret_vault_t vault;
+    lab_secret_init(&vault, observed_wipe);
+    lab_command_t cmd = command(LAB_COMMAND_SELFTEST_TRANSPORT);
+    execute(&workflows, &cmd, &vault, 36, "selftest_failed", "failed");
+    assert(f.selftests[2] == 1);
+    const char *stage = strstr(f.emitted, "\"stage\":\"cleanup_failure\"");
+    assert(stage);
+    assert(strstr(stage, "\"source\":\"unknown\","
+                         "\"step\":\"unknown\","
+                         "\"detail\":\"none\","
+                         "\"error_domain\":\"none\","
+                         "\"error\":0}") != NULL);
+    assert(strstr(stage + 1, "\"stage\":\"cleanup_failure\"") == NULL);
+    lab_workflows_deinit(&workflows);
+}
+
+static void adapter_close_result_controls_workflow_cleanup(void)
+{
+    const uint8_t boot_mac[6] = {0x02, 1, 2, 3, 4, 5};
+    for (unsigned case_index = 0; case_index < 2; ++case_index) {
+        bool close_ok = case_index == 1;
+        fixture_t f = {
+            .mount_ok = true,
+            .cleanup_ok = true,
+            .capture_result = WPS_SESSION_SETUP_LOCKED,
+            .exercise_adapter_cleanup = true,
+            .adapter_close_ok = close_ok,
+        };
+        memcpy(f.current_mac, boot_mac, sizeof(boot_mac));
+        lab_platform_t platform;
+        lab_platform_init(&platform, &platform_ops, &f, NULL);
+        lab_radio_t radio;
+        lab_radio_init(&radio, &platform, &clean_transport_ops, &f, boot_mac);
+        f.radio_for_cleanup = &radio;
+        lab_workflows_t workflows;
+        assert(lab_workflows_init_with_ops(&workflows, &platform, &radio,
+                                           &workflow_ops, &f));
+        lab_workflows_set_emitter(&workflows, capture_output, &f);
+        lab_secret_vault_t vault;
+        lab_secret_init(&vault, observed_wipe);
+        lab_command_t cmd = command(LAB_COMMAND_WPS_PIXIE);
+        execute(&workflows, &cmd, &vault, 37 + case_index,
+                close_ok ? "capture_setup_locked" : "pixie_capture_failed",
+                close_ok ? "ok" : "failed");
+
+        assert(f.captures == 1 && f.searches == 0 && f.verifies == 0);
+        assert(f.adapter_outcome_cleanup_ok == close_ok);
+        assert(f.adapter_outcome_quarantined == !close_ok);
+        assert(radio.phase == (close_ok ? LAB_RADIO_IDLE :
+                                         LAB_RADIO_QUARANTINED));
+        assert(radio.owner_token == 0);
+        assert(radio.scratch == NULL && radio.scratch_size == 0);
+        assert(!wps_transport_cleanup_pending(&radio.transport));
+        assert(radio.cleanup_diag.step == NULL);
+        assert(f.frees == 1);
+        const char *stage = strstr(f.emitted,
+                                   "\"stage\":\"cleanup_failure\"");
+        if (close_ok) {
+            assert(stage == NULL);
+        } else {
+            assert(stage != NULL);
+            assert(strstr(stage, "\"source\":\"unknown\","
+                                 "\"step\":\"unknown\","
+                                 "\"detail\":\"none\","
+                                 "\"error_domain\":\"none\","
+                                 "\"error\":0}") != NULL);
+            assert(strstr(stage + 1,
+                          "\"stage\":\"cleanup_failure\"") == NULL);
+        }
+        lab_workflows_deinit(&workflows);
+    }
 }
 
 static void foreground_q_cancels_radio_owner(void)
@@ -660,6 +827,8 @@ int main(void)
     pixie_cancels_during_retry_delay();
     pixie_stops_after_capture_lock_or_cleanup_failure();
     known_pin_and_selftests();
+    failed_transport_selftest_reports_unknown_cleanup_source();
+    adapter_close_result_controls_workflow_cleanup();
     foreground_q_cancels_radio_owner();
     pixie_reports_adapter_open_failure_reason();
     puts("PASS: WPS lab workflows");

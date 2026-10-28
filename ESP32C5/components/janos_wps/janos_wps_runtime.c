@@ -16,6 +16,7 @@
 #include "janos_wps_service.h"
 #include "janos_wps_transport.h"
 #include "janos_wps_wire.h"
+#include "private/janos_wps_download_wait.h"
 #include "private/janos_wps_worker_state.h"
 #include "private/workflow/lab_command.h"
 #include "private/workflow/lab_platform.h"
@@ -551,26 +552,53 @@ bool janos_wps_runtime_stop(uint32_t timeout_ms)
     return runtime_stop_attempt(timeout_ms).joined;
 }
 
+static bool download_read_state(void *context,
+                                janos_wps_download_state_t *output)
+{
+    runtime_t *state = context;
+    if (!state || !state->initialized || !output) return false;
+    janos_wps_service_status_t status =
+        janos_wps_service_status(&state->service);
+    *output = (janos_wps_download_state_t){
+        .service_quarantined =
+            status.phase == JANOS_WPS_SERVICE_QUARANTINED,
+        .worker_active = janos_wps_worker_state_active(&state->worker_state),
+        .service_generation = status.generation,
+        .lease = status.lease,
+    };
+    return true;
+}
+
+static void download_delay(void *context, uint32_t milliseconds)
+{
+    (void)context;
+    vTaskDelay(pdMS_TO_TICKS(milliseconds));
+}
+
 bool janos_wps_runtime_wait_quarantined_download(uint32_t timeout_ms)
 {
     if (!runtime.initialized) return false;
-    uint64_t deadline = platform_now(&runtime) + timeout_ms;
-    for (;;) {
-        janos_wps_service_status_t status =
-            janos_wps_service_status(&runtime.service);
-        if (status.phase != JANOS_WPS_SERVICE_QUARANTINED ||
-            status.generation == 0U ||
-            status.lease.owner != JANOS_RADIO_OWNER_WPS ||
-            status.lease.state != JANOS_RADIO_LEASE_QUARANTINED ||
-            status.lease.generation != status.generation)
-            return false;
-        if (janos_wps_runtime_download_quiescent(
-                true, janos_wps_worker_state_active(&runtime.worker_state),
-                status.generation, status.lease))
-            return true;
-        if (platform_now(&runtime) >= deadline) return false;
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
+    const janos_wps_download_wait_ops_t ops = {
+        .context = &runtime,
+        .read_state = download_read_state,
+        .now_ms = platform_now,
+        .delay_ms = download_delay,
+    };
+    return janos_wps_download_wait(&ops, timeout_ms);
+}
+
+static void terminal_transport_reset(void *context)
+{
+    janos_wps_transport_reset((janos_wps_transport_context_t *)context);
+}
+
+bool janos_wps_runtime_terminal_wipe_quarantined(void)
+{
+    janos_wps_download_state_t state = {0};
+    if (!download_read_state(&runtime, &state) ||
+        !janos_wps_download_ready(&state))
+        return false;
+    return lab_radio_terminal_wipe(&runtime.radio, terminal_transport_reset);
 }
 
 bool janos_wps_runtime_busy(void)

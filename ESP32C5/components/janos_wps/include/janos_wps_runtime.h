@@ -41,4 +41,7 @@ static inline bool janos_wps_runtime_download_quiescent(
 }
 
 bool janos_wps_runtime_wait_quarantined_download(uint32_t timeout_ms);
+/* Call immediately before a ROM reset, after the quarantined worker has
+ * finished. Erases retained transport/radio buffers without releasing lease. */
+bool janos_wps_runtime_terminal_wipe_quarantined(void);
 

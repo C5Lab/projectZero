@@ -37,6 +37,9 @@ static bool canonical_prepare;
 static bool preserve_disabled_bssid;
 static wifi_config_t *last_config_output;
 static char last_esp_error_log[200];
+static char all_esp_error_logs[1024];
+static size_t all_esp_error_logs_length;
+static unsigned esp_error_log_count;
 
 void test_esp_log_error(const char *tag, const char *format, ...)
 {
@@ -47,6 +50,14 @@ void test_esp_log_error(const char *tag, const char *format, ...)
                             format, arguments);
     va_end(arguments);
     assert(written > 0 && (size_t)written < sizeof(last_esp_error_log));
+    assert(all_esp_error_logs_length + (size_t)written + 2U <
+           sizeof(all_esp_error_logs));
+    memcpy(all_esp_error_logs + all_esp_error_logs_length,
+           last_esp_error_log, (size_t)written);
+    all_esp_error_logs_length += (size_t)written;
+    all_esp_error_logs[all_esp_error_logs_length++] = '\n';
+    all_esp_error_logs[all_esp_error_logs_length] = '\0';
+    esp_error_log_count++;
 }
 
 static int operation(char code)
@@ -406,6 +417,9 @@ static void reset_baseline(void)
     trace_length = 0;
     trace[0] = 0;
     last_esp_error_log[0] = 0;
+    all_esp_error_logs[0] = 0;
+    all_esp_error_logs_length = 0;
+    esp_error_log_count = 0;
 }
 
 static void wps_disable_failure_identifies_private_call(void)
@@ -463,6 +477,18 @@ static void snapshot_fault_matrix(void)
 static void restore_fault_and_readback_matrix(void)
 {
     const char failures[] = "sROKMSHFoghG";
+    const char *steps[] = {
+        "wifi_stop", "snapshot_restore", "snapshot_restore",
+        "snapshot_restore", "mac_restore", "snapshot_restore",
+        "snapshot_restore", "snapshot_restore", "snapshot_restore",
+        "snapshot_restore", "snapshot_restore", "snapshot_restore",
+    };
+    const char *details[] = {
+        NULL, "restore_ram", "restore_mode", "restore_config", NULL,
+        "restore_start", "restore_channel", "restore_storage",
+        "verify_get_mode", "verify_get_config", "verify_get_channel",
+        "verify_get_mac",
+    };
     for (size_t i = 0; i < sizeof(failures) - 1U; ++i) {
         reset_baseline();
         janos_wps_transport_context_t context = {0};
@@ -473,10 +499,16 @@ static void restore_fault_and_readback_matrix(void)
         primary = 6;
         failure = failures[i];
         assert(!wps_transport_cancel(&transport));
+        assert(strcmp(transport.cleanup_step, steps[i]) == 0);
+        if (details[i]) assert(strcmp(transport.cleanup_detail, details[i]) == 0);
+        else assert(transport.cleanup_detail == NULL);
+        assert(transport.cleanup_error == ESP_FAIL);
         assert(wps_transport_cleanup_pending(&transport));
         assert(context.borrowed && context.snapshot && !context.restore_verified);
         failure = 0;
         assert(wps_transport_cancel(&transport));
+        assert(transport.cleanup_step == NULL && transport.cleanup_detail == NULL);
+        assert(transport.cleanup_error == 0);
         assert(context.restore_verified && !context.snapshot);
         assert(storage == WIFI_STORAGE_FLASH && started);
         assert(primary == 11 && station_config.sta.password[0] == 0x5a);
@@ -519,6 +551,67 @@ static void restore_fault_and_readback_matrix(void)
         assert(wps_transport_cancel(&transport));
         assert(context.restore_verified && !context.snapshot);
     }
+}
+
+static void restore_retries_identify_internal_stop_and_mac_failures(void)
+{
+    reset_baseline();
+    janos_wps_transport_context_t context = {0};
+    wps_transport_t transport;
+    wps_transport_init(&transport, &janos_wps_transport_ops, &context);
+    assert(wps_transport_begin(&transport, session, original));
+    wrong_field = 'g';
+    assert(!wps_transport_cancel(&transport));
+    wrong_field = 0;
+    failure = 's';
+    assert(!wps_transport_cancel(&transport));
+    assert(strcmp(transport.cleanup_step, "snapshot_restore") == 0);
+    assert(strcmp(transport.cleanup_detail, "restore_stop") == 0);
+    assert(transport.cleanup_error == ESP_FAIL);
+    failure = 0;
+    assert(wps_transport_cancel(&transport));
+    assert(transport.cleanup_detail == NULL);
+
+    reset_baseline();
+    context = (janos_wps_transport_context_t){0};
+    wps_transport_init(&transport, &janos_wps_transport_ops, &context);
+    assert(wps_transport_begin(&transport, session, original));
+    failure = 'K';
+    assert(!wps_transport_cancel(&transport));
+    failure = 'M';
+    assert(!wps_transport_cancel(&transport));
+    assert(strcmp(transport.cleanup_step, "snapshot_restore") == 0);
+    assert(strcmp(transport.cleanup_detail, "restore_mac") == 0);
+    assert(transport.cleanup_error == ESP_FAIL);
+    failure = 0;
+    assert(wps_transport_cancel(&transport));
+    assert(transport.cleanup_detail == NULL);
+}
+
+static void config_failure_logs_no_secret_values(void)
+{
+    static const char secret_ssid[] = "LAB_SSID_SENTINEL_47";
+    static const char secret_password[] = "LAB_PASSWORD_SENTINEL_9247";
+    reset_baseline();
+    memset(&station_config, 0, sizeof(station_config));
+    memcpy(station_config.sta.ssid, secret_ssid, sizeof(secret_ssid));
+    memcpy(station_config.sta.password, secret_password,
+           sizeof(secret_password));
+    janos_wps_transport_context_t context = {0};
+    wps_transport_t transport;
+    wps_transport_init(&transport, &janos_wps_transport_ops, &context);
+    assert(wps_transport_begin(&transport, session, original));
+    wrong_field = 'm';
+    assert(!wps_transport_cancel(&transport));
+    assert(esp_error_log_count == 1U);
+    assert(strstr(all_esp_error_logs, secret_ssid) == NULL);
+    assert(strstr(all_esp_error_logs, secret_password) == NULL);
+    assert(strstr(all_esp_error_logs,
+                  "ssid_changed=0 password_changed=1") != NULL);
+    assert(strcmp(transport.cleanup_detail, "verify_config") == 0);
+    wrong_field = 0;
+    assert(wps_transport_cancel(&transport));
+    assert(esp_error_log_count == 1U);
 }
 
 static void inactive_bssid_payload_does_not_hold_radio(void)
@@ -649,6 +742,8 @@ static void terminal_reset_wipes_without_releasing(void)
     assert(snapshot_wipes == before + 1U && !context.snapshot);
     failure = 0;
     assert(!wps_transport_cancel(&transport));
+    assert(strcmp(transport.cleanup_step, "snapshot_restore") == 0);
+    assert(strcmp(transport.cleanup_detail, "restore_precondition") == 0);
     assert(wps_transport_cleanup_pending(&transport) && !context.restore_verified);
 }
 
@@ -702,12 +797,17 @@ static void full_restore_gates_radio_owner_release(void)
         wrong_field = 'g';
         lab_radio_result_t result = lab_radio_release(&radio, outcomes[i]);
         assert(!result.cleanup_ok && result.quarantined);
+        assert(strcmp(radio.cleanup_diag.step, "snapshot_restore") == 0);
+        assert(strcmp(radio.cleanup_diag.detail, "verify_config") == 0);
+        assert(strcmp(radio.cleanup_diag.error_domain, "esp") == 0);
+        assert(radio.cleanup_diag.error == ESP_ERR_INVALID_STATE);
         assert(memcmp(current_mac, original, 6) == 0);
         assert(radio.owner_token == owner && lab_radio_is_quarantined(&radio));
         assert(!context.restore_verified && context.snapshot);
         wrong_field = 0;
         result = lab_radio_release(&radio, outcomes[i]);
         assert(result.cleanup_ok && !result.quarantined);
+        assert(radio.cleanup_diag.step == NULL);
         assert(result.workflow_result == outcomes[i]);
         assert(radio.owner_token == 0 && context.restore_verified && !context.snapshot);
         assert(started && storage == WIFI_STORAGE_FLASH && mode == WIFI_MODE_STA);
@@ -782,6 +882,8 @@ int main(int argc, char **argv)
         exact_baseline_restore();
         snapshot_fault_matrix();
         restore_fault_and_readback_matrix();
+        restore_retries_identify_internal_stop_and_mac_failures();
+        config_failure_logs_no_secret_values();
         inactive_bssid_payload_does_not_hold_radio();
         inactive_bssid_does_not_mask_another_restore_mismatch();
         active_bssid_restores_exactly();
