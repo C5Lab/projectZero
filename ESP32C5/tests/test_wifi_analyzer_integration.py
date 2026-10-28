@@ -23,10 +23,12 @@ CORE = (ROOT / "main/wifi_analyzer_core.c").read_text(encoding="utf-8")
 HEADER = (ROOT / "main/wifi_analyzer_core.h").read_text(encoding="utf-8")
 CMAKE = (ROOT / "main/CMakeLists.txt").read_text(encoding="utf-8")
 
-# SHA-256 of the extracted function bodies in HEAD:main/main.c, with LF newlines.
-# This freezes only the three legacy presentation paths promised unchanged.
+# SHA-256 of the extracted function bodies in main/main.c, with LF newlines.
+# print_network_csv doubles '"' inside SSID and vendor (RFC 4180) and keeps the
+# one enclosing pair from its format string. See test_scan_csv_escape.py.
+# print_scan_results and cmd_show_scan_results stay on the previous presentation.
 LEGACY_BODY_SHA256 = {
-    "print_network_csv": "fb84404ef727dee679cbcd7775440a552de765f2ef5729811973e70e73a399dd",
+    "print_network_csv": "6c48ea609742ad15515d3272f64996d137546857552fb932cc3f43d363b44e2d",
     "print_scan_results": "accb6ae470203be6a018fade70b3eef94b90b2277e564e51bddab752c8fc56cf",
     "cmd_show_scan_results": "535a7680dd0ef3c5c63d17ee9f5cd24a11f505d83df55d8079dbb31a5bd78d7c",
 }

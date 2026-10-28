@@ -18,14 +18,16 @@ Commands are sent over UART as plain text terminated with `\r\n`. Responses are 
 ```
 "1","AX3","","C4:2B:44:12:29:20","112","WPA2/WPA3 Mixed","-59","5GHz"
 "2","BRW","","64:7C:34:41:8F:EC","7","WPA/WPA2 Mixed","-72","2.4GHz"
+"3","moja ""specjalna"" siec","Acme, ""Labs""","AA:BB:CC:DD:EE:FF","6","WPA2","-40","2.4GHz"
 Scan results printed.
 ```
-- **CSV fields**: `"index","SSID","(empty)","BSSID","channel","security","RSSI","band"`
-- **Notes**: Wardrive must be stopped first. Results are auto-printed; wait for `"Scan results printed"`.
+- **CSV fields**: `"index","SSID","vendor","BSSID","channel","security","RSSI","band"`
+- **SSID and vendor escaping**: SSID and vendor are always enclosed in exactly one pair of double quotes. Each `"` inside those fields is emitted as `""` (RFC 4180). A comma, CR, or LF stays inside that pair. A plain SSID or vendor name is copied unchanged between its one pair of quotes. Example: SSID `moja "specjalna" siec` is the field `"moja ""specjalna"" siec"` (line 3 above; the vendor field there is `Acme, "Labs"`). Parsers must treat `""` as one embedded `"` and keep reading until the field's closing quote.
+- **Notes**: Wardrive must be stopped first. Results are auto-printed; wait for `"Scan results printed"`. The third field is empty when vendor lookup is off.
 
 ### `show_scan_results`
 - **Syntax**: `show_scan_results`
-- **Description**: Prints results from last `scan_networks`. Same CSV format as above.
+- **Description**: Prints results from last `scan_networks`. Same CSV format as above, including the SSID and vendor `""` escaping rule.
 - **Completion marker**: `"Scan results printed"`
 
 ### `inspect_network`

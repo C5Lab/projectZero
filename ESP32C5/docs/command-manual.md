@@ -345,10 +345,10 @@ WFACTL1 busy line and nonzero console result documented in
 [shared radio ownership](janos-radio-lease.md).
 
 ### `scan_networks`
-- `scan_networks` — background Wi‑Fi scan on all channels. Results auto‑print as CSV; wait for `Scan results printed`. CSV: `"index","SSID","","BSSID","channel","security","RSSI","band"`. Wardrive must be stopped first.
+- `scan_networks` — background Wi‑Fi scan on all channels. Results auto‑print as CSV; wait for `Scan results printed`. CSV: `"index","SSID","","BSSID","channel","security","RSSI","band"`. The third field is the vendor name (empty when vendor lookup is off). SSID and vendor are each enclosed in exactly one pair of double quotes. A `"` inside either field is written as `""` (RFC 4180). A comma, CR, or LF stays inside that same pair. Example: SSID `moja "specjalna" siec` is the field `"moja ""specjalna"" siec"`. Wardrive must be stopped first.
 
 ### `show_scan_results`
-- `show_scan_results` — reprint the last scan results (same CSV).
+- `show_scan_results` — reprint the last scan results (same CSV, including the SSID and vendor quoting rule above).
 
 ### `inspect_network`
 - `inspect_network <index>` — passively capture beacons from one AP (~1.5 s) and report MFP (802.11w) capability/required flags and AP uptime (TSF). Output prefixed `[INSPECT]`.

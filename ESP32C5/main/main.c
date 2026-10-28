@@ -5146,6 +5146,10 @@ static bool check_channel_changes(void) {
     return false;
 }
 
+// Wardrive / WiGLE rows pass this straight into an unquoted %s. It doubles '"'
+// and, when the value contains ',' '"' CR or LF, wraps the field in one pair
+// of quotes. scan_networks uses escape_csv_quoted_content instead: that path's
+// format string already supplies the enclosing quotes.
 static void escape_csv_field(const char* input, char* output, size_t output_size) {
     if (!input || !output || output_size < 2) return;
 
@@ -5176,6 +5180,30 @@ static void escape_csv_field(const char* input, char* output, size_t output_size
     }
     if (needs_quotes && out_pos < output_size - 1) {
         output[out_pos++] = '"';
+    }
+    output[out_pos] = '\0';
+}
+
+// Escape text that print_network_csv places inside one format-supplied "..." pair.
+// Each '"' becomes "" (RFC 4180). The caller supplies the single enclosing pair,
+// so this does not add another. SSID is at most 32 bytes and a vendor name at
+// most VENDOR_RECORD_NAME_BYTES (60); every byte may be '"', so callers size
+// the buffer to (max * 2 + 1).
+static void escape_csv_quoted_content(const char* input, char* output, size_t output_size) {
+    if (!output || output_size == 0) return;
+
+    size_t out_pos = 0;
+    if (input) {
+        for (size_t i = 0; input[i] != '\0'; i++) {
+            size_t need = (input[i] == '"') ? 2 : 1;
+            if (out_pos + need >= output_size) break;
+            if (input[i] == '"') {
+                output[out_pos++] = '"';
+                output[out_pos++] = '"';
+            } else {
+                output[out_pos++] = input[i];
+            }
+        }
     }
     output[out_pos] = '\0';
 }
@@ -6135,11 +6163,13 @@ static const char* vendor_label(const uint8_t *mac) {
 
 
 static void print_network_csv(int index, const wifi_ap_record_t* ap) {
-    char escaped_ssid[64];
-    escape_csv_field((const char*)ap->ssid, escaped_ssid, sizeof(escaped_ssid));
-    char escaped_vendor[64];
+    // Worst case: 32 SSID bytes, each a '"', plus NUL.
+    char escaped_ssid[32 * 2 + 1];
+    escape_csv_quoted_content((const char*)ap->ssid, escaped_ssid, sizeof(escaped_ssid));
+    // Vendor names are capped at VENDOR_RECORD_NAME_BYTES (60); each byte may be '"'.
+    char escaped_vendor[VENDOR_RECORD_NAME_BYTES * 2 + 1];
     const char *vendor_name = vendor_is_enabled() ? lookup_vendor_name(ap->bssid) : NULL;
-    escape_csv_field(vendor_name ? vendor_name : "", escaped_vendor, sizeof(escaped_vendor));
+    escape_csv_quoted_content(vendor_name ? vendor_name : "", escaped_vendor, sizeof(escaped_vendor));
     
     MY_LOG_INFO(TAG, "\"%d\",\"%s\",\"%s\",\"%02X:%02X:%02X:%02X:%02X:%02X\",\"%d\",\"%s\",\"%d\",\"%s\"",
                 (index + 1),
