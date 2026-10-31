@@ -4,3 +4,15 @@ ESP32C5/.clangd
 ESP32C5/.vscode/settings.json
 ESP32C5/managed_components/
 ESP32C5/.DS_Store
+__pycache__/
+*.pyc
+/FLIPPER/knowledge/
+FLIPPER/dist/lab_c5.fap
+FLIPPER/dist/lab_c5_v0.41_unleashed.fap
+FLIPPER/dist/lab_c5_gps.fal
+FLIPPER/dist/*_trial.fap
+FLIPPER/dist/*_local_rebuild.fap
+FLIPPER/dist/archive/
+FLIPPER/dist/debug/
+FLIPPER/.vscode/compile_commands.json
+.DS_Store

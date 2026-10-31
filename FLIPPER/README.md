@@ -1,29 +1,49 @@
 # Flipper Companion App
 
-The Flipper Zero companion app (`Lab_C5.fap`) mirrors the ESP32-C5 CLI workflows (scan, results, attacks, wardrive, Sniffer Dog, portal control) so you can steer the board from the handheld UI.
+Flipper Zero controls the ESP32-C5 Monster running JanOS through 3.3 V GPIO UART. The app keeps its menu, UART and power control in the host; larger features are embedded FAL plugins loaded when opened.
 
-## Build with compatible SDKs
+## Current Unleashed artifact
 
-If you need an alternate firmware SDK that keeps the app compatible with the Unleashed or Momentum releases, refresh the toolchain and build with `ufbt`:
+| File | Purpose | Device evidence |
+| --- | --- | --- |
+| [lab_c5_v0.41_unleashed_clean_candidate.fap](dist/lab_c5_v0.41_unleashed_clean_candidate.fap) | Current source, 12 embedded FAL plugins; 269,300 B; SHA-256 `A5E6D2E10E810F7C9E295D3BECB806EEFF4FF56AE5BBD1A7818FCD2D6B9B4E15` | User reported 8 separate reboot → first-start cycles with no OOM or Monster 5 V dropout; Connect → Nmap → GPS → Package Monitor worked. |
 
-```bash
-ufbt update --hw f7 --url="https://github.com/DarkFlippers/unleashed-firmware/releases/download/unlshd-083/flipper-z-f7-sdk-unlshd-083.zip"
-ufbt launch
+The clean candidate was built against Unleashed SDK `unlshd-083`. Its host ELF has `SHF_ALLOC` 69,330 B, a preload section-size lower bound of 80,070 B and a largest-section-plus-1024-B estimate of 34,216 B. These are build metrics, not measured free RAM on the Flipper. The candidate retains its tested filename because the FAP basename determines its extracted plugin asset path. The older Momentum and Momentum Dev binaries in `dist/` are separate historical builds; they have not received this current-source device test.
 
-ufbt update --hw f7 --url="https://github.com/Next-Flip/Momentum-Firmware/releases/download/mntm-011/flipper-z-f7-sdk-mntm-011.zip"
-ufbt launch
-```
+## Build and verify (Windows PowerShell)
 
-Each `ufbt update` pulls the SDK that matches the specific firmware track (Unleashed or Momentum) before running `ufbt launch` to build and drop the `.fap` into `dist/`. Future firmware drops may move to different SDK names, so be prepared to pick the correct SDK zip manually from the firmware release page to keep builds in sync.
+From the repository root:
 
-## Install the `.fap` (Windows + qFlipper)
+~~~powershell
+Set-Location .\FLIPPER
+py -3 -B -m unittest discover -s .\tests -p "test_*.py"
+py -3 -B .\tests\run_adoption_c_tests.py
+py -3 .\build_fap.py --no-upload --variant unleashed --artifact-suffix local_rebuild
+py -3 .\tests\check_fap_code_sections.py .\dist\lab_c5_v0.41_unleashed_local_rebuild.fap
+Get-FileHash .\dist\lab_c5_v0.41_unleashed_local_rebuild.fap -Algorithm SHA256
+~~~
 
-1. Build or grab the packaged binary from `FLIPPER/dist/Lab_C5.fap`.
-2. Launch **qFlipper**, connect your Flipper Zero, and wait until it shows as `Connected`.
-3. Open **File manager** in qFlipper, then navigate to your SD card (`SD Card` tab) and browse to `/apps`.
-4. Drag-drop or copy `Lab_C5.fap` from your PC (the repo `FLIPPER/dist` folder) into `/apps` on the SD card.
-5. Safely eject the device or close qFlipper—the app now appears under **Applications → External** on the Flipper.
+The build script checks the 12 embedded FAL entry points and ABI before publishing the FAP. `local_rebuild` creates a separate file and leaves the tested candidate and rollback binaries intact. A fresh build may have different bytes and needs its own hash and device check. Match the SDK variant to the firmware on the Flipper.
 
-A short walkthrough video is also available: https://youtu.be/Jf8JnbvrvnI
+Pre-commit verification on 2026-10-30: 41/41 Python tests, 27/27 C host tests with ASan/UBSan, the candidate executable-section check and all 12 embedded FAL checks passed. This verification did not flash the device or measure its free RAM.
 
-Need help? Ping the team on Discord: https://discord.gg/57wmJzzR8C
+## Deploy over USB
+
+Close qFlipper and other serial clients, connect the Flipper to the PC, then run:
+
+~~~powershell
+py -3 .\dist\deploy_fap.py
+~~~
+
+Select exactly `lab_c5_v0.41_unleashed_clean_candidate.fap`, the Flipper COM port and `/ext/apps`. Answer `n` to removing old FAPs and `n` to automatic launch; pressing Enter on either `[Y/n]` prompt means yes. Unplug USB, reboot the Flipper and launch the app manually for a first-start RAM check. Two more separate reboot/start cycles would complete the planned 10-cycle sample. Watch Monster 5 V during transitions within the app; closing the entire app may reboot the Monster as part of its existing behavior.
+
+## Current behavior and limits
+
+- Scanner displays up to 64 results and limits GUI selection to six networks because the current JanOS `select_networks` summary uses a 500 B buffer.
+- Scanner → Connect uses JanOS saved Wi-Fi credentials. If no key exists, JanOS tries an open connection and the Connect screen reports that fallback.
+- GPS, Web/Portal/Evil Twin/Karma, Recon, Rogue AP, ARP, Nmap, MITM PCAP, Wardrive and other adopted features are loaded through on-demand FAL modules.
+- WPA-sec and Wardrive external upload screens remain blocked until JanOS TLS endpoint verification is resolved and tested.
+
+Walkthrough: https://youtu.be/Jf8JnbvrvnI
+
+Support: https://discord.gg/57wmJzzR8C

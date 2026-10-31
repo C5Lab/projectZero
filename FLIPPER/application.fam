@@ -10,4 +10,127 @@ App(
     fap_category="GPIO",
     fap_author="Lab_Team",
     fap_description="WiFi Deauther controller for Lab_C5 module via UART",
+    sources=["Lab_C5.c", "module_loader.c", "attack_rx_guard.c", "modules/recon/recon_targets.c"],
+)
+
+App(
+    appid="lab_c5_gps",
+    apptype=FlipperAppType.PLUGIN,
+    entry_point="lab_c5_gps_plugin_ep",
+    requires=["lab_c5"],
+    sources=["modules/gps/gps_module.c", "gps_coord.c"],
+    fal_embedded=True,
+)
+
+App(
+    appid="lab_c5_web",
+    apptype=FlipperAppType.PLUGIN,
+    entry_point="lab_c5_web_plugin_ep",
+    requires=["lab_c5"],
+    sources=[
+        "modules/web/web_module.c",
+        "modules/web/web_protocol.c",
+        "modules/web/web_lists.c",
+        "modules/web/web_qr.c",
+        "modules/web/web_status.c",
+        "modules/web/web_overlay.c",
+        "modules/web/web_karma.c",
+        "qrcodegen.c",
+    ],
+    fal_embedded=True,
+)
+
+App(
+    appid="lab_c5_recon",
+    apptype=FlipperAppType.PLUGIN,
+    entry_point="lab_c5_recon_plugin_ep",
+    requires=["lab_c5"],
+    sources=[
+        "modules/recon/recon_module.c",
+        "modules/recon/recon_scan.c",
+        "modules/recon/recon_sniffer_probe.c",
+        "modules/recon/recon_sniffer_clients.c",
+    ],
+    fal_embedded=True,
+)
+
+App(
+    appid="lab_c5_rogue",
+    apptype=FlipperAppType.PLUGIN,
+    entry_point="lab_c5_rogue_plugin_ep",
+    requires=["lab_c5"],
+    sources=["modules/rogue/rogue_module.c"],
+    fal_embedded=True,
+)
+
+App(
+    appid="lab_c5_arp",
+    apptype=FlipperAppType.PLUGIN,
+    entry_point="lab_c5_arp_plugin_ep",
+    requires=["lab_c5"],
+    sources=["modules/arp/arp_module.c"],
+    fal_embedded=True,
+)
+
+App(
+    appid="lab_c5_wardrive",
+    apptype=FlipperAppType.PLUGIN,
+    entry_point="lab_c5_wardrive_plugin_ep",
+    requires=["lab_c5"],
+    sources=["modules/wardrive/wardrive_module.c"],
+    fal_embedded=True,
+)
+
+App(
+    appid="lab_c5_beacon",
+    apptype=FlipperAppType.PLUGIN,
+    entry_point="lab_c5_beacon_plugin_ep",
+    requires=["lab_c5"],
+    sources=["modules/beacon/beacon_module.c"],
+    fal_embedded=True,
+)
+
+App(
+    appid="lab_c5_mitm_pcap",
+    apptype=FlipperAppType.PLUGIN,
+    entry_point="lab_c5_mitm_pcap_plugin_ep",
+    requires=["lab_c5"],
+    sources=["modules/mitm_pcap/mitm_pcap_module.c"],
+    fal_embedded=True,
+)
+
+App(
+    appid="lab_c5_wardrive_upload",
+    apptype=FlipperAppType.PLUGIN,
+    entry_point="lab_c5_wardrive_upload_plugin_ep",
+    requires=["lab_c5"],
+    sources=["modules/wardrive_upload/wardrive_upload_module.c"],
+    fal_embedded=True,
+)
+
+App(
+    appid="lab_c5_nmap",
+    apptype=FlipperAppType.PLUGIN,
+    entry_point="lab_c5_nmap_plugin_ep",
+    requires=["lab_c5"],
+    sources=["modules/nmap/nmap_module.c"],
+    fal_embedded=True,
+)
+
+App(
+    appid="lab_c5_wpasec",
+    apptype=FlipperAppType.PLUGIN,
+    entry_point="lab_c5_wpasec_plugin_ep",
+    requires=["lab_c5"],
+    sources=["modules/wpasec/wpasec_module.c"],
+    fal_embedded=True,
+)
+
+App(
+    appid="lab_c5_connect",
+    apptype=FlipperAppType.PLUGIN,
+    entry_point="lab_c5_connect_plugin_ep",
+    requires=["lab_c5"],
+    sources=["modules/connect/connect_module.c"],
+    fal_embedded=True,
 )
