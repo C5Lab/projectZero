@@ -632,11 +632,13 @@ static int64_t deauth_detector_last_channel_hop = 0;
 // Detector event pipeline (fixed storage; callback never logs or allocates).
 #define DETECTOR_EVENT_CAPACITY 24
 #define DETECTOR_DEAUTH_CAPACITY 16
+#define DETECTOR_DEAUTH_PREFIX_SIZE 26
 typedef struct {
     csa_event_t observation;
     bool is_csa;
     int legacy_channel;
     char legacy_ssid[33];
+    uint8_t deauth_prefix[DETECTOR_DEAUTH_PREFIX_SIZE];
 } detector_event_t;
 typedef struct { uint8_t bssid[6]; char ssid[33]; uint8_t channel; } detector_cache_entry_t;
 static detector_event_t detector_events[DETECTOR_EVENT_CAPACITY];
@@ -648,8 +650,106 @@ static size_t detector_cache_count;
 static size_t detector_event_head, detector_event_count;
 static uint32_t detector_generation, detector_dropped;
 static bool detector_accepting;
+static bool detector_details_mode, detector_details_announced;
+static bool detector_trace_requested, detector_trace_locked;
+static int64_t detector_trace_last_failure_ms = -2000;
 static csa_rate_limit_t detector_csa_rate;
 static portMUX_TYPE detector_event_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static size_t detector_details_skip_csi(const char in[33], size_t i) {
+    while (i < 32 && in[i]) {
+        uint8_t c = (uint8_t)in[i++];
+        if (c >= 0x40 && c <= 0x7e) break;
+    }
+    return i;
+}
+
+static size_t detector_details_skip_control_string(const char in[33], size_t i) {
+    while (i < 32 && in[i]) {
+        uint8_t c = (uint8_t)in[i];
+        if (c == 0x07 || c == 0x9c) return i + 1;
+        if (c == 0x1b && i + 1 < 32 && in[i + 1] == '\\') return i + 2;
+        ++i;
+    }
+    return i;
+}
+
+// Keep printable UTF-8; omit controls, ANSI sequences and field separators.
+static void detector_details_safe_ssid(char out[33], const char in[33]) {
+    size_t used = 0, characters = 0;
+    for (size_t i = 0; i < 32 && in[i] && characters < 32;) {
+        uint8_t c = (uint8_t)in[i];
+        if (c == 0x1b) {
+            ++i;
+            if (i >= 32 || !in[i]) break;
+            uint8_t command = (uint8_t)in[i++];
+            if (command == '[') {
+                i = detector_details_skip_csi(in, i);
+            } else if (command == ']' || command == 'P' || command == 'X' ||
+                       command == '^' || command == '_') {
+                i = detector_details_skip_control_string(in, i);
+            } else if (command >= 0x20 && command <= 0x2f) {
+                while (i < 32 && in[i] && (uint8_t)in[i] >= 0x20 &&
+                       (uint8_t)in[i] <= 0x2f) ++i;
+                if (i < 32 && in[i] && (uint8_t)in[i] >= 0x30 &&
+                    (uint8_t)in[i] <= 0x7e) ++i;
+            }
+            continue;
+        }
+        if (c == 0x9b) {
+            i = detector_details_skip_csi(in, i + 1);
+            continue;
+        }
+        if (c == 0x90 || c == 0x98 || c == 0x9d || c == 0x9e || c == 0x9f) {
+            i = detector_details_skip_control_string(in, i + 1);
+            continue;
+        }
+        if (c < 0x20 || c == 0x7f || c == '|' || c == 0x9c) {
+            ++i;
+            continue;
+        }
+        if (c < 0x80) {
+            out[used++] = (char)c;
+            ++characters;
+            ++i;
+            continue;
+        }
+        size_t bytes = 0;
+        uint32_t codepoint = 0;
+        if (c >= 0xc2 && c <= 0xdf) { bytes = 2; codepoint = c & 0x1f; }
+        else if (c >= 0xe0 && c <= 0xef) { bytes = 3; codepoint = c & 0x0f; }
+        else if (c >= 0xf0 && c <= 0xf4) { bytes = 4; codepoint = c & 0x07; }
+        if (!bytes || i + bytes > 32 || used + bytes > 32) {
+            ++i;
+            continue;
+        }
+        bool valid = true;
+        for (size_t j = 1; j < bytes; ++j) {
+            uint8_t next = (uint8_t)in[i + j];
+            if ((next & 0xc0) != 0x80) { valid = false; break; }
+            codepoint = (codepoint << 6) | (next & 0x3f);
+        }
+        if (!valid || codepoint < (bytes == 2 ? 0x80U : bytes == 3 ? 0x800U : 0x10000U) ||
+            codepoint > 0x10ffffU || (codepoint >= 0xd800U && codepoint <= 0xdfffU)) {
+            ++i;
+            continue;
+        }
+        // Also suppress Unicode control and direction-formatting characters.
+        if ((codepoint >= 0x80 && codepoint <= 0x9f) || codepoint == 0x61c ||
+            (codepoint >= 0x200b && codepoint <= 0x200f) ||
+            (codepoint >= 0x2028 && codepoint <= 0x202e) ||
+            (codepoint >= 0x2060 && codepoint <= 0x206f) || codepoint == 0xfeff) {
+            i += bytes;
+            continue;
+        }
+        memcpy(out + used, in + i, bytes);
+        used += bytes;
+        ++characters;
+        i += bytes;
+    }
+    out[used] = 0;
+    if (!used) strcpy(out, "<Unknown>");
+}
 // Deauth detector OLED shared state (written/rendered only by detector task)
 static volatile char dd_oled_ssid[22] = {0};
 static volatile char dd_oled_bssid[18] = {0};
@@ -2410,6 +2510,7 @@ static const char* boot_allowed_commands[] = {
     "start_gps_raw",
     "start_wardrive",
     "deauth_detector",
+    "deauth_detector_v2",
     "list_sd",
     "select_html",
     "start_portal"
@@ -2648,6 +2749,7 @@ static void sniffer_channel_task(void *pvParameters);
 static bool is_multicast_mac(const uint8_t *mac);
 // Deauth detector functions
 static int cmd_deauth_detector(int argc, char **argv);
+static int cmd_deauth_detector_v2(int argc, char **argv);
 static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void deauth_detector_task(void *pvParameters);
 static void deauth_detector_channel_hop(void);
@@ -15701,6 +15803,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "packet_monitor", " <channel>" },
     { "start_ap_locator", "" },
     { "deauth_detector", " [index1 index2 ... | --only index1 index2 ...]" },
+    { "deauth_detector_v2", " [index1 index2 ... | --only index1 index2 ...] [trace]" },
     { "select_networks", " <index1> [index2] ..." },
     { "select_stations", " <MAC1> [MAC2] ..." },
     { "sniffer_debug", " <0|1>" },
@@ -19693,21 +19796,28 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
     return 0;
 }
 
-static int cmd_deauth_detector(int argc, char **argv) {
+static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
+    const bool trace = details && argc > 1 && argv[argc - 1] &&
+                       strcmp(argv[argc - 1], "trace") == 0;
+    const int argument_count = argc - (trace ? 1 : 0);
     const bool watch_only = argc > 1 && strcmp(argv[1], "--only") == 0;
-    for (int i = 1; i < argc; ++i) {
+    for (int i = 1; i < argument_count; ++i) {
         if (!argv[i] ||
             (argv[i][0] == '-' && argv[i][1] == '-' && (!watch_only || i != 1))) {
             MY_LOG_INFO(TAG, "Invalid detector option; use --only before scan indices.");
             return 1;
         }
     }
-    if (watch_only && argc < 3) {
-        MY_LOG_INFO(TAG, "Usage: deauth_detector --only <scan-index> [scan-index ...]");
+    if (watch_only && argument_count < 3) {
+        if (details) {
+            MY_LOG_INFO(TAG, "Usage: deauth_detector_v2 --only <scan-index> [scan-index ...]");
+        } else {
+            MY_LOG_INFO(TAG, "Usage: deauth_detector --only <scan-index> [scan-index ...]");
+        }
         return 1;
     }
     oled_display_update_full("> Deauth Detect", "  Monitoring...", "  All channels", "  Passive scan");
-    log_memory_info("deauth_detector");
+    log_memory_info(details ? "deauth_detector_v2" : "deauth_detector");
     
     // Ensure WiFi is initialized
     if (!ensure_wifi_mode()) {
@@ -19750,7 +19860,7 @@ static int cmd_deauth_detector(int argc, char **argv) {
     }
     
     // Bare indices retain channel-only selection. --only also selects exact BSSIDs.
-    if (argc > 1) {
+    if (argument_count > 1) {
         if (!g_scan_done || g_scan_count == 0 ||
             (watch_only && (g_scan_in_progress || !g_scan_records_valid ||
                             g_scan_count > MAX_AP_CNT))) {
@@ -19767,13 +19877,18 @@ static int cmd_deauth_detector(int argc, char **argv) {
         MY_LOG_INFO(TAG, "Starting Deauth Detector in SELECTED mode...");
         
         // Parse indices and extract unique channels
-        for (int i = watch_only ? 2 : 1; i < argc; i++) {
+        for (int i = watch_only ? 2 : 1; i < argument_count; i++) {
             size_t idx;
-            if (watch_only) {
+            if (watch_only || details) {
                 if (!deauth_target_parse_index(argv[i], selected_scan_count, &idx)) {
-                    MY_LOG_INFO(TAG, "Invalid watch index '%.32s' (valid: 1-%u). Detector not started.",
+                    if (watch_only) {
+                        MY_LOG_INFO(TAG, "Invalid watch index '%.32s' (valid: 1-%u). Detector not started.",
+                                    argv[i], (unsigned)selected_scan_count);
+                        goto watch_prepare_failed;
+                    }
+                    MY_LOG_INFO(TAG, "Invalid detector index '%.32s' (valid: 1-%u). Detector not started.",
                                 argv[i], (unsigned)selected_scan_count);
-                    goto watch_prepare_failed;
+                    return 1;
                 }
             } else {
                 int user_idx = atoi(argv[i]);
@@ -19901,6 +20016,12 @@ static int cmd_deauth_detector(int argc, char **argv) {
         }
         portEXIT_CRITICAL(&detector_event_lock);
     }
+    portENTER_CRITICAL(&detector_event_lock);
+    detector_details_mode = details;
+    detector_details_announced = !details;
+    detector_trace_requested = trace;
+    detector_trace_locked = false;
+    portEXIT_CRITICAL(&detector_event_lock);
     // Activate deauth_detector
     deauth_detector_active = true;
     
@@ -19985,8 +20106,18 @@ static int cmd_deauth_detector(int argc, char **argv) {
             MY_LOG_INFO(TAG, "%s", line);
         }
     }
-    MY_LOG_INFO(TAG, "Output: [DEAUTH] CH: <ch> | AP: <name> (<bssid>) | RSSI: <rssi>");
+    if (details) {
+        MY_LOG_INFO(TAG, "Output: [DEAUTH_V2] CH: <ch> | BSSID: <bssid> | TX: <tx> | DA: <da> | RSSI: <rssi> | REASON: <reason> | SSID: <ssid>");
+    } else {
+        MY_LOG_INFO(TAG, "Output: [DEAUTH] CH: <ch> | AP: <name> (<bssid>) | RSSI: <rssi>");
+    }
     MY_LOG_INFO(TAG, "Use 'stop' to stop.");
+    if (details) {
+        MY_LOG_INFO(TAG, "[DETECTOR_INFO] format=deauth_v2");
+        portENTER_CRITICAL(&detector_event_lock);
+        detector_details_announced = true;
+        portEXIT_CRITICAL(&detector_event_lock);
+    }
     
     return 0;
 
@@ -19996,6 +20127,14 @@ watch_prepare_failed:
     deauth_detector_selected_mode = false;
     deauth_detector_selected_channels_count = 0;
     return 1;
+}
+
+static int cmd_deauth_detector(int argc, char **argv) {
+    return cmd_deauth_detector_impl(argc, argv, false);
+}
+
+static int cmd_deauth_detector_v2(int argc, char **argv) {
+    return cmd_deauth_detector_impl(argc, argv, true);
 }
 
 typedef struct {
@@ -27644,6 +27783,15 @@ static void register_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&deauth_detector_cmd));
 
+    const esp_console_cmd_t deauth_detector_v2_cmd = {
+        .command = "deauth_detector_v2",
+        .help = "Observe deauth and CSA/ECSA; emit deauth_v2 records; --only filters BSSIDs; trace stops hopping on first accepted deauth RX channel",
+        .hint = "[index1 index2 ... | --only index1 index2 ...] [trace]",
+        .func = &cmd_deauth_detector_v2,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&deauth_detector_v2_cmd));
+
     const esp_console_cmd_t select_cmd = {
         .command = "select_networks",
         .help = "Selects networks by indexes: select_networks 0 2 5",
@@ -30947,6 +31095,11 @@ static void deauth_detector_reset_events(void) {
     ++detector_generation;
     detector_event_head = detector_event_count = detector_cache_count = 0;
     detector_dropped = 0;
+    detector_details_mode = false;
+    detector_details_announced = false;
+    detector_trace_requested = false;
+    detector_trace_locked = false;
+    detector_trace_last_failure_ms = -2000;
     memset(&detector_watch_filter, 0, sizeof(detector_watch_filter));
     detector_watch_enabled = false;
     memset(&detector_csa_rate, 0, sizeof(detector_csa_rate));
@@ -30961,6 +31114,11 @@ static void deauth_detector_close_events(void) {
     detector_accepting = false;
     ++detector_generation;
     detector_event_head = detector_event_count = 0;
+    detector_details_mode = false;
+    detector_details_announced = false;
+    detector_trace_requested = false;
+    detector_trace_locked = false;
+    detector_trace_last_failure_ms = -2000;
     memset(&detector_watch_filter, 0, sizeof(detector_watch_filter));
     detector_watch_enabled = false;
     portEXIT_CRITICAL(&detector_event_lock);
@@ -30970,14 +31128,23 @@ static void deauth_detector_process_events(void) {
     // Bounded batch: callback arrivals cannot keep this task from channel hopping/stopping.
     for (size_t i = 0; i < DETECTOR_EVENT_CAPACITY; ++i) {
         detector_event_t event;
+        bool details = false;
+        bool trace_attempt = false;
+        uint32_t generation;
         portENTER_CRITICAL(&detector_event_lock);
-        if (!detector_accepting || !detector_event_count) {
+        if (!detector_accepting || !detector_event_count ||
+            (detector_details_mode && !detector_details_announced)) {
             portEXIT_CRITICAL(&detector_event_lock);
             break;
         }
         event = detector_events[detector_event_head];
+        generation = detector_generation;
         detector_event_head = (detector_event_head + 1) % DETECTOR_EVENT_CAPACITY;
         --detector_event_count;
+        if (!event.is_csa) {
+            details = detector_details_mode;
+            trace_attempt = detector_trace_requested && !detector_trace_locked;
+        }
         portEXIT_CRITICAL(&detector_event_lock);
         const csa_event_t *e = &event.observation;
         if (event.is_csa) {
@@ -30985,6 +31152,32 @@ static void deauth_detector_process_events(void) {
             if (csa_format_line(e, line, sizeof(line))) MY_LOG_INFO(TAG, "%s", line);
             // An observed channel announcement does not establish an attack.
             continue;
+        }
+        if (trace_attempt) {
+            esp_err_t tune = esp_wifi_set_channel(event.legacy_channel, WIFI_SECOND_CHAN_NONE);
+            int64_t now_ms = esp_timer_get_time() / 1000;
+            bool locked = false;
+            bool report_failure = false;
+            portENTER_CRITICAL(&detector_event_lock);
+            if (detector_accepting && deauth_detector_active &&
+                detector_generation == generation && detector_trace_requested &&
+                !detector_trace_locked) {
+                if (tune == ESP_OK) {
+                    detector_trace_locked = true;
+                    deauth_detector_current_channel = event.legacy_channel;
+                    locked = true;
+                } else if (now_ms - detector_trace_last_failure_ms >= 2000) {
+                    detector_trace_last_failure_ms = now_ms;
+                    report_failure = true;
+                }
+            }
+            portEXIT_CRITICAL(&detector_event_lock);
+            if (locked) {
+                MY_LOG_INFO(TAG, "[DETECTOR_TRACE] locked_channel=%d", event.legacy_channel);
+            } else if (report_failure) {
+                MY_LOG_INFO(TAG, "[DETECTOR_TRACE] lock_failed_channel=%d error=%s",
+                            event.legacy_channel, esp_err_to_name(tune));
+            }
         }
         led_status_notify_event(LED_STATUS_EVENT_THREAT);
         snprintf((char *)dd_oled_ssid, sizeof(dd_oled_ssid), "%.21s", event.legacy_ssid);
@@ -30994,9 +31187,33 @@ static void deauth_detector_process_events(void) {
         dd_oled_rssi = e->rssi;
         ++dd_oled_count;
         dd_oled_dirty = true;
-        MY_LOG_INFO(TAG, "[DEAUTH] CH: %d | AP: %s (%02X:%02X:%02X:%02X:%02X:%02X) | RSSI: %d",
-                    event.legacy_channel, event.legacy_ssid,
-                    e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5], (int)e->rssi);
+        if (details) {
+            char ssid[33];
+            char bssid[18], tx[18], da[18], reason_text[6], line[256];
+            const uint8_t *frame = event.deauth_prefix;
+            detector_details_safe_ssid(ssid, event.legacy_ssid);
+            snprintf(bssid, sizeof(bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     frame[16], frame[17], frame[18], frame[19], frame[20], frame[21]);
+            snprintf(tx, sizeof(tx), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     frame[10], frame[11], frame[12], frame[13], frame[14], frame[15]);
+            snprintf(da, sizeof(da), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     frame[4], frame[5], frame[6], frame[7], frame[8], frame[9]);
+            unsigned reason = (unsigned)frame[24] | ((unsigned)frame[25] << 8);
+            if ((frame[1] & 0x40U) && !(frame[4] & 0x01U)) {
+                // PMF encrypts the unicast frame body; these bytes are not a reason code.
+                strcpy(reason_text, "-");
+            } else {
+                snprintf(reason_text, sizeof(reason_text), "%u", reason);
+            }
+            int written = snprintf(line, sizeof(line),
+                                   "[DEAUTH_V2] CH: %d | BSSID: %s | TX: %s | DA: %s | RSSI: %d | REASON: %s | SSID: %s",
+                                   event.legacy_channel, bssid, tx, da, (int)e->rssi, reason_text, ssid);
+            if (written >= 0 && (size_t)written < sizeof(line)) MY_LOG_INFO(TAG, "%s", line);
+        } else {
+            MY_LOG_INFO(TAG, "[DEAUTH] CH: %d | AP: %s (%02X:%02X:%02X:%02X:%02X:%02X) | RSSI: %d",
+                        event.legacy_channel, event.legacy_ssid,
+                        e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5], (int)e->rssi);
+        }
     }
 }
 
@@ -31004,6 +31221,10 @@ static void deauth_detector_channel_hop(void) {
     if (!deauth_detector_active) {
         return;
     }
+    portENTER_CRITICAL(&detector_event_lock);
+    bool trace_locked = detector_trace_locked;
+    portEXIT_CRITICAL(&detector_event_lock);
+    if (trace_locked) return;
     
     // Check if we're in selected channels mode
     if (deauth_detector_selected_mode && deauth_detector_selected_channels_count > 0) {
@@ -31112,7 +31333,8 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
     detector_event_t event = {0};
     bool deauth = frame[0] == 0xc0;
     if (deauth) {
-        if (length < 26) return;
+        if (length < DETECTOR_DEAUTH_PREFIX_SIZE) return;
+        memcpy(event.deauth_prefix, frame, DETECTOR_DEAUTH_PREFIX_SIZE);
         memcpy(event.observation.bssid, frame + 16, 6);
         event.observation.rssi = pkt->rx_ctrl.rssi;
         event.legacy_channel = pkt->rx_ctrl.channel;
@@ -31121,7 +31343,7 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
         if (!csa_parse(frame, length, pkt->rx_ctrl.channel, pkt->rx_ctrl.rssi, &event.observation)) return;
         event.is_csa = true;
     }
-    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t now_ms = event.is_csa ? (uint32_t)(esp_timer_get_time() / 1000) : 0;
     portENTER_CRITICAL(&detector_event_lock);
     if (!detector_accepting || detector_generation != generation) {
         portEXIT_CRITICAL(&detector_event_lock);
@@ -31143,15 +31365,17 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
         return;
     }
     for (size_t i = 0; i < detector_cache_count; ++i) {
-        if (!memcmp(detector_cache[i].bssid, event.observation.bssid, 6)) {
-            if (deauth && detector_cache[i].ssid[0]) memcpy(event.legacy_ssid, detector_cache[i].ssid, 33);
-            else if (!strcmp(event.observation.ssid, "<Unknown>")) {
+        if (memcmp(detector_cache[i].bssid, event.observation.bssid, 6)) continue;
+        if (event.is_csa) {
+            if (!strcmp(event.observation.ssid, "<Unknown>")) {
                 size_t n = 0;
                 while (n < 32 && detector_cache[i].ssid[n]) ++n;
                 csa_safe_ssid(event.observation.ssid, (const uint8_t *)detector_cache[i].ssid, n);
             }
-            break;
+        } else if (detector_cache[i].ssid[0]) {
+            memcpy(event.legacy_ssid, detector_cache[i].ssid, sizeof(event.legacy_ssid));
         }
+        break;
     }
     size_t tail = (detector_event_head + detector_event_count) % DETECTOR_EVENT_CAPACITY;
     detector_events[tail] = event;

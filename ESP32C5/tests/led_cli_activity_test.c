@@ -27,6 +27,7 @@ static const cli_case_t cases[] = {
     {"start_ap_locator", NULL, LED_STATUS_MONITOR},
     {"channel_view", NULL, LED_STATUS_MONITOR},
     {"deauth_detector", NULL, LED_STATUS_MONITOR},
+    {"deauth_detector_v2", NULL, LED_STATUS_MONITOR},
     {"start_antisurveillance", NULL, LED_STATUS_MONITOR},
 
     {"start_handshake", NULL, LED_STATUS_CAPTURE},

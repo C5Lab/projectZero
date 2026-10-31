@@ -62,6 +62,9 @@ typedef int portMUX_TYPE;
 #define portMUX_INITIALIZER_UNLOCKED 0
 #define portENTER_CRITICAL(x) ((void)(x))
 #define portEXIT_CRITICAL(x) ((void)(x))
+typedef int esp_err_t;
+#define ESP_OK 0
+#define WIFI_SECOND_CHAN_NONE 0
 typedef enum { WIFI_PKT_MGMT, WIFI_PKT_DATA } wifi_promiscuous_pkt_type_t;
 typedef struct { struct { unsigned sig_len, dump_len, rx_state; int8_t rssi; uint8_t channel; } rx_ctrl; uint8_t payload[256]; } wifi_promiscuous_pkt_t;
 static bool deauth_detector_active=true;
@@ -69,6 +72,12 @@ static int deauth_detector_current_channel=11;
 static unsigned threat_events;
 static int64_t fake_us;
 static bool restart_during_callback;
+static esp_err_t esp_wifi_set_channel(int channel, int secondary) {
+    (void)channel; (void)secondary; return ESP_OK;
+}
+static const char *esp_err_to_name(int error) {
+    (void)error; return "fixture";
+}
 static void deauth_detector_reset_events(void);
 static void deauth_detector_close_events(void);
 static int64_t esp_timer_get_time(void) {
@@ -214,6 +223,7 @@ static int xTaskCreate(void(*f)(void*),const char*n,int stack,void*p,int prio,in
         code += source[start:end]
         code += function(source,"deauth_detector_reset_events")
         code += function(source,"deauth_detector_close_events")
+        code += function(source,"cmd_deauth_detector_impl")
         code += function(source,"cmd_deauth_detector")
         code += r'''
 int main(void) {

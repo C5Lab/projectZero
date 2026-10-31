@@ -26,6 +26,7 @@ static const led_cli_action_t actions[] = {
     {"start_ap_locator", LED_STATUS_MONITOR},
     {"channel_view", LED_STATUS_MONITOR},
     {"deauth_detector", LED_STATUS_MONITOR},
+    {"deauth_detector_v2", LED_STATUS_MONITOR},
     {"start_antisurveillance", LED_STATUS_MONITOR},
 
     {"start_handshake", LED_STATUS_CAPTURE},

@@ -1079,6 +1079,17 @@ ADDR      ROLE         PKTS  RSSI  LAST
 - Repeats for the same BSSID/TX/RX/target/mode/class are limited to once per two seconds; countdown/RSSI/source subtype do not defeat this limit. First announcements for up to 16 distinct keys can be emitted per two-second window. Capacity/queue losses have separate notices; stop/restart resets pending state. A CSA is an observation and may describe a legitimate AP/DFS channel change.
 - **Stop**: Send `stop`.
 
+### `deauth_detector_v2`
+- **Syntax**: `deauth_detector_v2 [trace]`, `deauth_detector_v2 <index1> [index2 ...] [trace]`, or `deauth_detector_v2 --only <index1> [index2 ...] [trace]`. Examples: `deauth_detector_v2 trace`, `deauth_detector_v2 1 3 trace`, `deauth_detector_v2 --only 1 3 trace`.
+- **Description**: Uses the legacy command's startup scan, channel selection, `--only` BSSID filter, CSA/ECSA output, and `stop` behavior, but emits detailed DEAUTH records. After a successful start, `[DETECTOR_INFO] format=deauth_v2` precedes the first new event. One accepted frame produces one `[DEAUTH_V2]` record and no parallel `[DEAUTH]` line.
+- **Trace**: With the trailing literal `trace` argument, the first queued DEAUTH event accepted by the current selection tunes to that frame's actual receive channel and stops detector-initiated hopping; queue overflow can delay this. CSA/ECSA announcements, short frames, and filtered DEAUTH frames do not trigger the lock. A spoofed DEAUTH can trigger the lock, including under `--only` if it claims a watched BSSID. If tuning to the trace channel fails, hopping continues and the failure is reported at a limited rate. `stop` clears the lock. A connected Wi-Fi mode can still let the driver control the radio channel, so continuous physical residency is not guaranteed. The observation does not establish an attack or prove a client disconnected.
+- **Continuous output**:
+```
+[DEAUTH_V2] CH: 2 | BSSID: D8:CF:61:5D:41:10 | TX: AA:BB:CC:DD:EE:FF | DA: FF:FF:FF:FF:FF:FF | RSSI: -40 | REASON: 7 | SSID: Example
+```
+- **Parse fields**: `CH` and `RSSI` come from receive metadata; `BSSID`, `TX`, and `DA` are frame Addresses 3, 2, and 1. `TX` is only a claimed transmitter. `DA` can be broadcast. `REASON` is the 16-bit reason code, or `-` when a protected unicast frame's body is encrypted. `SSID` comes from the BSSID-matched scan snapshot, never the DEAUTH frame. It is the last field, limited to 32 characters with controls, ANSI sequences, `|`, and malformed UTF-8 removed; the whole record is limited to 256 bytes. Queue overflow can drop observations.
+- **Stop**: Send `stop`. Detector monitoring sends no countermeasure frames or active defense; the no-argument startup scan can send probe requests. The legacy `deauth_detector` command and its output remain unchanged.
+
 ### `start_ap_locator`
 - **Syntax**: `start_ap_locator`
 - **Description**: Locks onto the channel of exactly one AP selected with `select_networks`, listens for its beacon frames, and prints RSSI once per second.
