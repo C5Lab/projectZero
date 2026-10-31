@@ -23,7 +23,14 @@ typedef int nvs_handle_t;
 typedef int BaseType_t;
 typedef uint32_t TickType_t;
 typedef void *esp_https_ota_handle_t;
-typedef int esp_ota_img_states_t;
+typedef enum {
+    ESP_OTA_IMG_NEW = 0x0U,
+    ESP_OTA_IMG_PENDING_VERIFY = 0x1U,
+    ESP_OTA_IMG_VALID = 0x2U,
+    ESP_OTA_IMG_INVALID = 0x3U,
+    ESP_OTA_IMG_ABORTED = 0x4U,
+    ESP_OTA_IMG_UNDEFINED = 0xFFFFFFFFU,
+} esp_ota_img_states_t;
 typedef struct { char project_name[32], version[32], idf_ver[32]; } esp_app_desc_t;
 typedef struct {
     const char *label;
@@ -60,9 +67,10 @@ typedef struct { esp_http_client_config_t *http_config; } esp_https_ota_config_t
 enum { ESP_OK = 0, ESP_FAIL = -1, ESP_ERR_INVALID_ARG = -2,
        ESP_ERR_INVALID_SIZE = -3, ESP_ERR_INVALID_STATE = -4, ESP_ERR_TIMEOUT = -5,
        ESP_ERR_NOT_FOUND = -6,
-       ESP_ERR_HTTPS_OTA_IN_PROGRESS = 1, ESP_OTA_IMG_UNDEFINED = 0,
-       ESP_OTA_IMG_PENDING_VERIFY = 1, ESP_OTA_IMG_VALID = 2,
+       ESP_ERR_HTTPS_OTA_IN_PROGRESS = 1,
        NVS_READONLY = 0, NVS_READWRITE = 1, pdPASS = 1 };
+_Static_assert((uint32_t)ESP_OTA_IMG_UNDEFINED == UINT32_MAX,
+               "ESP-IDF defines ESP_OTA_IMG_UNDEFINED as 0xFFFFFFFF");
 #define pdMS_TO_TICKS(ms) ((TickType_t)(ms))
 #define TAG "test"
 #ifndef CONFIG_PARTITION_TABLE_OFFSET

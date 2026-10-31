@@ -111,6 +111,8 @@
 #include "frame_analyzer_types.h"
 #include "sniffer.h"
 #include "sniffer_extended.h"
+#include "csa_detector_core.h"
+#include "deauth_target_core.h"
 #include "oled_display.h"
 #include "nrf24_jammer.h"
 #include "zig_recon.h"
@@ -118,6 +120,7 @@
 #include "crack_worker.h"
 #include "fs_command.h"
 #include "artifact_inventory_core.h"
+#include "ota_diag.h"
 #include "wifi_analyzer.h"
 #include "led_status_core.h"
 #include "led_cli_activity.h"
@@ -626,7 +629,28 @@ static volatile bool deauth_detector_active = false;
 static int deauth_detector_current_channel = 1;
 static int deauth_detector_channel_index = 0;
 static int64_t deauth_detector_last_channel_hop = 0;
-// Deauth detector OLED shared state (callback -> task)
+// Detector event pipeline (fixed storage; callback never logs or allocates).
+#define DETECTOR_EVENT_CAPACITY 24
+#define DETECTOR_DEAUTH_CAPACITY 16
+typedef struct {
+    csa_event_t observation;
+    bool is_csa;
+    int legacy_channel;
+    char legacy_ssid[33];
+} detector_event_t;
+typedef struct { uint8_t bssid[6]; char ssid[33]; uint8_t channel; } detector_cache_entry_t;
+static detector_event_t detector_events[DETECTOR_EVENT_CAPACITY];
+static detector_cache_entry_t detector_cache[MAX_AP_CNT];
+_Static_assert(DEAUTH_TARGET_MAX == MAX_AP_CNT, "detector target and scan capacities differ");
+static deauth_target_filter_t detector_watch_filter;
+static bool detector_watch_enabled;
+static size_t detector_cache_count;
+static size_t detector_event_head, detector_event_count;
+static uint32_t detector_generation, detector_dropped;
+static bool detector_accepting;
+static csa_rate_limit_t detector_csa_rate;
+static portMUX_TYPE detector_event_lock = portMUX_INITIALIZER_UNLOCKED;
+// Deauth detector OLED shared state (written/rendered only by detector task)
 static volatile char dd_oled_ssid[22] = {0};
 static volatile char dd_oled_bssid[18] = {0};
 static volatile int  dd_oled_ch = 0;
@@ -2032,6 +2056,10 @@ static wifi_ap_record_t g_scan_results[MAX_AP_CNT];
 static uint16_t g_scan_count = 0;
 static volatile bool g_scan_in_progress = false;
 static volatile bool g_scan_done = false;
+// Guards scan-result publication, blackout sorting, and detector watch snapshots.
+static StaticSemaphore_t g_scan_results_mutex_storage;
+static SemaphoreHandle_t g_scan_results_mutex = NULL;
+static bool g_scan_records_valid = false;
 static volatile bool g_scan_teardown_in_progress = false; // set when cancelling a scan to switch radio mode (suppresses misleading failure log)
 /* Unlike g_scan_in_progress this counter is not cleared by timeout/stop paths.
  * Analyzer admission requires the entire legacy completion callback to drain. */
@@ -2623,6 +2651,9 @@ static int cmd_deauth_detector(int argc, char **argv);
 static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void deauth_detector_task(void *pvParameters);
 static void deauth_detector_channel_hop(void);
+static void deauth_detector_reset_events(void);
+static void deauth_detector_close_events(void);
+static void deauth_detector_process_events(void);
 // BLE scanner functions (NimBLE)
 static int cmd_scan_bt(int argc, char **argv);
 static int cmd_scan_airtag(int argc, char **argv);
@@ -2801,6 +2832,27 @@ static void wdp_trace_add_point(const char *path, wdp_trace_ctx_t *c,
 static bool wdp_trace_write_poi(const char *path, wdp_trace_ctx_t *c, const wdp_poi_msg_t *p);
 static void register_commands(void);
 
+// The watch selector reads this cache under the same mutex as publication.
+static esp_err_t detector_publish_scan_records(uint32_t event_status)
+{
+    if (!g_scan_results_mutex ||
+        xSemaphoreTake(g_scan_results_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    g_scan_records_valid = false;
+    esp_err_t result = ESP_FAIL;
+    if (event_status == 0) {
+        g_scan_count = MAX_AP_CNT;
+        result = esp_wifi_scan_get_ap_records(&g_scan_count, g_scan_results);
+        if (result == ESP_OK) g_scan_records_valid = true;
+        else g_scan_count = 0;
+    } else {
+        g_scan_count = 0;
+    }
+    xSemaphoreGive(g_scan_results_mutex);
+    return result;
+}
+
 // --- Wi-Fi event handler ---
 static void wifi_event_handler(void *event_handler_arg,
                                esp_event_base_t event_base,
@@ -2971,10 +3023,8 @@ static void wifi_event_handler(void *event_handler_arg,
             }
 
             g_last_scan_status = e->status;
+            esp_err_t scan_records_err = detector_publish_scan_records(e->status);
             if (e->status == 0) { // Success
-                g_scan_count = MAX_AP_CNT;
-                esp_err_t scan_records_err = esp_wifi_scan_get_ap_records(
-                    &g_scan_count, g_scan_results);
                 bool discovered_new_bssid = false;
                 if (scan_records_err == ESP_OK) {
                     for (uint16_t i = 0; i < g_scan_count; ++i) {
@@ -2983,6 +3033,8 @@ static void wifi_event_handler(void *event_handler_arg,
                             discovered_new_bssid = true;
                         }
                     }
+                } else {
+                    MY_LOG_INFO(TAG, "Failed to read scan records: %s", esp_err_to_name(scan_records_err));
                 }
                 if (discovered_new_bssid && !suppress_scan_logs) {
                     led_status_notify_event(LED_STATUS_EVENT_NEW_TARGET);
@@ -3006,12 +3058,13 @@ static void wifi_event_handler(void *event_handler_arg,
                 if (!suppress_scan_logs) {
                     MY_LOG_INFO(TAG, "Scan failed with status: %" PRIu32, e->status);
                 }
-                g_scan_count = 0;
             }
             
+            xSemaphoreTake(g_scan_results_mutex, portMAX_DELAY);
             g_scan_done = true;
             g_scan_in_progress = false;
             g_scan_teardown_in_progress = false;
+            xSemaphoreGive(g_scan_results_mutex);
 
             // Update OLED with scan results (only if not suppressed / in sniffer)
             if (!suppress_scan_logs && !sniffer_active) {
@@ -4927,10 +4980,20 @@ static esp_err_t start_background_scan(uint32_t min_time, uint32_t max_time) {
         .scan_time.active.max = max_time,
     };
     
+    if (!g_scan_results_mutex ||
+        xSemaphoreTake(g_scan_results_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (g_scan_in_progress) {
+        xSemaphoreGive(g_scan_results_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
     g_scan_in_progress = true;
     g_scan_done = false;
+    g_scan_records_valid = false;
     g_scan_count = 0;
     g_scan_start_time_us = esp_timer_get_time(); // reset start timestamp for every scan path (sniffer, channel view, etc.)
+    xSemaphoreGive(g_scan_results_mutex);
     
     MY_LOG_INFO(TAG, "Starting background WiFi scan...");
     portENTER_CRITICAL(&analyzer_legacy_scan_lock);
@@ -4940,7 +5003,11 @@ static esp_err_t start_background_scan(uint32_t min_time, uint32_t max_time) {
     
     if (ret != ESP_OK) {
         analyzer_legacy_scan_finished();
+        xSemaphoreTake(g_scan_results_mutex, portMAX_DELAY);
         g_scan_in_progress = false;
+        g_scan_records_valid = false;
+        g_scan_count = 0;
+        xSemaphoreGive(g_scan_results_mutex);
         MY_LOG_INFO(TAG, "Failed to start scan: %s", esp_err_to_name(ret));
         return ret;
     }
@@ -6838,6 +6905,7 @@ static void blackout_attack_task(void *pvParameters) {
         MY_LOG_INFO(TAG, "Found %d networks, sorting by channel...", g_scan_count);
         
         // Sort networks by channel (ascending order)
+        xSemaphoreTake(g_scan_results_mutex, portMAX_DELAY);
         for (int i = 0; i < g_scan_count - 1; i++) {
             for (int j = 0; j < g_scan_count - i - 1; j++) {
                 if (g_scan_results[j].primary > g_scan_results[j + 1].primary) {
@@ -6847,6 +6915,7 @@ static void blackout_attack_task(void *pvParameters) {
                 }
             }
         }
+        xSemaphoreGive(g_scan_results_mutex);
         
         // Set all networks as selected for attack
         g_selected_count = g_scan_count;
@@ -14913,6 +14982,8 @@ static int cmd_stop(int argc, char **argv) {
     if (deauth_detector_active || deauth_detector_task_handle != NULL) {
         MY_LOG_INFO(TAG, "Stopping Deauth Detector task...");
         deauth_detector_active = false;
+        deauth_detector_close_events();
+        esp_wifi_set_promiscuous(false);
         
         // Wait a bit for task to finish
         for (int i = 0; i < 20 && deauth_detector_task_handle != NULL; i++) {
@@ -15629,7 +15700,7 @@ typedef struct {
 static const cli_hint_t k_cli_hints[] = {
     { "packet_monitor", " <channel>" },
     { "start_ap_locator", "" },
-    { "deauth_detector", " [index1 index2 ...]" },
+    { "deauth_detector", " [index1 index2 ... | --only index1 index2 ...]" },
     { "select_networks", " <index1> [index2] ..." },
     { "select_stations", " <MAC1> [MAC2] ..." },
     { "sniffer_debug", " <0|1>" },
@@ -16940,6 +17011,10 @@ static int cmd_ota_channel(int argc, char **argv) {
     return 0;
 }
 
+static void ota_diag_log_line(const char *line) {
+    MY_LOG_INFO(TAG, "%s", line);
+}
+
 static int cmd_ota_info(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -16998,6 +17073,8 @@ static int cmd_ota_info(int argc, char **argv) {
                         (int)part_state);
         }
     }
+
+    ota_diag_print(boot, running, ota0, ota1, ota_diag_log_line);
 
     return 0;
 }
@@ -19617,6 +19694,18 @@ static int cmd_start_sniffer_dog(int argc, char **argv) {
 }
 
 static int cmd_deauth_detector(int argc, char **argv) {
+    const bool watch_only = argc > 1 && strcmp(argv[1], "--only") == 0;
+    for (int i = 1; i < argc; ++i) {
+        if (!argv[i] ||
+            (argv[i][0] == '-' && argv[i][1] == '-' && (!watch_only || i != 1))) {
+            MY_LOG_INFO(TAG, "Invalid detector option; use --only before scan indices.");
+            return 1;
+        }
+    }
+    if (watch_only && argc < 3) {
+        MY_LOG_INFO(TAG, "Usage: deauth_detector --only <scan-index> [scan-index ...]");
+        return 1;
+    }
     oled_display_update_full("> Deauth Detect", "  Monitoring...", "  All channels", "  Passive scan");
     log_memory_info("deauth_detector");
     
@@ -19647,29 +19736,60 @@ static int cmd_deauth_detector(int argc, char **argv) {
     deauth_detector_selected_mode = false;
     deauth_detector_selected_channels_count = 0;
     memset(deauth_detector_selected_channels, 0, sizeof(deauth_detector_selected_channels));
+    deauth_target_filter_t requested_watch = {0};
+    uint16_t selected_scan_count = 0;
+    bool watch_scan_locked = false;
+    if (watch_only) {
+        deauth_detector_reset_events();
+        if (!g_scan_results_mutex ||
+            xSemaphoreTake(g_scan_results_mutex, portMAX_DELAY) != pdTRUE) {
+            MY_LOG_INFO(TAG, "Scan results unavailable. Detector not started.");
+            goto watch_prepare_failed;
+        }
+        watch_scan_locked = true;
+    }
     
-    // MODE B: With network indices (e.g., deauth_detector 1 3)
+    // Bare indices retain channel-only selection. --only also selects exact BSSIDs.
     if (argc > 1) {
-        // Check if scan was performed
-        if (!g_scan_done || g_scan_count == 0) {
-            MY_LOG_INFO(TAG, "No scan results available. Run 'scan_networks' first.");
+        if (!g_scan_done || g_scan_count == 0 ||
+            (watch_only && (g_scan_in_progress || !g_scan_records_valid ||
+                            g_scan_count > MAX_AP_CNT))) {
+            if (watch_only) {
+                MY_LOG_INFO(TAG, "No completed scan results available. Run 'scan_networks' first.");
+            } else {
+                MY_LOG_INFO(TAG, "No scan results available. Run 'scan_networks' first.");
+            }
+            if (watch_only) goto watch_prepare_failed;
             return 1;
         }
+        selected_scan_count = g_scan_count;
         
         MY_LOG_INFO(TAG, "Starting Deauth Detector in SELECTED mode...");
         
         // Parse indices and extract unique channels
-        for (int i = 1; i < argc; i++) {
-            int user_idx = atoi(argv[i]);
-            int idx = user_idx - 1; // Convert from 1-based (user) to 0-based (internal)
-            
-            // Validate index
-            if (idx < 0 || idx >= (int)g_scan_count) {
-                MY_LOG_INFO(TAG, "Invalid index %d (valid: 1-%d), skipping", user_idx, g_scan_count);
-                continue;
+        for (int i = watch_only ? 2 : 1; i < argc; i++) {
+            size_t idx;
+            if (watch_only) {
+                if (!deauth_target_parse_index(argv[i], selected_scan_count, &idx)) {
+                    MY_LOG_INFO(TAG, "Invalid watch index '%.32s' (valid: 1-%u). Detector not started.",
+                                argv[i], (unsigned)selected_scan_count);
+                    goto watch_prepare_failed;
+                }
+            } else {
+                int user_idx = atoi(argv[i]);
+                int legacy_idx = user_idx - 1;
+                if (legacy_idx < 0 || legacy_idx >= (int)g_scan_count) {
+                    MY_LOG_INFO(TAG, "Invalid index %d (valid: 1-%d), skipping", user_idx, g_scan_count);
+                    continue;
+                }
+                idx = (size_t)legacy_idx;
             }
-            
             wifi_ap_record_t *ap = &g_scan_results[idx];
+            if (watch_only && !deauth_target_add(&requested_watch, ap->bssid)) {
+                MY_LOG_INFO(TAG, "Too many APs selected (maximum %u). Detector not started.",
+                            (unsigned)DEAUTH_TARGET_MAX);
+                goto watch_prepare_failed;
+            }
             int channel = ap->primary;
             
             // Check if channel already in list
@@ -19683,16 +19803,33 @@ static int cmd_deauth_detector(int argc, char **argv) {
             
             if (!channel_exists && deauth_detector_selected_channels_count < MAX_AP_CNT) {
                 deauth_detector_selected_channels[deauth_detector_selected_channels_count++] = channel;
-                MY_LOG_INFO(TAG, "  Added: %s (ch %d)", ap->ssid, channel);
+                if (!watch_only) MY_LOG_INFO(TAG, "  Added: %s (ch %d)", ap->ssid, channel);
             }
         }
-        
-        if (deauth_detector_selected_channels_count == 0) {
+        if (deauth_detector_selected_channels_count == 0 ||
+            (watch_only && requested_watch.count == 0)) {
             MY_LOG_INFO(TAG, "No valid channels selected. Aborting.");
+            if (watch_only) goto watch_prepare_failed;
             return 1;
         }
         
         deauth_detector_selected_mode = true;
+        if (watch_only) {
+            // One scan mutex hold covers index resolution and all displayed target data.
+            portENTER_CRITICAL(&detector_event_lock);
+            detector_cache_count = selected_scan_count;
+            for (size_t i = 0; i < detector_cache_count; ++i) {
+                memcpy(detector_cache[i].bssid, g_scan_results[i].bssid, 6);
+                memcpy(detector_cache[i].ssid, g_scan_results[i].ssid, 32);
+                detector_cache[i].ssid[32] = 0;
+                detector_cache[i].channel = g_scan_results[i].primary;
+            }
+            detector_watch_filter = requested_watch;
+            detector_watch_enabled = true;
+            portEXIT_CRITICAL(&detector_event_lock);
+            xSemaphoreGive(g_scan_results_mutex);
+            watch_scan_locked = false;
+        }
         
         // Build channel list string for display
         char channel_list[128] = {0};
@@ -19749,18 +19886,38 @@ static int cmd_deauth_detector(int argc, char **argv) {
         deauth_detector_selected_mode = false;
     }
     
+    // The watch cache was captured with the selected BSSIDs under the scan mutex.
+    if (!watch_only) {
+        deauth_detector_reset_events();
+        portENTER_CRITICAL(&detector_event_lock);
+        if (g_scan_done && !g_scan_in_progress) {
+            detector_cache_count = g_scan_count < MAX_AP_CNT ? g_scan_count : MAX_AP_CNT;
+            for (size_t i = 0; i < detector_cache_count; ++i) {
+                memcpy(detector_cache[i].bssid, g_scan_results[i].bssid, 6);
+                memcpy(detector_cache[i].ssid, g_scan_results[i].ssid, 32);
+                detector_cache[i].ssid[32] = 0;
+                detector_cache[i].channel = g_scan_results[i].primary;
+            }
+        }
+        portEXIT_CRITICAL(&detector_event_lock);
+    }
     // Activate deauth_detector
     deauth_detector_active = true;
     
-    // Set promiscuous filter for MGMT frames only (deauth is a management frame)
+    // Configure reception only. The legacy startup scan above retains its existing behavior.
     wifi_promiscuous_filter_t mgmt_filter = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
     };
-    esp_wifi_set_promiscuous_filter(&mgmt_filter);
-    
-    // Enable promiscuous mode with deauth_detector callback
-    esp_wifi_set_promiscuous_rx_cb(deauth_detector_promiscuous_callback);
-    esp_wifi_set_promiscuous(true);
+    esp_err_t detector_setup = esp_wifi_set_promiscuous_filter(&mgmt_filter);
+    if (detector_setup == ESP_OK) detector_setup = esp_wifi_set_promiscuous_rx_cb(deauth_detector_promiscuous_callback);
+    if (detector_setup == ESP_OK) detector_setup = esp_wifi_set_promiscuous(true);
+    if (detector_setup != ESP_OK) {
+        MY_LOG_INFO(TAG, "Detector receiver setup failed: %s", esp_err_to_name(detector_setup));
+        deauth_detector_active = false;
+        deauth_detector_close_events();
+        esp_wifi_set_promiscuous(false);
+        return 1;
+    }
     
     // Initialize channel hopping
     deauth_detector_channel_index = 0;
@@ -19769,8 +19926,16 @@ static int cmd_deauth_detector(int argc, char **argv) {
     } else {
         deauth_detector_current_channel = dual_band_channels[0];
     }
-    esp_wifi_set_channel(deauth_detector_current_channel, WIFI_SECOND_CHAN_NONE);
+    esp_err_t detector_tune = esp_wifi_set_channel(deauth_detector_current_channel, WIFI_SECOND_CHAN_NONE);
+    if (detector_tune != ESP_OK) {
+        MY_LOG_INFO(TAG, "Detector initial channel %d unavailable: %s", deauth_detector_current_channel, esp_err_to_name(detector_tune));
+        deauth_detector_active = false;
+        deauth_detector_close_events();
+        esp_wifi_set_promiscuous(false);
+        return 1;
+    }
     deauth_detector_last_channel_hop = esp_timer_get_time() / 1000;
+    MY_LOG_INFO(TAG, "Detector channel coverage depends on current band/connection state; CSA RX is the received channel.");
     
     // Create channel hopping task (stack must be in internal RAM on ESP32-C5)
     BaseType_t task_created = xTaskCreate(
@@ -19785,6 +19950,7 @@ static int cmd_deauth_detector(int argc, char **argv) {
     if (task_created != pdPASS) {
         MY_LOG_INFO(TAG, "Failed to create Deauth Detector channel hopping task");
         deauth_detector_active = false;
+        deauth_detector_close_events();
         esp_wifi_set_promiscuous(false);
         
         return 1;
@@ -19795,10 +19961,41 @@ static int cmd_deauth_detector(int argc, char **argv) {
     } else {
         MY_LOG_INFO(TAG, "Deauth Detector started - scanning all channels for deauth frames...");
     }
+    MY_LOG_INFO(TAG, "[DETECTOR_INFO] CSA/ECSA announcements enabled.");
+    if (watch_only) {
+        for (size_t j = 0; j < requested_watch.count; ++j) {
+            const uint8_t *bssid = requested_watch.bssid[j];
+            char ssid[33] = "<Unknown>";
+            unsigned channel = 0;
+            for (size_t i = 0; i < detector_cache_count; ++i) {
+                if (memcmp(detector_cache[i].bssid, bssid, 6) == 0) {
+                    size_t n = 0;
+                    while (n < 32 && detector_cache[i].ssid[n]) ++n;
+                    csa_safe_ssid(ssid, (const uint8_t *)detector_cache[i].ssid, n);
+                    channel = detector_cache[i].channel;
+                    break;
+                }
+            }
+            char line[160];
+            snprintf(line, sizeof(line),
+                     "[DETECTOR_WATCH] count=%u ap=%u/%u CH=%u BSSID=%02X:%02X:%02X:%02X:%02X:%02X SSID=%s",
+                     (unsigned)requested_watch.count, (unsigned)(j + 1),
+                     (unsigned)requested_watch.count, channel,
+                     bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], ssid);
+            MY_LOG_INFO(TAG, "%s", line);
+        }
+    }
     MY_LOG_INFO(TAG, "Output: [DEAUTH] CH: <ch> | AP: <name> (<bssid>) | RSSI: <rssi>");
     MY_LOG_INFO(TAG, "Use 'stop' to stop.");
     
     return 0;
+
+watch_prepare_failed:
+    if (watch_scan_locked) xSemaphoreGive(g_scan_results_mutex);
+    deauth_detector_close_events();
+    deauth_detector_selected_mode = false;
+    deauth_detector_selected_channels_count = 0;
+    return 1;
 }
 
 typedef struct {
@@ -27440,8 +27637,8 @@ static void register_commands(void)
 
     const esp_console_cmd_t deauth_detector_cmd = {
         .command = "deauth_detector",
-        .help = "Detect deauth frames. No args: scan+all channels. With indices: selected channels only",
-        .hint = "[index1 index2 ...]",
+        .help = "Observe deauth and CSA/ECSA. Bare indices select channels; --only indices watch exact scan BSSIDs",
+        .hint = "[index1 index2 ... | --only index1 index2 ...]",
         .func = &cmd_deauth_detector,
         .argtable = NULL
     };
@@ -28368,6 +28565,8 @@ void app_main(void) {
     // heap_caps_print_heap_info(MALLOC_CAP_DEFAULT);
 
     printf("\n\n=== APP_MAIN START (v" JANOS_VERSION ") ===\n");
+    g_scan_results_mutex = xSemaphoreCreateMutexStatic(&g_scan_results_mutex_storage);
+    assert(g_scan_results_mutex != NULL);
     
     // Suppress WiFi internal WARNING logs (phy rate, etc.) - show only errors
     esp_log_level_set("wifi", ESP_LOG_ERROR);
@@ -30742,14 +30941,63 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
 
 // === DEAUTH DETECTOR FUNCTIONS ===
 
-// Helper function to find SSID by BSSID from scan results
-static const char* deauth_detector_find_ssid_by_bssid(const uint8_t *bssid) {
-    for (int i = 0; i < g_scan_count; i++) {
-        if (memcmp(g_scan_results[i].bssid, bssid, 6) == 0) {
-            return (const char*)g_scan_results[i].ssid;
+// No callback-owned allocation is ever freed. Generation checks discard late callbacks.
+static void deauth_detector_reset_events(void) {
+    portENTER_CRITICAL(&detector_event_lock);
+    ++detector_generation;
+    detector_event_head = detector_event_count = detector_cache_count = 0;
+    detector_dropped = 0;
+    memset(&detector_watch_filter, 0, sizeof(detector_watch_filter));
+    detector_watch_enabled = false;
+    memset(&detector_csa_rate, 0, sizeof(detector_csa_rate));
+    detector_accepting = true;
+    portEXIT_CRITICAL(&detector_event_lock);
+    dd_oled_count = 0;
+    dd_oled_dirty = false;
+}
+
+static void deauth_detector_close_events(void) {
+    portENTER_CRITICAL(&detector_event_lock);
+    detector_accepting = false;
+    ++detector_generation;
+    detector_event_head = detector_event_count = 0;
+    memset(&detector_watch_filter, 0, sizeof(detector_watch_filter));
+    detector_watch_enabled = false;
+    portEXIT_CRITICAL(&detector_event_lock);
+}
+
+static void deauth_detector_process_events(void) {
+    // Bounded batch: callback arrivals cannot keep this task from channel hopping/stopping.
+    for (size_t i = 0; i < DETECTOR_EVENT_CAPACITY; ++i) {
+        detector_event_t event;
+        portENTER_CRITICAL(&detector_event_lock);
+        if (!detector_accepting || !detector_event_count) {
+            portEXIT_CRITICAL(&detector_event_lock);
+            break;
         }
+        event = detector_events[detector_event_head];
+        detector_event_head = (detector_event_head + 1) % DETECTOR_EVENT_CAPACITY;
+        --detector_event_count;
+        portEXIT_CRITICAL(&detector_event_lock);
+        const csa_event_t *e = &event.observation;
+        if (event.is_csa) {
+            char line[CSA_LINE_SIZE];
+            if (csa_format_line(e, line, sizeof(line))) MY_LOG_INFO(TAG, "%s", line);
+            // An observed channel announcement does not establish an attack.
+            continue;
+        }
+        led_status_notify_event(LED_STATUS_EVENT_THREAT);
+        snprintf((char *)dd_oled_ssid, sizeof(dd_oled_ssid), "%.21s", event.legacy_ssid);
+        snprintf((char *)dd_oled_bssid, sizeof(dd_oled_bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5]);
+        dd_oled_ch = event.legacy_channel;
+        dd_oled_rssi = e->rssi;
+        ++dd_oled_count;
+        dd_oled_dirty = true;
+        MY_LOG_INFO(TAG, "[DEAUTH] CH: %d | AP: %s (%02X:%02X:%02X:%02X:%02X:%02X) | RSSI: %d",
+                    event.legacy_channel, event.legacy_ssid,
+                    e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5], (int)e->rssi);
     }
-    return NULL; // Unknown AP
 }
 
 static void deauth_detector_channel_hop(void) {
@@ -30776,7 +31024,16 @@ static void deauth_detector_channel_hop(void) {
         }
     }
     
-    esp_wifi_set_channel(deauth_detector_current_channel, WIFI_SECOND_CHAN_NONE);
+    esp_err_t result = esp_wifi_set_channel(deauth_detector_current_channel, WIFI_SECOND_CHAN_NONE);
+    if (result != ESP_OK) {
+        // At most one notice per two seconds; failed tuning never changes reported CSA RX.
+        static int64_t last_notice_ms = -2000;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - last_notice_ms >= 2000) {
+            MY_LOG_INFO(TAG, "Detector channel %d unavailable: %s", deauth_detector_current_channel, esp_err_to_name(result));
+            last_notice_ms = now_ms;
+        }
+    }
     deauth_detector_last_channel_hop = esp_timer_get_time() / 1000;
 }
 
@@ -30786,6 +31043,7 @@ static void deauth_detector_task(void *pvParameters) {
     
     log_memory_info("deauth_detector_task");
     int64_t dd_oled_last_us = 0;
+    int64_t overflow_last_ms = 0;
     
     while (deauth_detector_active) {
         vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
@@ -30794,6 +31052,19 @@ static void deauth_detector_task(void *pvParameters) {
             continue;
         }
         
+        deauth_detector_process_events();
+        int64_t overflow_now_ms = esp_timer_get_time() / 1000;
+        if (overflow_now_ms - overflow_last_ms >= 2000) {
+            portENTER_CRITICAL(&detector_event_lock);
+            uint32_t dropped = detector_dropped;
+            detector_dropped = 0;
+            uint32_t limited = detector_csa_rate.capacity_dropped;
+            detector_csa_rate.capacity_dropped = 0;
+            portEXIT_CRITICAL(&detector_event_lock);
+            if (dropped) MY_LOG_INFO(TAG, "Detector event queue overflow: %lu observations dropped", (unsigned long)dropped);
+            if (limited) MY_LOG_INFO(TAG, "Detector CSA rate capacity: %lu observations suppressed", (unsigned long)limited);
+            overflow_last_ms = overflow_now_ms;
+        }
         // Force channel hop if 250ms passed
         int64_t current_time = esp_timer_get_time() / 1000;
         bool time_expired = (current_time - deauth_detector_last_channel_hop >= sniffer_channel_hop_delay_ms);
@@ -30826,63 +31097,66 @@ static void deauth_detector_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-// Promiscuous callback for deauth_detector - detects deauthentication frames
+// Promiscuous callback: bounded parse/copy only; task owns output and display.
 static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
-    if (!deauth_detector_active) {
-        return;
-    }
-    
-    // Filter only MGMT packets (deauth is a management frame)
-    if (type != WIFI_PKT_MGMT) {
-        return;
-    }
-    
-    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    if (!buf || !deauth_detector_active || type != WIFI_PKT_MGMT) return;
+    portENTER_CRITICAL(&detector_event_lock);
+    bool accepting = detector_accepting;
+    uint32_t generation = detector_generation;
+    portEXIT_CRITICAL(&detector_event_lock);
+    if (!accepting) return;
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    size_t length;
+    if (!csa_capture_length(pkt->rx_ctrl.sig_len, pkt->rx_ctrl.dump_len, pkt->rx_ctrl.rx_state, &length)) return;
     const uint8_t *frame = pkt->payload;
-    int len = pkt->rx_ctrl.sig_len;
-    
-    if (len < 24) { // Minimum 802.11 header size
+    detector_event_t event = {0};
+    bool deauth = frame[0] == 0xc0;
+    if (deauth) {
+        if (length < 26) return;
+        memcpy(event.observation.bssid, frame + 16, 6);
+        event.observation.rssi = pkt->rx_ctrl.rssi;
+        event.legacy_channel = pkt->rx_ctrl.channel;
+        strcpy(event.legacy_ssid, "<Unknown>");
+    } else {
+        if (!csa_parse(frame, length, pkt->rx_ctrl.channel, pkt->rx_ctrl.rssi, &event.observation)) return;
+        event.is_csa = true;
+    }
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    portENTER_CRITICAL(&detector_event_lock);
+    if (!detector_accepting || detector_generation != generation) {
+        portEXIT_CRITICAL(&detector_event_lock);
         return;
     }
-    
-    // Check if this is a deauthentication frame
-    // Frame Control: Type=0 (Management), Subtype=12 (Deauthentication)
-    // Frame Control byte 0: 0xC0 = (subtype << 4) | (type << 2) = (12 << 4) | (0 << 2) = 0xC0
-    uint8_t frame_type = frame[0] & 0xFC;
-    if (frame_type != 0xC0) {
-        return; // Not a deauthentication frame
+    if (detector_watch_enabled &&
+        !deauth_target_contains(&detector_watch_filter, event.observation.bssid)) {
+        portEXIT_CRITICAL(&detector_event_lock);
+        return;
     }
-    
-    // Extract BSSID (Address 3 in management frames)
-    // 802.11 header: FC(2) + Duration(2) + Addr1(6) + Addr2(6) + Addr3(6) + SeqCtl(2)
-    // Addr3 is at offset 16
-    const uint8_t *bssid_mac = &frame[16];
-    
-    // Get RSSI from rx_ctrl
-    int rssi = pkt->rx_ctrl.rssi;
-    
-    // Lookup SSID by BSSID from scan results
-    const char *ssid = deauth_detector_find_ssid_by_bssid(bssid_mac);
-    const char *ap_name = (ssid && ssid[0] != '\0') ? ssid : "<Unknown>";
-    
-    led_status_notify_event(LED_STATUS_EVENT_THREAT);
-    
-    // Update shared OLED state for task to render
-    snprintf((char *)dd_oled_ssid, sizeof(dd_oled_ssid), "%s", ap_name);
-    snprintf((char *)dd_oled_bssid, sizeof(dd_oled_bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
-             bssid_mac[0], bssid_mac[1], bssid_mac[2], bssid_mac[3], bssid_mac[4], bssid_mac[5]);
-    dd_oled_ch = deauth_detector_current_channel;
-    dd_oled_rssi = rssi;
-    dd_oled_count++;
-    dd_oled_dirty = true;
-    
-    // Print detection: CHANNEL | AP NAME (MAC) | RSSI
-    MY_LOG_INFO(TAG, "[DEAUTH] CH: %d | AP: %s (%02X:%02X:%02X:%02X:%02X:%02X) | RSSI: %d",
-               deauth_detector_current_channel,
-               ap_name,
-               bssid_mac[0], bssid_mac[1], bssid_mac[2], bssid_mac[3], bssid_mac[4], bssid_mac[5],
-               rssi);
-    
+    // Reserve eight entries so a deauth burst cannot starve the first CSA observation.
+    if (detector_event_count >= (event.is_csa ? DETECTOR_EVENT_CAPACITY : DETECTOR_DEAUTH_CAPACITY)) {
+        if (detector_dropped != UINT32_MAX) ++detector_dropped;
+        portEXIT_CRITICAL(&detector_event_lock);
+        return;
+    }
+    if (event.is_csa && !csa_rate_allow(&detector_csa_rate, &event.observation, now_ms)) {
+        portEXIT_CRITICAL(&detector_event_lock);
+        return;
+    }
+    for (size_t i = 0; i < detector_cache_count; ++i) {
+        if (!memcmp(detector_cache[i].bssid, event.observation.bssid, 6)) {
+            if (deauth && detector_cache[i].ssid[0]) memcpy(event.legacy_ssid, detector_cache[i].ssid, 33);
+            else if (!strcmp(event.observation.ssid, "<Unknown>")) {
+                size_t n = 0;
+                while (n < 32 && detector_cache[i].ssid[n]) ++n;
+                csa_safe_ssid(event.observation.ssid, (const uint8_t *)detector_cache[i].ssid, n);
+            }
+            break;
+        }
+    }
+    size_t tail = (detector_event_head + detector_event_count) % DETECTOR_EVENT_CAPACITY;
+    detector_events[tail] = event;
+    ++detector_event_count;
+    portEXIT_CRITICAL(&detector_event_lock);
 }
 
 // === WARDRIVE HELPER FUNCTIONS ===

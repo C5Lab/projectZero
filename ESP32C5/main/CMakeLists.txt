@@ -1,5 +1,5 @@
 file(TO_CMAKE_PATH "$ENV{IDF_PATH}" CRACK_WORKER_IDF_PATH)
-idf_component_register(SRCS "oled_display.c" "main.c" "attack_handshake.c"
+idf_component_register(SRCS "oled_display.c" "main.c" "ota_diag.c" "attack_handshake.c"
                             "led_status_core.c" "led_cli_activity.c" "led_target_cache.c"
                             "handshake_tx_telemetry.c"
                             "handshake_ducb_guard.c"
@@ -11,7 +11,7 @@ idf_component_register(SRCS "oled_display.c" "main.c" "attack_handshake.c"
                             "sta_mac_boot.c" "sta_mac_command.c" "sta_mac_policy_nvs.c"
                             "wifi_country_policy.c" "wifi_country_store.c" "wifi_country_driver.c"
                             "wifi_channel_policy.c" "bssid_protection.c"
-                            "sniffer_extended.c"
+                            "sniffer_extended.c" "csa_detector_core.c" "deauth_target_core.c"
                        INCLUDE_DIRS .
                        PRIV_INCLUDE_DIRS "${CRACK_WORKER_IDF_PATH}/components/mbedtls/mbedtls/library"
                        REQUIRES esp_timer esp_wifi esp_event esp_psram nvs_flash 

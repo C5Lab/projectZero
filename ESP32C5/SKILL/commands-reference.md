@@ -1061,14 +1061,22 @@ ADDR      ROLE         PKTS  RSSI  LAST
 - **Completion marker**: `"[ZIG] END"`.
 
 ### `deauth_detector`
-- **Syntax**: `deauth_detector` or `deauth_detector [index1 index2 ...]`
-- **Description**: Detects deauth frames. No args = all channels; with indices = selected channels.
+- **Syntax**: `deauth_detector`, `deauth_detector [index1 index2 ...]`, or `deauth_detector --only <index1> [index2 ...]`
+- **Description**: Observes deauth frames and CSA/ECSA channel-switch announcements. No args = scan then hop all channels; bare indices = channels from selected networks, with events from any BSSID on those channels. `--only` = filter both deauth and CSA events to the exact BSSIDs at the given 1-based indices from the current completed scan cache, hopping their distinct scan channels. Run `scan_networks` immediately before selection because another scan can replace that cache; short `[DETECTOR_WATCH]` startup lines confirm each captured BSSID, SSID and channel. A missing/in-progress/failed scan or any invalid index rejects the whole command. Select each AP index when several APs share an SSID. The target snapshot and scan channels are fixed for the run; rescan and restart if an AP changes channel. BSSID values in received frames can be spoofed. CSA reception adds no countermeasure TX. Actual coverage depends on current band/connection/regulatory state; tuning failures are reported.
 - **Continuous output**:
 ```
 [DEAUTH] CH: 6 | AP: MyNetwork (AA:BB:CC:DD:EE:FF) | RSSI: -45
 [DEAUTH] CH: 1 | AP: AX3_2.4 (30:AA:E4:3C:3F:64) | RSSI: -72
 ```
 - **Parse fields**: `CH:` (int), `AP:` (string until `(`), BSSID (inside parens), `RSSI:` (int).
+- Legacy `CH` uses actual C5 receive metadata; line syntax/order is unchanged.
+- **Additional CSA output** (separate from legacy deauth):
+```
+[CSA] RX: 6 | TO: 36 | BSSID: AA:BB:CC:DD:EE:FF | TX: 02:11:22:33:44:55 | RSSI: -51 | VIA: beacon | COUNT: 3 | MODE: 1 | CLASS: - | SSID: Example
+```
+- `RX` comes from C5 receive metadata; `TO`/`COUNT`/`MODE`/numeric ECSA `CLASS` are raw advertised bytes. Plain CSA uses `CLASS: -`. `BSSID` is Address 3; `TX` is claimed Address 2, not authenticated identity. `VIA` is `beacon`, `probe`, or `action`. SSID is printable, at most 32 bytes, replaces controls/non-ASCII/`|` with `?`, and uses `<Unknown>` when absent/empty.
+- Supports IE 37/60 in complete beacon/probe-response frames, spectrum CSA Action 0/4 and public ECSA Action 4/4. Malformed/conflicting/truncated/error/encrypted/fragmented/HT-Control observations are ignored. Positive complete C5 `dump_len` required.
+- Repeats for the same BSSID/TX/RX/target/mode/class are limited to once per two seconds; countdown/RSSI/source subtype do not defeat this limit. First announcements for up to 16 distinct keys can be emitted per two-second window. Capacity/queue losses have separate notices; stop/restart resets pending state. A CSA is an observation and may describe a legitimate AP/DFS channel change.
 - **Stop**: Send `stop`.
 
 ### `start_ap_locator`

@@ -12,7 +12,14 @@
 #include <strings.h>
 
 typedef int esp_err_t;
-typedef int esp_ota_img_states_t;
+typedef enum {
+    ESP_OTA_IMG_NEW = 0x0U,
+    ESP_OTA_IMG_PENDING_VERIFY = 0x1U,
+    ESP_OTA_IMG_VALID = 0x2U,
+    ESP_OTA_IMG_INVALID = 0x3U,
+    ESP_OTA_IMG_ABORTED = 0x4U,
+    ESP_OTA_IMG_UNDEFINED = 0xFFFFFFFFU,
+} esp_ota_img_states_t;
 typedef struct { const char *label; } esp_partition_t;
 typedef struct { int unused; } esp_console_repl_t;
 typedef struct { int task_stack_size; const char *prompt; int max_cmdline_length; } esp_console_repl_config_t;
@@ -20,7 +27,7 @@ typedef struct { int baud_rate; } esp_console_dev_uart_config_t;
 typedef struct {
     const char *(*busy_reason)(void);
     esp_err_t (*prepare_wifi)(void);
-    int (*baud_rate)(void);
+    uint32_t (*baud_rate)(void);
     void (*tx_activity)(void);
     bool (*lease_acquire)(uint32_t *generation);
     bool (*lease_mark_running)(uint32_t generation);
@@ -35,17 +42,32 @@ typedef struct {
     void (*tx_activity)(void);
     void (*verified)(void);
 } janos_wps_runtime_hooks_t;
+typedef struct {
+    esp_err_t (*mount_sd)(void);
+    int (*send_file)(const char *absolute_path);
+    void (*transfer_active)(bool active);
+    uint32_t (*current_baud)(void);
+    void (*sync_sd)(void);
+} fs_command_hooks_t;
 
-enum { ESP_OK = 0, ESP_FAIL = -1, ESP_OTA_IMG_UNDEFINED = 0,
-       ESP_OTA_IMG_PENDING_VERIFY = 1, ESP_OTA_IMG_VALID = 2,
-       ESP_ERR_NOT_FOUND = -2 };
+enum { ESP_OK = 0, ESP_FAIL = -1, ESP_ERR_NOT_FOUND = -2 };
+_Static_assert((uint32_t)ESP_OTA_IMG_UNDEFINED == UINT32_MAX,
+               "ESP-IDF defines ESP_OTA_IMG_UNDEFINED as 0xFFFFFFFF");
 #define ESP_MAC_WIFI_STA 0
 #define TAG "test"
 #define JANOS_UART_DEFAULT_BAUD 115200
 #define ESP_CONSOLE_REPL_CONFIG_DEFAULT() ((esp_console_repl_config_t){0})
 #define ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT() ((esp_console_dev_uart_config_t){0})
 #define pdMS_TO_TICKS(ms) (ms)
-static void test_log(const char *tag, const char *fmt, ...) { (void)tag; (void)fmt; }
+static char ota_log[256];
+static void test_log(const char *tag, const char *fmt, ...) {
+    (void)tag;
+    if (strncmp(fmt, "OTA:", 4) != 0) return;
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(ota_log, sizeof(ota_log), fmt, args);
+    va_end(args);
+}
 #define MY_LOG_INFO test_log
 
 static char events[256];
@@ -123,13 +145,23 @@ static bool janos_wps_runtime_init(janos_radio_lease_t *lease,
                                    const janos_wps_runtime_hooks_t *hooks,
                                    const uint8_t mac[6])
 { (void)lease; (void)mac; assert(hooks->verified == led_status_wps_verified); return true; }
-static int uart_baud_current(void) { return JANOS_UART_DEFAULT_BAUD; }
+static uint32_t uart_baud_current(void) { return JANOS_UART_DEFAULT_BAUD; }
 static void uart_baud_note_activity(void) {}
 static esp_err_t init_sd_card(void) { event("sd"); return ESP_FAIL; }
 static void uart_baud_set_file_transfer_active(bool active) { (void)active; }
 static void wifi_analyzer_init(const wifi_analyzer_hooks_t *hooks) { (void)hooks; }
-static void crack_worker_init(esp_err_t (*sd)(void), void (*transfer)(bool), int (*baud)(void)) {
+static void crack_worker_init(esp_err_t (*sd)(void), void (*transfer)(bool), uint32_t (*baud)(void)) {
     (void)sd; (void)transfer; (void)baud;
+}
+static int fs_send_file_callback(const char *absolute_path)
+{ (void)absolute_path; return 0; }
+static void sd_sync(void) {}
+static void fs_command_init(const fs_command_hooks_t *hooks) {
+    assert(hooks->mount_sd == init_sd_card);
+    assert(hooks->send_file == fs_send_file_callback);
+    assert(hooks->transfer_active == uart_baud_set_file_transfer_active);
+    assert(hooks->current_baud == uart_baud_current);
+    assert(hooks->sync_sd == sd_sync);
 }
 static void esp_console_register_help_command(void) {}
 static void register_commands(void) { event("commands"); }
@@ -195,8 +227,8 @@ int main(int argc, char **argv) {
             command_result = cmd_ota_boot(2, args);
         }
     }
-    printf("events=%s\nmark=%d\naborted=%d\nstate=%d\nready=%d\nset_boot=%d\nrestart=%d\ncommand=%d\n",
+    printf("events=%s\nmark=%d\naborted=%d\nstate=%d\nready=%d\nset_boot=%d\nrestart=%d\ncommand=%d\nota_log=%s\n",
            events, mark_count, abort_count, image_state, (int)ota_boot_is_ready(),
-           set_boot_count, restart_count, command_result);
+           set_boot_count, restart_count, command_result, ota_log);
     return 0;
 }

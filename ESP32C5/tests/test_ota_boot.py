@@ -140,6 +140,12 @@ class OtaBootTest(unittest.TestCase):
                 self.assertEqual(self.results[scenario]["mark"], "0")
                 self.assertEqual(self.results[scenario]["ready"], "1")
 
+    def test_undefined_state_and_missing_metadata_take_distinct_paths(self):
+        self.assertEqual(self.results["legacy"]["ota_log"],
+                         "OTA: running state=-1, no mark needed")
+        self.assertEqual(self.results["no_otadata"]["ota_log"],
+                         "OTA: no OTA state metadata; boot ready on ota_1")
+
     def test_unexpected_state_read_error_fails_closed(self):
         self.assertEqual(self.results["state_fail"]["ready"], "0")
         self.assertEqual(self.results["state_fail"]["mark"], "0")
