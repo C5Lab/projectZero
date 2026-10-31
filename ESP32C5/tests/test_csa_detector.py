@@ -69,6 +69,10 @@ typedef enum { WIFI_PKT_MGMT, WIFI_PKT_DATA } wifi_promiscuous_pkt_type_t;
 typedef struct { struct { unsigned sig_len, dump_len, rx_state; int8_t rssi; uint8_t channel; } rx_ctrl; uint8_t payload[256]; } wifi_promiscuous_pkt_t;
 static bool deauth_detector_active=true;
 static int deauth_detector_current_channel=11;
+static int64_t deauth_detector_last_channel_hop;
+static const int dual_band_channels[]={1,6,11,36,40,44};
+static const int dual_band_channels_count=
+    sizeof(dual_band_channels)/sizeof(dual_band_channels[0]);
 static unsigned threat_events;
 static int64_t fake_us;
 static bool restart_during_callback;
@@ -92,7 +96,15 @@ static int64_t esp_timer_get_time(void) {
 static void led_status_notify_event(int event) { (void)event; ++threat_events; }
 '''
         code += source[globals_begin:globals_end]
-        for name in ("deauth_detector_reset_events", "deauth_detector_close_events",
+        for name in ("detector_trace_reset_locked",
+                     "detector_trace_add_candidate_locked",
+                     "detector_trace_build_candidates_locked",
+                     "detector_trace_record_locked",
+                     "detector_trace_observe_locked",
+                     "detector_trace_choose_channel_locked",
+                     "detector_trace_finish_if_due",
+                     "detector_trace_release_if_idle",
+                     "deauth_detector_reset_events", "deauth_detector_close_events",
                      "deauth_detector_process_events", "deauth_detector_promiscuous_callback"):
             code += '\n' + function(source,name)
         code += r'''
@@ -191,6 +203,8 @@ static int deauth_detector_current_channel,deauth_detector_channel_index;
 static int64_t deauth_detector_last_channel_hop;
 static int deauth_detector_task_handle;
 static int dual_band_channels[]={1,6,36,149};
+static const int dual_band_channels_count=
+    sizeof(dual_band_channels)/sizeof(dual_band_channels[0]);
 static int g_scan_min_channel_time=100,g_scan_max_channel_time=200;
 static int fail_step,setup_calls,task_result=pdPASS;
 static bool receiver_enabled;
@@ -221,6 +235,7 @@ static int xTaskCreate(void(*f)(void*),const char*n,int stack,void*p,int prio,in
 }
 '''
         code += source[start:end]
+        code += function(source,"detector_trace_reset_locked")
         code += function(source,"deauth_detector_reset_events")
         code += function(source,"deauth_detector_close_events")
         code += function(source,"cmd_deauth_detector_impl")

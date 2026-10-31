@@ -633,6 +633,9 @@ static int64_t deauth_detector_last_channel_hop = 0;
 #define DETECTOR_EVENT_CAPACITY 24
 #define DETECTOR_DEAUTH_CAPACITY 16
 #define DETECTOR_DEAUTH_PREFIX_SIZE 26
+#define DETECTOR_TRACE_CONFIRM_MS 1000
+#define DETECTOR_TRACE_IDLE_RELEASE_MS 20000
+#define DETECTOR_TRACE_MAX_CANDIDATES 5
 typedef struct {
     csa_event_t observation;
     bool is_csa;
@@ -653,6 +656,18 @@ static bool detector_accepting;
 static bool detector_details_mode, detector_details_announced;
 static bool detector_trace_requested, detector_trace_locked;
 static int64_t detector_trace_last_failure_ms = -2000;
+typedef struct {
+    int channel;
+    uint16_t count;
+    int32_t rssi_total;
+} detector_trace_candidate_t;
+static bool detector_trace_confirming;
+static uint8_t detector_trace_bssid[6];
+static detector_trace_candidate_t detector_trace_candidates[DETECTOR_TRACE_MAX_CANDIDATES];
+static size_t detector_trace_candidate_count, detector_trace_hop_index;
+static int detector_trace_first_channel, detector_trace_cached_channel;
+static int detector_trace_locked_channel;
+static int64_t detector_trace_deadline_ms, detector_trace_last_activity_ms;
 static csa_rate_limit_t detector_csa_rate;
 static portMUX_TYPE detector_event_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -20114,6 +20129,7 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
     MY_LOG_INFO(TAG, "Use 'stop' to stop.");
     if (details) {
         MY_LOG_INFO(TAG, "[DETECTOR_INFO] format=deauth_v2");
+        if (trace) MY_LOG_INFO(TAG, "[DETECTOR_TRACE] armed");
         portENTER_CRITICAL(&detector_event_lock);
         detector_details_announced = true;
         portEXIT_CRITICAL(&detector_event_lock);
@@ -27785,7 +27801,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t deauth_detector_v2_cmd = {
         .command = "deauth_detector_v2",
-        .help = "Observe deauth and CSA/ECSA; emit deauth_v2 records; --only filters BSSIDs; trace stops hopping on first accepted deauth RX channel",
+        .help = "Observe deauth and CSA/ECSA; emit deauth_v2 records; --only filters BSSIDs; trace confirms nearby RX channels and rearms after idle",
         .hint = "[index1 index2 ... | --only index1 index2 ...] [trace]",
         .func = &cmd_deauth_detector_v2,
         .argtable = NULL
@@ -31089,6 +31105,197 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
 
 // === DEAUTH DETECTOR FUNCTIONS ===
 
+static void detector_trace_reset_locked(void) {
+    detector_trace_confirming = false;
+    memset(detector_trace_bssid, 0, sizeof(detector_trace_bssid));
+    memset(detector_trace_candidates, 0, sizeof(detector_trace_candidates));
+    detector_trace_candidate_count = 0;
+    detector_trace_hop_index = 0;
+    detector_trace_first_channel = 0;
+    detector_trace_cached_channel = 0;
+    detector_trace_locked_channel = 0;
+    detector_trace_deadline_ms = 0;
+    detector_trace_last_activity_ms = -1;
+}
+
+static void detector_trace_add_candidate_locked(int channel) {
+    if (channel <= 0 || detector_trace_candidate_count >= DETECTOR_TRACE_MAX_CANDIDATES) return;
+    for (size_t i = 0; i < detector_trace_candidate_count; ++i) {
+        if (detector_trace_candidates[i].channel == channel) return;
+    }
+    detector_trace_candidates[detector_trace_candidate_count++].channel = channel;
+}
+
+static void detector_trace_build_candidates_locked(int first_channel) {
+    detector_trace_candidate_count = 0;
+    if (first_channel >= 1 && first_channel <= 14) {
+        int first = first_channel > 2 ? first_channel - 2 : 1;
+        int last = first_channel < 13 ? first_channel + 2 : 14;
+        for (int channel = first; channel <= last; ++channel) {
+            detector_trace_add_candidate_locked(channel);
+        }
+    } else {
+        for (int i = 0; i < dual_band_channels_count; ++i) {
+            if (dual_band_channels[i] != first_channel) continue;
+            if (i > 0 && dual_band_channels[i - 1] > 14) {
+                detector_trace_add_candidate_locked(dual_band_channels[i - 1]);
+            }
+            detector_trace_add_candidate_locked(first_channel);
+            if (i + 1 < dual_band_channels_count && dual_band_channels[i + 1] > 14) {
+                detector_trace_add_candidate_locked(dual_band_channels[i + 1]);
+            }
+            break;
+        }
+        if (!detector_trace_candidate_count) detector_trace_add_candidate_locked(first_channel);
+    }
+    detector_trace_hop_index = 0;
+    for (size_t i = 0; i < detector_trace_candidate_count; ++i) {
+        if (detector_trace_candidates[i].channel == first_channel) {
+            detector_trace_hop_index = (i + 1) % detector_trace_candidate_count;
+            break;
+        }
+    }
+}
+
+static void detector_trace_record_locked(int channel, int8_t rssi) {
+    for (size_t i = 0; i < detector_trace_candidate_count; ++i) {
+        detector_trace_candidate_t *candidate = &detector_trace_candidates[i];
+        if (candidate->channel != channel) continue;
+        if (candidate->count != UINT16_MAX) {
+            ++candidate->count;
+            candidate->rssi_total += rssi;
+        }
+        return;
+    }
+}
+
+static bool detector_trace_observe_locked(const detector_event_t *event, int64_t now_ms) {
+    if (!detector_trace_confirming) {
+        detector_trace_reset_locked();
+        detector_trace_confirming = true;
+        memcpy(detector_trace_bssid, event->observation.bssid, sizeof(detector_trace_bssid));
+        detector_trace_first_channel = event->legacy_channel;
+        detector_trace_deadline_ms = now_ms + DETECTOR_TRACE_CONFIRM_MS;
+        detector_trace_build_candidates_locked(event->legacy_channel);
+        for (size_t i = 0; i < detector_cache_count; ++i) {
+            if (!memcmp(detector_cache[i].bssid, detector_trace_bssid, 6)) {
+                detector_trace_cached_channel = detector_cache[i].channel;
+                break;
+            }
+        }
+        detector_trace_record_locked(event->legacy_channel, event->observation.rssi);
+        detector_trace_last_activity_ms = now_ms;
+        return true;
+    }
+    if (!memcmp(event->observation.bssid, detector_trace_bssid, 6)) {
+        detector_trace_record_locked(event->legacy_channel, event->observation.rssi);
+        detector_trace_last_activity_ms = now_ms;
+    }
+    return false;
+}
+
+static int detector_trace_choose_channel_locked(void) {
+    size_t best = SIZE_MAX;
+    for (size_t i = 0; i < detector_trace_candidate_count; ++i) {
+        const detector_trace_candidate_t *candidate = &detector_trace_candidates[i];
+        if (!candidate->count) continue;
+        if (best == SIZE_MAX) {
+            best = i;
+            continue;
+        }
+        const detector_trace_candidate_t *current = &detector_trace_candidates[best];
+        if (candidate->count > current->count ||
+            (candidate->count == current->count && candidate->rssi_total > current->rssi_total) ||
+            (candidate->count == current->count && candidate->rssi_total == current->rssi_total &&
+             candidate->channel == detector_trace_cached_channel &&
+             current->channel != detector_trace_cached_channel) ||
+            (candidate->count == current->count && candidate->rssi_total == current->rssi_total &&
+             candidate->channel != detector_trace_cached_channel &&
+             current->channel != detector_trace_cached_channel &&
+             candidate->channel == detector_trace_first_channel)) {
+            best = i;
+        }
+    }
+    return best == SIZE_MAX ? 0 : detector_trace_candidates[best].channel;
+}
+
+static int detector_trace_hop_delay_locked(void) {
+    int delay_ms = sniffer_channel_hop_delay_ms;
+    if (detector_trace_confirming && detector_trace_candidate_count > 1) {
+        int confirmation_delay_ms =
+            DETECTOR_TRACE_CONFIRM_MS / (int)detector_trace_candidate_count;
+        if (confirmation_delay_ms < 50) confirmation_delay_ms = 50;
+        if (confirmation_delay_ms < delay_ms) delay_ms = confirmation_delay_ms;
+    }
+    return delay_ms;
+}
+
+static void detector_trace_finish_if_due(void) {
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    int channel = 0;
+    uint32_t generation = 0;
+    portENTER_CRITICAL(&detector_event_lock);
+    if (detector_accepting && deauth_detector_active && detector_trace_requested &&
+        !detector_trace_locked && detector_trace_confirming &&
+        now_ms >= detector_trace_deadline_ms) {
+        channel = detector_trace_choose_channel_locked();
+        generation = detector_generation;
+        detector_trace_confirming = false;
+    }
+    portEXIT_CRITICAL(&detector_event_lock);
+    if (!channel) return;
+
+    esp_err_t tune = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    bool locked = false;
+    bool report_failure = false;
+    portENTER_CRITICAL(&detector_event_lock);
+    if (detector_accepting && deauth_detector_active &&
+        detector_generation == generation && detector_trace_requested &&
+        !detector_trace_locked) {
+        if (tune == ESP_OK) {
+            detector_trace_locked = true;
+            detector_trace_locked_channel = channel;
+            deauth_detector_current_channel = channel;
+            locked = true;
+        } else if (now_ms - detector_trace_last_failure_ms >= 2000) {
+            detector_trace_last_failure_ms = now_ms;
+            report_failure = true;
+        }
+    }
+    portEXIT_CRITICAL(&detector_event_lock);
+    if (locked) {
+        MY_LOG_INFO(TAG, "[DETECTOR_TRACE] locked_channel=%d", channel);
+    } else if (report_failure) {
+        MY_LOG_INFO(TAG, "[DETECTOR_TRACE] lock_failed_channel=%d error=%s",
+                    channel, esp_err_to_name(tune));
+    }
+}
+
+static void detector_trace_release_if_idle(void) {
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    int channel = 0;
+    bool released = false;
+    portENTER_CRITICAL(&detector_event_lock);
+    if (detector_accepting && deauth_detector_active && detector_trace_requested &&
+        detector_trace_locked && detector_trace_last_activity_ms >= 0 &&
+        now_ms - detector_trace_last_activity_ms >= DETECTOR_TRACE_IDLE_RELEASE_MS) {
+        channel = detector_trace_locked_channel > 0
+                      ? detector_trace_locked_channel
+                      : deauth_detector_current_channel;
+        detector_trace_locked = false;
+        detector_trace_reset_locked();
+        deauth_detector_last_channel_hop = 0;
+        released = true;
+    }
+    portEXIT_CRITICAL(&detector_event_lock);
+    if (released) {
+        MY_LOG_INFO(TAG,
+                    "[DETECTOR_TRACE] released_channel=%d reason=idle idle_ms=%d",
+                    channel, DETECTOR_TRACE_IDLE_RELEASE_MS);
+        MY_LOG_INFO(TAG, "[DETECTOR_TRACE] armed");
+    }
+}
+
 // No callback-owned allocation is ever freed. Generation checks discard late callbacks.
 static void deauth_detector_reset_events(void) {
     portENTER_CRITICAL(&detector_event_lock);
@@ -31100,6 +31307,7 @@ static void deauth_detector_reset_events(void) {
     detector_trace_requested = false;
     detector_trace_locked = false;
     detector_trace_last_failure_ms = -2000;
+    detector_trace_reset_locked();
     memset(&detector_watch_filter, 0, sizeof(detector_watch_filter));
     detector_watch_enabled = false;
     memset(&detector_csa_rate, 0, sizeof(detector_csa_rate));
@@ -31119,6 +31327,7 @@ static void deauth_detector_close_events(void) {
     detector_trace_requested = false;
     detector_trace_locked = false;
     detector_trace_last_failure_ms = -2000;
+    detector_trace_reset_locked();
     memset(&detector_watch_filter, 0, sizeof(detector_watch_filter));
     detector_watch_enabled = false;
     portEXIT_CRITICAL(&detector_event_lock);
@@ -31129,7 +31338,7 @@ static void deauth_detector_process_events(void) {
     for (size_t i = 0; i < DETECTOR_EVENT_CAPACITY; ++i) {
         detector_event_t event;
         bool details = false;
-        bool trace_attempt = false;
+        bool trace_session = false;
         uint32_t generation;
         portENTER_CRITICAL(&detector_event_lock);
         if (!detector_accepting || !detector_event_count ||
@@ -31143,7 +31352,7 @@ static void deauth_detector_process_events(void) {
         --detector_event_count;
         if (!event.is_csa) {
             details = detector_details_mode;
-            trace_attempt = detector_trace_requested && !detector_trace_locked;
+            trace_session = detector_trace_requested;
         }
         portEXIT_CRITICAL(&detector_event_lock);
         const csa_event_t *e = &event.observation;
@@ -31153,30 +31362,25 @@ static void deauth_detector_process_events(void) {
             // An observed channel announcement does not establish an attack.
             continue;
         }
-        if (trace_attempt) {
-            esp_err_t tune = esp_wifi_set_channel(event.legacy_channel, WIFI_SECOND_CHAN_NONE);
+        if (trace_session) {
+            bool confirming_started = false;
             int64_t now_ms = esp_timer_get_time() / 1000;
-            bool locked = false;
-            bool report_failure = false;
             portENTER_CRITICAL(&detector_event_lock);
             if (detector_accepting && deauth_detector_active &&
-                detector_generation == generation && detector_trace_requested &&
-                !detector_trace_locked) {
-                if (tune == ESP_OK) {
-                    detector_trace_locked = true;
-                    deauth_detector_current_channel = event.legacy_channel;
-                    locked = true;
-                } else if (now_ms - detector_trace_last_failure_ms >= 2000) {
-                    detector_trace_last_failure_ms = now_ms;
-                    report_failure = true;
+                detector_generation == generation && detector_trace_requested) {
+                if (detector_trace_locked) {
+                    if (!memcmp(event.observation.bssid, detector_trace_bssid, 6))
+                        detector_trace_last_activity_ms = now_ms;
+                } else {
+                    confirming_started = detector_trace_observe_locked(&event, now_ms);
                 }
             }
             portEXIT_CRITICAL(&detector_event_lock);
-            if (locked) {
-                MY_LOG_INFO(TAG, "[DETECTOR_TRACE] locked_channel=%d", event.legacy_channel);
-            } else if (report_failure) {
-                MY_LOG_INFO(TAG, "[DETECTOR_TRACE] lock_failed_channel=%d error=%s",
-                            event.legacy_channel, esp_err_to_name(tune));
+            if (confirming_started) {
+                MY_LOG_INFO(TAG,
+                            "[DETECTOR_TRACE] confirming_bssid=%02X:%02X:%02X:%02X:%02X:%02X first_channel=%d window_ms=%d",
+                            e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5],
+                            event.legacy_channel, DETECTOR_TRACE_CONFIRM_MS);
             }
         }
         led_status_notify_event(LED_STATUS_EVENT_THREAT);
@@ -31215,19 +31419,28 @@ static void deauth_detector_process_events(void) {
                         e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5], (int)e->rssi);
         }
     }
+    detector_trace_finish_if_due();
+    detector_trace_release_if_idle();
 }
 
 static void deauth_detector_channel_hop(void) {
     if (!deauth_detector_active) {
         return;
     }
+    int trace_channel = 0;
     portENTER_CRITICAL(&detector_event_lock);
     bool trace_locked = detector_trace_locked;
+    if (!trace_locked && detector_trace_confirming && detector_trace_candidate_count) {
+        trace_channel = detector_trace_candidates[detector_trace_hop_index].channel;
+        detector_trace_hop_index =
+            (detector_trace_hop_index + 1) % detector_trace_candidate_count;
+    }
     portEXIT_CRITICAL(&detector_event_lock);
     if (trace_locked) return;
-    
-    // Check if we're in selected channels mode
-    if (deauth_detector_selected_mode && deauth_detector_selected_channels_count > 0) {
+    if (trace_channel) {
+        deauth_detector_current_channel = trace_channel;
+    } else if (deauth_detector_selected_mode && deauth_detector_selected_channels_count > 0) {
+        // Check if we're in selected channels mode
         // Use selected channels only
         deauth_detector_current_channel = deauth_detector_selected_channels[deauth_detector_channel_index];
         
@@ -31288,7 +31501,11 @@ static void deauth_detector_task(void *pvParameters) {
         }
         // Force channel hop if 250ms passed
         int64_t current_time = esp_timer_get_time() / 1000;
-        bool time_expired = (current_time - deauth_detector_last_channel_hop >= sniffer_channel_hop_delay_ms);
+        portENTER_CRITICAL(&detector_event_lock);
+        int hop_delay_ms = detector_trace_hop_delay_locked();
+        portEXIT_CRITICAL(&detector_event_lock);
+        bool time_expired =
+            (current_time - deauth_detector_last_channel_hop >= hop_delay_ms);
         
         if (time_expired) {
             deauth_detector_channel_hop();

@@ -1,8 +1,8 @@
 """Run the production boot registration list and wrapper with a fake ESP backend.
 
-The old 128-context limit must reproduce the reported start_blespam abort. The
-production limit must register every command, keep contexts alive after returning
-from register_commands, and preserve both handler calling conventions.
+The old 128-context limit must fail on the first registration above its boundary.
+The production limit must register every command, keep contexts alive after
+returning from register_commands, and preserve both handler calling conventions.
 """
 from pathlib import Path
 import os
@@ -131,7 +131,15 @@ class ConsoleStartupTests(unittest.TestCase):
         cls.directory = Path(cls.tmp.name)
         source = (ROOT / "main/main.c").read_text()
         registration = function(source, "register_commands")
-        cls.expected = len(re.findall(r"esp_console_cmd_register\s*\(", registration))
+        registrations = re.findall(
+            r"esp_console_cmd_register\s*\(\s*([^)]+?)\s*\)", registration
+        )
+        cls.expected = len(registrations)
+        if len(registrations) <= 128:
+            raise AssertionError("production registration list no longer exceeds old limit")
+        cls.old_limit_failure_expression = (
+            f"esp_console_cmd_register({registrations[128]})"
+        )
         capacity = re.search(r"^#define JANOS_CONSOLE_MAX_COMMANDS\s+(\d+)U", source, re.M)
         if capacity is None:
             raise AssertionError("production command capacity not found")
@@ -179,7 +187,7 @@ static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
         run = subprocess.run([str(self.executables["old"])], text=True, capture_output=True)
         self.assertEqual(run.returncode, 42)
         self.assertIn("contexts=128 error=0x101", run.stderr)
-        self.assertIn("&start_blespam_cmd", run.stderr)
+        self.assertIn(self.old_limit_failure_expression, run.stderr)
 
     def test_entire_production_registration_and_legacy_names(self):
         output = self.run_mode()
