@@ -37,11 +37,16 @@ HARNESS_PREFIX = r"""
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "csa_detector_core.h"
+#include "deauth_defence_runtime.h"
+#include "deauth_defence_cli.h"
+#include "pmkid_probe_detector.h"
+#include "janos_radio_lease.h"
 #if defined(__has_include)
 #if __has_include("deauth_target_core.h")
 #include "deauth_target_core.h"
@@ -80,6 +85,7 @@ static void test_log(const char *format, ...) {
 #define MY_LOG_INFO(tag, ...) test_log(__VA_ARGS__)
 #define WIFI_PROMIS_FILTER_MASK_MGMT 1
 #define WIFI_SECOND_CHAN_NONE 0
+#define WIFI_IF_STA 0
 #define ESP_OK 0
 #define ESP_ERR_INVALID_STATE 5
 #define pdPASS 1
@@ -90,6 +96,7 @@ static void test_log(const char *format, ...) {
 typedef int esp_err_t;
 typedef int BaseType_t;
 typedef int TaskHandle_t;
+typedef int wifi_second_chan_t;
 typedef void *SemaphoreHandle_t;
 typedef int portMUX_TYPE;
 #define portMUX_INITIALIZER_UNLOCKED 0
@@ -101,7 +108,12 @@ typedef struct {
     uint8_t payload[256];
 } wifi_promiscuous_pkt_t;
 typedef struct { int filter_mask; } wifi_promiscuous_filter_t;
-typedef struct { uint8_t bssid[6], ssid[33]; int primary; } wifi_ap_record_t;
+enum { WIFI_AUTH_OPEN = 0, WIFI_AUTH_WPA2_PSK = 3 };
+enum { WIFI_CIPHER_TYPE_NONE = 0, WIFI_CIPHER_TYPE_CCMP = 4 };
+typedef struct {
+    uint8_t bssid[6], ssid[33];
+    int primary, authmode, pairwise_cipher;
+} wifi_ap_record_t;
 
 static wifi_ap_record_t g_scan_results[MAX_AP_CNT];
 static unsigned g_scan_count;
@@ -118,12 +130,18 @@ static const int dual_band_channels_count =
 static const int sniffer_channel_hop_delay_ms = 250;
 static int g_scan_min_channel_time = 100, g_scan_max_channel_time = 200;
 static int receiver_setup_calls, scan_calls;
-static bool receiver_enabled;
+static bool receiver_enabled, receiver_callback_installed;
 static bool fail_channel_tune, inject_event_during_start;
+static bool corrupt_lease_during_start;
+static int task_result = pdPASS;
 static int channel_tune_calls, last_successful_channel;
 static int channel_tune_history[64];
 static int64_t clock_us = 2000000;
 static unsigned threat_events;
+static janos_radio_lease_t janos_radio_lease;
+static unsigned raw_tx_calls;
+static size_t raw_tx_lengths[8];
+static unsigned detector_notifications;
 #define LED_STATUS_EVENT_THREAT 1
 static void led_status_notify_event(int event)
     {(void)event; ++threat_events;}
@@ -153,7 +171,8 @@ static void oled_display_update_full(const char *a, const char *b,
     {(void)a; (void)b; (void)c; (void)d;}
 static void log_memory_info(const char *text) {(void)text;}
 static bool ensure_wifi_mode(void) {return true;}
-static void vTaskDelay(int ms) {(void)ms;}
+static void vTaskDelay(int ms)
+    {(void)ms; if (!deauth_detector_active) deauth_detector_task_handle = 0;}
 static int64_t esp_timer_get_time(void) {return clock_us;}
 static const char *esp_err_to_name(int err) {(void)err; return "fixture";}
 static esp_err_t start_background_scan(int min, int max)
@@ -164,7 +183,8 @@ static esp_err_t esp_wifi_set_promiscuous_filter(const wifi_promiscuous_filter_t
     {(void)filter; ++receiver_setup_calls; return ESP_OK;}
 static esp_err_t esp_wifi_set_promiscuous_rx_cb(
     void (*callback)(void *, wifi_promiscuous_pkt_type_t))
-    {(void)callback; ++receiver_setup_calls; return ESP_OK;}
+    {receiver_callback_installed = callback != NULL;
+     ++receiver_setup_calls; return ESP_OK;}
 static esp_err_t esp_wifi_set_promiscuous(bool enabled)
     {receiver_enabled = enabled; ++receiver_setup_calls; return ESP_OK;}
 static esp_err_t esp_wifi_set_channel(int channel, int secondary)
@@ -175,6 +195,19 @@ static esp_err_t esp_wifi_set_channel(int channel, int secondary)
      if (fail_channel_tune) return ESP_ERR_INVALID_STATE;
      last_successful_channel = channel;
      return ESP_OK;}
+static esp_err_t esp_wifi_get_channel(uint8_t *primary, int *secondary)
+    {*primary = 11; *secondary = WIFI_SECOND_CHAN_NONE; return ESP_OK;}
+static esp_err_t esp_wifi_80211_tx(int interface, const void *frame,
+                                  int length, bool en_sys_seq)
+    {(void)interface; (void)frame; assert(en_sys_seq); assert(raw_tx_calls < 8);
+     raw_tx_lengths[raw_tx_calls++] = (size_t)length; return ESP_OK;}
+static void esp_fill_random(void *out, size_t length)
+    {static uint8_t seed = 1; uint8_t *bytes = out;
+     for (size_t i = 0; i < length; ++i) bytes[i] = seed++;}
+static void xTaskNotifyGive(TaskHandle_t handle)
+    {(void)handle; ++detector_notifications;}
+static bool zig_recon_radio_busy(char *reason, size_t reason_len)
+    {(void)reason; (void)reason_len; return false;}
 static void deauth_detector_task(void *arg) {(void)arg;}
 static int xTaskCreate(void (*run)(void *), const char *name, int stack,
                        void *arg, int priority, TaskHandle_t *handle)
@@ -198,7 +231,13 @@ static int xTaskCreate(void (*run)(void *), const char *name, int stack,
          deauth_detector_process_events();
          assert(logged_size == previous_log_size); /* startup output gate */
      }
-     *handle = 1; return pdPASS;}
+     if (task_result != pdPASS) return task_result;
+     *handle = 1;
+     if (corrupt_lease_during_start) {
+         atomic_store(&janos_radio_lease.state,
+                      JANOS_RADIO_LEASE_QUARANTINED);
+     }
+     return pdPASS;}
 """
 
 
@@ -221,6 +260,8 @@ static void scan_fixture(void) {
     g_scan_results[0].primary = 6;
     g_scan_results[1].primary = 6;
     g_scan_results[2].primary = 11;
+    g_scan_results[0].authmode = WIFI_AUTH_WPA2_PSK;
+    g_scan_results[0].pairwise_cipher = WIFI_CIPHER_TYPE_CCMP;
 }
 
 static void send_deauth(const uint8_t bssid[6], uint8_t channel) {
@@ -259,6 +300,38 @@ static void send_csa(const uint8_t bssid[6], uint8_t channel) {
     memcpy(packet.payload + 10, "\x02\x11\x22\x33\x44\x55", 6);
     memcpy(packet.payload + 16, bssid, 6);
     memcpy(packet.payload + 36, "\x00\x04" "Test" "\x25\x03\x01\x0b\x03", 11);
+    deauth_detector_promiscuous_callback(&packet, WIFI_PKT_MGMT);
+}
+
+static void send_management(uint8_t subtype, const uint8_t bssid[6],
+                            const uint8_t sta[6], uint8_t channel,
+                            unsigned payload_length) {
+    wifi_promiscuous_pkt_t packet = {0};
+    packet.rx_ctrl.sig_len = payload_length + 4;
+    packet.rx_ctrl.dump_len = payload_length;
+    packet.rx_ctrl.channel = channel;
+    packet.rx_ctrl.rssi = -47;
+    packet.payload[0] = subtype;
+    memcpy(packet.payload + 4, bssid, 6);
+    memcpy(packet.payload + 10, sta, 6);
+    memcpy(packet.payload + 16, bssid, 6);
+    for (unsigned i = 24; i < payload_length; ++i)
+        packet.payload[i] = (uint8_t)i;
+    deauth_detector_promiscuous_callback(&packet, WIFI_PKT_MGMT);
+}
+
+static void send_open_auth_request(const uint8_t bssid[6],
+                                   const uint8_t sta[6], uint8_t channel) {
+    wifi_promiscuous_pkt_t packet = {0};
+    packet.rx_ctrl.sig_len = 34;
+    packet.rx_ctrl.dump_len = 30;
+    packet.rx_ctrl.channel = channel;
+    packet.rx_ctrl.rssi = -45;
+    packet.payload[0] = 0xb0;
+    memcpy(packet.payload + 4, bssid, 6);
+    memcpy(packet.payload + 10, sta, 6);
+    memcpy(packet.payload + 16, bssid, 6);
+    packet.payload[26] = 1; /* transaction sequence 1; algorithm/status are 0 */
     deauth_detector_promiscuous_callback(&packet, WIFI_PKT_MGMT);
 }
 
@@ -345,6 +418,283 @@ static void one_target(void) {
     assert(!memcmp(detector_events[0].observation.bssid, AP_A, 6));
     assert(!memcmp(detector_events[1].observation.bssid, AP_A, 6));
     assert(!detector_events[0].is_csa && detector_events[1].is_csa);
+}
+
+static void defence_event_pipeline(void) {
+    static const uint8_t STA[6] = {0x06, 5, 4, 3, 2, 1};
+    char *args[] = {"deauth_detector_v2", "--only", "1"};
+    assert(cmd_deauth_detector_v2(3, args) == 0);
+
+    /* Passive detector behavior stays byte-for-byte narrow. */
+    send_management(0xa0, AP_A, STA, 6, 26);
+    send_management(0xb0, AP_A, STA, 6, 30);
+    send_management(0x00, AP_A, STA, 6, 28);
+    send_management(0x20, AP_A, STA, 6, 34);
+    assert(detector_event_count == 0 && detector_dropped == 0);
+
+    detector_defence_requested = true;
+    send_management(0xb0, AP_B, STA, 6, 30); /* selected-BSSID filter */
+    send_management(0xa0, AP_A, STA, 6, 25); /* truncated */
+    send_management(0xb0, AP_A, STA, 6, 29);
+    send_management(0x00, AP_A, STA, 6, 27);
+    send_management(0x20, AP_A, STA, 6, 33);
+    assert(detector_event_count == 0 && detector_dropped == 0);
+
+    clock_us = 3456789;
+    send_management(0xa0, AP_A, STA, 6, 26);
+    send_management(0xb0, AP_A, STA, 6, 30);
+    send_management(0x00, AP_A, STA, 6, 28);
+    send_management(0x20, AP_A, STA, 6, 34);
+    assert(detector_event_count == 4);
+    assert(detector_events[0].kind == DETECTOR_EVENT_DISASSOC);
+    assert(detector_events[1].kind == DETECTOR_EVENT_AUTH);
+    assert(detector_events[2].kind == DETECTOR_EVENT_ASSOC);
+    assert(detector_events[3].kind == DETECTOR_EVENT_REASSOC);
+    for (size_t i = 0; i < 4; ++i) {
+        assert(!detector_events[i].is_csa);
+        assert(detector_events[i].rx_us == clock_us);
+        assert(!memcmp(detector_events[i].management_prefix + 10, STA, 6));
+        assert(!memcmp(detector_events[i].observation.bssid, AP_A, 6));
+    }
+    assert(detector_events[0].management_length == 26);
+    assert(detector_events[1].management_length == 30);
+    assert(detector_events[2].management_length == 28);
+    assert(detector_events[3].management_length == 34);
+
+    clear_logged();
+    threat_events = 0;
+    deauth_detector_process_events();
+    assert(detector_event_count == 0 && threat_events == 0);
+    assert(count_lines_starting("[DEAUTH] ") == 0);
+    assert(count_lines_starting("[DEAUTH_V2] ") == 0);
+    assert(count_lines_starting("[CSA] ") == 0);
+
+    /* Sixteen deauth entries leave eight slots for Defence control events. */
+    for (int i = 0; i < DETECTOR_DEAUTH_CAPACITY; ++i) send_deauth(AP_A, 6);
+    assert(detector_event_count == DETECTOR_DEAUTH_CAPACITY);
+    send_management(0xb0, AP_A, STA, 6, 30);
+    assert(detector_event_count == DETECTOR_DEAUTH_CAPACITY + 1);
+    size_t auth_slot =
+        (detector_event_head + DETECTOR_DEAUTH_CAPACITY) % DETECTOR_EVENT_CAPACITY;
+    assert(detector_events[auth_slot].kind == DETECTOR_EVENT_AUTH);
+    send_deauth(AP_A, 6);
+    assert(detector_event_count == DETECTOR_DEAUTH_CAPACITY + 1);
+    assert(detector_dropped == 1);
+    assert(detector_dropped_total == 1);
+    stop_fixture();
+}
+
+static void defence_command_runtime(void) {
+    janos_radio_lease_init(&janos_radio_lease);
+    char *args[] = {"deauth_detector_v2", "--only", "1", "defence"};
+    inject_event_during_start = true;
+    assert(cmd_deauth_detector_v2(4, args) == 0);
+    inject_event_during_start = false;
+    janos_radio_lease_snapshot_t lease =
+        janos_radio_lease_snapshot(&janos_radio_lease);
+    assert(lease.owner == JANOS_RADIO_OWNER_DEFENCE);
+    assert(lease.state == JANOS_RADIO_LEASE_RUNNING);
+    assert(detector_defence_runtime.started && detector_defence_requested);
+    assert(detector_event_count == 0U && raw_tx_calls == 0U);
+    assert(detector_trace_requested && detector_watch_enabled);
+    const char *watch = strstr(logged, "[DETECTOR_WATCH] ");
+    const char *armed = strstr(logged, "[DETECTOR_DEFENCE] armed ");
+    assert(watch && armed && watch < armed);
+    assert(strstr(armed, "targets=1 trace=fast pmkid=monitor\n"));
+
+    raw_tx_calls = 0;
+    clock_us = 5000000;
+    fail_channel_tune = true;
+    send_deauth(AP_A, 6);
+    assert(detector_notifications == 1U);
+    deauth_detector_process_events();
+    assert(raw_tx_calls == 0U);
+    assert(detector_defence_runtime.core.state == DEF_ARMED_HOPPING);
+    assert(!detector_trace_confirming); /* failed fast response cannot orphan Trace */
+
+    fail_channel_tune = false;
+    clock_us += DEAUTH_DEFENCE_PAIR_COOLDOWN_US;
+    send_deauth(AP_A, 5); /* Overlap RX must stay pinned to scan channel 6. */
+    deauth_detector_process_events();
+    assert(raw_tx_calls == 2U);
+    assert(last_successful_channel == 6);
+    assert(detector_trace_candidate_count == 1U);
+    assert(detector_trace_candidates[0].channel == 6);
+    assert(raw_tx_lengths[0] == 131U && raw_tx_lengths[1] == 131U);
+    assert(strstr(logged,
+        "[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=ok frames=2 latency_us=0 error=none\n"));
+    assert(detector_defence_runtime.core.state == DEF_CONFIRMING);
+
+    int triggers_before = count_lines_starting(
+        "[DETECTOR_DEFENCE] trigger=deauth ");
+    int events_before = count_lines_starting("[DEAUTH_V2] ");
+    uint32_t oled_before = dd_oled_count;
+    clock_us += 100000;
+    send_deauth(AP_A, 6);
+    deauth_detector_process_events();
+    assert(raw_tx_calls == 2U);
+    assert(dd_oled_count == oled_before + 1U);
+    assert(count_lines_starting("[DETECTOR_DEFENCE] trigger=deauth ") ==
+           triggers_before);
+    assert(count_lines_starting("[DEAUTH_V2] ") == events_before);
+    fail_channel_tune = true;
+    clock_us += 1000000;
+    deauth_detector_process_events();
+    assert(!strstr(logged, "reason=response_satisfied"));
+
+    assert(detector_defence_runtime.core.state == DEF_ARMED_HOPPING);
+    assert(!detector_trace_locked && !detector_trace_confirming);
+    fail_channel_tune = false;
+
+    send_deauth(AP_B, 6);
+    deauth_detector_process_events();
+    assert(raw_tx_calls == 2U); /* callback allowlist is still authoritative */
+
+    deauth_defence_runtime_request_stop(&detector_defence_runtime);
+    deauth_detector_active = false;
+    deauth_detector_close_events();
+    receiver_enabled = false;
+    deauth_detector_task_handle = 0;
+    assert(!deauth_detector_stop_defence_session(0U, false));
+    assert(detector_defence_runtime.started);
+    lease = janos_radio_lease_snapshot(&janos_radio_lease);
+    assert(lease.owner == JANOS_RADIO_OWNER_DEFENCE);
+    assert(lease.state == JANOS_RADIO_LEASE_QUARANTINED);
+    assert(!strstr(logged, "[DETECTOR_DEFENCE] stopped "));
+    assert(deauth_detector_stop_defence_session(0U, true));
+    lease = janos_radio_lease_snapshot(&janos_radio_lease);
+    assert(lease.owner == JANOS_RADIO_OWNER_NONE);
+    assert(strstr(logged,
+        "[DETECTOR_DEFENCE] stopped observations=3 tx_pairs=1 pmkid_m1=0 responses=1 satisfied=1 errors=1 dropped=0 outcome=responded\n"));
+}
+
+static void defence_satisfied_activity_refreshes_trace_idle(void) {
+    janos_radio_lease_init(&janos_radio_lease);
+    char *args[] = {"deauth_detector_v2", "--only", "1", "defence"};
+    assert(cmd_deauth_detector_v2(4, args) == 0);
+
+    clock_us = 5000000;
+    send_deauth(AP_A, 5);
+    deauth_detector_process_events();
+    assert(raw_tx_calls == 2U);
+    assert(detector_trace_confirming && !detector_trace_locked);
+
+    clock_us = 6100000;
+    deauth_detector_process_events();
+    assert(detector_trace_locked);
+    assert(detector_defence_runtime.core.state == DEF_CONFIRMED_LOCK);
+
+    /* A suppressed eligible frame refreshes the common 20-second idle lease. */
+    clock_us = 24900000;
+    send_deauth(AP_A, 5);
+    deauth_detector_process_events();
+    assert(raw_tx_calls == 2U);
+    assert(detector_trace_locked);
+    assert(detector_defence_runtime.core.state == DEF_CONFIRMED_LOCK);
+
+    /* The original Trace deadline has passed, but the refreshed one has not. */
+    clock_us = 25100000;
+    deauth_detector_process_events();
+    assert(detector_trace_locked);
+    assert(detector_defence_runtime.core.state == DEF_CONFIRMED_LOCK);
+    assert(count_lines_starting("[DETECTOR_TRACE] released_channel=") == 0);
+    assert(count_lines_starting("[DETECTOR_DEFENCE] released_bssid=") == 0);
+
+    clock_us = 44899000;
+    deauth_detector_process_events();
+    assert(detector_trace_locked);
+    assert(detector_defence_runtime.core.state == DEF_CONFIRMED_LOCK);
+
+    clock_us = 44900000;
+    deauth_detector_process_events();
+    assert(!detector_trace_locked && !detector_trace_confirming);
+    assert(detector_defence_runtime.core.state == DEF_ARMED_HOPPING);
+    assert(count_lines_starting("[DETECTOR_TRACE] released_channel=6 reason=idle idle_ms=20000") == 1);
+    assert(count_lines_starting("[DETECTOR_DEFENCE] released_bssid=02:00:00:00:00:01 channel=6 reason=idle idle_ms=20000 response=decoy_4way suppressed=1") == 1);
+}
+
+static void defence_command_rejections_and_rollback(void) {
+    janos_radio_lease_init(&janos_radio_lease);
+    char *all[] = {"deauth_detector_v2", "defence"};
+    assert(cmd_deauth_detector_v2(2, all) == 1);
+    assert(strstr(logged, "Defence requires --only protected scan indices.\n"));
+    assert(receiver_setup_calls == 0 && !receiver_enabled);
+    assert(janos_radio_lease_snapshot(&janos_radio_lease).owner ==
+           JANOS_RADIO_OWNER_NONE);
+
+    clear_logged();
+    char *bad_pmkid[] = {"deauth_detector_v2", "--only", "1", "pmkid-decoy"};
+    assert(cmd_deauth_detector_v2(4, bad_pmkid) == 1);
+    assert(strstr(logged, "pmkid-decoy requires defence.\n"));
+
+    clear_logged();
+    uint32_t occupied_generation = 0;
+    assert(janos_radio_lease_acquire(&janos_radio_lease,
+                                     JANOS_RADIO_OWNER_ANALYZER,
+                                     &occupied_generation) ==
+           JANOS_RADIO_LEASE_OK);
+    char *active[] = {"deauth_detector_v2", "--only", "1", "defence"};
+    assert(cmd_deauth_detector_v2(4, active) == 1);
+    assert(strstr(logged, "Defence radio lease unavailable"));
+    assert(!receiver_enabled && !detector_defence_runtime.started);
+    assert(janos_radio_lease_request_cancel(&janos_radio_lease,
+                                            JANOS_RADIO_OWNER_ANALYZER,
+                                            occupied_generation));
+    assert(janos_radio_lease_begin_cleanup(&janos_radio_lease,
+                                           JANOS_RADIO_OWNER_ANALYZER,
+                                           occupied_generation));
+    assert(janos_radio_lease_finish_cleanup(&janos_radio_lease,
+                                            JANOS_RADIO_OWNER_ANALYZER,
+                                            occupied_generation, true));
+
+    clear_logged();
+    task_result = 0;
+    assert(cmd_deauth_detector_v2(4, active) == 1);
+    assert(!receiver_enabled && !detector_defence_runtime.started);
+    assert(janos_radio_lease_snapshot(&janos_radio_lease).owner ==
+           JANOS_RADIO_OWNER_NONE);
+    task_result = pdPASS;
+
+    clear_logged();
+    corrupt_lease_during_start = true;
+    assert(cmd_deauth_detector_v2(4, active) == 1);
+    corrupt_lease_during_start = false;
+    assert(!deauth_detector_active && !deauth_detector_task_handle);
+    assert(!receiver_enabled && !receiver_callback_installed);
+    assert(!detector_defence_runtime.started);
+    assert(janos_radio_lease_snapshot(&janos_radio_lease).owner ==
+           JANOS_RADIO_OWNER_NONE);
+}
+
+static void defence_pmkid_command(void) {
+    static const uint8_t STA[6] = {0x06, 9, 8, 7, 6, 5};
+    janos_radio_lease_init(&janos_radio_lease);
+    char *args[] = {"deauth_detector_v2", "--only", "1", "defence",
+                    "pmkid-decoy"};
+    assert(cmd_deauth_detector_v2(5, args) == 0);
+    assert(strstr(logged,
+        "[DETECTOR_DEFENCE] armed targets=1 trace=fast pmkid=decoy\n"));
+    assert(strstr(logged,
+        "[DETECTOR_DEFENCE] warning=pmkid_decoy_experimental legitimate_client_join_may_match\n"));
+
+    raw_tx_calls = 0;
+    clock_us = 7000000;
+    send_open_auth_request(AP_A, STA, 6);
+    clock_us += 100000;
+    send_management(0x00, AP_A, STA, 6, 28);
+    deauth_detector_process_events();
+    assert(raw_tx_calls == 1U && raw_tx_lengths[0] == 153U);
+    assert(strstr(logged,
+        "trigger=pmkid_probe BSSID=02:00:00:00:00:01 STA=06:09:08:07:06:05 RX=6 decision=decoy_pmkid reason=pmkid_decoy_opt_in\n"));
+    assert(strstr(logged,
+        "tx=decoy_pmkid stage=m1_pmkid result=ok frames=1 latency_us=0 error=none\n"));
+
+    deauth_defence_runtime_request_stop(&detector_defence_runtime);
+    deauth_detector_active = false;
+    deauth_detector_close_events();
+    receiver_enabled = false;
+    deauth_detector_task_handle = 0;
+    assert(deauth_detector_stop_defence_session(0U, true));
 }
 
 static void multiple_targets(void) {
@@ -1129,17 +1479,12 @@ static void trace_rejects_bad_syntax_before_receiver_setup(void) {
         assert(!deauth_detector_task_handle && channel_tune_calls == 0);
         assert(count_lines_starting("[DETECTOR_INFO] format=deauth_v2") == 0);
     }
-    /* Legacy atoi/skip semantics remain intact for mixed valid/invalid tokens. */
+    /* Active suffixes are V2-only; legacy never silently skips them. */
     clear_logged();
-    assert(cmd_deauth_detector(3, legacy_mixed) == 0);
-    assert(deauth_detector_selected_mode && deauth_detector_selected_channels_count == 1);
-    assert(deauth_detector_selected_channels[0] == 6);
-    assert(channel_tune_calls == 1 && receiver_enabled);
-    send_deauth(AP_A, 6);
-    deauth_detector_process_events();
-    assert(count_lines_starting("[DEAUTH] CH: ") == 1);
-    assert(count_lines_starting("[DETECTOR_TRACE] ") == 0);
-    stop_fixture();
+    assert(cmd_deauth_detector(3, legacy_mixed) == 1);
+    assert(strstr(logged,
+        "Active Defence is unavailable in legacy deauth_detector.\n"));
+    assert(!deauth_detector_active && !receiver_enabled);
 }
 
 int main(int argc, char **argv) {
@@ -1179,6 +1524,11 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "trace-retry-stop")) trace_failed_tune_retries_then_stop_clears_lock();
     else if (!strcmp(argv[1], "trace-failure-rate")) trace_failed_tune_notices_are_rate_limited();
     else if (!strcmp(argv[1], "trace-invalid")) trace_rejects_bad_syntax_before_receiver_setup();
+    else if (!strcmp(argv[1], "defence-events")) defence_event_pipeline();
+    else if (!strcmp(argv[1], "defence-command")) defence_command_runtime();
+    else if (!strcmp(argv[1], "defence-idle-refresh")) defence_satisfied_activity_refreshes_trace_idle();
+    else if (!strcmp(argv[1], "defence-rollback")) defence_command_rejections_and_rollback();
+    else if (!strcmp(argv[1], "defence-pmkid")) defence_pmkid_command();
     else return 2;
     puts("watch PASS");
     return 0;
@@ -1195,8 +1545,11 @@ class DeauthDetectorWatchTests(unittest.TestCase):
             "legacy live CLI hint changed",
         )
         self.assertTrue(
-            re.search(r'\{ "deauth_detector_v2", " [^"]*\[trace\]" \}', source),
-            "V2 live CLI hint must show the optional trace suffix",
+            re.search(
+                r'\{ "deauth_detector_v2", " [^"]*\[trace\][^"]*defence[^"]*pmkid-decoy[^"]*" \}',
+                source,
+            ),
+            "V2 live CLI hint must show Trace, Defence and PMKID opt-in",
         )
         self.assertEqual(len(re.findall(r'\.command\s*=\s*"deauth_detector"', source)), 1)
         self.assertEqual(len(re.findall(r'\.command\s*=\s*"deauth_detector_v2"', source)), 1)
@@ -1227,6 +1580,14 @@ class DeauthDetectorWatchTests(unittest.TestCase):
             "detector_trace_release_if_idle",
             "deauth_detector_reset_events",
             "deauth_detector_close_events",
+            "deauth_detector_stop_defence_session",
+            "detector_defence_random_adapter",
+            "detector_defence_tune_adapter",
+            "detector_defence_tx_adapter",
+            "detector_defence_now_adapter",
+            "detector_defence_notify_adapter",
+            "detector_defence_telemetry_adapter",
+            "detector_defence_process_event",
             "deauth_detector_process_events",
             "deauth_detector_channel_hop",
             "cmd_deauth_detector_impl",
@@ -1242,14 +1603,26 @@ class DeauthDetectorWatchTests(unittest.TestCase):
         harness = directory / "watch.c"
         cls.binary = directory / "watch"
         harness.write_text(code, encoding="utf-8")
-        files = [harness, ROOT / "main/csa_detector_core.c"]
+        files = [
+            harness,
+            ROOT / "main/csa_detector_core.c",
+            ROOT / "main/deauth_defence_runtime.c",
+            ROOT / "main/deauth_defence_core.c",
+            ROOT / "main/pmkid_probe_detector.c",
+            ROOT / "main/wpa_decoy.c",
+            ROOT / "main/wpa_crypto_primitives.c",
+            ROOT / "main/crack_worker_sw_sha1.c",
+            ROOT / "main/deauth_defence_cli.c",
+            ROOT / "components/janos_wps/janos_radio_lease.c",
+        ]
         target_core = ROOT / "main/deauth_target_core.c"
         if target_core.exists():
             files.append(target_core)
         build = subprocess.run(
             [
-                "cc", "-std=c11", "-Wall", "-Wextra", "-Wno-unused-function",
+                "cc", "-std=gnu11", "-Wall", "-Wextra", "-Wno-unused-function",
                 "-Wno-unused-variable", "-I", str(ROOT / "main"),
+                "-I", str(ROOT / "components/janos_wps/include"),
                 *map(str, files), "-o", str(cls.binary),
             ],
             capture_output=True,
@@ -1366,6 +1739,21 @@ class DeauthDetectorWatchTests(unittest.TestCase):
 
     def test_trace_rejects_misplaced_duplicate_and_dashed_tokens(self):
         self.check_scenario("trace-invalid")
+
+    def test_defence_rx_classification_is_opt_in_bounded_and_worker_owned(self):
+        self.check_scenario("defence-events")
+
+    def test_defence_command_owns_radio_and_transmits_from_local_worker(self):
+        self.check_scenario("defence-command")
+
+    def test_satisfied_defence_activity_refreshes_trace_idle_lease(self):
+        self.check_scenario("defence-idle-refresh")
+
+    def test_defence_rejects_unsafe_forms_and_rolls_back_failed_start(self):
+        self.check_scenario("defence-rollback")
+
+    def test_opt_in_pmkid_probe_sequence_reaches_single_decoy_m1(self):
+        self.check_scenario("defence-pmkid")
 
 
 if __name__ == "__main__":

@@ -31,6 +31,14 @@ static bool is_always_safe(const char *command, const char *subcommand)
             equals(subcommand, "stop")) || is_status_read(command, subcommand);
 }
 
+static bool is_defence_safe(const char *command, const char *subcommand)
+{
+    return equals(command, "stop") || equals(command, "ping") ||
+           equals(command, "version") || equals(command, "help") ||
+           equals(command, "show_scan_results") ||
+           is_status_read(command, subcommand);
+}
+
 janos_console_admission_result_t janos_console_admission_decide(
     janos_radio_owner_t owner,
     const char *command,
@@ -39,8 +47,12 @@ janos_console_admission_result_t janos_console_admission_decide(
     bool analyzer_busy)
 {
     if (command == NULL || command[0] == '\0' ||
-        owner < JANOS_RADIO_OWNER_NONE || owner > JANOS_RADIO_OWNER_LEGACY) {
+        owner < JANOS_RADIO_OWNER_NONE || owner > JANOS_RADIO_OWNER_DEFENCE) {
         return JANOS_CONSOLE_BUSY_RADIO_LEASE;
+    }
+    if (owner == JANOS_RADIO_OWNER_DEFENCE) {
+        return is_defence_safe(command, subcommand) ?
+            JANOS_CONSOLE_ADMIT : JANOS_CONSOLE_BUSY_RADIO_LEASE;
     }
     if (is_always_safe(command, subcommand)) return JANOS_CONSOLE_ADMIT;
 
@@ -94,6 +106,14 @@ janos_console_admission_result_t janos_console_admission_begin(
         snapshot.generation != 0U && commands_inflight == 0U &&
         !analyzer_busy)
         return JANOS_CONSOLE_ADMIT;
+    /* A failed Defence radio restore retains ownership. Only a bare reboot
+     * may bypass that quarantined owner; running Defence still blocks it. */
+    if (equals(command, "reboot") && subcommand == NULL &&
+        snapshot.owner == JANOS_RADIO_OWNER_DEFENCE &&
+        snapshot.state == JANOS_RADIO_LEASE_QUARANTINED &&
+        snapshot.generation != 0U && commands_inflight == 0U &&
+        !analyzer_busy)
+        return JANOS_CONSOLE_ADMIT;
     janos_console_admission_result_t result = janos_console_admission_decide(
         snapshot.owner, command, subcommand, commands_inflight, analyzer_busy);
     if (result != JANOS_CONSOLE_ADMIT) return result;
@@ -101,6 +121,8 @@ janos_console_admission_result_t janos_console_admission_begin(
      * host baseline. Their own reservation rechecks any racing legacy start. */
     if (is_always_safe(command, subcommand) ||
         janos_wps_command_family_name(command) ||
+        (equals(command, "deauth_detector_v2") &&
+         equals(subcommand, "defence")) ||
         (equals(command, "wifi_analyzer") &&
                                      !equals(subcommand, "clear")))
         return JANOS_CONSOLE_ADMIT;

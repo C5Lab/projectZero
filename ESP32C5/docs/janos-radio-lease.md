@@ -1,14 +1,15 @@
 # JanOS shared radio ownership
 
-JanOS coordinates legacy radio commands, the Wi-Fi analyzer and WPS through
+JanOS coordinates legacy radio commands, the Wi-Fi analyzer, WPS and active
+Deauth Defence through
 one owner/generation lease. The coordinator prevents overlapping mutation of
 the ESP32-C5 Wi-Fi driver while preserving the established WFA/1, console and
 WPS schema-v1 contracts used by existing clients.
 
 ## Owners and lifecycle
 
-Owners are `NONE`, `LEGACY`, `ANALYZER` and `WPS`. `QUARANTINED` is a lease
-state, not an owner:
+Owners are `NONE`, `LEGACY`, `ANALYZER`, `WPS` and `DEFENCE`. `QUARANTINED` is
+a lease state, not an owner:
 
 ```text
 IDLE/NONE -> PREPARING/<owner> -> RUNNING/<owner> -> CLEANUP/<owner> -> IDLE/NONE
@@ -26,12 +27,17 @@ IDLE/NONE -> PREPARING/<owner> -> RUNNING/<owner> -> CLEANUP/<owner> -> IDLE/NON
   admission lock. The handler consumes the same generation; invalid arguments,
   initialization failure or scan-ID exhaustion roll it back. A stale token
   cannot release or cancel a newer owner.
-- WPS and direct analyzer callers acquire their long-lived owner before
+- WPS, active `deauth_detector_v2` Defence, and direct analyzer callers acquire
+  their long-lived owner before
   checking the mutable host baseline, closing the opposite admission race.
+- `DEFENCE` is long-lived from the validated fresh `--only` selected BSSID
+  allowlist through raw TX, worker join, saved-channel restoration and cleanup.
+  Passive detector and Trace runs do not acquire this owner and do not transmit.
 - Callbacks are accepted only for the current owner, generation and `RUNNING`
   state while the callback gate is open. Cleanup closes callback admission.
 - Successful exact restoration releases owner/generation. Failed or uncertain
-  restoration retains them in `QUARANTINED`; reboot is the recovery path.
+  restoration retains them in `QUARANTINED`; a later global `stop` can retry
+  verified restoration, while a bare `reboot` is the fail-safe recovery path.
 - Snapshot reads are bounded and fail conservatively busy during the tiny
   publication windows rather than spinning indefinitely.
 
@@ -76,11 +82,14 @@ stop.
 | idle | analyzer `scan` | announce `ANALYZER/PREPARING` before dispatcher unlock |
 | idle | analyzer `clear` | short `LEGACY` transaction |
 | idle | `wps verify`, `wps pixie`, `jwps campaign`, `selftest transport` | WPS service acquires `WPS/PREPARING` before baseline validation |
+| idle | `deauth_detector_v2 --only ... defence [pmkid-decoy]` | handler validates the fresh selected BSSID allowlist, then acquires `DEFENCE/PREPARING` before Wi-Fi mutation |
 | any owner | `jwps plan`, `selftest db`, `selftest fragment`, `selftest pixie` | ADMIT; serialized offline WPS service, no radio lease |
 | analyzer | WPS/JWPS operation requiring radio | busy: `radio_lease` |
 | WPS | analyzer scan/clear or other radio mutation | busy: `radio_lease` |
 | legacy preparing | analyzer or radio-using WPS/JWPS | busy: `command_in_progress` |
 | analyzer or WPS | status/read commands, `show_scan_results`, built-in `help`, `reboot`, global `stop` | ADMIT |
+| running Defence | `ping`, `version`, built-in `help`, `show_scan_results`, status reads, global `stop` | ADMIT; reboot and every radio mutation remain busy |
+| quarantined Defence | bare `reboot`, global `stop` | ADMIT; `stop` retries cleanup and reboot remains the fail-safe recovery path |
 | any owner, including quarantine | `sta_mac status` | ADMIT; read-only, no Wi-Fi initialization |
 | active or quarantined owner | `sta_mac set ...` | busy: `radio_lease`; no NVS change |
 | analyzer or WPS | `wps stop` / `wifi_analyzer stop` | ADMIT; each handler affects only its own subsystem and is otherwise idempotent |
@@ -109,6 +118,13 @@ lease.
   a transient busy result.
 - Owner-specific stop output retains its subsystem contract. WPS can report
   `stopped`, `stop_pending` or `quarantined`; analyzer retains WFACTL1 records.
+- Defence Stop closes its event generation before requesting worker stop,
+  disables promiscuous receive, waits for TX to quiesce, restores the saved
+  channel, zeroizes response material, and only then completes `CLEANUP` and
+  emits `[DETECTOR_DEFENCE] stopped ...`. An unverified restore retains the
+  `DEFENCE` owner in `QUARANTINED`; it is never reported as a successful stop.
+  A later global `stop` may re-enter cleanup for the same owner/generation and
+  emits `stopped` only after verified restoration and release.
 
 ## Exact idle-STA WPS restore
 
