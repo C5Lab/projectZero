@@ -112,9 +112,10 @@ static bool sniffer_active, sniffer_dog_active, deauth_detector_active;
 static int deauth_detector_current_channel, deauth_detector_channel_index;
 static int64_t deauth_detector_last_channel_hop;
 static TaskHandle_t deauth_detector_task_handle;
-static int dual_band_channels[] = {1, 6, 11, 36};
+static int dual_band_channels[] = {1, 6, 11, 36, 40, 44};
 static const int dual_band_channels_count =
     sizeof(dual_band_channels) / sizeof(dual_band_channels[0]);
+static const int sniffer_channel_hop_delay_ms = 250;
 static int g_scan_min_channel_time = 100, g_scan_max_channel_time = 200;
 static int receiver_setup_calls, scan_calls;
 static bool receiver_enabled;
@@ -725,7 +726,7 @@ static void legacy_ssid_is_captured_at_receive(void) {
     assert(!strstr(logged, "[DEAUTH] CH: 6 | AP: Renamed"));
 }
 
-static void trace_all_locks_first_queued_deauth(void) {
+static void trace_all_confirms_first_queued_deauth_bssid(void) {
     char *args[] = {"deauth_detector_v2", "trace"};
     inject_event_during_start = true;
     assert(cmd_deauth_detector_v2(2, args) == 0);
@@ -734,25 +735,35 @@ static void trace_all_locks_first_queued_deauth(void) {
     assert(last_successful_channel == 1 && channel_tune_history[0] == 1);
     assert(detector_event_count == 1);
     assert(count_lines_starting("[DETECTOR_INFO] format=deauth_v2") == 1);
-    assert(count_lines_starting("[DETECTOR_TRACE] ") == 0);
+    assert(count_lines_starting("[DETECTOR_TRACE] armed") == 1);
+    assert(count_lines_starting("[DETECTOR_TRACE] confirming_bssid=") == 0);
     assert(count_lines_starting("[DEAUTH_V2] ") == 0);
 
     send_deauth(AP_C, 11); /* Second accepted frame waits in the same FIFO. */
     assert(detector_event_count == 2 && channel_tune_calls == 1);
     deauth_detector_process_events();
-    assert(channel_tune_calls == 2 && channel_tune_history[1] == 2);
-    assert(last_successful_channel == 2 && deauth_detector_current_channel == 2);
-    assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=2") == 1);
+    assert(channel_tune_calls == 1);
+    assert(count_lines_starting("[DETECTOR_TRACE] confirming_bssid=02:00:00:00:00:01 first_channel=2 window_ms=1000") == 1);
+    assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=") == 0);
     assert(count_lines_starting("[DEAUTH_V2] ") == 2);
     assert(count_lines_starting("[DEAUTH] ") == 0);
     const char *marker = first_line_starting("[DETECTOR_INFO] format=deauth_v2");
-    const char *locked = first_line_starting("[DETECTOR_TRACE] locked_channel=2");
+    const char *armed = first_line_starting("[DETECTOR_TRACE] armed");
+    const char *confirming = first_line_starting("[DETECTOR_TRACE] confirming_bssid=");
     const char *event = first_line_starting("[DEAUTH_V2] ");
-    assert(marker && locked && event && marker < locked && locked < event);
+    assert(marker && armed && confirming && event && marker < armed && armed < confirming && confirming < event);
     assert(strstr(event,
         "[DEAUTH_V2] CH: 2 | BSSID: 02:00:00:00:00:01 | TX: AA:BB:CC:DD:EE:FF | DA: FF:FF:FF:FF:FF:FF | RSSI: -40 | REASON: 7 | SSID: Office\n"));
     assert(strstr(logged,
         "[DEAUTH_V2] CH: 11 | BSSID: 02:00:00:00:00:03 | TX: 00:00:00:00:00:00 | DA: 00:00:00:00:00:00 | RSSI: -50 | REASON: 0 | SSID: Guest\n"));
+
+    clock_us = 3100000;
+    deauth_detector_process_events();
+    assert(channel_tune_calls == 2 && channel_tune_history[1] == 2);
+    assert(last_successful_channel == 2 && deauth_detector_current_channel == 2);
+    assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=2") == 1);
+    const char *locked = first_line_starting("[DETECTOR_TRACE] locked_channel=2");
+    assert(locked && event < locked);
 
     send_deauth(AP_B, 6);
     assert(detector_event_count == 1 && channel_tune_calls == 2);
@@ -761,6 +772,186 @@ static void trace_all_locks_first_queued_deauth(void) {
     assert(channel_tune_calls == 2 && last_successful_channel == 2);
     assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=") == 1);
     assert(count_lines_starting("[DEAUTH_V2] ") == 3);
+}
+
+static void trace_confirmation_prefers_repeated_stronger_channel(void) {
+    char *args[] = {"deauth_detector_v2", "trace"};
+    const uint8_t zero[6] = {0};
+    assert(cmd_deauth_detector_v2(2, args) == 0);
+    assert(channel_tune_calls == 1 && last_successful_channel == 1);
+
+    clock_us = 2000000;
+    send_deauth_fields(AP_A, zero, zero, 1, -37, 7, 26);
+    deauth_detector_process_events();
+    assert(channel_tune_calls == 1);
+    assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=") == 0);
+
+    send_deauth_fields(AP_A, zero, zero, 2, -33, 7, 26);
+    send_deauth_fields(AP_A, zero, zero, 2, -34, 7, 26);
+    send_deauth_fields(AP_A, zero, zero, 2, -33, 7, 26);
+    send_deauth_fields(AP_B, zero, zero, 3, -10, 7, 26);
+    deauth_detector_process_events();
+    assert(channel_tune_calls == 1);
+
+    clock_us = 3100000;
+    deauth_detector_process_events();
+    assert(channel_tune_calls == 2);
+    assert(channel_tune_history[1] == 2 && last_successful_channel == 2);
+    assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=2") == 1);
+    assert(count_lines_starting("[DEAUTH_V2] ") == 5);
+}
+
+static void trace_confirmation_uses_average_rssi_then_scan_cache(void) {
+    char *args[] = {"deauth_detector_v2", "trace"};
+    const uint8_t zero[6] = {0};
+    assert(cmd_deauth_detector_v2(2, args) == 0);
+
+    send_deauth_fields(AP_A, zero, zero, 1, -40, 7, 26);
+    send_deauth_fields(AP_A, zero, zero, 2, -30, 7, 26);
+    deauth_detector_process_events();
+    clock_us = 3100000;
+    deauth_detector_process_events();
+    assert(channel_tune_calls == 2 && channel_tune_history[1] == 2);
+    assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=2") == 1);
+
+    stop_fixture();
+    clear_logged();
+    channel_tune_calls = 0;
+    last_successful_channel = 0;
+    clock_us = 2000000;
+    assert(cmd_deauth_detector_v2(2, args) == 0);
+
+    /* Equal count and average RSSI: the fresh scan-cache channel wins. */
+    send_deauth_fields(AP_A, zero, zero, 5, -40, 7, 26);
+    send_deauth_fields(AP_A, zero, zero, 6, -40, 7, 26);
+    deauth_detector_process_events();
+    assert(detector_trace_candidate_count == 5);
+    assert(detector_trace_hop_delay_locked() == 200);
+    clock_us = 3100000;
+    deauth_detector_process_events();
+    assert(channel_tune_calls == 2 && channel_tune_history[1] == 6);
+    assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=6") == 1);
+}
+
+static void trace_confirmation_samples_adjacent_5ghz_channels(void) {
+    char *args[] = {"deauth_detector_v2", "trace"};
+    const uint8_t zero[6] = {0};
+    assert(cmd_deauth_detector_v2(2, args) == 0);
+
+    send_deauth_fields(AP_C, zero, zero, 40, -50, 7, 26);
+    deauth_detector_process_events();
+    assert(detector_trace_confirming && detector_trace_candidate_count == 3);
+    assert(detector_trace_candidates[0].channel == 36);
+    assert(detector_trace_candidates[1].channel == 40);
+    assert(detector_trace_candidates[2].channel == 44);
+
+    deauth_detector_channel_hop();
+    assert(channel_tune_calls == 2 && channel_tune_history[1] == 44);
+    send_deauth_fields(AP_C, zero, zero, 44, -45, 7, 26);
+    send_deauth_fields(AP_C, zero, zero, 44, -44, 7, 26);
+    deauth_detector_process_events();
+    deauth_detector_channel_hop();
+    assert(channel_tune_calls == 3 && channel_tune_history[2] == 36);
+
+    clock_us = 3100000;
+    deauth_detector_process_events();
+    assert(channel_tune_calls == 4 && channel_tune_history[3] == 44);
+    assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=44") == 1);
+}
+
+static void trace_stop_during_confirmation_discards_pending_lock(void) {
+    char *args[] = {"deauth_detector_v2", "trace"};
+    assert(cmd_deauth_detector_v2(2, args) == 0);
+    send_deauth(AP_A, 2);
+    deauth_detector_process_events();
+    assert(detector_trace_confirming && !detector_trace_locked);
+    assert(count_lines_starting("[DETECTOR_TRACE] confirming_bssid=") == 1);
+    int tunes_before_stop = channel_tune_calls;
+
+    stop_fixture();
+    assert(!detector_trace_requested && !detector_trace_confirming &&
+           !detector_trace_locked && detector_trace_candidate_count == 0);
+    clock_us = 5000000;
+    deauth_detector_process_events();
+    deauth_detector_channel_hop();
+    assert(channel_tune_calls == tunes_before_stop);
+    assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=") == 0);
+}
+
+static void trace_idle_release_ignores_other_bssids_and_rearms(void) {
+    char *args[] = {"deauth_detector_v2", "trace"};
+    assert(cmd_deauth_detector_v2(2, args) == 0);
+    send_deauth(AP_A, 2);
+    deauth_detector_process_events();
+    clock_us = 3100000;
+    deauth_detector_process_events();
+    assert(detector_trace_locked && last_successful_channel == 2);
+
+    /* Unrelated traffic remains visible but cannot keep this Trace lock alive. */
+    clock_us = 21000000;
+    send_deauth(AP_B, 3);
+    deauth_detector_process_events();
+    assert(detector_trace_locked);
+    assert(count_lines_starting("[DETECTOR_TRACE] released_channel=") == 0);
+
+    clock_us = 22001000;
+    deauth_detector_process_events();
+    assert(!detector_trace_locked && !detector_trace_confirming);
+    assert(detector_trace_requested);
+    assert(count_lines_starting(
+        "[DETECTOR_TRACE] released_channel=2 reason=idle idle_ms=20000") == 1);
+    assert(count_lines_starting("[DETECTOR_TRACE] armed") == 2);
+    const char *release = first_line_starting("[DETECTOR_TRACE] released_channel=");
+    const char *first_armed = first_line_starting("[DETECTOR_TRACE] armed");
+    const char *rearmed = first_armed ? strstr(first_armed + 1,
+                                               "[DETECTOR_TRACE] armed\n") : NULL;
+    assert(release && rearmed && release < rearmed);
+
+    int tunes_after_release = channel_tune_calls;
+    deauth_detector_channel_hop();
+    assert(channel_tune_calls == tunes_after_release + 1);
+    clock_us = 23000000;
+    send_deauth(AP_B, 6);
+    deauth_detector_process_events();
+    assert(detector_trace_confirming && !detector_trace_locked);
+    assert(count_lines_starting(
+        "[DETECTOR_TRACE] confirming_bssid=02:00:00:00:00:02 first_channel=6 window_ms=1000") == 1);
+}
+
+static void trace_matching_bssid_refreshes_idle_deadline(void) {
+    char *args[] = {"deauth_detector_v2", "trace"};
+    assert(cmd_deauth_detector_v2(2, args) == 0);
+    send_deauth(AP_A, 2);
+    deauth_detector_process_events();
+    clock_us = 3100000;
+    deauth_detector_process_events();
+    assert(detector_trace_locked);
+
+    clock_us = 21000000;
+    send_deauth(AP_A, 2);
+    deauth_detector_process_events();
+    clock_us = 22001000;
+    deauth_detector_process_events();
+    assert(detector_trace_locked);
+    assert(count_lines_starting("[DETECTOR_TRACE] released_channel=") == 0);
+
+    clock_us = 40999000;
+    deauth_detector_process_events();
+    assert(detector_trace_locked);
+    clock_us = 41001000;
+    deauth_detector_process_events();
+    assert(!detector_trace_locked);
+    assert(count_lines_starting(
+        "[DETECTOR_TRACE] released_channel=2 reason=idle idle_ms=20000") == 1);
+}
+
+static void trace_start_announces_armed_after_v2_format(void) {
+    char *args[] = {"deauth_detector_v2", "trace"};
+    assert(cmd_deauth_detector_v2(2, args) == 0);
+    const char *format = first_line_starting("[DETECTOR_INFO] format=deauth_v2");
+    const char *armed = first_line_starting("[DETECTOR_TRACE] armed");
+    assert(format && armed && format < armed);
+    assert(count_lines_starting("[DETECTOR_TRACE] armed") == 1);
 }
 
 static void trace_selected_channels_waits_for_deauth(void) {
@@ -773,11 +964,17 @@ static void trace_selected_channels_waits_for_deauth(void) {
     send_csa(AP_C, 11);
     deauth_detector_process_events();
     assert(count_lines_starting("[CSA] ") == 1);
-    assert(count_lines_starting("[DETECTOR_TRACE] ") == 0);
+    assert(count_lines_starting("[DETECTOR_TRACE] armed") == 1);
+    assert(count_lines_starting("[DETECTOR_TRACE] confirming_bssid=") == 0);
+    assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=") == 0);
     assert(channel_tune_calls == 1 && last_successful_channel == 6);
 
     send_deauth(AP_B, 11); /* Bare indices select channels, not BSSIDs. */
     assert(detector_event_count == 1 && channel_tune_calls == 1);
+    deauth_detector_process_events();
+    assert(channel_tune_calls == 1);
+    assert(count_lines_starting("[DETECTOR_TRACE] confirming_bssid=") == 1);
+    clock_us = 3100000;
     deauth_detector_process_events();
     assert(channel_tune_calls == 2 && last_successful_channel == 11);
     assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=11") == 1);
@@ -801,12 +998,18 @@ static void trace_only_ignores_rejected_and_short_frames(void) {
     assert(detector_event_count == 1 && channel_tune_calls == 1);
     deauth_detector_process_events();
     assert(count_lines_starting("[CSA] ") == 1);
-    assert(count_lines_starting("[DETECTOR_TRACE] ") == 0);
+    assert(count_lines_starting("[DETECTOR_TRACE] armed") == 1);
+    assert(count_lines_starting("[DETECTOR_TRACE] confirming_bssid=") == 0);
+    assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=") == 0);
     assert(count_lines_starting("[DEAUTH_V2] ") == 0);
     assert(channel_tune_calls == 1 && last_successful_channel == 6);
 
     send_deauth(AP_C, 11);
     assert(detector_event_count == 1 && channel_tune_calls == 1);
+    deauth_detector_process_events();
+    assert(channel_tune_calls == 1);
+    assert(count_lines_starting("[DETECTOR_TRACE] confirming_bssid=") == 1);
+    clock_us = 3100000;
     deauth_detector_process_events();
     assert(channel_tune_calls == 2 && last_successful_channel == 11);
     assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=11") == 1);
@@ -826,6 +1029,9 @@ static void trace_failed_tune_retries_then_stop_clears_lock(void) {
     fail_channel_tune = true;
     send_deauth(AP_A, 11);
     deauth_detector_process_events();
+    assert(channel_tune_calls == 1);
+    clock_us = 3100000;
+    deauth_detector_process_events();
     assert(channel_tune_calls == 2 && channel_tune_history[1] == 11);
     assert(last_successful_channel == 1);
     assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=") == 0);
@@ -834,6 +1040,9 @@ static void trace_failed_tune_retries_then_stop_clears_lock(void) {
     deauth_detector_channel_hop();
     assert(channel_tune_calls == 3); /* Failed lock did not stop hopping. */
     send_deauth(AP_B, 6);
+    deauth_detector_process_events();
+    assert(channel_tune_calls == 3);
+    clock_us = 4201000;
     deauth_detector_process_events();
     assert(channel_tune_calls == 4 && last_successful_channel == 6);
     assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=6") == 1);
@@ -858,6 +1067,9 @@ static void trace_failed_tune_retries_then_stop_clears_lock(void) {
     started_tunes = channel_tune_calls;
     send_deauth(AP_A, 11);
     deauth_detector_process_events();
+    assert(channel_tune_calls == started_tunes);
+    clock_us += 1100000;
+    deauth_detector_process_events();
     assert(channel_tune_calls == started_tunes + 1);
     assert(last_successful_channel == 11);
     assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=11") == 1);
@@ -868,19 +1080,22 @@ static void trace_failed_tune_notices_are_rate_limited(void) {
     assert(cmd_deauth_detector_v2(2, trace) == 0);
     assert(channel_tune_calls == 1 && last_successful_channel == 1);
     fail_channel_tune = true;
-    const int64_t times_us[] = {2000000, 2500000, 3900000, 4100000};
-    for (size_t i = 0; i < sizeof(times_us) / sizeof(times_us[0]); ++i) {
-        clock_us = times_us[i];
+    const int64_t starts_us[] = {2000000, 3200000, 4400000};
+    for (size_t i = 0; i < sizeof(starts_us) / sizeof(starts_us[0]); ++i) {
+        clock_us = starts_us[i];
         size_t before_callback = logged_size;
         send_deauth(AP_A, 11);
         assert(logged_size == before_callback && detector_event_count == 1);
+        deauth_detector_process_events();
+        assert(channel_tune_calls == (int)i + 1);
+        clock_us += 1100000;
         deauth_detector_process_events();
         assert(channel_tune_calls == (int)i + 2);
         assert(last_successful_channel == 1);
         assert(count_lines_starting("[DEAUTH_V2] ") == (int)i + 1);
         assert(count_lines_starting("[DEAUTH] ") == 0);
         assert(count_lines_starting("[DETECTOR_TRACE] locked_channel=") == 0);
-        int expected_notices = i == 3 ? 2 : 1;
+        int expected_notices = i == 2 ? 2 : 1;
         assert(count_lines_starting("[DETECTOR_TRACE] lock_failed_channel=") == expected_notices);
     }
 }
@@ -951,7 +1166,14 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "details-utf8")) details_printable_utf8_ssid();
     else if (!strcmp(argv[1], "details-protected")) details_protected_reason_availability();
     else if (!strcmp(argv[1], "legacy-v2-flag")) legacy_rejects_v2_flag();
-    else if (!strcmp(argv[1], "trace-all")) trace_all_locks_first_queued_deauth();
+    else if (!strcmp(argv[1], "trace-all")) trace_all_confirms_first_queued_deauth_bssid();
+    else if (!strcmp(argv[1], "trace-confirm")) trace_confirmation_prefers_repeated_stronger_channel();
+    else if (!strcmp(argv[1], "trace-score")) trace_confirmation_uses_average_rssi_then_scan_cache();
+    else if (!strcmp(argv[1], "trace-5ghz")) trace_confirmation_samples_adjacent_5ghz_channels();
+    else if (!strcmp(argv[1], "trace-stop-confirm")) trace_stop_during_confirmation_discards_pending_lock();
+    else if (!strcmp(argv[1], "trace-idle-release")) trace_idle_release_ignores_other_bssids_and_rearms();
+    else if (!strcmp(argv[1], "trace-idle-refresh")) trace_matching_bssid_refreshes_idle_deadline();
+    else if (!strcmp(argv[1], "trace-armed")) trace_start_announces_armed_after_v2_format();
     else if (!strcmp(argv[1], "trace-selected")) trace_selected_channels_waits_for_deauth();
     else if (!strcmp(argv[1], "trace-only")) trace_only_ignores_rejected_and_short_frames();
     else if (!strcmp(argv[1], "trace-retry-stop")) trace_failed_tune_retries_then_stop_clears_lock();
@@ -994,6 +1216,15 @@ class DeauthDetectorWatchTests(unittest.TestCase):
         end = source.index("// Wardrive task", begin)
         code = HARNESS_PREFIX + source[begin:end]
         for name in (
+            "detector_trace_reset_locked",
+            "detector_trace_add_candidate_locked",
+            "detector_trace_build_candidates_locked",
+            "detector_trace_record_locked",
+            "detector_trace_observe_locked",
+            "detector_trace_choose_channel_locked",
+            "detector_trace_hop_delay_locked",
+            "detector_trace_finish_if_due",
+            "detector_trace_release_if_idle",
             "deauth_detector_reset_events",
             "deauth_detector_close_events",
             "deauth_detector_process_events",
@@ -1097,8 +1328,29 @@ class DeauthDetectorWatchTests(unittest.TestCase):
     def test_legacy_command_rejects_v2_option(self):
         self.check_scenario("legacy-v2-flag")
 
-    def test_trace_all_channels_locks_first_queued_deauth_after_format_marker(self):
+    def test_trace_all_channels_confirms_first_queued_bssid_after_format_marker(self):
         self.check_scenario("trace-all")
+
+    def test_trace_confirmation_prefers_repeated_stronger_channel(self):
+        self.check_scenario("trace-confirm")
+
+    def test_trace_confirmation_uses_average_rssi_then_scan_cache_tie_break(self):
+        self.check_scenario("trace-score")
+
+    def test_trace_confirmation_samples_adjacent_5ghz_channels(self):
+        self.check_scenario("trace-5ghz")
+
+    def test_trace_stop_during_confirmation_discards_pending_lock(self):
+        self.check_scenario("trace-stop-confirm")
+
+    def test_trace_idle_release_ignores_other_bssids_and_rearms(self):
+        self.check_scenario("trace-idle-release")
+
+    def test_trace_matching_bssid_refreshes_idle_deadline(self):
+        self.check_scenario("trace-idle-refresh")
+
+    def test_trace_start_announces_armed_after_v2_format(self):
+        self.check_scenario("trace-armed")
 
     def test_trace_selected_indices_waits_for_deauth_and_keeps_bssid_semantics(self):
         self.check_scenario("trace-selected")
