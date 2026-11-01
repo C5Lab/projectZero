@@ -73,9 +73,10 @@ CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
 
-# Verify TLS upload endpoints against the bundled root CAs and URL hostname.
-# CONFIG_ESP_TLS_INSECURE is not set
-# CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY is not set
+# Allow WPA-sec to skip verification when no CA bundle is attached.
+# Other TLS endpoints explicitly attach the bundle and retain verification.
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 

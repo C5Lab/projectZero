@@ -12561,7 +12561,7 @@ static int wpasec_tls_write_all(esp_tls_t *tls, const char *buf, int len) {
 /**
  * @brief Upload a single .pcap file to wpa-sec.stanev.org
  *
- * Uses esp_tls directly with the certificate bundle for server verification.
+ * Uses esp_tls directly without server certificate verification for WPA-sec.
  *
  * @param filepath  Full path to .pcap file on SD card
  * @param filename  Just the filename (for the Content-Disposition header)
@@ -12637,9 +12637,10 @@ static int wpasec_upload_file(const char *filepath, const char *filename) {
         "\r\n",
         wpasec_api_key, boundary, body_total_len);
 
-    // Open TLS connection with server certificate verification.
+    // WPA-sec explicitly uses the CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY fallback.
+    // Other upload endpoints attach the CA bundle and still verify their servers.
     esp_tls_cfg_t tls_cfg = {
-        .crt_bundle_attach = esp_crt_bundle_attach,
+        .crt_bundle_attach = NULL,
         .timeout_ms = 15000,
     };
 
