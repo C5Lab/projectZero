@@ -90,3 +90,9 @@
 2026-10-18: secret reveal escaping TDD batch complete; no new reusable skill observation.
 2026-10-18: no new reusable skill observation from D-UCB reservation cleanup; existing concurrency-boundary principles covered the TDD workflow.
 2026-10-18: no observations - JSONL partial-append rollback fix followed existing TDD and systematic-debugging guidance.
+2026-11-01 Deauth Defence Tasks 1-4 checkpoint: observation 0010 recorded after two fixture-only failures were root-caused to shell escape ambiguity and PMK/ANonce byte aliasing; CLI, radio owner, WPA primitives, and decoy builder focused tests are green.
+2026-11-01 Deauth Defence integration checkpoint: observation 0011 recorded after a repeated-comment patch anchor targeted the wrong command; function-signature anchors plus immediate rg/diff context checks are now required for large translation units.
+2026-11-01 Deauth Defence review-hardening checkpoint: reusable observation - publish terminal success only after verified resource restoration and ownership release; quiescence alone is not a successful stop.
+2026-11-01 Deauth Defence RF validation checkpoint: no new reusable skill observation after adjacent-channel pinning, cross-action response latch, synchronized Trace/Defence idle lease, host regression tests, and independent code review.
+2026-11-01 Deauth Defence telemetry checkpoint: no new reusable skill observation after replacing satisfied-heartbeat spam with factual release/stop summaries; evidence-before-claims already covers responded versus prevented wording.
+2026-11-01 Deauth Defence merge checkpoint: no new reusable skill observation; source-first integration and rebuilding divergent generated binaries are already covered by artifact verification guidance.

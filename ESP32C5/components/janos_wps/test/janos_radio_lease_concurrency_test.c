@@ -157,7 +157,9 @@ int main(void)
         atomic_uint ready = ATOMIC_VAR_INIT(0U);
         contender_t analyzer = {
             .lease = &lease,
-            .owner = iteration % 2U ? JANOS_RADIO_OWNER_ANALYZER : JANOS_RADIO_OWNER_LEGACY,
+            .owner = iteration % 3U == 0U ? JANOS_RADIO_OWNER_DEFENCE :
+                     iteration % 2U ? JANOS_RADIO_OWNER_ANALYZER :
+                                      JANOS_RADIO_OWNER_LEGACY,
             .start = &start,
             .ready = &ready,
         };

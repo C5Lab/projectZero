@@ -35,10 +35,20 @@ class CsaDetectorTests(unittest.TestCase):
                 source = directory / "integration.c"
                 source.write_text(code)
             exe = directory / "csa-test"
-            subprocess.run([os.environ.get("CC", "gcc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
+            subprocess.run([os.environ.get("CC", "gcc"), "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                             "-Wno-unused-function", "-Wno-unused-variable", "-I", str(ROOT / "main"),
+                            "-I", str(ROOT / "components/janos_wps/include"),
                             str(source), str(ROOT / "main/csa_detector_core.c"),
-                            str(ROOT / "main/deauth_target_core.c"), "-o", str(exe)], check=True)
+                            str(ROOT / "main/deauth_target_core.c"),
+                            str(ROOT / "main/deauth_defence_runtime.c"),
+                            str(ROOT / "main/deauth_defence_core.c"),
+                            str(ROOT / "main/pmkid_probe_detector.c"),
+                            str(ROOT / "main/wpa_decoy.c"),
+                            str(ROOT / "main/wpa_crypto_primitives.c"),
+                            str(ROOT / "main/crack_worker_sw_sha1.c"),
+                            str(ROOT / "main/deauth_defence_cli.c"),
+                            str(ROOT / "components/janos_wps/janos_radio_lease.c"),
+                            "-o", str(exe)], check=True)
             return subprocess.check_output([str(exe)], text=True)
 
     def test_parser_bounds_protocol_and_rate_lifecycle(self):
@@ -56,9 +66,12 @@ class CsaDetectorTests(unittest.TestCase):
 #include <string.h>
 #include "csa_detector_core.h"
 #include "deauth_target_core.h"
+#include "deauth_defence_runtime.h"
+#include "pmkid_probe_detector.h"
 #define MAX_AP_CNT 64
 #define MY_LOG_INFO(tag, ...) do { printf(__VA_ARGS__); puts(""); } while(0)
 typedef int portMUX_TYPE;
+typedef int wifi_second_chan_t;
 #define portMUX_INITIALIZER_UNLOCKED 0
 #define portENTER_CRITICAL(x) ((void)(x))
 #define portEXIT_CRITICAL(x) ((void)(x))
@@ -105,6 +118,7 @@ static void led_status_notify_event(int event) { (void)event; ++threat_events; }
                      "detector_trace_finish_if_due",
                      "detector_trace_release_if_idle",
                      "deauth_detector_reset_events", "deauth_detector_close_events",
+                     "detector_defence_process_event",
                      "deauth_detector_process_events", "deauth_detector_promiscuous_callback"):
             code += '\n' + function(source,name)
         code += r'''
@@ -174,6 +188,10 @@ int main(void) {
 #include <string.h>
 #include "csa_detector_core.h"
 #include "deauth_target_core.h"
+#include "deauth_defence_runtime.h"
+#include "pmkid_probe_detector.h"
+#include "deauth_defence_cli.h"
+#include "janos_radio_lease.h"
 #define MAX_AP_CNT 64
 #define MY_LOG_INFO(tag, ...) do { printf(__VA_ARGS__); puts(""); } while(0)
 typedef int portMUX_TYPE;
@@ -183,6 +201,7 @@ typedef int portMUX_TYPE;
 typedef int esp_err_t;
 typedef int BaseType_t;
 typedef void *SemaphoreHandle_t;
+typedef int wifi_second_chan_t;
 #define ESP_OK 0
 #define ESP_ERR_INVALID_STATE 5
 #define WIFI_PROMIS_FILTER_MASK_MGMT 1
@@ -192,7 +211,12 @@ typedef void *SemaphoreHandle_t;
 #define portMAX_DELAY 0xffffffffu
 #define pdMS_TO_TICKS(x) (x)
 typedef struct { int filter_mask; } wifi_promiscuous_filter_t;
-typedef struct { uint8_t bssid[6],ssid[33]; int primary; } wifi_ap_record_t;
+enum { WIFI_AUTH_OPEN = 0, WIFI_AUTH_WPA2_PSK = 3 };
+enum { WIFI_CIPHER_TYPE_NONE = 0, WIFI_CIPHER_TYPE_CCMP = 4 };
+typedef struct {
+    uint8_t bssid[6],ssid[33];
+    int primary, authmode, pairwise_cipher;
+} wifi_ap_record_t;
 static wifi_ap_record_t g_scan_results[MAX_AP_CNT];
 static SemaphoreHandle_t g_scan_results_mutex=(void *)1;
 static bool g_scan_records_valid=true;
@@ -209,6 +233,7 @@ static int g_scan_min_channel_time=100,g_scan_max_channel_time=200;
 static int fail_step,setup_calls,task_result=pdPASS;
 static bool receiver_enabled;
 static unsigned scan_calls;
+static janos_radio_lease_t janos_radio_lease;
 static void oled_display_update_full(const char*a,const char*b,const char*c,const char*d) {(void)a;(void)b;(void)c;(void)d;}
 static void log_memory_info(const char*s) {(void)s;}
 static bool ensure_wifi_mode(void) {return true;}
@@ -227,7 +252,24 @@ static esp_err_t esp_wifi_set_promiscuous(bool enabled) {
     receiver_enabled=enabled;return 0;
 }
 static esp_err_t esp_wifi_set_channel(int ch,int second) {(void)ch;(void)second;return ++setup_calls==fail_step?9:0;}
+static esp_err_t esp_wifi_get_channel(uint8_t *ch,wifi_second_chan_t *second)
+    {*ch=1;*second=WIFI_SECOND_CHAN_NONE;return ESP_OK;}
+static bool zig_recon_radio_busy(char *reason,size_t size)
+    {(void)reason;(void)size;return false;}
+static bool detector_defence_random_adapter(void *o,uint8_t *p,size_t n)
+    {(void)o;memset(p,1,n);return true;}
+static int detector_defence_tune_adapter(void *o,uint8_t c)
+    {(void)o;(void)c;return 0;}
+static int detector_defence_tx_adapter(void *o,const uint8_t *p,size_t n,bool s)
+    {(void)o;(void)p;(void)n;(void)s;return 0;}
+static int64_t detector_defence_now_adapter(void *o) {(void)o;return 2000000;}
+static void detector_defence_notify_adapter(void *o) {(void)o;}
+static void detector_defence_telemetry_adapter(void *o,const char *s)
+    {(void)o;(void)s;}
+static bool deauth_detector_stop_defence_session(uint32_t d,bool r)
+    {(void)d;(void)r;return true;}
 static void deauth_detector_task(void*p) {(void)p;}
+static void xTaskNotifyGive(int handle) {(void)handle;}
 static int xTaskCreate(void(*f)(void*),const char*n,int stack,void*p,int prio,int*h) {
     (void)f;(void)n;(void)stack;(void)p;(void)prio;
     if(task_result==pdPASS)*h=1;

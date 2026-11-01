@@ -1,5 +1,6 @@
 #include "crack_worker_crypto.h"
 #include "crack_worker_sw_sha1.h"
+#include "wpa_crypto_primitives.h"
 
 #include <string.h>
 
@@ -13,35 +14,11 @@
 static bool compute_kck(const uint8_t pmk[32], const crack_worker_hccapx_t *record,
                         uint8_t kck[16])
 {
-    static const char label[] = "Pairwise key expansion";
-    const uint8_t *mac_min = record->mac_ap;
-    const uint8_t *mac_max = record->mac_sta;
-    const uint8_t *nonce_min = record->nonce_ap;
-    const uint8_t *nonce_max = record->nonce_sta;
-    if (memcmp(mac_min, mac_max, 6) > 0) {
-        mac_min = record->mac_sta;
-        mac_max = record->mac_ap;
-    }
-    if (memcmp(nonce_min, nonce_max, 32) > 0) {
-        nonce_min = record->nonce_sta;
-        nonce_max = record->nonce_ap;
-    }
-
-    uint8_t data[100];
-    size_t offset = 0;
-    memcpy(data + offset, label, 22); offset += 22;
-    data[offset++] = 0;
-    memcpy(data + offset, mac_min, 6); offset += 6;
-    memcpy(data + offset, mac_max, 6); offset += 6;
-    memcpy(data + offset, nonce_min, 32); offset += 32;
-    memcpy(data + offset, nonce_max, 32); offset += 32;
-    data[offset++] = 0;
-
-    uint8_t digest[20];
-    bool ok = crack_worker_sw_hmac_sha1(pmk, 32, data, offset, digest) == 0;
-    if (ok) memcpy(kck, digest, 16);
-    mbedtls_platform_zeroize(digest, sizeof(digest));
-    mbedtls_platform_zeroize(data, sizeof(data));
+    uint8_t ptk[64] = {0};
+    bool ok = janos_wpa_ptk_sha1(pmk, record->mac_ap, record->mac_sta,
+                                 record->nonce_ap, record->nonce_sta, ptk);
+    if (ok) memcpy(kck, ptk, 16U);
+    janos_wpa_zeroize(ptk, sizeof(ptk));
     return ok;
 }
 
@@ -60,8 +37,8 @@ static int test_pmk(const uint8_t pmk[32], const crack_worker_hccapx_t *record)
         error = md == NULL ? -1 : mbedtls_md_hmac(md, kck, sizeof(kck), eapol,
                                                   record->eapol_len, mic);
     } else {
-        error = crack_worker_sw_hmac_sha1(kck, sizeof(kck), eapol,
-                                          record->eapol_len, mic);
+        error = janos_wpa_eapol_mic_v2(kck, eapol, record->eapol_len, mic) ?
+                    0 : -1;
     }
     if (error == 0) result = memcmp(mic, record->keymic, 16) == 0;
 done:

@@ -5,6 +5,8 @@ idf_component_register(SRCS "oled_display.c" "main.c" "ota_diag.c" "attack_hands
                             "handshake_ducb_guard.c"
                             "pmkid_parser.c" "pmkid_capture.c"
                             "crack_worker.c" "crack_worker_core.c" "crack_worker_transfer.c" "crack_worker_crypto.c"
+                            "wpa_crypto_primitives.c"
+                            "wpa_decoy.c"
                             "fs_core.c" "fs_command.c"
                             "crack_worker_sw_sha1.c" "artifact_inventory_core.c"
                             "wifi_analyzer.c" "wifi_analyzer_core.c" "janos_console_admission.c"
@@ -13,6 +15,10 @@ idf_component_register(SRCS "oled_display.c" "main.c" "ota_diag.c" "attack_hands
                             "wifi_country_policy.c" "wifi_country_store.c" "wifi_country_driver.c"
                             "wifi_channel_policy.c" "bssid_protection.c"
                             "sniffer_extended.c" "csa_detector_core.c" "deauth_target_core.c"
+                            "deauth_defence_cli.c"
+                            "deauth_defence_core.c"
+                            "deauth_defence_runtime.c"
+                            "pmkid_probe_detector.c"
                        INCLUDE_DIRS .
                        PRIV_INCLUDE_DIRS "${CRACK_WORKER_IDF_PATH}/components/mbedtls/mbedtls/library"
                        REQUIRES esp_timer esp_wifi esp_event esp_psram nvs_flash 

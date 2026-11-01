@@ -87,6 +87,23 @@ static void policy_matrix(void)
         {JANOS_RADIO_OWNER_LEGACY, "start_portal", NULL, 0, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
         {JANOS_RADIO_OWNER_LEGACY, "ping", NULL, 1, false, JANOS_CONSOLE_ADMIT},
         {JANOS_RADIO_OWNER_LEGACY, "version", NULL, 1, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_DEFENCE, "stop", NULL, 1, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_DEFENCE, "help", NULL, 1, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_DEFENCE, "ping", NULL, 1, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_DEFENCE, "version", NULL, 1, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_DEFENCE, "show_scan_results", NULL, 1, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_DEFENCE, "wps", "status", 1, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_DEFENCE, "wifi_analyzer", "status", 1, false, JANOS_CONSOLE_ADMIT},
+        {JANOS_RADIO_OWNER_DEFENCE, "reboot", NULL, 1, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_DEFENCE, "wps", "stop", 1, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_DEFENCE, "wifi_analyzer", "stop", 1, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_DEFENCE, "deauth_detector_v2", NULL, 0, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_DEFENCE, "scan_networks", NULL, 0, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_DEFENCE, "wifi_analyzer", "scan", 0, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_DEFENCE, "wps", "verify", 0, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_DEFENCE, "start_portal", NULL, 0, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_DEFENCE, "sta_mac", "set", 0, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
+        {JANOS_RADIO_OWNER_DEFENCE, "test_radio_channel", "6", 0, false, JANOS_CONSOLE_BUSY_RADIO_LEASE},
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
@@ -234,6 +251,56 @@ static void only_quarantined_wps_can_enter_download_without_releasing_lease(void
                                          &token) == JANOS_CONSOLE_BUSY_RADIO_LEASE);
 }
 
+static void defence_command_reserves_its_own_long_lived_owner(void)
+{
+    janos_radio_lease_t lease;
+    janos_radio_lease_init(&lease);
+    janos_console_admission_token_t token = {0};
+    assert(janos_console_admission_begin(
+        &lease, "deauth_detector_v2", "defence", 0U, false, &token) ==
+        JANOS_CONSOLE_ADMIT);
+    assert(token.owner == JANOS_RADIO_OWNER_NONE && token.generation == 0U);
+    janos_radio_lease_snapshot_t snapshot = janos_radio_lease_snapshot(&lease);
+    assert(snapshot.owner == JANOS_RADIO_OWNER_NONE);
+    assert(snapshot.state == JANOS_RADIO_LEASE_IDLE);
+    assert(janos_console_admission_end(&lease, token));
+
+    assert(janos_console_admission_begin(
+        &lease, "deauth_detector_v2", "--only", 0U, false, &token) ==
+        JANOS_CONSOLE_ADMIT);
+    assert(token.owner == JANOS_RADIO_OWNER_LEGACY && token.generation != 0U);
+    assert(janos_console_admission_end(&lease, token));
+}
+
+static void only_quarantined_defence_can_reboot(void)
+{
+    janos_radio_lease_t lease;
+    janos_radio_lease_init(&lease);
+    janos_console_admission_token_t token = {0};
+    uint32_t generation = 0U;
+    assert(janos_radio_lease_acquire(&lease, JANOS_RADIO_OWNER_DEFENCE,
+                                     &generation) == JANOS_RADIO_LEASE_OK);
+    assert(janos_radio_lease_mark_running(&lease, JANOS_RADIO_OWNER_DEFENCE,
+                                          generation));
+    assert(janos_console_admission_begin(&lease, "reboot", NULL, 0U, false,
+                                         &token) ==
+           JANOS_CONSOLE_BUSY_RADIO_LEASE);
+    assert(janos_radio_lease_begin_cleanup(&lease, JANOS_RADIO_OWNER_DEFENCE,
+                                           generation));
+    assert(!janos_radio_lease_finish_cleanup(&lease,
+                                              JANOS_RADIO_OWNER_DEFENCE,
+                                              generation, false));
+    assert(janos_console_admission_begin(&lease, "reboot", NULL, 0U, false,
+                                         &token) == JANOS_CONSOLE_ADMIT);
+    assert(token.owner == JANOS_RADIO_OWNER_NONE && token.generation == 0U);
+    assert(janos_console_admission_begin(&lease, "reboot", "now", 0U, false,
+                                         &token) ==
+           JANOS_CONSOLE_BUSY_RADIO_LEASE);
+    assert(janos_console_admission_begin(&lease, "reboot", NULL, 1U, false,
+                                         &token) ==
+           JANOS_CONSOLE_BUSY_RADIO_LEASE);
+}
+
 int main(void)
 {
     policy_matrix();
@@ -242,6 +309,8 @@ int main(void)
     busy_wire_is_byte_stable();
     stale_startup_tokens_cannot_release_or_cancel_new_owners();
     only_quarantined_wps_can_enter_download_without_releasing_lease();
+    defence_command_reserves_its_own_long_lived_owner();
+    only_quarantined_defence_can_reboot();
     puts("PASS: JanOS console admission policy");
     return 0;
 }
