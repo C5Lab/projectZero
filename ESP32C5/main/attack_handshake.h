@@ -32,6 +32,10 @@ typedef enum{
  */
 esp_err_t attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_methods_t method);
 
+/* Switch an already-running passive capture to the legacy broadcast-deauth
+ * phase. Used after clientless PMKID solicitation has completed. */
+esp_err_t attack_handshake_enable_broadcast_deauth(void);
+
 /**
  * @brief Stops handshake attack.
  * 

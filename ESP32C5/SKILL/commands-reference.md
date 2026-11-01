@@ -206,7 +206,7 @@ Target BSSID[0]: AX3_2.4, BSSID: C4:2B:44:12:29:1C, Channel: 1
 
 ### `start_handshake`
 - **Syntax**: `start_handshake`
-- **Description**: Captures WPA handshakes. With selection = targeted; without = scans every 5 min and attacks all.
+- **Description**: Captures WPA handshakes and PMKIDs. With selection = targeted; without = automatic sniffer/D-UCB mode. For every AP it first performs two clientless STA auth/association PMKID attempts; only afterwards may it deauthenticate discovered clients. PMKID in EAPOL-Key or association/reassociation RSN is saved independently to `/sdcard/lab/handshakes/{SSID}_{MAC_suffix}_{timestamp}_pmkid.pcap`; capture continues toward a complete handshake. Target selection and `white.txt` apply to both kinds of capture.
 - **Success markers** (monitor continuously):
 ```
 HANDSHAKE IS COMPLETE AND VALID
@@ -218,6 +218,7 @@ Handshake #1 captured!
   - `strstr("HANDSHAKE IS COMPLETE AND VALID")` -- handshake validated
   - `strstr("PCAP saved:")` -- file saved, extract path after `/sdcard/`
   - `strstr("handshake saved for SSID:")` -- extract SSID after `"SSID: "`
+  - `strstr("PMKID saved:")` -- separate PMKID PCAP committed; does not indicate a complete handshake
 - **Stop**: Send `stop`.
 
 ### `save_handshake`

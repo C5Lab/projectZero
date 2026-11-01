@@ -3,6 +3,7 @@ idf_component_register(SRCS "oled_display.c" "main.c" "ota_diag.c" "attack_hands
                             "led_status_core.c" "led_cli_activity.c" "led_target_cache.c"
                             "handshake_tx_telemetry.c"
                             "handshake_ducb_guard.c"
+                            "pmkid_parser.c" "pmkid_capture.c"
                             "crack_worker.c" "crack_worker_core.c" "crack_worker_transfer.c" "crack_worker_crypto.c"
                             "fs_core.c" "fs_command.c"
                             "crack_worker_sw_sha1.c" "artifact_inventory_core.c"

