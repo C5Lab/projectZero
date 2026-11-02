@@ -45,7 +45,12 @@ class DeauthDefenceDocumentationTests(unittest.TestCase):
             "observations=<n>",
             "outcome=<responded|observed|idle>",
             "response=<decoy_4way|decoy_pmkid>",
-            "never transmits",
+            "750 ms SSID-resolution window",
+            "exactly one active scan",
+            "20–60 ms active dwell",
+            "without replacing the main scan cache",
+            "disabled in Defence mode",
+            "probe requests",
             "host tests",
             "RF validation",
         )

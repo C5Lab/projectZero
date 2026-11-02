@@ -96,3 +96,4 @@
 2026-11-01 Deauth Defence RF validation checkpoint: no new reusable skill observation after adjacent-channel pinning, cross-action response latch, synchronized Trace/Defence idle lease, host regression tests, and independent code review.
 2026-11-01 Deauth Defence telemetry checkpoint: no new reusable skill observation after replacing satisfied-heartbeat spam with factual release/stop summaries; evidence-before-claims already covers responded versus prevented wording.
 2026-11-01 Deauth Defence merge checkpoint: no new reusable skill observation; source-first integration and rebuilding divergent generated binaries are already covered by artifact verification guidance.
+2026-11-02 Deauth Forensics design and RED checkpoint: no new reusable skill observation; the bounded design approval and exact producer-contract tests follow existing brainstorming and TDD guidance.

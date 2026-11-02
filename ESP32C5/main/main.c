@@ -641,6 +641,10 @@ static int64_t deauth_detector_last_channel_hop = 0;
 #define DETECTOR_TRACE_CONFIRM_MS 1000
 #define DETECTOR_TRACE_IDLE_RELEASE_MS 20000
 #define DETECTOR_TRACE_MAX_CANDIDATES 5
+#define DETECTOR_RESOLVED_SSID_CAPACITY 8
+#define DETECTOR_SSID_PASSIVE_WAIT_MS 750
+#define DETECTOR_SSID_ACTIVE_MIN_MS 20
+#define DETECTOR_SSID_ACTIVE_MAX_MS 60
 typedef enum {
     DETECTOR_EVENT_DEAUTH = 0,
     DETECTOR_EVENT_DISASSOC,
@@ -664,10 +668,12 @@ typedef struct {
 typedef struct { uint8_t bssid[6]; char ssid[33]; uint8_t channel; } detector_cache_entry_t;
 static detector_event_t detector_events[DETECTOR_EVENT_CAPACITY];
 static detector_cache_entry_t detector_cache[MAX_AP_CNT];
+static detector_cache_entry_t detector_resolved_ssids[DETECTOR_RESOLVED_SSID_CAPACITY];
 _Static_assert(DEAUTH_TARGET_MAX == MAX_AP_CNT, "detector target and scan capacities differ");
 static deauth_target_filter_t detector_watch_filter;
 static bool detector_watch_enabled;
 static size_t detector_cache_count;
+static size_t detector_resolved_ssid_count, detector_resolved_ssid_replace;
 static size_t detector_event_head, detector_event_count;
 static uint32_t detector_generation, detector_dropped, detector_dropped_total;
 static bool detector_accepting;
@@ -693,6 +699,15 @@ static size_t detector_trace_candidate_count, detector_trace_hop_index;
 static int detector_trace_first_channel, detector_trace_cached_channel;
 static int detector_trace_locked_channel;
 static int64_t detector_trace_deadline_ms, detector_trace_last_activity_ms;
+typedef struct {
+    bool pending;
+    uint8_t bssid[6];
+    uint8_t channel;
+    uint32_t generation;
+    int64_t deadline_ms;
+} detector_ssid_resolver_t;
+static detector_ssid_resolver_t detector_ssid_resolver;
+static uint8_t detector_targeted_scan_events_pending;
 static csa_rate_limit_t detector_csa_rate;
 static portMUX_TYPE detector_event_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -3162,6 +3177,14 @@ static void wifi_event_handler(void *event_handler_arg,
         }
         case WIFI_EVENT_SCAN_DONE: {
             const wifi_event_sta_scan_done_t *e = (const wifi_event_sta_scan_done_t *)event_data;
+            bool detector_targeted_scan = false;
+            portENTER_CRITICAL(&detector_event_lock);
+            if (detector_targeted_scan_events_pending) {
+                --detector_targeted_scan_events_pending;
+                detector_targeted_scan = true;
+            }
+            portEXIT_CRITICAL(&detector_event_lock);
+            if (detector_targeted_scan) break;
             if (wifi_analyzer_on_scan_done(e)) break;
             bool suppress_scan_logs = periodic_rescan_in_progress || wardrive_active || channel_view_scan_mode || g_scan_teardown_in_progress;
 
@@ -20581,6 +20604,7 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
     }
     if (details) {
         MY_LOG_INFO(TAG, "Output: [DEAUTH_V2] CH: <ch> | BSSID: <bssid> | TX: <tx> | DA: <da> | RSSI: <rssi> | REASON: <reason> | SSID: <ssid>");
+        MY_LOG_INFO(TAG, "Forensics: [DEAUTH_FORENSIC/1] is enabled by default for deauth and disassoc frames.");
     } else {
         MY_LOG_INFO(TAG, "Output: [DEAUTH] CH: <ch> | AP: <name> (<bssid>) | RSSI: <rssi>");
     }
@@ -28272,7 +28296,7 @@ static void register_commands(void)
 
     const esp_console_cmd_t deauth_detector_v2_cmd = {
         .command = "deauth_detector_v2",
-        .help = "V2 passive/trace monitor emitting deauth_v2; defence sends bounded decoy EAPOL only for fresh --only selected WPA2 BSSIDs; pmkid-decoy is experimental",
+        .help = "V2 passive/trace monitor emitting deauth_v2 plus default forensic deauth/disassoc evidence; defence sends bounded decoy EAPOL only for fresh --only selected WPA2 BSSIDs; pmkid-decoy is experimental",
         .hint = "[index1 index2 ... | --only index1 index2 ...] [trace] [defence [pmkid-decoy]]",
         .func = &cmd_deauth_detector_v2,
         .argtable = NULL
@@ -31576,7 +31600,166 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
 
 // === DEAUTH DETECTOR FUNCTIONS ===
 
+static bool detector_ssid_lookup_locked(const uint8_t bssid[6], char ssid[33]) {
+    for (size_t i = 0; i < detector_resolved_ssid_count; ++i) {
+        if (!memcmp(detector_resolved_ssids[i].bssid, bssid, 6) &&
+            detector_resolved_ssids[i].ssid[0]) {
+            memcpy(ssid, detector_resolved_ssids[i].ssid, 33);
+            return true;
+        }
+    }
+    for (size_t i = 0; i < detector_cache_count; ++i) {
+        if (!memcmp(detector_cache[i].bssid, bssid, 6) &&
+            detector_cache[i].ssid[0]) {
+            memcpy(ssid, detector_cache[i].ssid, 33);
+            return true;
+        }
+    }
+    ssid[0] = 0;
+    return false;
+}
+
+static void detector_ssid_store_locked(const uint8_t bssid[6], int channel,
+                                       const uint8_t *ssid, size_t ssid_length) {
+    if (!ssid || !ssid_length) return;
+    if (ssid_length > 32) ssid_length = 32;
+    size_t slot = detector_resolved_ssid_count;
+    for (size_t i = 0; i < detector_resolved_ssid_count; ++i) {
+        if (!memcmp(detector_resolved_ssids[i].bssid, bssid, 6)) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == detector_resolved_ssid_count) {
+        if (detector_resolved_ssid_count < DETECTOR_RESOLVED_SSID_CAPACITY) {
+            ++detector_resolved_ssid_count;
+        } else {
+            slot = detector_resolved_ssid_replace;
+            detector_resolved_ssid_replace =
+                (detector_resolved_ssid_replace + 1) % DETECTOR_RESOLVED_SSID_CAPACITY;
+        }
+    }
+    detector_cache_entry_t *entry = &detector_resolved_ssids[slot];
+    memcpy(entry->bssid, bssid, 6);
+    memset(entry->ssid, 0, sizeof(entry->ssid));
+    memcpy(entry->ssid, ssid, ssid_length);
+    entry->channel = channel > 0 && channel <= UINT8_MAX ? (uint8_t)channel : 0;
+}
+
+static bool detector_ssid_parse_management(const uint8_t *frame, size_t length,
+                                           const uint8_t **ssid,
+                                           size_t *ssid_length) {
+    if (!frame || !ssid || !ssid_length || length < 36) return false;
+    uint8_t subtype = frame[0] & 0xfcU;
+    if (subtype != 0x80U && subtype != 0x50U) return false;
+    size_t offset = 36;
+    while (offset + 2 <= length) {
+        uint8_t id = frame[offset];
+        size_t field_length = frame[offset + 1];
+        offset += 2;
+        if (field_length > length - offset) return false;
+        if (id == 0) {
+            if (!field_length || field_length > 32) return false;
+            *ssid = frame + offset;
+            *ssid_length = field_length;
+            return true;
+        }
+        offset += field_length;
+    }
+    return false;
+}
+
+static void detector_ssid_resolver_observe(const uint8_t *frame, size_t length,
+                                           int channel, uint32_t generation) {
+    const uint8_t *ssid = NULL;
+    size_t ssid_length = 0;
+    if (!detector_ssid_parse_management(frame, length, &ssid, &ssid_length)) return;
+    portENTER_CRITICAL(&detector_event_lock);
+    if (detector_accepting && deauth_detector_active && detector_trace_requested &&
+        detector_trace_locked && !detector_defence_requested &&
+        detector_generation == generation && detector_ssid_resolver.pending &&
+        detector_ssid_resolver.generation == generation &&
+        detector_ssid_resolver.channel == channel &&
+        !memcmp(detector_ssid_resolver.bssid, frame + 16, 6)) {
+        detector_ssid_store_locked(frame + 16, channel, ssid, ssid_length);
+        detector_ssid_resolver.pending = false;
+    }
+    portEXIT_CRITICAL(&detector_event_lock);
+}
+
+static void detector_ssid_resolver_arm_locked(int64_t now_ms, int channel) {
+    char known_ssid[33];
+    memset(&detector_ssid_resolver, 0, sizeof(detector_ssid_resolver));
+    if (detector_defence_requested ||
+        detector_ssid_lookup_locked(detector_trace_bssid, known_ssid)) return;
+    detector_ssid_resolver.pending = true;
+    memcpy(detector_ssid_resolver.bssid, detector_trace_bssid, 6);
+    detector_ssid_resolver.channel = (uint8_t)channel;
+    detector_ssid_resolver.generation = detector_generation;
+    detector_ssid_resolver.deadline_ms = now_ms + DETECTOR_SSID_PASSIVE_WAIT_MS;
+}
+
+static void detector_ssid_resolver_poll(void) {
+    uint8_t bssid[6];
+    int channel = 0;
+    uint32_t generation = 0;
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    portENTER_CRITICAL(&detector_event_lock);
+    if (detector_accepting && deauth_detector_active && detector_trace_requested &&
+        detector_trace_locked && !detector_defence_requested &&
+        detector_ssid_resolver.pending &&
+        now_ms >= detector_ssid_resolver.deadline_ms) {
+        memcpy(bssid, detector_ssid_resolver.bssid, sizeof(bssid));
+        channel = detector_ssid_resolver.channel;
+        generation = detector_ssid_resolver.generation;
+        detector_ssid_resolver.pending = false;
+        if (detector_targeted_scan_events_pending != UINT8_MAX)
+            ++detector_targeted_scan_events_pending;
+    }
+    portEXIT_CRITICAL(&detector_event_lock);
+    if (!channel) return;
+
+    wifi_scan_config_t scan = {
+        .ssid = NULL,
+        .bssid = bssid,
+        .channel = (uint8_t)channel,
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active.min = DETECTOR_SSID_ACTIVE_MIN_MS,
+        .scan_time.active.max = DETECTOR_SSID_ACTIVE_MAX_MS,
+        .home_chan_dwell_time = 0,
+    };
+    esp_err_t started = esp_wifi_scan_start(&scan, true);
+    if (started != ESP_OK) {
+        portENTER_CRITICAL(&detector_event_lock);
+        if (detector_targeted_scan_events_pending)
+            --detector_targeted_scan_events_pending;
+        portEXIT_CRITICAL(&detector_event_lock);
+        return;
+    }
+
+    wifi_ap_record_t record = {0};
+    uint16_t count = 1;
+    if (esp_wifi_scan_get_ap_records(&count, &record) != ESP_OK || count != 1 ||
+        memcmp(record.bssid, bssid, 6) || record.primary != channel ||
+        !record.ssid[0]) return;
+    size_t ssid_length = 0;
+    while (ssid_length < 32 && record.ssid[ssid_length]) ++ssid_length;
+    if (!ssid_length) return;
+
+    portENTER_CRITICAL(&detector_event_lock);
+    if (detector_accepting && deauth_detector_active && detector_trace_requested &&
+        detector_trace_locked && !detector_defence_requested &&
+        detector_generation == generation &&
+        detector_trace_locked_channel == channel &&
+        !memcmp(detector_trace_bssid, bssid, 6)) {
+        detector_ssid_store_locked(bssid, channel, record.ssid, ssid_length);
+    }
+    portEXIT_CRITICAL(&detector_event_lock);
+}
+
 static void detector_trace_reset_locked(void) {
+    memset(&detector_ssid_resolver, 0, sizeof(detector_ssid_resolver));
     detector_trace_confirming = false;
     memset(detector_trace_bssid, 0, sizeof(detector_trace_bssid));
     memset(detector_trace_candidates, 0, sizeof(detector_trace_candidates));
@@ -31737,6 +31920,7 @@ static void detector_trace_finish_if_due(void) {
             detector_trace_locked = true;
             detector_trace_locked_channel = channel;
             deauth_detector_current_channel = channel;
+            detector_ssid_resolver_arm_locked(now_ms, channel);
             locked = true;
         } else if (now_ms - detector_trace_last_failure_ms >= 2000) {
             detector_trace_last_failure_ms = now_ms;
@@ -31792,6 +31976,9 @@ static void deauth_detector_reset_events(void) {
     portENTER_CRITICAL(&detector_event_lock);
     ++detector_generation;
     detector_event_head = detector_event_count = detector_cache_count = 0;
+    detector_resolved_ssid_count = detector_resolved_ssid_replace = 0;
+    detector_targeted_scan_events_pending = 0;
+    memset(detector_resolved_ssids, 0, sizeof(detector_resolved_ssids));
     detector_dropped = 0;
     detector_dropped_total = 0;
     detector_details_mode = false;
@@ -31816,6 +32003,8 @@ static void deauth_detector_close_events(void) {
     detector_accepting = false;
     ++detector_generation;
     detector_event_head = detector_event_count = 0;
+    detector_resolved_ssid_count = detector_resolved_ssid_replace = 0;
+    memset(detector_resolved_ssids, 0, sizeof(detector_resolved_ssids));
     detector_details_mode = false;
     detector_details_announced = false;
     detector_trace_requested = false;
@@ -31877,6 +32066,57 @@ static bool detector_defence_process_event(const detector_event_t *event) {
     return detector_defence_runtime.response_activity;
 }
 
+static void detector_forensic_log_event(const detector_event_t *event) {
+    if (!event || (event->kind != DETECTOR_EVENT_DEAUTH &&
+                   event->kind != DETECTOR_EVENT_DISASSOC)) return;
+
+    const uint8_t *frame = event->deauth_prefix;
+    char channel_text[4], rssi_text[5], reason_text[6];
+    if (event->legacy_channel >= 1 && event->legacy_channel <= 233) {
+        snprintf(channel_text, sizeof(channel_text), "%d",
+                 event->legacy_channel);
+    } else {
+        strcpy(channel_text, "-");
+    }
+    if (event->observation.rssi >= -127 && event->observation.rssi <= 0) {
+        snprintf(rssi_text, sizeof(rssi_text), "%d",
+                 (int)event->observation.rssi);
+    } else {
+        strcpy(rssi_text, "-");
+    }
+
+    const bool protected_frame = (frame[1] & 0x40U) != 0U;
+    const bool protected_unicast = protected_frame &&
+                                   (frame[4] & 0x01U) == 0U;
+    if (protected_unicast) {
+        strcpy(reason_text, "-");
+    } else {
+        unsigned reason = (unsigned)frame[24] |
+                          ((unsigned)frame[25] << 8);
+        snprintf(reason_text, sizeof(reason_text), "%u", reason);
+    }
+
+    uint16_t frame_control = (uint16_t)frame[0] |
+                             ((uint16_t)frame[1] << 8);
+    uint16_t sequence_control = (uint16_t)frame[22] |
+                                ((uint16_t)frame[23] << 8);
+    unsigned sequence = (unsigned)((sequence_control >> 4) & 0x0fffU);
+    uint64_t timestamp_us = event->rx_us < 0 ? 0U : (uint64_t)event->rx_us;
+
+    MY_LOG_INFO(
+        TAG,
+        "[DEAUTH_FORENSIC/1] FRAME=%s CH=%s BSSID=%02X:%02X:%02X:%02X:%02X:%02X TX=%02X:%02X:%02X:%02X:%02X:%02X DA=%02X:%02X:%02X:%02X:%02X:%02X RSSI=%s REASON=%s SEQ=%u RETRY=%u PROTECTED=%u FC=0x%04X TS_US=%llu",
+        event->kind == DETECTOR_EVENT_DEAUTH ? "deauth" : "disassoc",
+        channel_text,
+        frame[16], frame[17], frame[18], frame[19], frame[20], frame[21],
+        frame[10], frame[11], frame[12], frame[13], frame[14], frame[15],
+        frame[4], frame[5], frame[6], frame[7], frame[8], frame[9],
+        rssi_text, reason_text, sequence,
+        (frame[1] & 0x08U) != 0U ? 1U : 0U,
+        protected_frame ? 1U : 0U, (unsigned)frame_control,
+        (unsigned long long)timestamp_us);
+}
+
 static void deauth_detector_process_events(void) {
     // Bounded batch: callback arrivals cannot keep this task from channel hopping/stopping.
     for (size_t i = 0; i < DETECTOR_EVENT_CAPACITY; ++i) {
@@ -31898,6 +32138,10 @@ static void deauth_detector_process_events(void) {
         trace_session = detector_trace_requested;
         portEXIT_CRITICAL(&detector_event_lock);
         const csa_event_t *e = &event.observation;
+        if (details && (event.kind == DETECTOR_EVENT_DEAUTH ||
+                        event.kind == DETECTOR_EVENT_DISASSOC)) {
+            detector_forensic_log_event(&event);
+        }
         bool defence_activity = detector_defence_process_event(&event);
         bool suppress_active_log = detector_defence_requested &&
             detector_defence_runtime.observation_log_suppressed;
@@ -31971,6 +32215,7 @@ static void deauth_detector_process_events(void) {
         }
     }
     detector_trace_finish_if_due();
+    detector_ssid_resolver_poll();
     (void)deauth_defence_runtime_poll_idle(&detector_defence_runtime);
     detector_trace_release_if_idle();
 }
@@ -32093,6 +32338,7 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
     if (!buf || !deauth_detector_active || type != WIFI_PKT_MGMT) return;
     portENTER_CRITICAL(&detector_event_lock);
     bool accepting = detector_accepting;
+    bool details = detector_details_mode;
     bool defence = detector_defence_requested;
     uint32_t generation = detector_generation;
     portEXIT_CRITICAL(&detector_event_lock);
@@ -32104,6 +32350,10 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
     const uint8_t *frame = pkt->payload;
     detector_event_t event = {0};
     uint8_t subtype = frame[0] & 0xfcU;
+    if (!defence && (subtype == 0x80U || subtype == 0x50U)) {
+        detector_ssid_resolver_observe(frame, length, pkt->rx_ctrl.channel,
+                                       generation);
+    }
     if (subtype == 0xc0U) {
         if (length < DETECTOR_DEAUTH_PREFIX_SIZE) return;
         memcpy(event.deauth_prefix, frame, DETECTOR_DEAUTH_PREFIX_SIZE);
@@ -32112,11 +32362,22 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
         event.legacy_channel = pkt->rx_ctrl.channel;
         strcpy(event.legacy_ssid, "<Unknown>");
         event.kind = DETECTOR_EVENT_DEAUTH;
+    } else if ((details || defence) && subtype == 0xa0U) {
+        if (length < DETECTOR_DEAUTH_PREFIX_SIZE) return;
+        memcpy(event.deauth_prefix, frame, DETECTOR_DEAUTH_PREFIX_SIZE);
+        size_t captured = length < DETECTOR_MGMT_PREFIX_SIZE
+                              ? length : DETECTOR_MGMT_PREFIX_SIZE;
+        memcpy(event.management_prefix, frame, captured);
+        event.management_length = (uint8_t)captured;
+        event.rx_us = esp_timer_get_time();
+        memcpy(event.observation.bssid, frame + 16, 6);
+        event.observation.rssi = pkt->rx_ctrl.rssi;
+        event.legacy_channel = pkt->rx_ctrl.channel;
+        event.kind = DETECTOR_EVENT_DISASSOC;
     } else if (defence &&
-               (subtype == 0xa0U || subtype == 0xb0U ||
-                subtype == 0x00U || subtype == 0x20U)) {
-        size_t minimum = subtype == 0xa0U ? 26U :
-                         subtype == 0xb0U ? 30U :
+               (subtype == 0xb0U || subtype == 0x00U ||
+                subtype == 0x20U)) {
+        size_t minimum = subtype == 0xb0U ? 30U :
                          subtype == 0x00U ? 28U : 34U;
         if (length < minimum) return;
         size_t captured = length < DETECTOR_MGMT_PREFIX_SIZE
@@ -32127,8 +32388,7 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
         memcpy(event.observation.bssid, frame + 16, 6);
         event.observation.rssi = pkt->rx_ctrl.rssi;
         event.legacy_channel = pkt->rx_ctrl.channel;
-        event.kind = subtype == 0xa0U ? DETECTOR_EVENT_DISASSOC :
-                     subtype == 0xb0U ? DETECTOR_EVENT_AUTH :
+        event.kind = subtype == 0xb0U ? DETECTOR_EVENT_AUTH :
                      subtype == 0x00U ? DETECTOR_EVENT_ASSOC :
                                         DETECTOR_EVENT_REASSOC;
     } else {
@@ -32150,7 +32410,9 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
         return;
     }
     // Reserve eight entries so a deauth burst cannot starve CSA/Defence control events.
-    if (detector_event_count >= (event.kind == DETECTOR_EVENT_DEAUTH
+    const bool bounded_forensic = event.kind == DETECTOR_EVENT_DEAUTH ||
+        (details && !defence && event.kind == DETECTOR_EVENT_DISASSOC);
+    if (detector_event_count >= (bounded_forensic
                                      ? DETECTOR_DEAUTH_CAPACITY
                                      : DETECTOR_EVENT_CAPACITY)) {
         if (detector_dropped != UINT32_MAX) ++detector_dropped;
@@ -32162,18 +32424,16 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
         portEXIT_CRITICAL(&detector_event_lock);
         return;
     }
-    for (size_t i = 0; i < detector_cache_count; ++i) {
-        if (memcmp(detector_cache[i].bssid, event.observation.bssid, 6)) continue;
-        if (event.is_csa) {
-            if (!strcmp(event.observation.ssid, "<Unknown>")) {
-                size_t n = 0;
-                while (n < 32 && detector_cache[i].ssid[n]) ++n;
-                csa_safe_ssid(event.observation.ssid, (const uint8_t *)detector_cache[i].ssid, n);
-            }
-        } else if (detector_cache[i].ssid[0]) {
-            memcpy(event.legacy_ssid, detector_cache[i].ssid, sizeof(event.legacy_ssid));
+    char resolved_ssid[33];
+    if (detector_ssid_lookup_locked(event.observation.bssid, resolved_ssid)) {
+        if (event.is_csa && !strcmp(event.observation.ssid, "<Unknown>")) {
+            size_t n = 0;
+            while (n < 32 && resolved_ssid[n]) ++n;
+            csa_safe_ssid(event.observation.ssid,
+                          (const uint8_t *)resolved_ssid, n);
+        } else if (!event.is_csa) {
+            memcpy(event.legacy_ssid, resolved_ssid, sizeof(event.legacy_ssid));
         }
-        break;
     }
     size_t tail = (detector_event_head + detector_event_count) % DETECTOR_EVENT_CAPACITY;
     detector_events[tail] = event;

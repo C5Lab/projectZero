@@ -78,8 +78,17 @@ typedef int wifi_second_chan_t;
 typedef int esp_err_t;
 #define ESP_OK 0
 #define WIFI_SECOND_CHAN_NONE 0
+#define WIFI_SCAN_TYPE_ACTIVE 1
 typedef enum { WIFI_PKT_MGMT, WIFI_PKT_DATA } wifi_promiscuous_pkt_type_t;
 typedef struct { struct { unsigned sig_len, dump_len, rx_state; int8_t rssi; uint8_t channel; } rx_ctrl; uint8_t payload[256]; } wifi_promiscuous_pkt_t;
+typedef struct {
+    uint8_t *ssid, *bssid, channel;
+    bool show_hidden;
+    int scan_type;
+    struct { struct { uint32_t min, max; } active; uint32_t passive; } scan_time;
+    uint8_t home_chan_dwell_time;
+} wifi_scan_config_t;
+typedef struct { uint8_t bssid[6], ssid[33]; int primary; } wifi_ap_record_t;
 static bool deauth_detector_active=true;
 static int deauth_detector_current_channel=11;
 static int64_t deauth_detector_last_channel_hop;
@@ -91,6 +100,13 @@ static int64_t fake_us;
 static bool restart_during_callback;
 static esp_err_t esp_wifi_set_channel(int channel, int secondary) {
     (void)channel; (void)secondary; return ESP_OK;
+}
+static esp_err_t esp_wifi_scan_start(const wifi_scan_config_t *scan, bool block) {
+    (void)scan; (void)block; return ESP_OK;
+}
+static esp_err_t esp_wifi_scan_get_ap_records(uint16_t *count,
+                                              wifi_ap_record_t *records) {
+    (void)records; *count=0; return ESP_OK;
 }
 static const char *esp_err_to_name(int error) {
     (void)error; return "fixture";
@@ -109,7 +125,13 @@ static int64_t esp_timer_get_time(void) {
 static void led_status_notify_event(int event) { (void)event; ++threat_events; }
 '''
         code += source[globals_begin:globals_end]
-        for name in ("detector_trace_reset_locked",
+        for name in ("detector_ssid_lookup_locked",
+                     "detector_ssid_store_locked",
+                     "detector_ssid_parse_management",
+                     "detector_ssid_resolver_observe",
+                     "detector_ssid_resolver_arm_locked",
+                     "detector_ssid_resolver_poll",
+                     "detector_trace_reset_locked",
                      "detector_trace_add_candidate_locked",
                      "detector_trace_build_candidates_locked",
                      "detector_trace_record_locked",
@@ -119,6 +141,7 @@ static void led_status_notify_event(int event) { (void)event; ++threat_events; }
                      "detector_trace_release_if_idle",
                      "deauth_detector_reset_events", "deauth_detector_close_events",
                      "detector_defence_process_event",
+                     "detector_forensic_log_event",
                      "deauth_detector_process_events", "deauth_detector_promiscuous_callback"):
             code += '\n' + function(source,name)
         code += r'''

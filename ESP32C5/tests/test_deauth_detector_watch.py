@@ -88,6 +88,7 @@ static void test_log(const char *format, ...) {
 #define WIFI_IF_STA 0
 #define ESP_OK 0
 #define ESP_ERR_INVALID_STATE 5
+#define WIFI_SCAN_TYPE_ACTIVE 1
 #define pdPASS 1
 #define pdTRUE 1
 #define pdMS_TO_TICKS(ms) (ms)
@@ -108,6 +109,18 @@ typedef struct {
     uint8_t payload[256];
 } wifi_promiscuous_pkt_t;
 typedef struct { int filter_mask; } wifi_promiscuous_filter_t;
+typedef struct {
+    uint8_t *ssid;
+    uint8_t *bssid;
+    uint8_t channel;
+    bool show_hidden;
+    int scan_type;
+    struct {
+        struct { uint32_t min, max; } active;
+        uint32_t passive;
+    } scan_time;
+    uint8_t home_chan_dwell_time;
+} wifi_scan_config_t;
 enum { WIFI_AUTH_OPEN = 0, WIFI_AUTH_WPA2_PSK = 3 };
 enum { WIFI_CIPHER_TYPE_NONE = 0, WIFI_CIPHER_TYPE_CCMP = 4 };
 typedef struct {
@@ -142,6 +155,14 @@ static janos_radio_lease_t janos_radio_lease;
 static unsigned raw_tx_calls;
 static size_t raw_tx_lengths[8];
 static unsigned detector_notifications;
+static unsigned targeted_scan_calls, targeted_scan_get_calls;
+static bool targeted_scan_has_result, targeted_scan_start_fails;
+static uint8_t targeted_scan_requested_bssid[6];
+static uint8_t targeted_scan_requested_channel;
+static bool targeted_scan_requested_show_hidden;
+static int targeted_scan_requested_type;
+static uint32_t targeted_scan_requested_min_ms, targeted_scan_requested_max_ms;
+static wifi_ap_record_t targeted_scan_result;
 #define LED_STATUS_EVENT_THREAT 1
 static void led_status_notify_event(int event)
     {(void)event; ++threat_events;}
@@ -195,6 +216,23 @@ static esp_err_t esp_wifi_set_channel(int channel, int secondary)
      if (fail_channel_tune) return ESP_ERR_INVALID_STATE;
      last_successful_channel = channel;
      return ESP_OK;}
+static esp_err_t esp_wifi_scan_start(const wifi_scan_config_t *config,
+                                     bool block)
+    {assert(config && block && config->bssid);
+     ++targeted_scan_calls;
+     memcpy(targeted_scan_requested_bssid, config->bssid, 6);
+     targeted_scan_requested_channel = config->channel;
+     targeted_scan_requested_show_hidden = config->show_hidden;
+     targeted_scan_requested_type = config->scan_type;
+     targeted_scan_requested_min_ms = config->scan_time.active.min;
+     targeted_scan_requested_max_ms = config->scan_time.active.max;
+     return targeted_scan_start_fails ? ESP_ERR_INVALID_STATE : ESP_OK;}
+static esp_err_t esp_wifi_scan_get_ap_records(uint16_t *count,
+                                              wifi_ap_record_t *records)
+    {assert(count && records); ++targeted_scan_get_calls;
+     if (!targeted_scan_has_result) {*count = 0; return ESP_OK;}
+     assert(*count >= 1); records[0] = targeted_scan_result; *count = 1;
+     return ESP_OK;}
 static esp_err_t esp_wifi_get_channel(uint8_t *primary, int *secondary)
     {*primary = 11; *secondary = WIFI_SECOND_CHAN_NONE; return ESP_OK;}
 static esp_err_t esp_wifi_80211_tx(int interface, const void *frame,
@@ -245,6 +283,9 @@ HARNESS_SCENARIOS = r"""
 static const uint8_t AP_A[6] = {0x02, 0, 0, 0, 0, 1};
 static const uint8_t AP_B[6] = {0x02, 0, 0, 0, 0, 2};
 static const uint8_t AP_C[6] = {0x02, 0, 0, 0, 0, 3};
+static const uint8_t AP_D[6] = {0x02, 0, 0, 0, 0, 4};
+static const uint8_t AP_E[6] = {0x02, 0, 0, 0, 0, 5};
+static const uint8_t AP_F[6] = {0x02, 0, 0, 0, 0, 6};
 
 static void scan_fixture(void) {
     g_scan_done = true;
@@ -291,6 +332,29 @@ static void send_deauth_fields(const uint8_t bssid[6], const uint8_t tx[6],
     deauth_detector_promiscuous_callback(&packet, WIFI_PKT_MGMT);
 }
 
+static void send_forensic_frame(uint8_t subtype, uint8_t flags,
+                                const uint8_t bssid[6], const uint8_t tx[6],
+                                const uint8_t da[6], uint8_t channel,
+                                int8_t rssi, uint16_t reason,
+                                uint16_t sequence) {
+    wifi_promiscuous_pkt_t packet = {0};
+    packet.rx_ctrl.sig_len = 30;
+    packet.rx_ctrl.dump_len = 26;
+    packet.rx_ctrl.channel = channel;
+    packet.rx_ctrl.rssi = rssi;
+    packet.payload[0] = subtype;
+    packet.payload[1] = flags;
+    memcpy(packet.payload + 4, da, 6);
+    memcpy(packet.payload + 10, tx, 6);
+    memcpy(packet.payload + 16, bssid, 6);
+    uint16_t sequence_control = (uint16_t)((sequence & 0x0fffU) << 4);
+    packet.payload[22] = (uint8_t)sequence_control;
+    packet.payload[23] = (uint8_t)(sequence_control >> 8);
+    packet.payload[24] = (uint8_t)reason;
+    packet.payload[25] = (uint8_t)(reason >> 8);
+    deauth_detector_promiscuous_callback(&packet, WIFI_PKT_MGMT);
+}
+
 static void send_csa(const uint8_t bssid[6], uint8_t channel) {
     wifi_promiscuous_pkt_t packet = {0};
     packet.rx_ctrl.sig_len = packet.rx_ctrl.dump_len = 51;
@@ -300,6 +364,25 @@ static void send_csa(const uint8_t bssid[6], uint8_t channel) {
     memcpy(packet.payload + 10, "\x02\x11\x22\x33\x44\x55", 6);
     memcpy(packet.payload + 16, bssid, 6);
     memcpy(packet.payload + 36, "\x00\x04" "Test" "\x25\x03\x01\x0b\x03", 11);
+    deauth_detector_promiscuous_callback(&packet, WIFI_PKT_MGMT);
+}
+
+static void send_beacon(const uint8_t bssid[6], uint8_t channel,
+                        const char *ssid) {
+    wifi_promiscuous_pkt_t packet = {0};
+    size_t ssid_length = strlen(ssid);
+    assert(ssid_length <= 32);
+    packet.rx_ctrl.dump_len = (unsigned)(38 + ssid_length);
+    packet.rx_ctrl.sig_len = packet.rx_ctrl.dump_len + 4;
+    packet.rx_ctrl.channel = channel;
+    packet.rx_ctrl.rssi = -48;
+    packet.payload[0] = 0x80;
+    memset(packet.payload + 4, 0xff, 6);
+    memcpy(packet.payload + 10, bssid, 6);
+    memcpy(packet.payload + 16, bssid, 6);
+    packet.payload[36] = 0;
+    packet.payload[37] = (uint8_t)ssid_length;
+    memcpy(packet.payload + 38, ssid, ssid_length);
     deauth_detector_promiscuous_callback(&packet, WIFI_PKT_MGMT);
 }
 
@@ -425,12 +508,18 @@ static void defence_event_pipeline(void) {
     char *args[] = {"deauth_detector_v2", "--only", "1"};
     assert(cmd_deauth_detector_v2(3, args) == 0);
 
-    /* Passive detector behavior stays byte-for-byte narrow. */
+    /* Passive V2 admits disassoc only for Forensics; active-only frames stay out. */
     send_management(0xa0, AP_A, STA, 6, 26);
     send_management(0xb0, AP_A, STA, 6, 30);
     send_management(0x00, AP_A, STA, 6, 28);
     send_management(0x20, AP_A, STA, 6, 34);
-    assert(detector_event_count == 0 && detector_dropped == 0);
+    assert(detector_event_count == 1 && detector_dropped == 0);
+    assert(detector_events[detector_event_head].kind == DETECTOR_EVENT_DISASSOC);
+    clear_logged();
+    deauth_detector_process_events();
+    assert(detector_event_count == 0);
+    assert(count_lines_starting("[DEAUTH_FORENSIC/1] FRAME=disassoc ") == 1);
+    assert(count_lines_starting("[DEAUTH_V2] ") == 0);
 
     detector_defence_requested = true;
     send_management(0xb0, AP_B, STA, 6, 30); /* selected-BSSID filter */
@@ -446,20 +535,23 @@ static void defence_event_pipeline(void) {
     send_management(0x00, AP_A, STA, 6, 28);
     send_management(0x20, AP_A, STA, 6, 34);
     assert(detector_event_count == 4);
-    assert(detector_events[0].kind == DETECTOR_EVENT_DISASSOC);
-    assert(detector_events[1].kind == DETECTOR_EVENT_AUTH);
-    assert(detector_events[2].kind == DETECTOR_EVENT_ASSOC);
-    assert(detector_events[3].kind == DETECTOR_EVENT_REASSOC);
+    const detector_event_kind_t expected_kinds[] = {
+        DETECTOR_EVENT_DISASSOC, DETECTOR_EVENT_AUTH,
+        DETECTOR_EVENT_ASSOC, DETECTOR_EVENT_REASSOC,
+    };
     for (size_t i = 0; i < 4; ++i) {
-        assert(!detector_events[i].is_csa);
-        assert(detector_events[i].rx_us == clock_us);
-        assert(!memcmp(detector_events[i].management_prefix + 10, STA, 6));
-        assert(!memcmp(detector_events[i].observation.bssid, AP_A, 6));
+        detector_event_t *queued =
+            &detector_events[(detector_event_head + i) % DETECTOR_EVENT_CAPACITY];
+        assert(queued->kind == expected_kinds[i]);
+        assert(!queued->is_csa);
+        assert(queued->rx_us == clock_us);
+        assert(!memcmp(queued->management_prefix + 10, STA, 6));
+        assert(!memcmp(queued->observation.bssid, AP_A, 6));
     }
-    assert(detector_events[0].management_length == 26);
-    assert(detector_events[1].management_length == 30);
-    assert(detector_events[2].management_length == 28);
-    assert(detector_events[3].management_length == 34);
+    assert(detector_events[(detector_event_head + 0) % DETECTOR_EVENT_CAPACITY].management_length == 26);
+    assert(detector_events[(detector_event_head + 1) % DETECTOR_EVENT_CAPACITY].management_length == 30);
+    assert(detector_events[(detector_event_head + 2) % DETECTOR_EVENT_CAPACITY].management_length == 28);
+    assert(detector_events[(detector_event_head + 3) % DETECTOR_EVENT_CAPACITY].management_length == 34);
 
     clear_logged();
     threat_events = 0;
@@ -528,6 +620,7 @@ static void defence_command_runtime(void) {
     int triggers_before = count_lines_starting(
         "[DETECTOR_DEFENCE] trigger=deauth ");
     int events_before = count_lines_starting("[DEAUTH_V2] ");
+    int forensics_before = count_lines_starting("[DEAUTH_FORENSIC/1] ");
     uint32_t oled_before = dd_oled_count;
     clock_us += 100000;
     send_deauth(AP_A, 6);
@@ -537,6 +630,8 @@ static void defence_command_runtime(void) {
     assert(count_lines_starting("[DETECTOR_DEFENCE] trigger=deauth ") ==
            triggers_before);
     assert(count_lines_starting("[DEAUTH_V2] ") == events_before);
+    assert(count_lines_starting("[DEAUTH_FORENSIC/1] ") ==
+           forensics_before + 1);
     fail_channel_tune = true;
     clock_us += 1000000;
     deauth_detector_process_events();
@@ -905,9 +1000,11 @@ static void details_only_filters_deauth_and_csa(void) {
     assert(detector_event_count == 3);
     deauth_detector_process_events();
     assert(count_lines_starting("[DEAUTH_V2] ") == 2);
+    assert(count_lines_starting("[DEAUTH_FORENSIC/1] ") == 2);
     assert(count_lines_starting("[DEAUTH] CH: ") == 0);
     assert(count_lines_starting("[CSA] ") == 1);
     assert(!strstr(logged, "[DEAUTH_V2] CH: 6 | BSSID: 02:00:00:00:00:02"));
+    assert(!strstr(logged, "[DEAUTH_FORENSIC/1] FRAME=deauth CH=6 BSSID=02:00:00:00:00:02"));
 }
 
 static void details_short_frame_and_ssid_safety(void) {
@@ -920,8 +1017,10 @@ static void details_short_frame_and_ssid_safety(void) {
     assert(detector_event_count == 0);
     deauth_detector_process_events();
     assert(count_lines_starting("[DEAUTH_V2] ") == 0);
+    assert(count_lines_starting("[DEAUTH_FORENSIC/1] ") == 0);
     send_deauth_fields(AP_A, tx, da, 6, -30, 7, 26);
     deauth_detector_process_events();
+    assert(count_lines_starting("[DEAUTH_FORENSIC/1] ") == 1);
     const char *line = first_line_starting("[DEAUTH_V2] ");
     assert(line && strstr(line, " | SSID: ABC\n"));
     const char *end = strchr(line, '\n');
@@ -1021,6 +1120,51 @@ static void details_protected_reason_availability(void) {
     assert(strstr(logged, " | REASON: 4660 | SSID: Office\n"));
 }
 
+static void default_forensic_deauth_record(void) {
+    char *args[] = {"deauth_detector_v2"};
+    const uint8_t tx[6] = {0xD8, 0xCF, 0x61, 0x5D, 0x41, 0x10};
+    const uint8_t da[6] = {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC};
+    assert(cmd_deauth_detector_v2(1, args) == 0);
+    clock_us = 3456789;
+    size_t before_callback = logged_size;
+    send_forensic_frame(0xc0, 0x08, AP_C, tx, da, 11, -52, 0x1234,
+                        0x0abc);
+    assert(logged_size == before_callback && detector_event_count == 1);
+    deauth_detector_process_events();
+    const char *forensic = first_line_starting("[DEAUTH_FORENSIC/1] ");
+    const char *event = first_line_starting("[DEAUTH_V2] ");
+    const char *expected =
+        "[DEAUTH_FORENSIC/1] FRAME=deauth CH=11 BSSID=02:00:00:00:00:03 "
+        "TX=D8:CF:61:5D:41:10 DA=12:34:56:78:9A:BC RSSI=-52 "
+        "REASON=4660 SEQ=2748 RETRY=1 PROTECTED=0 FC=0x08C0 "
+        "TS_US=3456789\n";
+    assert(forensic && !strncmp(forensic, expected, strlen(expected)));
+    assert(event && forensic < event);
+    assert(count_lines_starting("[DEAUTH_FORENSIC/1] ") == 1);
+    assert(count_lines_starting("[DEAUTH_V2] ") == 1);
+}
+
+static void default_forensic_disassoc_record(void) {
+    char *args[] = {"deauth_detector_v2"};
+    const uint8_t tx[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+    const uint8_t da[6] = {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC};
+    assert(cmd_deauth_detector_v2(1, args) == 0);
+    clock_us = 9876543;
+    send_forensic_frame(0xa0, 0x48, AP_A, tx, da, 6, -42, 0x1234,
+                        0x0fff);
+    assert(detector_event_count == 1);
+    deauth_detector_process_events();
+    const char *forensic = first_line_starting("[DEAUTH_FORENSIC/1] ");
+    const char *expected =
+        "[DEAUTH_FORENSIC/1] FRAME=disassoc CH=6 BSSID=02:00:00:00:00:01 "
+        "TX=AA:BB:CC:DD:EE:FF DA=12:34:56:78:9A:BC RSSI=-42 REASON=- "
+        "SEQ=4095 RETRY=1 PROTECTED=1 FC=0x48A0 TS_US=9876543\n";
+    assert(forensic && !strncmp(forensic, expected, strlen(expected)));
+    assert(count_lines_starting("[DEAUTH_FORENSIC/1] ") == 1);
+    assert(count_lines_starting("[DEAUTH_V2] ") == 0);
+    assert(dd_oled_count == 0 && threat_events == 0);
+}
+
 static void details_stop_and_legacy_restart(void) {
     char *details[] = {"deauth_detector_v2"};
     char *legacy[] = {"deauth_detector"};
@@ -1037,6 +1181,7 @@ static void details_stop_and_legacy_restart(void) {
     deauth_detector_process_events();
     assert(count_lines_starting("[DEAUTH] CH: ") == 1);
     assert(count_lines_starting("[DEAUTH_V2] ") == 0);
+    assert(count_lines_starting("[DEAUTH_FORENSIC/1] ") == 0);
     assert(count_lines_starting("[DETECTOR_INFO] format=deauth_v2") == 0);
 }
 
@@ -1450,6 +1595,86 @@ static void trace_failed_tune_notices_are_rate_limited(void) {
     }
 }
 
+static void trace_resolves_unknown_ssid_from_passive_beacon(void) {
+    char *args[] = {"deauth_detector_v2", "trace"};
+    assert(cmd_deauth_detector_v2(2, args) == 0);
+    clock_us = 2000000;
+    send_deauth(AP_D, 9);
+    deauth_detector_process_events();
+    assert(strstr(logged, "BSSID: 02:00:00:00:00:04") &&
+           strstr(logged, "SSID: <Unknown>\n"));
+    clock_us += 1100000;
+    deauth_detector_process_events();
+    assert(detector_trace_locked && detector_trace_locked_channel == 9);
+    send_beacon(AP_D, 9, "Late AP");
+    send_deauth(AP_D, 9);
+    deauth_detector_process_events();
+    assert(targeted_scan_calls == 0 && targeted_scan_get_calls == 0);
+    assert(strstr(logged,
+        "BSSID: 02:00:00:00:00:04 | TX: 00:00:00:00:00:00 | DA: 00:00:00:00:00:00 | RSSI: -50 | REASON: 0 | SSID: Late AP\n"));
+}
+
+static void trace_resolves_unknown_ssid_with_one_targeted_scan(void) {
+    char *args[] = {"deauth_detector_v2", "trace"};
+    wifi_ap_record_t scan_snapshot[3];
+    memcpy(scan_snapshot, g_scan_results, sizeof(scan_snapshot));
+    memcpy(targeted_scan_result.bssid, AP_E, 6);
+    strcpy((char *)targeted_scan_result.ssid, "Targeted AP");
+    targeted_scan_result.primary = 9;
+    targeted_scan_has_result = true;
+    assert(cmd_deauth_detector_v2(2, args) == 0);
+    clock_us = 5000000;
+    send_deauth(AP_E, 9);
+    deauth_detector_process_events();
+    clock_us += 1100000;
+    deauth_detector_process_events();
+    assert(detector_trace_locked && detector_trace_locked_channel == 9);
+    clock_us += 749000;
+    deauth_detector_process_events();
+    assert(targeted_scan_calls == 0);
+    clock_us += 1000;
+    deauth_detector_process_events();
+    assert(targeted_scan_calls == 1 && targeted_scan_get_calls == 1);
+    assert(!memcmp(targeted_scan_requested_bssid, AP_E, 6));
+    assert(targeted_scan_requested_channel == 9);
+    assert(targeted_scan_requested_show_hidden);
+    assert(targeted_scan_requested_type == WIFI_SCAN_TYPE_ACTIVE);
+    assert(targeted_scan_requested_min_ms == 20);
+    assert(targeted_scan_requested_max_ms == 60);
+    assert(g_scan_count == 3);
+    assert(!memcmp(scan_snapshot, g_scan_results, sizeof(scan_snapshot)));
+    send_deauth(AP_E, 9);
+    deauth_detector_process_events();
+    assert(strstr(logged,
+        "BSSID: 02:00:00:00:00:05 | TX: 00:00:00:00:00:00 | DA: 00:00:00:00:00:00 | RSSI: -50 | REASON: 0 | SSID: Targeted AP\n"));
+    clock_us += 1000000;
+    deauth_detector_process_events();
+    assert(targeted_scan_calls == 1 && targeted_scan_get_calls == 1);
+}
+
+static void trace_does_not_repeat_failed_targeted_ssid_scan(void) {
+    char *args[] = {"deauth_detector_v2", "trace"};
+    targeted_scan_has_result = false;
+    assert(cmd_deauth_detector_v2(2, args) == 0);
+    clock_us = 8000000;
+    send_deauth(AP_F, 9);
+    deauth_detector_process_events();
+    clock_us += 1100000;
+    deauth_detector_process_events();
+    clock_us += 750000;
+    deauth_detector_process_events();
+    assert(targeted_scan_calls == 1 && targeted_scan_get_calls == 1);
+    for (int i = 0; i < 3; ++i) {
+        clock_us += 500000;
+        deauth_detector_process_events();
+    }
+    assert(targeted_scan_calls == 1 && targeted_scan_get_calls == 1);
+    send_deauth(AP_F, 9);
+    deauth_detector_process_events();
+    const char *last = strstr(logged, "BSSID: 02:00:00:00:00:06");
+    assert(last && strstr(last, "SSID: <Unknown>\n"));
+}
+
 static void trace_rejects_bad_syntax_before_receiver_setup(void) {
     char *duplicate[] = {"deauth_detector_v2", "trace", "trace"};
     char *before_index[] = {"deauth_detector_v2", "trace", "1"};
@@ -1510,6 +1735,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "details-copy")) details_copies_frame_before_task_runs();
     else if (!strcmp(argv[1], "details-utf8")) details_printable_utf8_ssid();
     else if (!strcmp(argv[1], "details-protected")) details_protected_reason_availability();
+    else if (!strcmp(argv[1], "forensic-deauth")) default_forensic_deauth_record();
+    else if (!strcmp(argv[1], "forensic-disassoc")) default_forensic_disassoc_record();
     else if (!strcmp(argv[1], "legacy-v2-flag")) legacy_rejects_v2_flag();
     else if (!strcmp(argv[1], "trace-all")) trace_all_confirms_first_queued_deauth_bssid();
     else if (!strcmp(argv[1], "trace-confirm")) trace_confirmation_prefers_repeated_stronger_channel();
@@ -1523,6 +1750,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "trace-only")) trace_only_ignores_rejected_and_short_frames();
     else if (!strcmp(argv[1], "trace-retry-stop")) trace_failed_tune_retries_then_stop_clears_lock();
     else if (!strcmp(argv[1], "trace-failure-rate")) trace_failed_tune_notices_are_rate_limited();
+    else if (!strcmp(argv[1], "trace-ssid-passive")) trace_resolves_unknown_ssid_from_passive_beacon();
+    else if (!strcmp(argv[1], "trace-ssid-scan")) trace_resolves_unknown_ssid_with_one_targeted_scan();
+    else if (!strcmp(argv[1], "trace-ssid-miss")) trace_does_not_repeat_failed_targeted_ssid_scan();
     else if (!strcmp(argv[1], "trace-invalid")) trace_rejects_bad_syntax_before_receiver_setup();
     else if (!strcmp(argv[1], "defence-events")) defence_event_pipeline();
     else if (!strcmp(argv[1], "defence-command")) defence_command_runtime();
@@ -1537,6 +1767,17 @@ int main(int argc, char **argv) {
 
 
 class DeauthDetectorWatchTests(unittest.TestCase):
+    def test_targeted_resolver_scan_done_cannot_replace_main_scan_cache(self):
+        source = (ROOT / "main/main.c").read_text(encoding="utf-8")
+        scan_done = source.split("case WIFI_EVENT_SCAN_DONE:", 1)[1].split(
+            "case WIFI_EVENT_STA_DISCONNECTED:", 1
+        )[0]
+        claim = scan_done.index("detector_targeted_scan_events_pending")
+        stop = scan_done.index("if (detector_targeted_scan) break;")
+        publish = scan_done.index("detector_publish_scan_records")
+        self.assertLess(claim, stop)
+        self.assertLess(stop, publish)
+
     def test_split_commands_have_distinct_help_and_registration(self):
         source = (ROOT / "main/main.c").read_text(encoding="utf-8")
         self.assertTrue(
@@ -1569,6 +1810,12 @@ class DeauthDetectorWatchTests(unittest.TestCase):
         end = source.index("// Wardrive task", begin)
         code = HARNESS_PREFIX + source[begin:end]
         for name in (
+            "detector_ssid_lookup_locked",
+            "detector_ssid_store_locked",
+            "detector_ssid_parse_management",
+            "detector_ssid_resolver_observe",
+            "detector_ssid_resolver_arm_locked",
+            "detector_ssid_resolver_poll",
             "detector_trace_reset_locked",
             "detector_trace_add_candidate_locked",
             "detector_trace_build_candidates_locked",
@@ -1588,6 +1835,7 @@ class DeauthDetectorWatchTests(unittest.TestCase):
             "detector_defence_notify_adapter",
             "detector_defence_telemetry_adapter",
             "detector_defence_process_event",
+            "detector_forensic_log_event",
             "deauth_detector_process_events",
             "deauth_detector_channel_hop",
             "cmd_deauth_detector_impl",
@@ -1698,6 +1946,12 @@ class DeauthDetectorWatchTests(unittest.TestCase):
     def test_details_does_not_invent_reason_for_protected_unicast(self):
         self.check_scenario("details-protected")
 
+    def test_v2_emits_default_forensic_deauth_record_with_exact_raw_fields(self):
+        self.check_scenario("forensic-deauth")
+
+    def test_v2_emits_default_forensic_disassoc_without_normal_event_side_effects(self):
+        self.check_scenario("forensic-disassoc")
+
     def test_legacy_command_rejects_v2_option(self):
         self.check_scenario("legacy-v2-flag")
 
@@ -1736,6 +1990,15 @@ class DeauthDetectorWatchTests(unittest.TestCase):
 
     def test_trace_failed_tune_notices_are_rate_limited_without_dropping_events(self):
         self.check_scenario("trace-failure-rate")
+
+    def test_trace_resolves_unknown_ssid_from_passive_beacon_before_scanning(self):
+        self.check_scenario("trace-ssid-passive")
+
+    def test_trace_falls_back_to_one_bssid_and_channel_targeted_scan(self):
+        self.check_scenario("trace-ssid-scan")
+
+    def test_trace_does_not_repeat_a_targeted_ssid_scan_that_found_nothing(self):
+        self.check_scenario("trace-ssid-miss")
 
     def test_trace_rejects_misplaced_duplicate_and_dashed_tokens(self):
         self.check_scenario("trace-invalid")
