@@ -173,22 +173,48 @@ static void normal_download_stops_before_reset_and_never_wipes(void)
     assert(janos_console_admission_end(&lease, token));
 }
 
-static void unsupported_or_unowned_download_fails_before_side_effects(void)
+static void active_shield_download_forces_stop_before_reset(void)
+{
+    fixture_t fixture = {.wait_ready = true, .arm_ready = true,
+                         .wipe_ready = true};
+    janos_download_flow_ops_t hooks = ops(&fixture);
+    janos_radio_lease_snapshot_t snapshot = {
+        .owner = JANOS_RADIO_OWNER_SHIELD,
+        .state = JANOS_RADIO_LEASE_RUNNING,
+        .generation = 2U,
+        .callbacks_open = true,
+    };
+    assert(janos_download_flow_run(snapshot, &hooks, 5000U) ==
+           JANOS_DOWNLOAD_RESET_RETURNED);
+    assert(strcmp(fixture.calls, "SFDARU") == 0);
+
+    fixture = (fixture_t){.stop_result = 1, .arm_ready = true,
+                          .wipe_ready = true};
+    hooks = ops(&fixture);
+    assert(janos_download_flow_run(snapshot, &hooks, 5000U) ==
+           JANOS_DOWNLOAD_STOP_FAILED);
+    assert(strcmp(fixture.calls, "S") == 0);
+}
+
+static void unsupported_or_invalid_download_fails_before_side_effects(void)
 {
     fixture_t fixture = {.wait_ready = true, .arm_ready = true,
                          .wipe_ready = true};
     janos_download_flow_ops_t hooks = ops(&fixture);
     janos_radio_lease_snapshot_t snapshot = {
         .owner = JANOS_RADIO_OWNER_WPS,
-        .state = JANOS_RADIO_LEASE_RUNNING,
+        .state = JANOS_RADIO_LEASE_QUARANTINED,
         .generation = 2U,
+        .callbacks_open = true,
     };
     assert(janos_download_flow_run(snapshot, &hooks, 5000U) ==
            JANOS_DOWNLOAD_REFUSED_OWNER);
     assert(fixture.used == 0U);
-    snapshot.owner = JANOS_RADIO_OWNER_ANALYZER;
+    snapshot.owner = (janos_radio_owner_t)99;
+    snapshot.state = JANOS_RADIO_LEASE_RUNNING;
     assert(janos_download_flow_run(snapshot, &hooks, 5000U) ==
            JANOS_DOWNLOAD_REFUSED_OWNER);
+    assert(fixture.used == 0U);
     hooks.rom_supported = false;
     assert(janos_download_flow_run(snapshot, &hooks, 5000U) ==
            JANOS_DOWNLOAD_UNSUPPORTED);
@@ -200,7 +226,8 @@ int main(void)
     quarantine_download_runs_wipe_before_reset_and_retains_lease();
     quarantine_failures_never_reset();
     normal_download_stops_before_reset_and_never_wipes();
-    unsupported_or_unowned_download_fails_before_side_effects();
+    active_shield_download_forces_stop_before_reset();
+    unsupported_or_invalid_download_fails_before_side_effects();
     puts("PASS: JanOS ROM download flow");
     return 0;
 }

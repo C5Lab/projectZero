@@ -1,0 +1,27 @@
+{
+  "text_accept": [
+    "Fixture Networks",
+    "CC0-1.0-test-fixture",
+    "Test fixed release 2.0"
+  ],
+  "text_reject": [
+    "Réseau fixture",
+    "é",
+    "line\nbreak"
+  ],
+  "url_accept": [
+    "https://security.example.invalid/advisories",
+    "https://security.example.invalid:8443/advisories",
+    "https://security.example.invalid/path@name0",
+    "https://security.example.invalid/CVE:2099-1"
+  ],
+  "url_reject": [
+    "https://security.-xample.invalid/advisories",
+    "https://security.example.invalid/advis?x=10",
+    "https://user@security.invalid/advisoriesxxx",
+    "https://security.example.invalid:0/advisory",
+    "https://security.example.invalid/advis%20xx",
+    "https://security.example.invalid/advis#x=10",
+    "https://security.example.invalid/a;b=cdefgh"
+  ]
+}

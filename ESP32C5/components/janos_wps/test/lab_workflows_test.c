@@ -30,6 +30,9 @@ typedef struct {
     size_t verify_result_count;
     size_t verify_result_index;
     bool verify_has_credential;
+    bool capture_has_credential;
+    char stored_pin[9];
+    char stored_source[16];
     bool pixie_found;
     bool pixie_cancelled;
     bool session_cancelled;
@@ -230,6 +233,12 @@ static lab_workflow_session_outcome_t capture_pixie(
     };
     out.result.session_result = f->capture_result;
     out.result.fatal_reason = f->capture_fatal_reason;
+    if (f->capture_has_credential) {
+        static const uint8_t key[] = "control-pin-key";
+        memcpy(out.result.network_key, key, sizeof(key) - 1U);
+        out.result.network_key_len = sizeof(key) - 1U;
+        out.result.credential_present = true;
+    }
     if (f->exercise_radio_cleanup) {
         static const uint8_t session_mac[6] = {0x02, 6, 7, 8, 9, 10};
         uint32_t owner = 0;
@@ -301,6 +310,10 @@ static lab_store_status_t store_success(void *opaque,
     ++f->stored_successes;
     assert(record->authenticated_m7);
     assert(record->pin != NULL && strlen(record->pin) == 8);
+    memcpy(f->stored_pin, record->pin, 9);
+    if (record->recovery_source)
+        (void)snprintf(f->stored_source, sizeof(f->stored_source), "%s",
+                       record->recovery_source);
     assert(record->network_key_len != 0);
     assert(strcmp(record->manufacturer, "LabVendor") == 0);
     return f->success_store_status;
@@ -523,6 +536,32 @@ static void pixie_uses_capture_search_and_fresh_verification(void)
             "not_required");
     assert(f.captures == captures_before);
     lab_workflows_deinit(&workflows);
+}
+
+static void pixie_control_pin_m7_skips_search_and_verification(void)
+{
+    fixture_t f = {.mount_ok = true, .cleanup_ok = true, .pixie_found = true,
+                   .capture_has_credential = true,
+                   .success_store_status = LAB_STORE_OK};
+    lab_platform_t platform;
+    lab_platform_init(&platform, &platform_ops, &f, NULL);
+    lab_workflows_t workflows;
+    assert(lab_workflows_init_with_ops(&workflows, &platform, NULL,
+                                       &workflow_ops, &f));
+    lab_workflows_set_emitter(&workflows, capture_output, &f);
+    lab_secret_vault_t vault;
+    lab_secret_init(&vault, observed_wipe);
+    lab_command_t cmd = command(LAB_COMMAND_WPS_PIXIE);
+    execute(&workflows, &cmd, &vault, 31, "control_pin_and_m7_verified", "ok");
+    assert(f.captures == 1 && f.searches == 0 && f.verifies == 0);
+    assert(strcmp(f.flow, "C") == 0);
+    assert(lab_secret_status(&vault, 1234).state == LAB_SECRET_AVAILABLE);
+    assert(f.stored_successes == 1 && f.stored_observations == 0);
+    assert(strcmp(f.stored_pin, "12345670") == 0);
+    assert(strcmp(f.stored_source, "control_pin") == 0);
+    assert(strstr(f.emitted, "\"stage\":\"pixie_capture\"") != NULL);
+    assert(strstr(f.emitted, "\"stage\":\"pixie_done\"") == NULL);
+    lab_secret_erase(&vault);
 }
 
 static void pixie_retries_only_fresh_transport_failures(void)
@@ -823,6 +862,7 @@ int main(void)
     sd_is_always_unmounted();
     campaign_decisions_and_bounds();
     pixie_uses_capture_search_and_fresh_verification();
+    pixie_control_pin_m7_skips_search_and_verification();
     pixie_retries_only_fresh_transport_failures();
     pixie_cancels_during_retry_delay();
     pixie_stops_after_capture_lock_or_cleanup_failure();

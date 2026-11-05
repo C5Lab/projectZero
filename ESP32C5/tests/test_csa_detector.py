@@ -6,11 +6,17 @@ No firmware build or RF activity occurs.
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+
+def wsl_path(path):
+    path = Path(path).resolve()
+    return (f"/mnt/{path.drive.rstrip(':').lower()}/"
+            f"{path.relative_to(path.anchor).as_posix()}")
 
 def function(source, name):
     masked = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|/\*.*?\*/|//[^\n]*',
@@ -35,21 +41,37 @@ class CsaDetectorTests(unittest.TestCase):
                 source = directory / "integration.c"
                 source.write_text(code)
             exe = directory / "csa-test"
-            subprocess.run([os.environ.get("CC", "gcc"), "-std=gnu11", "-Wall", "-Wextra", "-Werror",
-                            "-Wno-unused-function", "-Wno-unused-variable", "-I", str(ROOT / "main"),
-                            "-I", str(ROOT / "components/janos_wps/include"),
-                            str(source), str(ROOT / "main/csa_detector_core.c"),
-                            str(ROOT / "main/deauth_target_core.c"),
-                            str(ROOT / "main/deauth_defence_runtime.c"),
-                            str(ROOT / "main/deauth_defence_core.c"),
-                            str(ROOT / "main/pmkid_probe_detector.c"),
-                            str(ROOT / "main/wpa_decoy.c"),
-                            str(ROOT / "main/wpa_crypto_primitives.c"),
-                            str(ROOT / "main/crack_worker_sw_sha1.c"),
-                            str(ROOT / "main/deauth_defence_cli.c"),
-                            str(ROOT / "components/janos_wps/janos_radio_lease.c"),
-                            "-o", str(exe)], check=True)
-            return subprocess.check_output([str(exe)], text=True)
+            compiler = next((shutil.which(name) for name in
+                             (os.environ.get("CC"), "cc", "gcc", "clang")
+                             if name and shutil.which(name)), None)
+            flags = ["-std=gnu11", "-Wall", "-Wextra", "-Werror",
+                     "-Wno-unused-function", "-Wno-unused-variable",
+                     "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+                     "-fno-omit-frame-pointer"]
+            includes = [ROOT / "main", ROOT / "components/janos_wps/include"]
+            sources = [source, ROOT / "main/csa_detector_core.c",
+                       ROOT / "main/deauth_target_core.c",
+                       ROOT / "main/deauth_defence_runtime.c",
+                       ROOT / "main/deauth_defence_core.c",
+                       ROOT / "main/pmkid_probe_detector.c",
+                       ROOT / "main/wpa_decoy.c",
+                       ROOT / "main/wpa_crypto_primitives.c",
+                       ROOT / "main/crack_worker_sw_sha1.c",
+                       ROOT / "main/deauth_defence_cli.c",
+                       ROOT / "components/janos_wps/janos_radio_lease.c"]
+            if compiler:
+                command = [compiler, *flags,
+                           *[arg for path in includes for arg in ("-I", str(path))],
+                           *map(str, sources), "-o", str(exe)]
+                run = [str(exe)]
+            else:
+                self.assertTrue(shutil.which("wsl.exe"), "host C compiler required")
+                command = ["wsl.exe", "cc", *flags,
+                           *[arg for path in includes for arg in ("-I", wsl_path(path))],
+                           *map(wsl_path, sources), "-o", wsl_path(exe)]
+                run = ["wsl.exe", wsl_path(exe)]
+            subprocess.run(command, check=True)
+            return subprocess.check_output(run, text=True)
 
     def test_parser_bounds_protocol_and_rate_lifecycle(self):
         self.assertEqual(self.compile_run(), "CSA core: PASS\n")
@@ -63,11 +85,13 @@ class CsaDetectorTests(unittest.TestCase):
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "csa_detector_core.h"
 #include "deauth_target_core.h"
 #include "deauth_defence_runtime.h"
 #include "pmkid_probe_detector.h"
+#include "wifi_shield.h"
 #define MAX_AP_CNT 64
 #define MY_LOG_INFO(tag, ...) do { printf(__VA_ARGS__); puts(""); } while(0)
 typedef int portMUX_TYPE;
@@ -77,6 +101,9 @@ typedef int wifi_second_chan_t;
 #define portEXIT_CRITICAL(x) ((void)(x))
 typedef int esp_err_t;
 #define ESP_OK 0
+#define ESP_ERR_INVALID_STATE 5
+#define MALLOC_CAP_SPIRAM 1U
+#define MALLOC_CAP_8BIT 2U
 #define WIFI_SECOND_CHAN_NONE 0
 #define WIFI_SCAN_TYPE_ACTIVE 1
 typedef enum { WIFI_PKT_MGMT, WIFI_PKT_DATA } wifi_promiscuous_pkt_type_t;
@@ -98,6 +125,22 @@ static const int dual_band_channels_count=
 static unsigned threat_events;
 static int64_t fake_us;
 static bool restart_during_callback;
+static void *heap_caps_calloc(size_t count,size_t size,unsigned caps) {
+    assert(caps==(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
+    return calloc(count,size);
+}
+static void heap_caps_free(void *memory) { free(memory); }
+bool wifi_shield_deauth_profile_retune(uint8_t channel) {
+    (void)channel; return true;
+}
+bool wifi_shield_deauth_profile_radio_enter(
+    uint8_t channel, wifi_shield_deauth_radio_token_t *token) {
+    token->channel=channel;token->held=true;return true;
+}
+bool wifi_shield_deauth_profile_radio_leave(
+    wifi_shield_deauth_radio_token_t *token) {
+    token->held=false;return true;
+}
 static esp_err_t esp_wifi_set_channel(int channel, int secondary) {
     (void)channel; (void)secondary; return ESP_OK;
 }
@@ -142,7 +185,9 @@ static void led_status_notify_event(int event) { (void)event; ++threat_events; }
                      "deauth_detector_reset_events", "deauth_detector_close_events",
                      "detector_defence_process_event",
                      "detector_forensic_log_event",
-                     "deauth_detector_process_events", "deauth_detector_promiscuous_callback"):
+                     "deauth_detector_process_events",
+                     "deauth_detector_capture_packet",
+                     "deauth_detector_promiscuous_callback"):
             code += '\n' + function(source,name)
         code += r'''
 int main(void) {
@@ -215,6 +260,7 @@ int main(void) {
 #include "pmkid_probe_detector.h"
 #include "deauth_defence_cli.h"
 #include "janos_radio_lease.h"
+#include "wifi_shield.h"
 #define MAX_AP_CNT 64
 #define MY_LOG_INFO(tag, ...) do { printf(__VA_ARGS__); puts(""); } while(0)
 typedef int portMUX_TYPE;
@@ -227,6 +273,8 @@ typedef void *SemaphoreHandle_t;
 typedef int wifi_second_chan_t;
 #define ESP_OK 0
 #define ESP_ERR_INVALID_STATE 5
+#define MALLOC_CAP_SPIRAM 1U
+#define MALLOC_CAP_8BIT 2U
 #define WIFI_PROMIS_FILTER_MASK_MGMT 1
 #define WIFI_SECOND_CHAN_NONE 0
 #define pdPASS 1
@@ -257,6 +305,9 @@ static int fail_step,setup_calls,task_result=pdPASS;
 static bool receiver_enabled;
 static unsigned scan_calls;
 static janos_radio_lease_t janos_radio_lease;
+static void *heap_caps_calloc(size_t count,size_t size,unsigned caps)
+    {assert(caps==(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));return calloc(count,size);}
+static void heap_caps_free(void *memory) {free(memory);}
 static void oled_display_update_full(const char*a,const char*b,const char*c,const char*d) {(void)a;(void)b;(void)c;(void)d;}
 static void log_memory_info(const char*s) {(void)s;}
 static bool ensure_wifi_mode(void) {return true;}
@@ -283,6 +334,10 @@ static bool detector_defence_random_adapter(void *o,uint8_t *p,size_t n)
     {(void)o;memset(p,1,n);return true;}
 static int detector_defence_tune_adapter(void *o,uint8_t c)
     {(void)o;(void)c;return 0;}
+static int detector_defence_radio_enter_adapter(void *o,uint8_t c)
+    {(void)o;(void)c;return 0;}
+static int detector_defence_radio_leave_adapter(void *o)
+    {(void)o;return 0;}
 static int detector_defence_tx_adapter(void *o,const uint8_t *p,size_t n,bool s)
     {(void)o;(void)p;(void)n;(void)s;return 0;}
 static int64_t detector_defence_now_adapter(void *o) {(void)o;return 2000000;}
@@ -291,6 +346,33 @@ static void detector_defence_telemetry_adapter(void *o,const char *s)
     {(void)o;(void)s;}
 static bool deauth_detector_stop_defence_session(uint32_t d,bool r)
     {(void)d;(void)r;return true;}
+static bool deauth_detector_v2_profile_validate(void *o) {(void)o;return true;}
+static void deauth_detector_v2_profile_wipe(void *o) {(void)o;}
+static bool deauth_detector_v2_profile_consume(
+    void *o,const wifi_security_frame_slot_t *s,const wifi_security_decoded_t *d)
+    {(void)o;(void)s;(void)d;return true;}
+static void deauth_detector_v2_profile_uncertainty(
+    void *o,wifi_security_session_result_t r,bool owned)
+    {(void)o;(void)r;(void)owned;}
+static bool deauth_detector_v2_borrowed_receive(
+    void *o,uint32_t g,const wifi_security_rx_view_t *v)
+    {(void)o;(void)g;(void)v;return true;}
+static void deauth_detector_v2_worker_poll(void *o) {(void)o;}
+static bool deauth_detector_retained_profile_blocks_start(void) {return false;}
+static bool deauth_detector_stop_v2_profile(uint32_t timeout_ms);
+bool wifi_shield_reserve_deauth_scan(wifi_shield_deauth_scan_token_t *token)
+    {token->packed_lifecycle=1;token->held=true;return true;}
+bool wifi_shield_abort_deauth_scan(wifi_shield_deauth_scan_token_t *token,uint32_t t)
+    {(void)t;token->held=false;return true;}
+wifi_security_session_result_t wifi_shield_start_deauth_profile(
+    const wifi_shield_target_t *t,size_t n,const uint8_t *c,size_t m,
+    const wifi_security_session_config_t *s,wifi_shield_deauth_scan_token_t *token)
+    {(void)t;(void)n;(void)c;(void)m;(void)s;if(token)token->held=false;return WIFI_SECURITY_SESSION_OK;}
+bool wifi_shield_deauth_profile_generation(uint32_t *g)
+    {*g=1;return true;}
+bool wifi_shield_stop_deauth_profile(uint32_t t) {(void)t;return true;}
+static bool deauth_detector_stop_v2_profile(uint32_t timeout_ms)
+    {return wifi_shield_stop_deauth_profile(timeout_ms);}
 static void deauth_detector_task(void*p) {(void)p;}
 static void xTaskNotifyGive(int handle) {(void)handle;}
 static int xTaskCreate(void(*f)(void*),const char*n,int stack,void*p,int prio,int*h) {

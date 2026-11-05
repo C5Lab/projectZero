@@ -34,7 +34,7 @@ static void assert_decision(deauth_defence_decision_t decision,
 static void test_state_machine_and_idle_release(void)
 {
     deauth_defence_core_t core;
-    deauth_defence_core_reset(&core, false, 7U);
+    deauth_defence_core_reset(&core, false, false, 7U);
     assert(core.state == DEF_ARMED_HOPPING && core.generation == 7U);
 
     deauth_defence_observation_t event = observation(DEF_TRIG_DEAUTH);
@@ -67,7 +67,7 @@ static void test_state_machine_and_idle_release(void)
 static void test_filter_akm_address_channel_and_time_fail_closed(void)
 {
     deauth_defence_core_t core;
-    deauth_defence_core_reset(&core, false, 1U);
+    deauth_defence_core_reset(&core, false, false, 1U);
     deauth_defence_observation_t event = observation(DEF_TRIG_DISASSOC);
 
     event.selected = false;
@@ -101,7 +101,7 @@ static void test_filter_akm_address_channel_and_time_fail_closed(void)
 static void test_pair_cooldown_and_window_are_exact(void)
 {
     deauth_defence_core_t core;
-    deauth_defence_core_reset(&core, false, 2U);
+    deauth_defence_core_reset(&core, false, false, 2U);
     deauth_defence_observation_t event = observation(DEF_TRIG_CSA);
     int64_t start = INT64_C(5000000);
     assert_decision(deauth_defence_consume(&core, &event, start),
@@ -127,7 +127,7 @@ static void test_pair_cooldown_and_window_are_exact(void)
                         start + DEAUTH_DEFENCE_PAIR_WINDOW_US),
                     DEF_ACT_DECOY_4WAY, "selected_wpa2", false);
 
-    deauth_defence_core_reset(&core, false, 9U);
+    deauth_defence_core_reset(&core, false, false, 9U);
     assert(deauth_defence_consume(&core, &event, start).action ==
            DEF_ACT_DECOY_4WAY);
     assert(deauth_defence_consume(
@@ -156,11 +156,11 @@ static void test_pmkid_is_opt_in_and_station_rate_limited(void)
 {
     deauth_defence_observation_t event = observation(DEF_TRIG_PMKID_PROBE);
     deauth_defence_core_t core;
-    deauth_defence_core_reset(&core, false, 3U);
+    deauth_defence_core_reset(&core, false, false, 3U);
     assert_decision(deauth_defence_consume(&core, &event, 1000U),
                     DEF_ACT_OBSERVE, "pmkid_monitor", false);
 
-    deauth_defence_core_reset(&core, true, 4U);
+    deauth_defence_core_reset(&core, true, false, 4U);
     assert_decision(deauth_defence_consume(&core, &event, 1000U),
                     DEF_ACT_DECOY_PMKID, "pmkid_decoy_opt_in", true);
     assert_decision(deauth_defence_consume(
@@ -181,7 +181,7 @@ static void test_pmkid_is_opt_in_and_station_rate_limited(void)
 static void test_pmkid_capacity_fails_closed_without_evicting_cooldown(void)
 {
     deauth_defence_core_t core;
-    deauth_defence_core_reset(&core, true, 10U);
+    deauth_defence_core_reset(&core, true, false, 10U);
     deauth_defence_observation_t event = observation(DEF_TRIG_PMKID_PROBE);
     int64_t start = INT64_C(1000000);
 
@@ -209,7 +209,7 @@ static void test_pmkid_capacity_fails_closed_without_evicting_cooldown(void)
 static void test_burst_is_bounded(void)
 {
     deauth_defence_core_t core;
-    deauth_defence_core_reset(&core, false, 5U);
+    deauth_defence_core_reset(&core, false, false, 5U);
     deauth_defence_observation_t event = observation(DEF_TRIG_DEAUTH);
     unsigned actions = 0U;
     for (int64_t i = 0; i < 100000; ++i) {
@@ -219,7 +219,7 @@ static void test_burst_is_bounded(void)
     }
     assert(actions == 1U);
 
-    deauth_defence_core_reset(&core, false, 6U);
+    deauth_defence_core_reset(&core, false, false, 6U);
     for (int64_t i = 0; i < 100000; ++i) {
         event.selected = false;
         event.bssid[5] = (uint8_t)i;
@@ -232,7 +232,7 @@ static void test_burst_is_bounded(void)
 static void test_aborted_attempt_keeps_cooldown_without_false_lock(void)
 {
     deauth_defence_core_t core;
-    deauth_defence_core_reset(&core, false, 8U);
+    deauth_defence_core_reset(&core, false, false, 8U);
     deauth_defence_observation_t event = observation(DEF_TRIG_DEAUTH);
     assert(deauth_defence_consume(&core, &event, 1000000U).action ==
            DEF_ACT_DECOY_4WAY);
@@ -248,7 +248,7 @@ static void test_aborted_attempt_keeps_cooldown_without_false_lock(void)
 static void test_success_latches_all_decoys_until_idle_release(void)
 {
     deauth_defence_core_t core;
-    deauth_defence_core_reset(&core, true, 11U);
+    deauth_defence_core_reset(&core, true, false, 11U);
     deauth_defence_observation_t pmkid =
         observation(DEF_TRIG_PMKID_PROBE);
     int64_t start = INT64_C(30000000);
@@ -275,6 +275,56 @@ static void test_success_latches_all_decoys_until_idle_release(void)
                     DEF_ACT_DECOY_4WAY, "selected_wpa2", true);
 }
 
+static void test_multi_vector_allows_deauth_after_pmkid(void)
+{
+    deauth_defence_core_t core;
+    deauth_defence_core_reset(&core, true, true, 12U);
+    deauth_defence_observation_t pmkid =
+        observation(DEF_TRIG_PMKID_PROBE);
+    deauth_defence_observation_t deauth = observation(DEF_TRIG_DEAUTH);
+    int64_t start = INT64_C(40000000);
+
+    assert_decision(deauth_defence_consume(&core, &pmkid, start),
+                    DEF_ACT_DECOY_PMKID, "pmkid_decoy_opt_in", true);
+    assert(deauth_defence_response_started(&core));
+    assert(deauth_defence_confirmation_started(&core));
+    assert(deauth_defence_response_succeeded(&core));
+    assert_decision(deauth_defence_consume(&core, &pmkid, start + 1),
+                    DEF_ACT_OBSERVE, "response_satisfied", false);
+
+    assert_decision(deauth_defence_consume(&core, &deauth, start + 2),
+                    DEF_ACT_DECOY_4WAY, "selected_wpa2", false);
+    assert(deauth_defence_response_succeeded(&core));
+    assert_decision(deauth_defence_consume(&core, &deauth, start + 3),
+                    DEF_ACT_OBSERVE, "response_satisfied", false);
+    assert_decision(deauth_defence_consume(&core, &pmkid, start + 4),
+                    DEF_ACT_OBSERVE, "response_satisfied", false);
+}
+
+static void test_multi_vector_allows_pmkid_after_deauth(void)
+{
+    deauth_defence_core_t core;
+    deauth_defence_core_reset(&core, true, true, 13U);
+    deauth_defence_observation_t deauth = observation(DEF_TRIG_DEAUTH);
+    deauth_defence_observation_t pmkid =
+        observation(DEF_TRIG_PMKID_PROBE);
+    int64_t start = INT64_C(50000000);
+
+    assert_decision(deauth_defence_consume(&core, &deauth, start),
+                    DEF_ACT_DECOY_4WAY, "selected_wpa2", true);
+    assert(deauth_defence_response_started(&core));
+    assert(deauth_defence_confirmation_started(&core));
+    assert(deauth_defence_response_succeeded(&core));
+    assert_decision(deauth_defence_consume(&core, &deauth, start + 1),
+                    DEF_ACT_OBSERVE, "response_satisfied", false);
+
+    assert_decision(deauth_defence_consume(&core, &pmkid, start + 2),
+                    DEF_ACT_DECOY_PMKID, "pmkid_decoy_opt_in", false);
+    assert(deauth_defence_response_succeeded(&core));
+    assert_decision(deauth_defence_consume(&core, &pmkid, start + 3),
+                    DEF_ACT_OBSERVE, "response_satisfied", false);
+}
+
 int main(void)
 {
     test_state_machine_and_idle_release();
@@ -285,6 +335,8 @@ int main(void)
     test_burst_is_bounded();
     test_aborted_attempt_keeps_cooldown_without_false_lock();
     test_success_latches_all_decoys_until_idle_release();
+    test_multi_vector_allows_deauth_after_pmkid();
+    test_multi_vector_allows_pmkid_after_deauth();
     puts("deauth defence core: PASS");
     return 0;
 }

@@ -128,7 +128,7 @@ static void test_capture_terminal_handshake(void) {
     test_capture_continues_with_m4_until_terminal_event(LAB_WPS_EVENT_DISCONNECTED);
 }
 
-static void test_capture_m5_closes_without_m6(bool pin_half_verified) {
+static void test_capture_unverified_m5_closes_without_m6(bool pin_half_verified) {
     const lab_wps_event_t events[] = {
         {.kind = LAB_WPS_EVENT_ASSOCIATED},
         {.kind = LAB_WPS_EVENT_M1, .eap_id = 2, .authenticated = true},
@@ -153,6 +153,131 @@ static void test_capture_m5_closes_without_m6(bool pin_half_verified) {
     assert(result.session_result == WPS_SESSION_SUCCESS);
     assert(fake.action_count == sizeof(expected) / sizeof(expected[0]));
     assert(memcmp(fake.actions, expected, sizeof(expected)) == 0);
+}
+
+typedef struct {
+    lab_wps_result_t result;
+    pixie_bundle_t bundle;
+    fake_transport_t fake;
+} capture_run_t;
+
+static void run_capture(const lab_wps_event_t *events, size_t count,
+                        capture_run_t *run) {
+    memset(run, 0, sizeof(*run));
+    run->fake.events = events;
+    run->fake.count = count;
+    lab_wps_session_t state = session(&run->fake);
+    lab_wps_request_t input = request("12345670");
+    assert(lab_wps_capture_pixie(&state, &input, &run->bundle, &run->result));
+}
+
+static void assert_actions(const fake_transport_t *fake,
+                           const lab_wps_action_t *expected, size_t count) {
+    assert(fake->action_count == count);
+    assert(memcmp(fake->actions, expected, count * sizeof(*expected)) == 0);
+}
+
+static void test_capture_verified_m5_continues_to_m7_credential(void) {
+    static const uint8_t key[] = "control-pin-key";
+    static const uint8_t ssid[] = "TCL Lab";
+    lab_wps_event_t events[] = {
+        {.kind = LAB_WPS_EVENT_ASSOCIATED},
+        {.kind = LAB_WPS_EVENT_M1, .eap_id = 2, .authenticated = true},
+        {.kind = LAB_WPS_EVENT_M3, .eap_id = 3, .authenticated = true},
+        {.kind = LAB_WPS_EVENT_M5, .eap_id = 4, .authenticated = true,
+         .pin_half_verified = true},
+        {.kind = LAB_WPS_EVENT_M7, .eap_id = 5, .authenticated = true,
+         .pin_half_verified = true, .credential_present = true,
+         .network_key = key, .network_key_len = sizeof(key) - 1,
+         .ssid = ssid, .ssid_len = sizeof(ssid) - 1},
+    };
+    memset(events[2].bundle.e_nonce, 0x42, sizeof(events[2].bundle.e_nonce));
+    const lab_wps_action_t expected[] = {
+        LAB_WPS_ACTION_START, LAB_WPS_ACTION_M2, LAB_WPS_ACTION_M4,
+        LAB_WPS_ACTION_M6, LAB_WPS_ACTION_NACK,
+    };
+    capture_run_t run;
+    run_capture(events, sizeof(events) / sizeof(events[0]), &run);
+    assert(run.result.session_result == WPS_SESSION_SUCCESS);
+    assert(run.result.credential_present);
+    assert(run.result.network_key_len == sizeof(key) - 1);
+    assert(memcmp(run.result.network_key, key, sizeof(key) - 1) == 0);
+    assert(strcmp(run.result.ssid, "TCL Lab") == 0);
+    assert(run.bundle.e_nonce[0] == 0x42 && run.bundle.e_nonce[15] == 0x42);
+    assert_actions(&run.fake, expected, sizeof(expected) / sizeof(expected[0]));
+}
+
+static void test_capture_after_m6_keeps_bundle(lab_wps_event_t terminal) {
+    lab_wps_event_t events[] = {
+        {.kind = LAB_WPS_EVENT_ASSOCIATED},
+        {.kind = LAB_WPS_EVENT_M1, .eap_id = 2, .authenticated = true},
+        {.kind = LAB_WPS_EVENT_M3, .eap_id = 3, .authenticated = true},
+        {.kind = LAB_WPS_EVENT_M5, .eap_id = 4, .authenticated = true,
+         .pin_half_verified = true},
+        terminal,
+    };
+    memset(events[2].bundle.e_hash2, 0x17, sizeof(events[2].bundle.e_hash2));
+    capture_run_t run;
+    run_capture(events, sizeof(events) / sizeof(events[0]), &run);
+    assert(run.result.session_result == WPS_SESSION_SUCCESS);
+    assert(!run.result.credential_present && run.result.network_key_len == 0);
+    assert(run.bundle.e_hash2[0] == 0x17 && run.bundle.e_hash2[31] == 0x17);
+    assert(run.fake.action_count >= 4);
+    assert(run.fake.actions[3] == LAB_WPS_ACTION_M6);
+}
+
+static void test_capture_second_half_outcomes_keep_bundle(void) {
+    test_capture_after_m6_keeps_bundle(
+        (lab_wps_event_t){.kind = LAB_WPS_EVENT_NACK});
+    test_capture_after_m6_keeps_bundle(
+        (lab_wps_event_t){.kind = LAB_WPS_EVENT_EAP_FAILURE});
+    test_capture_after_m6_keeps_bundle(
+        (lab_wps_event_t){.kind = LAB_WPS_EVENT_DISCONNECTED});
+    test_capture_after_m6_keeps_bundle(
+        (lab_wps_event_t){.kind = LAB_WPS_EVENT_M7, .eap_id = 5,
+                          .authenticated = true, .pin_half_verified = false});
+    test_capture_after_m6_keeps_bundle(
+        (lab_wps_event_t){.kind = LAB_WPS_EVENT_M7, .eap_id = 5,
+                          .authenticated = true, .pin_half_verified = true,
+                          .credential_present = false});
+}
+
+static void test_capture_timeout_after_m6_is_terminal_success(void) {
+    const lab_wps_event_t events[] = {
+        {.kind = LAB_WPS_EVENT_ASSOCIATED},
+        {.kind = LAB_WPS_EVENT_M1, .eap_id = 2, .authenticated = true},
+        {.kind = LAB_WPS_EVENT_M3, .eap_id = 3, .authenticated = true},
+        {.kind = LAB_WPS_EVENT_M5, .eap_id = 4, .authenticated = true,
+         .pin_half_verified = true},
+        {.kind = LAB_WPS_EVENT_TIMEOUT},
+        {.kind = LAB_WPS_EVENT_TIMEOUT},
+        {.kind = LAB_WPS_EVENT_TIMEOUT},
+    };
+    const lab_wps_action_t expected[] = {
+        LAB_WPS_ACTION_START, LAB_WPS_ACTION_M2, LAB_WPS_ACTION_M4,
+        LAB_WPS_ACTION_M6, LAB_WPS_ACTION_M6, LAB_WPS_ACTION_M6,
+    };
+    capture_run_t run;
+    run_capture(events, sizeof(events) / sizeof(events[0]), &run);
+    assert(run.result.session_result == WPS_SESSION_SUCCESS);
+    assert(!run.result.credential_present);
+    assert_actions(&run.fake, expected, sizeof(expected) / sizeof(expected[0]));
+}
+
+static void test_capture_setup_lock_after_m6_is_preserved(void) {
+    const lab_wps_event_t events[] = {
+        {.kind = LAB_WPS_EVENT_ASSOCIATED},
+        {.kind = LAB_WPS_EVENT_M1, .eap_id = 2, .authenticated = true},
+        {.kind = LAB_WPS_EVENT_M3, .eap_id = 3, .authenticated = true},
+        {.kind = LAB_WPS_EVENT_M5, .eap_id = 4, .authenticated = true,
+         .pin_half_verified = true},
+        {.kind = LAB_WPS_EVENT_NACK, .config_error_present = true,
+         .config_error = 15},
+    };
+    capture_run_t run;
+    run_capture(events, sizeof(events) / sizeof(events[0]), &run);
+    assert(run.result.session_result == WPS_SESSION_SETUP_LOCKED);
+    assert(!run.result.credential_present);
 }
 
 static void test_capture_retransmits_m4_for_duplicate_m3(void) {
@@ -366,8 +491,11 @@ static void test_identity_loop_and_cancel(void) {
 int main(void) {
     test_complete_verify();
     test_capture_terminal_handshake();
-    test_capture_m5_closes_without_m6(false);
-    test_capture_m5_closes_without_m6(true);
+    test_capture_unverified_m5_closes_without_m6(false);
+    test_capture_verified_m5_continues_to_m7_credential();
+    test_capture_second_half_outcomes_keep_bundle();
+    test_capture_timeout_after_m6_is_terminal_success();
+    test_capture_setup_lock_after_m6_is_preserved();
     test_capture_retransmits_m4_for_duplicate_m3();
     test_capture_timeout_after_m4_is_terminal_success();
     test_capture_preserves_setup_lock_result();

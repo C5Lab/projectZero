@@ -10,6 +10,10 @@
 #define DEAUTH_DEFENCE_PAIR_WINDOW_US INT64_C(10000000)
 #define DEAUTH_DEFENCE_PMKID_COOLDOWN_US INT64_C(5000000)
 #define DEAUTH_DEFENCE_IDLE_RELEASE_US INT64_C(20000000)
+#define DEAUTH_DEFENCE_COMPLETED_4WAY UINT8_C(0x01)
+#define DEAUTH_DEFENCE_COMPLETED_PMKID UINT8_C(0x02)
+#define DEAUTH_DEFENCE_COMPLETED_ALL \
+    (DEAUTH_DEFENCE_COMPLETED_4WAY | DEAUTH_DEFENCE_COMPLETED_PMKID)
 
 typedef enum {
     DEF_TRIG_DEAUTH = 0,
@@ -68,7 +72,10 @@ typedef struct {
 typedef struct {
     deauth_defence_state_t state;
     bool pmkid_decoy_enabled;
+    bool multi_vector_enabled;
     bool response_satisfied;
+    uint8_t completed_actions;
+    deauth_defence_action_t pending_action;
     uint32_t generation;
     uint8_t active_bssid[6];
     uint8_t active_channel;
@@ -81,6 +88,7 @@ typedef struct {
 
 void deauth_defence_core_reset(deauth_defence_core_t *core,
                                bool pmkid_decoy_enabled,
+                               bool multi_vector_enabled,
                                uint32_t generation);
 
 deauth_defence_decision_t deauth_defence_consume(

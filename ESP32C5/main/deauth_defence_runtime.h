@@ -22,6 +22,8 @@ typedef struct {
 typedef bool (*deauth_defence_random_fn)(void *opaque, uint8_t *out,
                                          size_t length);
 typedef int (*deauth_defence_tune_fn)(void *opaque, uint8_t channel);
+typedef int (*deauth_defence_radio_enter_fn)(void *opaque, uint8_t channel);
+typedef int (*deauth_defence_radio_leave_fn)(void *opaque);
 typedef int (*deauth_defence_tx_fn)(void *opaque, const uint8_t *frame,
                                     size_t length, bool en_sys_seq);
 typedef int64_t (*deauth_defence_now_fn)(void *opaque);
@@ -37,10 +39,13 @@ typedef struct {
     const deauth_defence_runtime_target_t *targets;
     size_t target_count;
     bool pmkid_decoy;
+    bool multi_vector;
     uint32_t generation;
     void *opaque;
     deauth_defence_random_fn random;
     deauth_defence_tune_fn tune;
+    deauth_defence_radio_enter_fn radio_enter;
+    deauth_defence_radio_leave_fn radio_leave;
     deauth_defence_tx_fn tx;
     deauth_defence_now_fn now;
     deauth_defence_notify_fn notify;

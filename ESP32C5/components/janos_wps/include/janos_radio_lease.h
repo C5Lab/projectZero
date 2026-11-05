@@ -16,6 +16,8 @@ typedef enum {
     JANOS_RADIO_OWNER_WPS,
     JANOS_RADIO_OWNER_LEGACY,
     JANOS_RADIO_OWNER_DEFENCE,
+    JANOS_RADIO_OWNER_SECURITY_MONITOR,
+    JANOS_RADIO_OWNER_SHIELD,
 } janos_radio_owner_t;
 
 typedef enum {

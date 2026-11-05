@@ -7,7 +7,6 @@
   "cmd_unselect_networks": "7d03a53f78632b555784c30b3eb2049ca182db6ccf9c1ef393b539d320624013",
   "cmd_unselect_stations": "4427083551ba41ac02b6664e8ecd763dcaaf2d0a5e8202d11b5cc0af3ff68988",
   "cmd_start_deauth": "867ab4b55f1f5e95860b7fe3edae0c93fa66490d8bda6969955b4064e0262db6",
-  "cmd_stop": "31a52825e42deec269694dcff90b23b873feec9354d97c1aa311f8b4e26ee61b",
   "sniffer_capture_legacy_locked": "1ea3f74153ff697265ec346890cc2b7d7eb66cc901c0f47d4547510afa0be926",
   "wsl_bypasser_send_deauth_frame_multiple_aps": "fc136540bfde0e8ecfd6aba62befc620d4f607bc1501f4fdea167b38d9fe9d7a"
 }

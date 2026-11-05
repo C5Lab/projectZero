@@ -24,6 +24,10 @@ static void secure_wipe(void *memory, size_t length)
     while (length--) *bytes++ = 0;
 }
 
+/* Capture uses this PIN. If the AP accepts it, the capture session itself
+ * reaches an authenticated M7 and the offline search is skipped. */
+static const char pixie_control_pin[9] = "12345670";
+
 static void *pixie_cache_alloc(void *context, size_t size)
 {
     return lab_platform_psram_alloc(context, size);
@@ -510,8 +514,7 @@ static lab_workflow_session_outcome_t real_verify(
 static lab_workflow_session_outcome_t real_capture(
     void *context, const uint8_t bssid[6], pixie_bundle_t *bundle)
 {
-    static const char control_pin[] = "12345670";
-    return real_session(context, bssid, control_pin, bundle);
+    return real_session(context, bssid, pixie_control_pin, bundle);
 }
 
 static bool real_recover(void *context, const pixie_bundle_t *bundle,
@@ -955,6 +958,17 @@ static bool execute_pixie(lab_workflows_t *workflows,
         goto done;
     }
 
+    if (session.result.credential_present) {
+        bool stored = store_authenticated_secret(
+            vault, pixie_control_pin, &session.result, operation_id,
+            lab_platform_now_ms(workflows->platform));
+        *result = stored ? "control_pin_and_m7_verified" : "credential_missing";
+        if (stored)
+            persist_success(workflows, command, pixie_control_pin,
+                            &session.result, operation_id, "control_pin");
+        goto done;
+    }
+
     /* Wifit3 resets association/transport between attempts but keeps the
      * operation's client MAC. A later operation generates a new random MAC. */
     workflows->reuse_previous_session_mac = true;
@@ -1116,7 +1130,8 @@ bool lab_workflows_execute(lab_workflows_t *workflows,
             emit_cleanup_failure(workflows, operation_id);
         bool success_result =
             strcmp(*operation_result, "pin_and_m7_verified") == 0 ||
-            strcmp(*operation_result, "pixie_pin_and_m7_verified") == 0;
+            strcmp(*operation_result, "pixie_pin_and_m7_verified") == 0 ||
+            strcmp(*operation_result, "control_pin_and_m7_verified") == 0;
         bool success = success_result && strcmp(*cleanup_result, "ok") == 0;
         if (!success) persist_observation(workflows, command, *operation_result);
         return executed;

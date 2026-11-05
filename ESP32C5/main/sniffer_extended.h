@@ -7,6 +7,7 @@
 
 #define SX_SELECTORS 8
 #define SX_TEXT_BYTES 64
+#define SX_RSNXE_BYTES 32U
 #define SX_AP_SUFFIX_BYTES 2304
 #define SX_CLIENT_SUFFIX_BYTES 96
 /* Conservative full UART record bounds, including possible CRLF, excluding NUL. */
@@ -26,7 +27,7 @@ typedef struct {
     bool group_present, management_present;
     uint8_t pairwise[SX_SELECTORS][4], akm[SX_SELECTORS][4];
     uint8_t pairwise_count, akm_count;
-    bool pairwise_known, akm_known, truncated;
+    bool pairwise_known, akm_known, capabilities_present, truncated;
     bool pmf_capable, pmf_required;
 } sx_security_t;
 typedef struct {
@@ -36,6 +37,16 @@ typedef struct {
     bool truncated, present;
 } sx_wps_t;
 typedef struct {
+    sx_status_t status;
+    bool present, truncated;
+    uint8_t len;
+    uint8_t bytes[SX_RSNXE_BYTES];
+} sx_rsnxe_t;
+typedef struct {
+    sx_status_t status;
+    uint8_t code[3];
+} sx_country_t;
+typedef struct {
     int8_t hidden; /* -1 unknown; beacon evidence only */
     uint8_t resolved_ssid[32], resolved_len;
     sx_source_t ssid_source, profile_source;
@@ -43,6 +54,8 @@ typedef struct {
     int8_t privacy; /* capability bit, independent of RSN/WPA */
     sx_security_t rsn, wpa;
     sx_wps_t wps;
+    sx_rsnxe_t rsnxe;
+    sx_country_t country;
 } sx_ap_t;
 typedef struct {
     uint8_t bssid[6];
@@ -52,6 +65,8 @@ typedef struct {
     int8_t hidden, privacy;
     sx_security_t rsn, wpa;
     sx_wps_t wps;
+    sx_rsnxe_t rsnxe;
+    sx_country_t country;
 } sx_observation_t;
 
 void sx_init(sx_ap_t *ap);

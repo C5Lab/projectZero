@@ -46,7 +46,7 @@ static bool matches(const janos_radio_lease_t *lease,
                     janos_radio_owner_t owner, uint32_t generation)
 {
     return lease && owner > JANOS_RADIO_OWNER_NONE &&
-        owner <= JANOS_RADIO_OWNER_DEFENCE && generation != 0U &&
+        owner <= JANOS_RADIO_OWNER_SHIELD && generation != 0U &&
         atomic_load_explicit(&lease->owner, memory_order_acquire) ==
             (uint32_t)owner &&
         atomic_load_explicit(&lease->generation, memory_order_acquire) ==
@@ -58,7 +58,7 @@ janos_radio_lease_result_t janos_radio_lease_acquire(
     uint32_t *generation_out)
 {
     if (!lease || owner <= JANOS_RADIO_OWNER_NONE ||
-        owner > JANOS_RADIO_OWNER_DEFENCE) return JANOS_RADIO_LEASE_INVALID;
+        owner > JANOS_RADIO_OWNER_SHIELD) return JANOS_RADIO_LEASE_INVALID;
     mutation_enter(lease);
     janos_radio_lease_result_t result = JANOS_RADIO_LEASE_BUSY;
     const uint32_t state = atomic_load_explicit(&lease->state, memory_order_acquire);

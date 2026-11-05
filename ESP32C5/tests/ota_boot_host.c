@@ -136,6 +136,32 @@ static bool analyzer_host_lease_release(uint32_t generation, bool restored)
 { (void)generation; return restored; }
 static janos_radio_lease_t janos_radio_lease;
 static void janos_radio_lease_init(janos_radio_lease_t *lease) { (void)lease; }
+static int wifi_shield_runtime_hooks, wifi_shield_output_hooks;
+static int wps_guard_runtime_hooks, wps_guard_output_hooks;
+static int sae_guard_runtime_hooks, sae_guard_output_hooks;
+static int wifi_trust_runtime_hooks, wifi_trust_storage_hooks, wifi_trust_output_hooks;
+static int client_isolation_hooks;
+static void *router_cve_storage_mutex;
+static int router_cve_storage_mutex_storage;
+enum { ROUTER_AUDIT_COMMAND_WORKSPACE_MIN = 1 };
+static unsigned char router_audit_command_workspace[ROUTER_AUDIT_COMMAND_WORKSPACE_MIN];
+static struct {
+    void *command_workspace;
+    size_t command_workspace_size;
+} router_audit_hooks;
+static bool wifi_security_platform_init(void) { return true; }
+static bool wifi_shield_init(const void *runtime, const void *output)
+{ (void)runtime; (void)output; return true; }
+static bool wps_guard_init(const void *runtime, const void *output)
+{ (void)runtime; (void)output; return true; }
+static bool sae_guard_init(const void *runtime, const void *output)
+{ (void)runtime; (void)output; return true; }
+static bool wifi_trust_init(const void *runtime, const void *storage, const void *output)
+{ (void)runtime; (void)storage; (void)output; return true; }
+static void client_isolation_command_init(const void *hooks) { (void)hooks; }
+static bool router_audit_init(const void *hooks) { (void)hooks; return true; }
+static bool wifi_shield_presentation_start(void) { return true; }
+#define ESP_LOGW(...) ((void)0)
 static void led_status_wps_verified(void) {}
 static void led_status_handshake_saved(void) {}
 static void led_status_start_renderer(void) { event("led"); }

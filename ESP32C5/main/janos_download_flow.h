@@ -32,9 +32,11 @@ typedef struct {
     void (*reset_rom)(void *context);
 } janos_download_flow_ops_t;
 
-/* Admission runs first and supplies the reserved lease snapshot. The ROM
- * reset callback must not return on device; if it does, the flag is restored
- * and RESET_RETURNED is reported. No branch releases a quarantined lease. */
+/* Admission runs first and supplies the active or reserved lease snapshot.
+ * Non-WPS owners go through the universal Stop path before ROM boot is armed.
+ * The reset callback must not return on device; if it does, the flag is
+ * restored and RESET_RETURNED is reported. The quarantined WPS branch retains
+ * its lease and uses the dedicated terminal wipe path. */
 janos_download_result_t janos_download_flow_run(
     janos_radio_lease_snapshot_t lease,
     const janos_download_flow_ops_t *ops,

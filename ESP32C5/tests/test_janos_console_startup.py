@@ -15,6 +15,17 @@ import unittest
 from test_sniffer_extended import function
 
 ROOT = Path(__file__).resolve().parents[1]
+SHIELD_HELP = (
+    "Wi-Fi Shield: start [--only indexes...] "
+    "[--protect-all | --defence decoy-4way "
+    "[--pmkid-decoy [--multi-vector]]] | status | report | log status | stop"
+)
+
+
+def wsl_path(path):
+    path = Path(path).resolve()
+    return (f"/mnt/{path.drive.rstrip(':').lower()}/"
+            f"{path.relative_to(path.anchor).as_posix()}")
 
 STUBS = r'''
 #include <assert.h>
@@ -99,6 +110,25 @@ int main(int argc, char **argv)
         assert(cmd->func_w_context(cmd->context, 1, args) == 1);
         assert(last_handler != NULL);
     }
+    if (argc > 1 && !strcmp(argv[1], "shield")) {
+        const esp_console_cmd_t *shield = NULL;
+        for (size_t i=0; i<registered_count; ++i) {
+            if (!strcmp(registered[i].command, "wifi_shield")) {
+                assert(shield == NULL);
+                shield = &registered[i];
+            }
+        }
+        assert(shield != NULL);
+        assert(shield->help != NULL);
+        assert(!strcmp(shield->help, EXPECTED_WIFI_SHIELD_HELP_TEXT));
+        last_handler = NULL;
+        char *args[] = {"wifi_shield"};
+        assert(shield->func_w_context(shield->context, 1, args) == 1);
+        assert(last_handler != NULL);
+        assert(!strcmp(last_handler, "wifi_shield_command"));
+        puts("PASS: wifi_shield exact help and handler");
+        return 0;
+    }
     assert(!strcmp(registered[registered_count-1].command, "version"));
     puts("REGISTERED_COMMANDS_BEGIN");
     for (size_t i=0; i<registered_count; ++i) puts(registered[i].command);
@@ -124,9 +154,13 @@ int main(int argc, char **argv)
 class ConsoleStartupTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.compiler = shutil.which(os.environ.get("CC", "cc"))
-        if cls.compiler is None:
-            raise unittest.SkipTest("host C compiler required")
+        requested = os.environ.get("CC", "")
+        cls.compiler = shutil.which(requested) if requested else next(
+            (shutil.which(name) for name in ("cc", "gcc", "clang")
+             if shutil.which(name)), None)
+        cls.wsl = None if cls.compiler else shutil.which("wsl.exe")
+        if cls.compiler is None and cls.wsl is None:
+            raise AssertionError("host C compiler required (native or WSL)")
         cls.tmp = tempfile.TemporaryDirectory(prefix="janos-console-startup-")
         cls.directory = Path(cls.tmp.name)
         source = (ROOT / "main/main.c").read_text()
@@ -144,6 +178,12 @@ class ConsoleStartupTests(unittest.TestCase):
         if capacity is None:
             raise AssertionError("production command capacity not found")
         cls.capacity = int(capacity[1])
+        shield_header = (ROOT / "main/wifi_shield.h").read_text(encoding="utf-8")
+        shield_help = re.search(
+            r'#define WIFI_SHIELD_HELP_TEXT\s*\\\s*\n\s*"([^"]+)"',
+            shield_header)
+        if shield_help is None or shield_help.group(1) != SHIELD_HELP:
+            raise AssertionError("production Wi-Fi Shield help bytes changed")
         contexts = re.search(r"typedef struct \{[^{}]+\} janos_console_cmd_context_t;", source).group()
         locator = re.search(r"static const esp_console_cmd_t ap_locator_cmd\s*=\s*\{[^{}]+\};", source).group()
         handlers = sorted(set(re.findall(r"\.func\s*=\s*&?(\w+)", registration + locator)))
@@ -156,6 +196,8 @@ static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
     return cmd->func ? cmd->func(argc, argv) : cmd->func_w_context(cmd->context, argc, argv);
 }
 '''
+        code += (f'#define WIFI_SHIELD_HELP_TEXT "{SHIELD_HELP}"\n'
+                 f'#define EXPECTED_WIFI_SHIELD_HELP_TEXT "{SHIELD_HELP}"\n')
         code += function(source, "janos_console_cmd_register") + "\n"
         code += "\n".join(
             f'static int {name}(int argc, char **argv) {{ (void)argv; last_handler="{name}"; return argc; }}'
@@ -169,22 +211,35 @@ static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
             exe = cls.directory / label
             flags = ["-std=c11", "-Wall", "-Wextra", "-Werror", f"-DJANOS_CONSOLE_MAX_COMMANDS={limit}U", f"-DEXPECTED_COMMANDS={cls.expected}U"]
             if os.environ.get("JANOS_TEST_SANITIZERS"):
-                flags += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
-            subprocess.run([cls.compiler, *flags, str(path), "-o", str(exe)], check=True)
-            cls.executables[label] = exe
+                flags += ["-fsanitize=address,undefined",
+                          "-fno-sanitize-recover=all",
+                          "-fno-omit-frame-pointer"]
+            if cls.compiler:
+                command = [cls.compiler, *flags, str(path), "-o", str(exe)]
+                run = [str(exe)]
+            else:
+                command = [cls.wsl, "cc", *flags, wsl_path(path),
+                           "-o", wsl_path(exe)]
+                run = [cls.wsl, wsl_path(exe)]
+            built = subprocess.run(command, cwd=ROOT, capture_output=True,
+                                   text=True)
+            if built.returncode != 0:
+                raise AssertionError(built.stdout + built.stderr)
+            cls.executables[label] = run
 
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
     def run_mode(self, mode=None):
-        args = [str(self.executables["current"])]
+        args = list(self.executables["current"])
         if mode:
             args.append(mode)
         return subprocess.check_output(args, text=True)
 
     def test_old_limit_reproduces_reported_boot_failure(self):
-        run = subprocess.run([str(self.executables["old"])], text=True, capture_output=True)
+        run = subprocess.run(self.executables["old"], text=True,
+                             capture_output=True)
         self.assertEqual(run.returncode, 42)
         self.assertIn("contexts=128 error=0x101", run.stderr)
         self.assertIn(self.old_limit_failure_expression, run.stderr)
@@ -205,3 +260,7 @@ static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
 
     def test_backend_failure_does_not_consume_context(self):
         self.assertIn("PASS: registration rollback and contextual handler", self.run_mode("backend-failure"))
+
+    def test_wifi_shield_registration_uses_exact_help_and_handler(self):
+        self.assertIn("PASS: wifi_shield exact help and handler",
+                      self.run_mode("shield"))

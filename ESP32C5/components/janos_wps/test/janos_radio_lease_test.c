@@ -6,8 +6,80 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#define SHIELD_OWNER JANOS_RADIO_OWNER_SHIELD
+
+static void shield_owner_lifecycle(void)
+{
+    _Static_assert(JANOS_RADIO_OWNER_NONE == 0 &&
+                   JANOS_RADIO_OWNER_ANALYZER == 1 &&
+                   JANOS_RADIO_OWNER_WPS == 2 &&
+                   JANOS_RADIO_OWNER_LEGACY == 3 &&
+                   JANOS_RADIO_OWNER_DEFENCE == 4 &&
+                   JANOS_RADIO_OWNER_SECURITY_MONITOR == 5 &&
+                   JANOS_RADIO_OWNER_SHIELD == 6,
+                   "Existing owner values are a compatibility contract");
+    janos_radio_lease_t lease;
+    janos_radio_lease_init(&lease);
+    uint32_t old_generation = 0U;
+    assert(janos_radio_lease_acquire(&lease, SHIELD_OWNER,
+                                     &old_generation) == JANOS_RADIO_LEASE_OK);
+    assert(old_generation != 0U);
+    janos_radio_lease_snapshot_t snapshot = janos_radio_lease_snapshot(&lease);
+    assert(snapshot.owner == SHIELD_OWNER);
+    assert(snapshot.state == JANOS_RADIO_LEASE_PREPARING);
+    assert(janos_radio_lease_mark_running(&lease, SHIELD_OWNER, old_generation));
+    assert(janos_radio_lease_accept_callback(&lease, SHIELD_OWNER, old_generation));
+    const janos_radio_owner_t contenders[] = {
+        JANOS_RADIO_OWNER_ANALYZER, JANOS_RADIO_OWNER_WPS,
+        JANOS_RADIO_OWNER_LEGACY, JANOS_RADIO_OWNER_DEFENCE,
+        JANOS_RADIO_OWNER_SECURITY_MONITOR, SHIELD_OWNER,
+    };
+    for (size_t i = 0; i < sizeof(contenders) / sizeof(contenders[0]); ++i)
+        assert(janos_radio_lease_acquire(&lease, contenders[i], NULL) ==
+               JANOS_RADIO_LEASE_BUSY);
+    assert(!janos_radio_lease_finish_startup(&lease, SHIELD_OWNER, old_generation));
+    assert(janos_radio_lease_request_cancel(&lease, SHIELD_OWNER, old_generation));
+    assert(janos_radio_lease_cancel_requested(&lease, SHIELD_OWNER, old_generation));
+    assert(!janos_radio_lease_accept_callback(&lease, SHIELD_OWNER, old_generation));
+    assert(janos_radio_lease_begin_cleanup(&lease, SHIELD_OWNER, old_generation));
+    assert(!janos_radio_lease_begin_cleanup(&lease, SHIELD_OWNER, old_generation));
+    assert(janos_radio_lease_finish_cleanup(&lease, SHIELD_OWNER, old_generation, true));
+    assert(!janos_radio_lease_finish_cleanup(&lease, SHIELD_OWNER, old_generation, true));
+    snapshot = janos_radio_lease_snapshot(&lease);
+    assert(snapshot.owner == JANOS_RADIO_OWNER_NONE);
+    assert(snapshot.state == JANOS_RADIO_LEASE_IDLE);
+    assert(snapshot.generation == 0U);
+
+    uint32_t generation = 0U;
+    assert(janos_radio_lease_acquire(&lease, SHIELD_OWNER, &generation) ==
+           JANOS_RADIO_LEASE_OK);
+    assert(generation != old_generation);
+    assert(janos_radio_lease_mark_running(&lease, SHIELD_OWNER, generation));
+    assert(!janos_radio_lease_request_cancel(&lease, SHIELD_OWNER, old_generation));
+    assert(!janos_radio_lease_begin_cleanup(&lease, SHIELD_OWNER, old_generation));
+    assert(!janos_radio_lease_finish_cleanup(&lease, SHIELD_OWNER, old_generation, true));
+    assert(!janos_radio_lease_cancel_requested(&lease, SHIELD_OWNER, generation));
+    assert(janos_radio_lease_accept_callback(&lease, SHIELD_OWNER, generation));
+    assert(janos_radio_lease_begin_cleanup(&lease, SHIELD_OWNER, generation));
+    assert(!janos_radio_lease_finish_cleanup(&lease, SHIELD_OWNER, generation, false));
+    snapshot = janos_radio_lease_snapshot(&lease);
+    assert(snapshot.owner == SHIELD_OWNER);
+    assert(snapshot.state == JANOS_RADIO_LEASE_QUARANTINED);
+    assert(snapshot.generation == generation);
+    assert(!snapshot.callbacks_open);
+    for (size_t i = 0; i < sizeof(contenders) / sizeof(contenders[0]); ++i)
+        assert(janos_radio_lease_acquire(&lease, contenders[i], NULL) ==
+               JANOS_RADIO_LEASE_QUARANTINED_RESULT);
+    assert(janos_radio_lease_begin_cleanup(&lease, SHIELD_OWNER, generation));
+    assert(janos_radio_lease_finish_cleanup(&lease, SHIELD_OWNER, generation, true));
+    assert(!janos_radio_lease_finish_cleanup(&lease, SHIELD_OWNER, generation, true));
+    assert(janos_radio_lease_acquire(&lease, (janos_radio_owner_t)(SHIELD_OWNER + 1),
+                                     NULL) == JANOS_RADIO_LEASE_INVALID);
+}
+
 int main(void)
 {
+    shield_owner_lifecycle();
     janos_radio_lease_t lease;
     janos_radio_lease_init(&lease);
     /* Simulate a preempted startup release after clearing its generation.
@@ -192,6 +264,76 @@ int main(void)
         &lease, JANOS_RADIO_OWNER_DEFENCE, defence_generation));
     assert(janos_radio_lease_finish_cleanup(
         &lease, JANOS_RADIO_OWNER_DEFENCE, defence_generation, true));
+
+    const janos_radio_owner_t security_monitor_owner =
+        JANOS_RADIO_OWNER_SECURITY_MONITOR;
+    uint32_t security_generation = 0U;
+    assert(janos_radio_lease_acquire(&lease, security_monitor_owner,
+                                     &security_generation) ==
+           JANOS_RADIO_LEASE_OK);
+    assert(security_generation != 0U);
+    snapshot = janos_radio_lease_snapshot(&lease);
+    assert(snapshot.owner == security_monitor_owner);
+    assert(snapshot.state == JANOS_RADIO_LEASE_PREPARING);
+    assert(snapshot.generation == security_generation);
+    assert(janos_radio_lease_mark_running(
+        &lease, security_monitor_owner, security_generation));
+    assert(janos_radio_lease_accept_callback(
+        &lease, security_monitor_owner, security_generation));
+    const janos_radio_owner_t other_owners[] = {
+        JANOS_RADIO_OWNER_ANALYZER, JANOS_RADIO_OWNER_WPS,
+        JANOS_RADIO_OWNER_LEGACY, JANOS_RADIO_OWNER_DEFENCE,
+    };
+    for (unsigned i = 0; i < sizeof(other_owners) / sizeof(other_owners[0]); ++i) {
+        assert(janos_radio_lease_acquire(&lease, other_owners[i], NULL) ==
+               JANOS_RADIO_LEASE_BUSY);
+    }
+    assert(janos_radio_lease_request_cancel(
+        &lease, security_monitor_owner, security_generation));
+    assert(janos_radio_lease_cancel_requested(
+        &lease, security_monitor_owner, security_generation));
+    assert(!janos_radio_lease_accept_callback(
+        &lease, security_monitor_owner, security_generation));
+    assert(janos_radio_lease_begin_cleanup(
+        &lease, security_monitor_owner, security_generation));
+    assert(janos_radio_lease_finish_cleanup(
+        &lease, security_monitor_owner, security_generation, true));
+    assert(!janos_radio_lease_finish_cleanup(
+        &lease, security_monitor_owner, security_generation, true));
+
+    uint32_t new_security_generation = 0U;
+    assert(janos_radio_lease_acquire(&lease, security_monitor_owner,
+                                     &new_security_generation) ==
+           JANOS_RADIO_LEASE_OK);
+    assert(new_security_generation != security_generation);
+    assert(janos_radio_lease_mark_running(
+        &lease, security_monitor_owner, new_security_generation));
+    assert(!janos_radio_lease_request_cancel(
+        &lease, security_monitor_owner, security_generation));
+    assert(!janos_radio_lease_begin_cleanup(
+        &lease, security_monitor_owner, security_generation));
+    assert(!janos_radio_lease_finish_cleanup(
+        &lease, security_monitor_owner, security_generation, true));
+    assert(!janos_radio_lease_cancel_requested(
+        &lease, security_monitor_owner, new_security_generation));
+    assert(janos_radio_lease_accept_callback(
+        &lease, security_monitor_owner, new_security_generation));
+    assert(janos_radio_lease_begin_cleanup(
+        &lease, security_monitor_owner, new_security_generation));
+    assert(!janos_radio_lease_finish_cleanup(
+        &lease, security_monitor_owner, security_generation, true));
+    assert(janos_radio_lease_finish_cleanup(
+        &lease, security_monitor_owner, new_security_generation, true));
+    assert(!janos_radio_lease_finish_cleanup(
+        &lease, security_monitor_owner, new_security_generation, true));
+    snapshot = janos_radio_lease_snapshot(&lease);
+    assert(snapshot.owner == JANOS_RADIO_OWNER_NONE);
+    assert(snapshot.state == JANOS_RADIO_LEASE_IDLE);
+    assert(snapshot.generation == 0U);
+    assert(!snapshot.cancel_requested);
+    assert(!snapshot.callbacks_open);
+    assert(janos_radio_lease_acquire(&lease, (janos_radio_owner_t)(SHIELD_OWNER + 1), NULL) ==
+           JANOS_RADIO_LEASE_INVALID);
 
     puts("PASS: JanOS shared radio lease");
     return 0;

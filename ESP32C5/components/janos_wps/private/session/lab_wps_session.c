@@ -152,19 +152,22 @@ static bool run(lab_wps_session_t *session, const lab_wps_request_t *request,
             identities_at_stage = 0;
             break;
         case LAB_WPS_EVENT_M5:
-            if (capture && bundle_captured) {
+            if (capture && bundle_captured && !event.pin_half_verified) {
                 if (!event.authenticated) {
                     result->session_result = WPS_SESSION_FATAL;
                     result->fatal_reason = LAB_WPS_FATAL_INVALID_SEQUENCE;
                     return true;
                 }
-                /* M5 confirms that the AP accepted M4. The control PIN is
-                 * irrelevant to capture, so never advance this attempt to M6. */
+                /* The first half of the control PIN did not verify, so the
+                 * retained M3 bundle is all this attempt can provide. */
                 (void)session->ops.send_action(
                     session->ops_context, LAB_WPS_ACTION_NACK, event.eap_id);
                 result->session_result = WPS_SESSION_SUCCESS;
                 return true;
             }
+            /* A verified first half means the AP may accept the whole control
+             * PIN. Continue to M6/M7 as a normal PIN session; any later
+             * rejection still keeps the retained bundle usable. */
             if (stage == 3U && event.authenticated && event.pin_half_verified &&
                 last_action_valid && last_action == LAB_WPS_ACTION_M6 &&
                 event.eap_id == last_eap_id) {
@@ -194,12 +197,17 @@ static bool run(lab_wps_session_t *session, const lab_wps_request_t *request,
                 return true;
             }
             if (!event.pin_half_verified) {
-                result->session_result = WPS_SESSION_PIN_REJECTED;
+                result->session_result = capture && bundle_captured ?
+                    WPS_SESSION_SUCCESS : WPS_SESSION_PIN_REJECTED;
                 return true;
             }
             if (!event.credential_present || !event.network_key ||
                 event.network_key_len == 0U ||
                 event.network_key_len > sizeof(result->network_key)) {
+                if (capture && bundle_captured) {
+                    result->session_result = WPS_SESSION_SUCCESS;
+                    return true;
+                }
                 result->session_result = WPS_SESSION_FATAL;
                 result->fatal_reason = LAB_WPS_FATAL_CREDENTIAL;
                 return true;
@@ -248,7 +256,8 @@ static bool run(lab_wps_session_t *session, const lab_wps_request_t *request,
              * silence terminates the control-PIN attempt without invalidating
              * the bundle. Verification still happens in a fresh session. */
             result->session_result = capture && bundle_captured &&
-                                     last_action == LAB_WPS_ACTION_M4 ?
+                                     (last_action == LAB_WPS_ACTION_M4 ||
+                                      last_action == LAB_WPS_ACTION_M6) ?
                                      WPS_SESSION_SUCCESS : WPS_SESSION_TIMEOUT;
             return true;
         case LAB_WPS_EVENT_DISCONNECTED:

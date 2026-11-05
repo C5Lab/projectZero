@@ -1,0 +1,69 @@
+{
+  "schema": "janos-router-cve-manifest-v1",
+  "created_epoch": 4070908800,
+  "expires_epoch": 4083782400,
+  "serial": 7,
+  "key_id": "00112233445566778899aabbccddeeff",
+  "sources": [
+    {
+      "id": "test-advisory-source",
+      "url": "https://security.example.invalid/advisories",
+      "retrieved_utc": "2099-01-03T00:00:00Z",
+      "license": "CC0-1.0-test-fixture",
+      "revision": "fixture-rev-1",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+  ],
+  "products": [
+    {
+      "id": "fixture-router-one",
+      "vendor": "Fixture Networks",
+      "model": "Router One",
+      "aliases": ["Router-One", "R1 Test"]
+    },
+    {
+      "id": "fixture-router-two",
+      "vendor": "Fixture Networks",
+      "model": "Router Two",
+      "aliases": []
+    }
+  ],
+  "advisories": [
+    {
+      "cve": "CVE-2099-0001",
+      "source": "test-advisory-source",
+      "url": "https://security.example.invalid/advisories/CVE-2099-0001",
+      "published": "2099-01-02",
+      "severity": "high",
+      "kev_date": null,
+      "eol": false,
+      "fixed_version": "Test fixed release 2.0",
+      "affected": [
+        {
+          "product": "fixture-router-one",
+          "firmware": ["1.0.0", "1.1.0"]
+        },
+        {
+          "product": "fixture-router-two",
+          "firmware": ["0.9.0"]
+        }
+      ]
+    },
+    {
+      "cve": "CVE-2099-0002",
+      "source": "test-advisory-source",
+      "url": "https://security.example.invalid/advisories/CVE-2099-0002",
+      "published": "2099-01-03",
+      "severity": "medium",
+      "kev_date": "2099-01-04",
+      "eol": true,
+      "fixed_version": "No fixture fix",
+      "affected": [
+        {
+          "product": "fixture-router-one",
+          "firmware": ["1.0.0"]
+        }
+      ]
+    }
+  ]
+}

@@ -19,7 +19,8 @@ static janos_wps_service_status_t verified_status(const char *result)
 int main(void)
 {
     const char *successes[] = {
-        "success", "pin_and_m7_verified", "pixie_pin_and_m7_verified"
+        "success", "pin_and_m7_verified", "pixie_pin_and_m7_verified",
+        "control_pin_and_m7_verified"
     };
     for (size_t i = 0; i < sizeof(successes) / sizeof(successes[0]); ++i) {
         janos_wps_service_status_t status = verified_status(successes[i]);

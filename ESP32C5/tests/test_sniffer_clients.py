@@ -153,8 +153,12 @@ class LegacyContractTests(unittest.TestCase):
   for name,digest in hashes.items():
    with self.subTest(command=name):
     body=function(source,name)
-    if name=='cmd_stop': body=body.replace('    sniffer_station_cleanup();\n\n','')
     self.assertEqual(hashlib.sha256(body.encode()).hexdigest(),digest)
+
+ def test_global_stop_keeps_sniffer_identity_cleanup(self):
+  source=(ROOT/'main/main.c').read_text()
+  body=function(source,'cmd_stop')
+  self.assertEqual(body.count('sniffer_station_cleanup();'),1)
 
 class CaptureIdentityTests(unittest.TestCase):
  def test_real_scan_and_capture_identity_without_legacy_changes(self):

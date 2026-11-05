@@ -28,6 +28,8 @@ static void xSemaphoreGiveRecursive(pthread_mutex_t *mutex)
 static void uart_baud_note_activity(void) {}
 static bool wifi_analyzer_busy(void) { return false; }
 static void linenoiseHistoryFree(void) {}
+static void client_isolation_scrub_cli_token(char *argument)
+{ (void)argument; }
 static void led_cli_activity_change(led_status_activity_t activity, bool begin)
 { (void)activity; (void)begin; }
 /* Scan lifecycle itself is exercised by janos_analyzer_admission_test.c. */

@@ -17,5 +17,6 @@ bool janos_wps_runtime_result_verified(
 
     return strcmp(status->operation_result, "success") == 0 ||
            strcmp(status->operation_result, "pin_and_m7_verified") == 0 ||
-           strcmp(status->operation_result, "pixie_pin_and_m7_verified") == 0;
+           strcmp(status->operation_result, "pixie_pin_and_m7_verified") == 0 ||
+           strcmp(status->operation_result, "control_pin_and_m7_verified") == 0;
 }

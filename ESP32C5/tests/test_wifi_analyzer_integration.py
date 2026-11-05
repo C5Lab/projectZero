@@ -95,7 +95,7 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
             "case WIFI_EVENT_STA_DISCONNECTED:", 1)[0]
         body = tokens(scan_case)
         claim = body.index("if (wifi_analyzer_on_scan_done(e)) break;")
-        legacy_write = body.index("esp_wifi_scan_get_ap_records(&g_scan_count, g_scan_results)")
+        legacy_write = body.index("detector_publish_scan_records(e->status)")
         self.assertLess(claim, legacy_write)
         self.assertLess(claim, body.index("g_last_scan_status = e->status"))
 
@@ -203,21 +203,23 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         self.assertEqual(tokens(MAIN).count("analyzer_legacy_scan_finished()"), 2)
 
     def test_analyzer_wifi_preparation_returns_errors_and_cleans_up(self):
-        prepare = tokens(function_body(MAIN, "analyzer_host_prepare_wifi"))
+        prepare = tokens(function_body(MAIN, "wifi_prepare_sta_driver"))
+        analyzer = tokens(function_body(MAIN, "analyzer_host_prepare_wifi"))
         self.assertNotIn("ESP_ERROR_CHECK", prepare)
-        self.assertNotIn("wifi_init_ap_sta(", prepare)
         self.assertNotIn("esp_netif_create_default_wifi_sta(", prepare)
         self.assertLess(prepare.index("esp_netif_new(&netif_config)"),
                         prepare.index("if (netif == NULL) return ESP_ERR_NO_MEM"))
         self.assertIn("esp_netif_destroy_default_wifi(netif)", prepare)
         self.assertLess(prepare.index("err = wifi_start_with_boot_sta_mac()"),
-                        prepare.index("current_radio_mode = RADIO_MODE_WIFI"))
+                        prepare.index("return ESP_OK"))
+        self.assertLess(analyzer.index("wifi_prepare_sta_driver()"),
+                        analyzer.index("current_radio_mode = RADIO_MODE_WIFI"))
         start = tokens(function_body(MAIN, "wifi_start_with_boot_sta_mac"))
         self.assertLess(start.index("sta_mac_boot_apply(&sta_mac_boot, &driver)"),
                         start.index("return esp_wifi_start()"))
         self.assertIn("status != STA_MAC_BOOT_APPLY_OK", start)
         self.assertIn("wifi_start_with_boot_sta_mac()",
-                      tokens(function_body(MAIN, "wifi_init_ap_sta")))
+                      prepare)
         self.assertEqual(tokens(MAIN).count("esp_wifi_start()"), 1)
         self.assertIn("esp_wifi_deinit() != ESP_OK", prepare)
         self.assertIn("analyzer_legacy_radio_uncertain = true", prepare)
@@ -242,12 +244,15 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         self.assertLess(wrapper.index("esp_wifi_init(config)"),
                         wrapper.index("wifi_apply_configured_country()"))
         self.assertIn("esp_wifi_deinit()", wrapper)
+        self.assertIn("analyzer_legacy_radio_uncertain = true", wrapper)
         self.assertEqual(len(re.findall(r"\besp_wifi_init\s*\(", tokens(MAIN))), 1)
 
+        prepare = tokens(function_body(MAIN, "wifi_prepare_sta_driver"))
         legacy = tokens(function_body(MAIN, "wifi_init_ap_sta"))
         analyzer = tokens(function_body(MAIN, "analyzer_host_prepare_wifi"))
-        self.assertIn("wifi_init_with_configured_country(&cfg)", legacy)
-        self.assertIn("wifi_init_with_configured_country(&init)", analyzer)
+        self.assertIn("wifi_init_with_configured_country(&cfg)", prepare)
+        self.assertIn("wifi_prepare_sta_driver()", legacy)
+        self.assertIn("wifi_prepare_sta_driver()", analyzer)
 
     def test_handshake_reasserts_configured_country_before_starting_worker(self):
         handshake_source = function_body(MAIN, "cmd_start_handshake")
@@ -513,6 +518,27 @@ class AnalyzerIntegrationSourceTest(unittest.TestCase):
         busy = tokens(function_body(MAIN, "analyzer_host_busy_reason"))
         self.assertIn("bool uncertain = analyzer_legacy_radio_uncertain", busy)
         self.assertIn("if (uncertain) return", busy)
+
+    def test_verified_full_wifi_reset_is_the_only_uncertainty_recovery(self):
+        recovery = tokens(function_body(MAIN, "analyzer_confirm_clean_wifi_reinit"))
+        for condition in (
+            "stop_result != ESP_OK", "deinit_result != ESP_OK", "!reinitialized",
+            "esp_wifi_get_mode(&mode) != ESP_OK", "mode != WIFI_MODE_STA",
+            "esp_wifi_sta_get_ap_info(&ap_info) != ESP_ERR_WIFI_NOT_CONNECT",
+            "esp_wifi_get_promiscuous(&promiscuous) != ESP_OK", "promiscuous",
+        ):
+            self.assertIn(condition, recovery)
+        self.assertNotRegex(recovery, r"\banalyzer_legacy_scan_pending\s*=")
+        self.assertLess(recovery.index("analyzer_sta_connect_pending = false"),
+                        recovery.index("analyzer_legacy_radio_uncertain = false"))
+
+        stop = tokens(function_body(MAIN, "cmd_stop"))
+        reset = stop.index("esp_err_t stop_result = esp_wifi_stop()")
+        recovered = stop.index("analyzer_confirm_clean_wifi_reinit(", reset)
+        self.assertLess(reset, recovered)
+        self.assertLess(stop.index("esp_err_t deinit_result = esp_wifi_deinit()", reset), recovered)
+        self.assertLess(stop.index("bool reinitialized = ensure_wifi_mode()", reset), recovered)
+        self.assertEqual(tokens(MAIN).count("analyzer_legacy_radio_uncertain = false"), 1)
 
     def test_every_main_wifi_connect_uses_tracked_driver_wrapper(self):
         wrapper = tokens(function_body(MAIN, "analyzer_tracked_wifi_connect"))

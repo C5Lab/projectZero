@@ -59,7 +59,7 @@ static void security_profiles(void) {
     sx_observation_t o = parse(); assert(o.complete && o.rsn.status == SX_VALID);
     assert(o.rsn.pairwise_count == 2 && o.rsn.akm_count == 2);
     assert(o.rsn.pairwise[1][3] == 0xfe && o.rsn.management_present);
-    assert(o.rsn.pmf_capable && !o.rsn.pmf_required);
+    assert(o.rsn.capabilities_present && o.rsn.pmf_capable && !o.rsn.pmf_required);
     frame[frame_len-8] = 0xc0; o = parse(); assert(o.rsn.pmf_required);
     uint8_t wpa[64] = {0,0x50,0xf2,1};
     const uint8_t body[] = {1,0,0,0x50,0xf2,2,1,0,0,0x50,0xf2,4,1,0,0,0x50,0xf2,2};
@@ -68,7 +68,118 @@ static void security_profiles(void) {
     assert(o.wpa.status == SX_VALID && o.wpa.akm[0][3] == 2 && o.rsn.status == SX_ABSENT);
     start(0x80); ie(0,"",0); o = parse();
     assert(o.rsn.status == SX_ABSENT && o.wpa.status == SX_ABSENT);
+    const uint8_t version_only[] = {1,0};
+    start(0x80); ie(0,"X",1); ie(48,version_only,sizeof(version_only)); o=parse();
+    assert(o.rsn.status == SX_VALID && !o.rsn.capabilities_present &&
+           !o.rsn.pmf_capable && !o.rsn.pmf_required);
+    start(0x80); ie(0,"X",1);
     ie(48, rsn, sizeof(rsn)-1); o = parse(); assert(o.rsn.status == SX_INVALID);
+}
+static void rsnxe_and_country_evidence(void) {
+    static const uint8_t rsnxe_one[] = {0x21};
+    static const uint8_t country_pl[] = {'P','L',' '};
+    static const uint8_t country_us_triplets[] = {
+        'U','S','I', 1, 11, 20, 36, 4, 17
+    };
+    sx_observation_t o;
+
+    /* Complete advertisement absence is confirmed and fully zero-initialized. */
+    start(0x80); ie(0,"X",1);
+    memset(&o, 0xa5, sizeof(o)); assert(sx_parse(frame, frame_len, &o));
+    assert(o.complete && o.source == SX_BEACON);
+    assert(o.rsnxe.status == SX_ABSENT && !o.rsnxe.present &&
+           !o.rsnxe.truncated && o.rsnxe.len == 0);
+    for (size_t i=0; i<SX_RSNXE_BYTES; ++i) assert(o.rsnxe.bytes[i] == 0);
+    assert(o.country.status == SX_ABSENT);
+    assert(o.country.code[0] == 0 && o.country.code[1] == 0 &&
+           o.country.code[2] == 0);
+
+    /* Present zero-length RSNXE remains visible but is structurally invalid. */
+    start(0x80); ie(0,"X",1); ie(244,"",0); o=parse();
+    assert(o.complete && o.rsnxe.status == SX_INVALID && o.rsnxe.present &&
+           !o.rsnxe.truncated && o.rsnxe.len == 0);
+    /* Valid lengths 1 and 32 retain exact bounded bytes. */
+    start(0x50); ie(0,"X",1); ie(244,rsnxe_one,sizeof(rsnxe_one)); o=parse();
+    assert(o.source == SX_PROBE_RESP && o.rsnxe.status == SX_VALID &&
+           o.rsnxe.len == 1 && o.rsnxe.bytes[0] == 0x21);
+    uint8_t rsnxe_32[SX_RSNXE_BYTES];
+    for (size_t i=0; i<sizeof(rsnxe_32); ++i) rsnxe_32[i]=(uint8_t)(0x80U+i);
+    start(0x80); ie(0,"X",1); ie(244,rsnxe_32,sizeof(rsnxe_32)); o=parse();
+    assert(o.rsnxe.status == SX_VALID && o.rsnxe.len == SX_RSNXE_BYTES &&
+           !o.rsnxe.truncated && !memcmp(o.rsnxe.bytes,rsnxe_32,sizeof(rsnxe_32)));
+
+    /* Overlength remains visible but invalid for baseline mutation. */
+    uint8_t rsnxe_33[SX_RSNXE_BYTES+1U];
+    for (size_t i=0; i<sizeof(rsnxe_33); ++i) rsnxe_33[i]=(uint8_t)(i+1U);
+    start(0x80); ie(0,"X",1); ie(244,rsnxe_33,sizeof(rsnxe_33)); o=parse();
+    assert(o.complete && o.rsnxe.status == SX_INVALID && o.rsnxe.present &&
+           o.rsnxe.truncated && o.rsnxe.len == SX_RSNXE_BYTES);
+    assert(!memcmp(o.rsnxe.bytes,rsnxe_33,SX_RSNXE_BYTES));
+    sx_ap_t invalid_ap; sx_init(&invalid_ap); sx_apply(&invalid_ap,&o);
+    assert(invalid_ap.frame_status == SX_INVALID &&
+           invalid_ap.rsnxe.status == SX_INVALID &&
+           invalid_ap.rsnxe.truncated);
+
+    /* Duplicate evidence invalidates the advertisement field. */
+    start(0x80); ie(0,"X",1); ie(244,rsnxe_one,sizeof(rsnxe_one));
+    ie(244,rsnxe_32,sizeof(rsnxe_32)); o=parse();
+    assert(!o.complete && o.rsnxe.status == SX_INVALID);
+
+    /* Country accepts exactly its three-byte identity and ignores triplets. */
+    start(0x80); ie(0,"X",1); ie(7,country_pl,sizeof(country_pl)); o=parse();
+    assert(o.complete && o.country.status == SX_VALID &&
+           !memcmp(o.country.code,country_pl,3));
+    start(0x50); ie(0,"X",1); ie(7,country_us_triplets,
+                                  sizeof(country_us_triplets)); o=parse();
+    assert(o.source == SX_PROBE_RESP && o.country.status == SX_VALID &&
+           !memcmp(o.country.code,country_us_triplets,3));
+    const uint8_t country_outdoor[] = {'D','E','O'};
+    start(0x80); ie(0,"X",1); ie(7,country_outdoor,3); o=parse();
+    assert(o.complete && o.country.status == SX_VALID &&
+           !memcmp(o.country.code,country_outdoor,3));
+
+    /* Short, duplicate and noncanonical Country evidence is exact but invalid. */
+    for (size_t n=0; n<3; ++n) {
+        start(0x80); ie(0,"X",1); ie(7,country_pl,n); o=parse();
+        assert(o.complete && o.country.status == SX_INVALID);
+        assert(!memcmp(o.country.code,country_pl,n));
+        for (size_t i=n; i<3; ++i) assert(o.country.code[i] == 0);
+    }
+    const uint8_t bad_countries[][3] = {
+        {'p','L',' '}, {'P',0xff,' '}, {'P','L','x'}, {'P','L','\n'}
+    };
+    for (size_t i=0; i<sizeof(bad_countries)/sizeof(bad_countries[0]); ++i) {
+        start(0x80); ie(0,"X",1); ie(7,bad_countries[i],3); o=parse();
+        assert(o.complete && o.country.status == SX_INVALID &&
+               !memcmp(o.country.code,bad_countries[i],3));
+    }
+    start(0x80); ie(0,"X",1); ie(7,country_pl,3); ie(7,country_us_triplets,3);
+    o=parse(); assert(!o.complete && o.country.status == SX_INVALID);
+
+    /* A malformed IE tail invalidates both new trust fields. */
+    start(0x80); ie(0,"X",1); ie(244,rsnxe_one,1); ie(7,country_pl,3);
+    frame[frame_len++]=244;
+    o=parse(); assert(!o.complete && o.rsnxe.status == SX_INVALID &&
+                      o.country.status == SX_INVALID);
+    /* A declared IE body longer than the remaining frame has the same result. */
+    start(0x50); ie(0,"X",1); ie(244,rsnxe_one,1); ie(7,country_pl,3);
+    frame[frame_len++]=7; frame[frame_len++]=3; frame[frame_len++]='P';
+    o=parse(); assert(!o.complete && o.rsnxe.status == SX_INVALID &&
+                      o.country.status == SX_INVALID);
+
+    /* Beacon and Probe observations stay source-specific; sx_apply keeps only
+     * the explicit latest source rather than fabricating a merged value. */
+    start(0x80); ie(0,"X",1); ie(244,rsnxe_one,1); ie(7,country_pl,3);
+    sx_observation_t beacon=parse();
+    const uint8_t probe_rsnxe[]={0x31};
+    start(0x50); ie(0,"X",1); ie(244,probe_rsnxe,1);
+    ie(7,country_us_triplets,3); sx_observation_t probe=parse();
+    assert(beacon.source == SX_BEACON && probe.source == SX_PROBE_RESP);
+    assert(beacon.rsnxe.bytes[0] != probe.rsnxe.bytes[0]);
+    assert(memcmp(beacon.country.code,probe.country.code,3) != 0);
+    sx_ap_t ap; sx_init(&ap); sx_apply(&ap,&beacon); sx_apply(&ap,&probe);
+    assert(ap.profile_source == SX_PROBE_RESP && ap.rsnxe.bytes[0] == 0x31 &&
+           !memcmp(ap.country.code,country_us_triplets,3));
 }
 static void wps_attributes(void) {
     const uint8_t wps[] = {0,0x50,0xf2,4, 0x10,0x44,0,1,2,
@@ -232,7 +343,8 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1],"--examples")) { examples(argc > 2); return 0; }
     binary_zero_ssid_is_not_assumed_hidden();
     reject_invalid_transmitters();
-    hidden_and_discovery(); security_profiles(); wps_attributes(); truncation_and_format();
+    hidden_and_discovery(); security_profiles(); rsnxe_and_country_evidence();
+    wps_attributes(); truncation_and_format();
     bounded_lists_and_optional_fields(); wps_fragmentation_and_limits(); fuzz_and_maximum_line();
     puts("sniffer extended parser fixtures: PASS");
 }

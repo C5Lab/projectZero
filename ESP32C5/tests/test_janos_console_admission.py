@@ -56,12 +56,17 @@ class JanosConsoleAdmissionTest(unittest.TestCase):
                                    text=True)
             self.assertEqual(built.returncode, 0,
                              built.stdout + built.stderr)
-            result = subprocess.run(run, cwd=ROOT, capture_output=True,
-                                    text=True)
-            self.assertEqual(result.returncode, 0,
-                             result.stdout + result.stderr)
-            self.assertEqual(result.stdout.strip(),
-                             "PASS: JanOS console admission policy")
+            scenarios = [([], "PASS: JanOS console admission policy"),
+                         (["security-policy"], "PASS: JanOS security admission policy"),
+                         (["security-lifecycle"], "PASS: JanOS security admission lifecycle"),
+                         (["shield-policy"], "PASS: JanOS Shield admission policy and lifecycle")]
+            for arguments, expected in scenarios:
+                with self.subTest(scenario=arguments or ["legacy"]):
+                    result = subprocess.run([*run, *arguments], cwd=ROOT,
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0,
+                                     result.stdout + result.stderr)
+                    self.assertEqual(result.stdout.strip(), expected)
 
 
 if __name__ == "__main__":

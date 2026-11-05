@@ -93,6 +93,14 @@ static uint32_t event_duration_ms(led_status_event_t event)
             return 600U;
         case LED_STATUS_EVENT_NEW_TARGET:
             return 200U;
+        case LED_STATUS_EVENT_SHIELD_INFO:
+            return 200U;
+        case LED_STATUS_EVENT_SHIELD_WARN:
+            return 400U;
+        case LED_STATUS_EVENT_SHIELD_ALERT:
+            return 600U;
+        case LED_STATUS_EVENT_SHIELD_DECOY_TX:
+            return 300U;
         default:
             return 0;
     }
@@ -145,7 +153,8 @@ bool led_status_queue_event(led_status_t *status, led_status_event_t event, uint
 
 static led_status_rgb_t render_event(led_status_event_t event, uint64_t elapsed_ms)
 {
-    uint32_t on_ms = event == LED_STATUS_EVENT_WPS_VERIFIED ? 150U : 100U;
+    uint32_t on_ms = event == LED_STATUS_EVENT_WPS_VERIFIED ? 150U :
+                     event == LED_STATUS_EVENT_SHIELD_DECOY_TX ? 50U : 100U;
     if ((elapsed_ms % (2U * on_ms)) >= on_ms) {
         return rgb(0, 0, 0);
     }
@@ -153,7 +162,12 @@ static led_status_rgb_t render_event(led_status_event_t event, uint64_t elapsed_
         case LED_STATUS_EVENT_WPS_VERIFIED:
             return rgb(0, 255, 0);
         case LED_STATUS_EVENT_THREAT:
+        case LED_STATUS_EVENT_SHIELD_ALERT:
+        case LED_STATUS_EVENT_SHIELD_DECOY_TX:
             return rgb(255, 0, 0);
+        case LED_STATUS_EVENT_SHIELD_INFO:
+        case LED_STATUS_EVENT_SHIELD_WARN:
+            return rgb(255, 128, 0);
         case LED_STATUS_EVENT_HANDSHAKE_SAVED:
         case LED_STATUS_EVENT_NEW_TARGET:
             return rgb(255, 255, 255);

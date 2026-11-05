@@ -6,13 +6,21 @@ hardware/task calls. It never builds firmware or transmits radio frames.
 """
 
 from pathlib import Path
+import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def wsl_path(path):
+    path = Path(path).resolve()
+    return (f"/mnt/{path.drive.rstrip(':').lower()}/"
+            f"{path.relative_to(path.anchor).as_posix()}")
 
 
 def function(source, name):
@@ -47,6 +55,7 @@ HARNESS_PREFIX = r"""
 #include "deauth_defence_cli.h"
 #include "pmkid_probe_detector.h"
 #include "janos_radio_lease.h"
+#include "wifi_shield.h"
 #if defined(__has_include)
 #if __has_include("deauth_target_core.h")
 #include "deauth_target_core.h"
@@ -94,6 +103,8 @@ static void test_log(const char *format, ...) {
 #define pdMS_TO_TICKS(ms) (ms)
 #define portMAX_DELAY 0xffffffffu
 #define TAG "test"
+#define MALLOC_CAP_SPIRAM 1U
+#define MALLOC_CAP_8BIT 2U
 typedef int esp_err_t;
 typedef int BaseType_t;
 typedef int TaskHandle_t;
@@ -103,6 +114,22 @@ typedef int portMUX_TYPE;
 #define portMUX_INITIALIZER_UNLOCKED 0
 #define portENTER_CRITICAL(lock) ((void)(lock))
 #define portEXIT_CRITICAL(lock) ((void)(lock))
+static unsigned context_allocations, context_frees, context_wipes;
+static void *live_context;
+static size_t live_context_size;
+static unsigned verified_full_context_wipes;
+static void *heap_caps_calloc(size_t count, size_t size, unsigned caps)
+    {assert(caps == (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+     void *memory = calloc(count, size); assert(memory && !live_context);
+     live_context = memory; live_context_size = count * size;
+     ++context_allocations; return memory;}
+static void heap_caps_free(void *memory)
+    {assert(memory && memory == live_context);
+     const uint8_t *bytes = memory;
+     for (size_t i = 0; i < live_context_size; ++i) assert(bytes[i] == 0U);
+     ++verified_full_context_wipes;
+     live_context = NULL; live_context_size = 0U;
+     ++context_frees; free(memory);}
 typedef enum { WIFI_PKT_MGMT, WIFI_PKT_DATA } wifi_promiscuous_pkt_type_t;
 typedef struct {
     struct { unsigned sig_len, dump_len, rx_state; int8_t rssi; uint8_t channel; } rx_ctrl;
@@ -131,9 +158,12 @@ typedef struct {
 static wifi_ap_record_t g_scan_results[MAX_AP_CNT];
 static unsigned g_scan_count;
 static bool g_scan_done, g_scan_in_progress, operation_stop_requested;
+static bool background_scan_fails;
 static bool g_scan_records_valid = true;
 static SemaphoreHandle_t g_scan_results_mutex = (void *)1;
 static bool sniffer_active, sniffer_dog_active, deauth_detector_active;
+static bool detector_accepting;
+static deauth_defence_runtime_t detector_defence_runtime;
 static int deauth_detector_current_channel, deauth_detector_channel_index;
 static int64_t deauth_detector_last_channel_hop;
 static TaskHandle_t deauth_detector_task_handle;
@@ -155,6 +185,19 @@ static janos_radio_lease_t janos_radio_lease;
 static unsigned raw_tx_calls;
 static size_t raw_tx_lengths[8];
 static unsigned detector_notifications;
+static unsigned profile_radio_enter_calls, profile_radio_leave_calls;
+static bool profile_active;
+static bool profile_scan_reserved;
+static unsigned profile_scan_packed, profile_scan_epoch;
+static bool profile_reserve_retained_failure;
+static bool profile_start_retained_uncertain;
+static unsigned profile_stop_failures_remaining;
+static unsigned profile_abort_failures_remaining;
+static bool expect_defence_stop_latched;
+static uint32_t profile_generation;
+static wifi_security_session_config_t profile_config;
+static uint8_t profile_requested_channels[64];
+static size_t profile_requested_channel_count;
 static unsigned targeted_scan_calls, targeted_scan_get_calls;
 static bool targeted_scan_has_result, targeted_scan_start_fails;
 static uint8_t targeted_scan_requested_bssid[6];
@@ -169,6 +212,7 @@ static void led_status_notify_event(int event)
 static void deauth_detector_process_events(void);
 static void deauth_detector_promiscuous_callback(
     void *buf, wifi_promiscuous_pkt_type_t type);
+static bool deauth_detector_stop_v2_profile(uint32_t timeout_ms);
 
 static void replace_scan_record(void) {
     memcpy(g_scan_results[0].bssid, g_scan_results[2].bssid, 6);
@@ -198,7 +242,8 @@ static int64_t esp_timer_get_time(void) {return clock_us;}
 static const char *esp_err_to_name(int err) {(void)err; return "fixture";}
 static esp_err_t start_background_scan(int min, int max)
     {(void)min; (void)max; ++scan_calls; g_scan_done = true;
-     g_scan_in_progress = false; return ESP_OK;}
+     g_scan_in_progress = false;
+     return background_scan_fails ? ESP_ERR_INVALID_STATE : ESP_OK;}
 static void esp_wifi_scan_stop(void) {}
 static esp_err_t esp_wifi_set_promiscuous_filter(const wifi_promiscuous_filter_t *filter)
     {(void)filter; ++receiver_setup_calls; return ESP_OK;}
@@ -244,6 +289,8 @@ static void esp_fill_random(void *out, size_t length)
      for (size_t i = 0; i < length; ++i) bytes[i] = seed++;}
 static void xTaskNotifyGive(TaskHandle_t handle)
     {(void)handle; ++detector_notifications;}
+static void security_notify(void *context)
+    {(void)context; ++detector_notifications;}
 static bool zig_recon_radio_busy(char *reason, size_t reason_len)
     {(void)reason; (void)reason_len; return false;}
 static void deauth_detector_task(void *arg) {(void)arg;}
@@ -276,6 +323,183 @@ static int xTaskCreate(void (*run)(void *), const char *name, int stack,
                       JANOS_RADIO_LEASE_QUARANTINED);
      }
      return pdPASS;}
+
+wifi_security_session_result_t wifi_shield_start_deauth_profile(
+    const wifi_shield_target_t *targets, size_t target_count,
+    const uint8_t *channels, size_t channel_count,
+    const wifi_security_session_config_t *config,
+    wifi_shield_deauth_scan_token_t *scan_token)
+{
+    (void)targets; (void)target_count;
+    if (!config || !channels || channel_count == 0U || profile_active ||
+        !config->validate(config->context)) return WIFI_SECURITY_SESSION_INVALID;
+    if (task_result != pdPASS) return WIFI_SECURITY_SESSION_WORKER_FAILED;
+    uint32_t generation = 0U;
+    if (janos_radio_lease_acquire(&janos_radio_lease,
+            JANOS_RADIO_OWNER_SECURITY_MONITOR, &generation) !=
+        JANOS_RADIO_LEASE_OK)
+        return WIFI_SECURITY_SESSION_BUSY;
+    if (esp_wifi_set_channel(channels[0], WIFI_SECOND_CHAN_NONE) != ESP_OK) {
+        assert(janos_radio_lease_begin_cleanup(&janos_radio_lease,
+            JANOS_RADIO_OWNER_SECURITY_MONITOR, generation));
+        assert(janos_radio_lease_finish_cleanup(&janos_radio_lease,
+            JANOS_RADIO_OWNER_SECURITY_MONITOR, generation, true));
+        return WIFI_SECURITY_SESSION_CHANNEL_FAILED;
+    }
+    profile_config = *config;
+    assert(channel_count <= sizeof(profile_requested_channels));
+    memcpy(profile_requested_channels, channels, channel_count);
+    profile_requested_channel_count = channel_count;
+    profile_generation = generation;
+    if (profile_scan_reserved) {
+        if (!scan_token || !scan_token->held ||
+            scan_token->packed_lifecycle != profile_scan_packed)
+            return WIFI_SECURITY_SESSION_CANCELLED;
+        *scan_token = (wifi_shield_deauth_scan_token_t){0};
+        profile_scan_reserved = false;
+        profile_scan_packed = 0U;
+    } else if (scan_token != NULL) {
+        return WIFI_SECURITY_SESSION_CANCELLED;
+    }
+    profile_active = true;
+    receiver_enabled = true;
+    assert(janos_radio_lease_mark_running(&janos_radio_lease,
+        JANOS_RADIO_OWNER_SECURITY_MONITOR, profile_generation));
+    if (inject_event_during_start) {
+        uint8_t frame[26] = {0};
+        const uint8_t bssid[6] = {0x02, 0, 0, 0, 0, 1};
+        const uint8_t tx[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+        memset(frame + 4, 0xFF, 6); memcpy(frame + 10, tx, 6);
+        memcpy(frame + 16, bssid, 6); frame[0] = 0xc0; frame[24] = 7;
+        wifi_security_rx_view_t view = {
+            .bytes = frame, .captured_length = 26, .signal_length = 30,
+            .dump_length = 26, .rssi = -40, .channel = 2,
+            .packet_class = WIFI_SECURITY_RECEIVE_MGMT,
+        };
+        size_t previous_log_size = logged_size;
+        (void)profile_config.borrowed_receive(profile_config.context,
+                                              profile_generation, &view);
+        assert(logged_size == previous_log_size);
+        deauth_detector_process_events();
+        assert(logged_size == previous_log_size);
+    }
+    if (corrupt_lease_during_start) {
+        (void)janos_radio_lease_request_cancel(&janos_radio_lease,
+            JANOS_RADIO_OWNER_SECURITY_MONITOR, profile_generation);
+        assert(janos_radio_lease_begin_cleanup(&janos_radio_lease,
+            JANOS_RADIO_OWNER_SECURITY_MONITOR, profile_generation));
+        assert(janos_radio_lease_finish_cleanup(&janos_radio_lease,
+            JANOS_RADIO_OWNER_SECURITY_MONITOR, profile_generation, true));
+        profile_active = false; receiver_enabled = false;
+        profile_config.wipe(profile_config.context);
+        memset(&profile_config, 0, sizeof(profile_config));
+        return WIFI_SECURITY_SESSION_MARK_FAILED;
+    }
+    if (profile_start_retained_uncertain)
+        return WIFI_SECURITY_SESSION_CLEANUP_FAILED;
+    return WIFI_SECURITY_SESSION_OK;
+}
+bool wifi_shield_stop_deauth_profile(uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    if (expect_defence_stop_latched) {
+        assert(!detector_accepting);
+        assert(atomic_load_explicit(&detector_defence_runtime.tx_gate,
+                                    memory_order_acquire) != 0U);
+        expect_defence_stop_latched = false;
+    }
+    if (!profile_active) return true;
+    if (profile_stop_failures_remaining > 0U) {
+        --profile_stop_failures_remaining;
+        return false;
+    }
+    profile_active = false;
+    receiver_enabled = false;
+    (void)janos_radio_lease_request_cancel(&janos_radio_lease,
+        JANOS_RADIO_OWNER_SECURITY_MONITOR, profile_generation);
+    assert(janos_radio_lease_begin_cleanup(&janos_radio_lease,
+        JANOS_RADIO_OWNER_SECURITY_MONITOR, profile_generation));
+    assert(janos_radio_lease_finish_cleanup(&janos_radio_lease,
+        JANOS_RADIO_OWNER_SECURITY_MONITOR, profile_generation, true));
+    if (profile_config.wipe) {
+        ++context_wipes;
+        profile_config.wipe(profile_config.context);
+    }
+    memset(&profile_config, 0, sizeof(profile_config));
+    return true;
+}
+bool wifi_shield_deauth_profile_pending(void)
+{
+    return profile_active || profile_scan_reserved;
+}
+bool wifi_shield_reserve_deauth_scan(wifi_shield_deauth_scan_token_t *token)
+{
+    if (!token || token->held || profile_active || profile_scan_reserved)
+        return false;
+    profile_scan_reserved = true;
+    profile_scan_packed = ++profile_scan_epoch;
+    if (!profile_scan_packed) profile_scan_packed = ++profile_scan_epoch;
+    token->packed_lifecycle = profile_scan_packed;
+    token->held = true;
+    if (profile_reserve_retained_failure) {
+        profile_reserve_retained_failure = false;
+        return false;
+    }
+    return true;
+}
+bool wifi_shield_abort_deauth_scan(wifi_shield_deauth_scan_token_t *token,
+                                   uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    if (!token || !token->held) return false;
+    if (profile_abort_failures_remaining > 0U) {
+        --profile_abort_failures_remaining;
+        return false;
+    }
+    if (!profile_scan_reserved ||
+        token->packed_lifecycle != profile_scan_packed) {
+        *token = (wifi_shield_deauth_scan_token_t){0};
+        return true;
+    }
+    profile_scan_reserved = false;
+    profile_scan_packed = 0U;
+    *token = (wifi_shield_deauth_scan_token_t){0};
+    return true;
+}
+bool wifi_shield_deauth_profile_generation(uint32_t *generation)
+{
+    if (!profile_active || !generation) return false;
+    *generation = profile_generation;
+    return true;
+}
+bool wifi_shield_deauth_profile_retune(uint8_t channel)
+{
+    return profile_active &&
+        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE) == ESP_OK;
+}
+bool wifi_shield_deauth_profile_radio_enter(
+    uint8_t channel, wifi_shield_deauth_radio_token_t *token)
+{
+    if (!profile_active || !token || token->held ||
+        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE) != ESP_OK)
+        return false;
+    ++profile_radio_enter_calls;
+    token->packed_lifecycle = 1U;
+    token->runtime_generation = profile_generation;
+    token->channel = channel;
+    token->held = true;
+    return true;
+}
+bool wifi_shield_deauth_profile_radio_leave(
+    wifi_shield_deauth_radio_token_t *token)
+{
+    if (!token || !token->held) return false;
+    ++profile_radio_leave_calls;
+    bool current = profile_active &&
+        token->runtime_generation == profile_generation;
+    *token = (wifi_shield_deauth_radio_token_t){0};
+    return current;
+}
 """
 
 
@@ -288,6 +512,7 @@ static const uint8_t AP_E[6] = {0x02, 0, 0, 0, 0, 5};
 static const uint8_t AP_F[6] = {0x02, 0, 0, 0, 0, 6};
 
 static void scan_fixture(void) {
+    janos_radio_lease_init(&janos_radio_lease);
     g_scan_done = true;
     g_scan_in_progress = false;
     g_scan_records_valid = true;
@@ -312,7 +537,22 @@ static void send_deauth(const uint8_t bssid[6], uint8_t channel) {
     packet.rx_ctrl.rssi = -50;
     packet.payload[0] = 0xc0;
     memcpy(packet.payload + 16, bssid, 6);
-    deauth_detector_promiscuous_callback(&packet, WIFI_PKT_MGMT);
+    if (profile_active) {
+        wifi_security_rx_view_t view = {
+            .bytes = packet.payload,
+            .captured_length = (uint16_t)(packet.rx_ctrl.sig_len - 4U),
+            .signal_length = (uint16_t)packet.rx_ctrl.sig_len,
+            .dump_length = (uint16_t)packet.rx_ctrl.dump_len,
+            .rx_state = packet.rx_ctrl.rx_state,
+            .rssi = packet.rx_ctrl.rssi,
+            .channel = packet.rx_ctrl.channel,
+            .packet_class = WIFI_SECURITY_RECEIVE_MGMT,
+        };
+        (void)profile_config.borrowed_receive(
+            profile_config.context, profile_generation, &view);
+    } else {
+        deauth_detector_promiscuous_callback(&packet, WIFI_PKT_MGMT);
+    }
 }
 
 static void send_deauth_fields(const uint8_t bssid[6], const uint8_t tx[6],
@@ -419,6 +659,7 @@ static void send_open_auth_request(const uint8_t bssid[6],
 }
 
 static void stop_fixture(void) {
+    assert(wifi_shield_stop_deauth_profile(100U));
     deauth_detector_active = false;
     deauth_detector_task_handle = 0;
     deauth_detector_close_events();
@@ -584,7 +825,7 @@ static void defence_command_runtime(void) {
     inject_event_during_start = false;
     janos_radio_lease_snapshot_t lease =
         janos_radio_lease_snapshot(&janos_radio_lease);
-    assert(lease.owner == JANOS_RADIO_OWNER_DEFENCE);
+    assert(lease.owner == JANOS_RADIO_OWNER_SECURITY_MONITOR);
     assert(lease.state == JANOS_RADIO_LEASE_RUNNING);
     assert(detector_defence_runtime.started && detector_defence_requested);
     assert(detector_event_count == 0U && raw_tx_calls == 0U);
@@ -645,18 +886,8 @@ static void defence_command_runtime(void) {
     deauth_detector_process_events();
     assert(raw_tx_calls == 2U); /* callback allowlist is still authoritative */
 
-    deauth_defence_runtime_request_stop(&detector_defence_runtime);
-    deauth_detector_active = false;
-    deauth_detector_close_events();
-    receiver_enabled = false;
-    deauth_detector_task_handle = 0;
-    assert(!deauth_detector_stop_defence_session(0U, false));
-    assert(detector_defence_runtime.started);
-    lease = janos_radio_lease_snapshot(&janos_radio_lease);
-    assert(lease.owner == JANOS_RADIO_OWNER_DEFENCE);
-    assert(lease.state == JANOS_RADIO_LEASE_QUARANTINED);
-    assert(!strstr(logged, "[DETECTOR_DEFENCE] stopped "));
-    assert(deauth_detector_stop_defence_session(0U, true));
+    expect_defence_stop_latched = true;
+    assert(deauth_detector_stop_v2_profile(100U));
     lease = janos_radio_lease_snapshot(&janos_radio_lease);
     assert(lease.owner == JANOS_RADIO_OWNER_NONE);
     assert(strstr(logged,
@@ -784,12 +1015,7 @@ static void defence_pmkid_command(void) {
     assert(strstr(logged,
         "tx=decoy_pmkid stage=m1_pmkid result=ok frames=1 latency_us=0 error=none\n"));
 
-    deauth_defence_runtime_request_stop(&detector_defence_runtime);
-    deauth_detector_active = false;
-    deauth_detector_close_events();
-    receiver_enabled = false;
-    deauth_detector_task_handle = 0;
-    assert(deauth_detector_stop_defence_session(0U, true));
+    assert(wifi_shield_stop_deauth_profile(100U));
 }
 
 static void multiple_targets(void) {
@@ -985,6 +1211,45 @@ static void details_selected_indices(void) {
     assert(count_lines_starting("[DEAUTH] CH: ") == 0);
 }
 
+static void details_only_preserves_selected_snapshot_metadata(void) {
+    char *args[] = {"deauth_detector_v2", "--only", "1"};
+    assert(cmd_deauth_detector_v2(3, args) == 0);
+    assert(strstr(logged,
+        "[DETECTOR_WATCH] count=1 ap=1/1 CH=6 BSSID=02:00:00:00:00:01 SSID=Office\n"));
+    assert(detector_v2_context != NULL);
+    assert(detector_cache == detector_v2_context->cache);
+    assert(detector_cache_count == 3U);
+    assert(!memcmp(detector_cache[0].bssid, AP_A, 6U));
+    assert(detector_cache[0].channel == 6U);
+    assert(!strcmp(detector_cache[0].ssid, "Office"));
+    assert(profile_requested_channel_count == 1U &&
+           profile_requested_channels[0] == 6U);
+    assert(!memcmp(detector_v2_context->profile_targets[0].bssid, AP_A, 6U));
+    assert(detector_v2_context->profile_targets[0].channel == 6U);
+
+    send_deauth(AP_A, 6);
+    deauth_detector_process_events();
+    assert(strstr(logged,
+        "[DEAUTH_V2] CH: 6 | BSSID: 02:00:00:00:00:01 | TX: 00:00:00:00:00:00 | DA: 00:00:00:00:00:00 | RSSI: -50 | REASON: 0 | SSID: Office\n"));
+}
+
+static void details_failed_hop_retries_same_selected_channel(void) {
+    char *args[] = {"deauth_detector_v2", "1", "3"};
+    assert(cmd_deauth_detector_v2(3, args) == 0);
+    assert(channel_tune_calls == 1 && channel_tune_history[0] == 6);
+    fail_channel_tune = true;
+    deauth_detector_channel_hop();
+    deauth_detector_channel_hop();
+    assert(channel_tune_calls == 3);
+    assert(channel_tune_history[1] == 6);
+    assert(channel_tune_history[2] == 6);
+    fail_channel_tune = false;
+    deauth_detector_channel_hop();
+    assert(channel_tune_history[3] == 6 && last_successful_channel == 6);
+    deauth_detector_channel_hop();
+    assert(channel_tune_history[4] == 11 && last_successful_channel == 11);
+}
+
 static void details_only_filters_deauth_and_csa(void) {
     char *args[] = {"deauth_detector_v2", "--only", "1", "3"};
     assert(cmd_deauth_detector_v2(4, args) == 0);
@@ -1075,6 +1340,134 @@ static void details_invalid_options_and_failed_start(void) {
     assert(cmd_deauth_detector_v2(1, valid) == 1);
     assert(!deauth_detector_active && !receiver_enabled);
     assert(count_lines_starting("[DETECTOR_INFO] format=deauth_v2") == 0);
+}
+
+static void details_retained_start_cleanup_is_retryable(void) {
+    char *args[] = {"deauth_detector_v2"};
+    unsigned allocations_before = context_allocations;
+    unsigned frees_before = context_frees;
+    unsigned wipes_before = context_wipes;
+    profile_start_retained_uncertain = true;
+    profile_stop_failures_remaining = 1U;
+
+    assert(cmd_deauth_detector_v2(1, args) == 1);
+    assert(!deauth_detector_active);
+    assert(profile_active && receiver_enabled);
+    assert(detector_v2_context != NULL);
+    assert(live_context == detector_v2_context);
+    assert(context_allocations == allocations_before + 1U);
+    assert(context_frees == frees_before);
+    assert(context_wipes == wipes_before);
+
+    void *retained_context = detector_v2_context;
+    unsigned scan_before = scan_calls;
+    int tune_before = channel_tune_calls;
+    int receiver_before = receiver_setup_calls;
+    unsigned allocations_after_retained = context_allocations;
+    char *bare_v2[] = {"deauth_detector_v2"};
+    char *legacy[] = {"deauth_detector"};
+    assert(cmd_deauth_detector_v2(1, bare_v2) == 1);
+    assert(cmd_deauth_detector(1, legacy) == 1);
+    assert(profile_active && live_context == retained_context &&
+           detector_v2_context == retained_context);
+    assert(scan_calls == scan_before && channel_tune_calls == tune_before &&
+           receiver_setup_calls == receiver_before);
+    assert(context_allocations == allocations_after_retained &&
+           context_frees == frees_before && context_wipes == wipes_before);
+
+    /* A retained callback/poll pair may race the failed command return.  The
+     * context must remain allocated until controller cleanup is verified. */
+    uint8_t frame[26] = {0};
+    wifi_security_rx_view_t view = {
+        .bytes = frame, .captured_length = sizeof(frame),
+        .signal_length = 30U, .dump_length = sizeof(frame),
+        .channel = 6U, .packet_class = WIFI_SECURITY_RECEIVE_MGMT,
+    };
+    assert(!profile_config.borrowed_receive(
+        profile_config.context, profile_generation, &view));
+    profile_config.worker_poll(profile_config.context);
+    assert(live_context == profile_config.context);
+    assert(context_frees == frees_before);
+
+    profile_start_retained_uncertain = false;
+    assert(deauth_detector_stop_v2_profile(100U));
+    assert(!profile_active && !receiver_enabled);
+    assert(detector_v2_context == NULL && live_context == NULL);
+    assert(context_wipes == wipes_before + 1U);
+    assert(context_frees == frees_before + 1U);
+    assert(wifi_shield_stop_deauth_profile(100U));
+    assert(context_wipes == wipes_before + 1U);
+    assert(context_frees == frees_before + 1U);
+}
+
+static void details_retained_scan_prepare_cleanup_is_retryable(void) {
+    char *v2[] = {"deauth_detector_v2"};
+    char *legacy[] = {"deauth_detector"};
+    unsigned allocations_before = context_allocations;
+    unsigned frees_before = context_frees;
+    background_scan_fails = true;
+    profile_abort_failures_remaining = 1U;
+    assert(cmd_deauth_detector_v2(1, v2) == 1);
+    assert(profile_scan_reserved && detector_v2_context != NULL &&
+           live_context == detector_v2_context);
+    assert(context_allocations == allocations_before + 1U &&
+           context_frees == frees_before);
+
+    unsigned scans_before = scan_calls;
+    int tunes_before = channel_tune_calls;
+    int receiver_before = receiver_setup_calls;
+    assert(cmd_deauth_detector_v2(1, v2) == 1);
+    assert(cmd_deauth_detector(1, legacy) == 1);
+    assert(scan_calls == scans_before && channel_tune_calls == tunes_before &&
+           receiver_setup_calls == receiver_before);
+    assert(profile_scan_reserved && live_context == detector_v2_context &&
+           context_frees == frees_before);
+
+    background_scan_fails = false;
+    assert(deauth_detector_stop_v2_profile(100U));
+    assert(!profile_scan_reserved && detector_v2_context == NULL &&
+           live_context == NULL && context_frees == frees_before + 1U);
+    assert(deauth_detector_stop_v2_profile(100U));
+    assert(context_frees == frees_before + 1U);
+}
+
+static void details_reserve_internal_abort_failure_is_retryable(void) {
+    char *v2[] = {"deauth_detector_v2"};
+    char *legacy[] = {"deauth_detector"};
+    unsigned allocations_before = context_allocations;
+    unsigned frees_before = context_frees;
+    unsigned wipes_before = verified_full_context_wipes;
+    profile_reserve_retained_failure = true;
+    profile_abort_failures_remaining = 1U;
+
+    assert(cmd_deauth_detector_v2(1, v2) == 1);
+    assert(profile_scan_reserved && detector_v2_context != NULL &&
+           detector_v2_context->scan_token.held &&
+           live_context == detector_v2_context);
+    assert(context_allocations == allocations_before + 1U &&
+           context_frees == frees_before &&
+           verified_full_context_wipes == wipes_before);
+
+    unsigned scans_before = scan_calls;
+    int tunes_before = channel_tune_calls;
+    int receiver_before = receiver_setup_calls;
+    assert(cmd_deauth_detector_v2(1, v2) == 1);
+    assert(cmd_deauth_detector(1, legacy) == 1);
+    assert(scan_calls == scans_before && channel_tune_calls == tunes_before &&
+           receiver_setup_calls == receiver_before);
+    assert(profile_scan_reserved && detector_v2_context != NULL &&
+           detector_v2_context->scan_token.held &&
+           context_frees == frees_before &&
+           verified_full_context_wipes == wipes_before);
+
+    assert(deauth_detector_stop_v2_profile(100U));
+    assert(!profile_scan_reserved && detector_v2_context == NULL &&
+           live_context == NULL);
+    assert(context_frees == frees_before + 1U &&
+           verified_full_context_wipes == wipes_before + 1U);
+    assert(deauth_detector_stop_v2_profile(100U));
+    assert(context_frees == frees_before + 1U &&
+           verified_full_context_wipes == wipes_before + 1U);
 }
 
 static void legacy_rejects_v2_flag(void) {
@@ -1455,6 +1848,11 @@ static void trace_selected_channels_waits_for_deauth(void) {
     assert(deauth_detector_selected_mode && deauth_detector_selected_channels_count == 2);
     assert(deauth_detector_selected_channels[0] == 6);
     assert(deauth_detector_selected_channels[1] == 11);
+    bool trace_channel_nine_allowed = false;
+    for (size_t i = 0; i < profile_requested_channel_count; ++i)
+        trace_channel_nine_allowed = trace_channel_nine_allowed ||
+            profile_requested_channels[i] == 9U;
+    assert(trace_channel_nine_allowed);
     assert(channel_tune_calls == 1 && last_successful_channel == 6);
     send_csa(AP_C, 11);
     deauth_detector_process_events();
@@ -1632,9 +2030,13 @@ static void trace_resolves_unknown_ssid_with_one_targeted_scan(void) {
     clock_us += 749000;
     deauth_detector_process_events();
     assert(targeted_scan_calls == 0);
+    unsigned radio_enter_before = profile_radio_enter_calls;
+    unsigned radio_leave_before = profile_radio_leave_calls;
     clock_us += 1000;
     deauth_detector_process_events();
     assert(targeted_scan_calls == 1 && targeted_scan_get_calls == 1);
+    assert(profile_radio_enter_calls == radio_enter_before + 1U);
+    assert(profile_radio_leave_calls == radio_leave_before + 1U);
     assert(!memcmp(targeted_scan_requested_bssid, AP_E, 6));
     assert(targeted_scan_requested_channel == 9);
     assert(targeted_scan_requested_show_hidden);
@@ -1728,9 +2130,14 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "legacy-snapshot")) legacy_ssid_is_captured_at_receive();
     else if (!strcmp(argv[1], "details-all")) details_all_and_early_event();
     else if (!strcmp(argv[1], "details-selected")) details_selected_indices();
+    else if (!strcmp(argv[1], "details-only-metadata")) details_only_preserves_selected_snapshot_metadata();
+    else if (!strcmp(argv[1], "details-retune-retry")) details_failed_hop_retries_same_selected_channel();
     else if (!strcmp(argv[1], "details-only")) details_only_filters_deauth_and_csa();
     else if (!strcmp(argv[1], "details-safety")) details_short_frame_and_ssid_safety();
     else if (!strcmp(argv[1], "details-invalid")) details_invalid_options_and_failed_start();
+    else if (!strcmp(argv[1], "details-retained-cleanup")) details_retained_start_cleanup_is_retryable();
+    else if (!strcmp(argv[1], "details-retained-prepare")) details_retained_scan_prepare_cleanup_is_retryable();
+    else if (!strcmp(argv[1], "details-retained-reserve")) details_reserve_internal_abort_failure_is_retryable();
     else if (!strcmp(argv[1], "details-stop")) details_stop_and_legacy_restart();
     else if (!strcmp(argv[1], "details-copy")) details_copies_frame_before_task_runs();
     else if (!strcmp(argv[1], "details-utf8")) details_printable_utf8_ssid();
@@ -1767,6 +2174,34 @@ int main(int argc, char **argv) {
 
 
 class DeauthDetectorWatchTests(unittest.TestCase):
+    def test_v2_context_is_transactional_explicit_spiram_and_fully_wiped(self):
+        source = (ROOT / "main/main.c").read_text(encoding="utf-8")
+        acquire = function(source, "deauth_detector_v2_context_acquire")
+        release = function(source, "deauth_detector_v2_context_release")
+        self.assertIn("MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT", acquire)
+        self.assertEqual(acquire.count("heap_caps_calloc"), 1)
+        self.assertNotIn("MALLOC_CAP_8BIT)", acquire.replace(
+            "MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)", ""))
+        self.assertIn("volatile uint8_t", release)
+        self.assertIn("sizeof(*context)", release)
+        self.assertIn("heap_caps_free(context)", release)
+
+    def test_v2_profile_target_snapshot_is_owned_by_spiram_context(self):
+        source = (ROOT / "main/main.c").read_text(encoding="utf-8")
+        context_end = source.index("} detector_v2_context_t;")
+        context_start = source.rfind("typedef struct {", 0, context_end)
+        context = source[context_start:context_end]
+        command = function(source, "cmd_deauth_detector_impl")
+        self.assertIn(
+            "wifi_shield_target_t profile_targets[DEAUTH_TARGET_MAX]",
+            context,
+        )
+        self.assertNotIn(
+            "wifi_shield_target_t profile_targets[DEAUTH_TARGET_MAX]",
+            command,
+        )
+        self.assertIn("context->profile_targets", command)
+
     def test_targeted_resolver_scan_done_cannot_replace_main_scan_cache(self):
         source = (ROOT / "main/main.c").read_text(encoding="utf-8")
         scan_done = source.split("case WIFI_EVENT_SCAN_DONE:", 1)[1].split(
@@ -1803,6 +2238,68 @@ class DeauthDetectorWatchTests(unittest.TestCase):
         boot = source.split('static const char* boot_allowed_commands[] = {', 1)[1].split('};', 1)[0]
         self.assertIn('"deauth_detector_v2"', boot)
 
+    def test_packed_profile_module_bound_covers_appended_deauth_identity(self):
+        source = (ROOT / "main/wifi_shield.c").read_text(encoding="utf-8")
+        self.assertIn(
+            "_Static_assert(WIFI_SECURITY_MODULE_DEAUTH_V2 <= "
+            "SHIELD_PROFILE_MODULE_MASK",
+            source,
+        )
+
+    def test_bare_v2_scan_reserves_and_adopts_one_module_identity(self):
+        source = (ROOT / "main/main.c").read_text(encoding="utf-8")
+        command = function(source, "cmd_deauth_detector_impl")
+        reserve = command.index(
+            "wifi_shield_reserve_deauth_scan(deauth_scan_token)"
+        )
+        scan = command.index("start_background_scan(")
+        adopt = command.index("wifi_shield_start_deauth_profile(")
+        self.assertLess(reserve, scan)
+        self.assertLess(scan, adopt)
+        self.assertIn("wifi_shield_abort_deauth_scan", command)
+        self.assertIn("deauth_scan_token->held ?", command)
+        self.assertIn("shield_scan_module", source)
+        self.assertIn(
+            "config->module != security_platform.shield_scan_module",
+            source,
+        )
+
+    def test_failed_v2_profile_start_stops_retained_session_before_context_release(self):
+        source = (ROOT / "main/main.c").read_text(encoding="utf-8")
+        command = function(source, "cmd_deauth_detector_impl")
+        failure = command.split(
+            "if (profile_result != WIFI_SECURITY_SESSION_OK)", 1
+        )[1].split("uint32_t runtime_generation", 1)[0]
+        stop = failure.index("deauth_detector_stop_v2_profile(5000U)")
+        release = failure.index("deauth_detector_v2_context_release")
+        self.assertLess(stop, release)
+        self.assertNotIn("deauth_scan_token->held", failure)
+        self.assertIn("context == detector_v2_context", failure)
+        self.assertIn(
+            "if (profile_stopped && context == detector_v2_context)",
+            failure,
+        )
+
+    def test_retained_admission_uses_authoritative_deauth_profile_state(self):
+        source = (ROOT / "main/main.c").read_text(encoding="utf-8")
+        guard = function(source, "deauth_detector_retained_profile_blocks_start")
+        self.assertIn("wifi_shield_deauth_profile_pending()", guard)
+
+    def test_all_detector_csa_defence_wrappers_have_wsl_and_fatal_sanitizers(self):
+        wrappers = (
+            "test_deauth_defence_cli.py",
+            "test_deauth_defence_core.py",
+            "test_deauth_defence_runtime.py",
+            "test_deauth_scan_records.py",
+            "test_deauth_target_core.py",
+            "test_csa_detector.py",
+        )
+        for name in wrappers:
+            text = (ROOT / "tests" / name).read_text(encoding="utf-8")
+            with self.subTest(wrapper=name):
+                self.assertIn("wsl.exe", text)
+                self.assertIn("-fno-sanitize-recover=all", text)
+
     @classmethod
     def setUpClass(cls):
         source = (ROOT / "main/main.c").read_text(encoding="utf-8")
@@ -1830,14 +2327,25 @@ class DeauthDetectorWatchTests(unittest.TestCase):
             "deauth_detector_stop_defence_session",
             "detector_defence_random_adapter",
             "detector_defence_tune_adapter",
+            "detector_defence_radio_enter_adapter",
+            "detector_defence_radio_leave_adapter",
             "detector_defence_tx_adapter",
             "detector_defence_now_adapter",
             "detector_defence_notify_adapter",
             "detector_defence_telemetry_adapter",
+            "deauth_detector_retained_profile_blocks_start",
+            "deauth_detector_stop_v2_profile",
             "detector_defence_process_event",
             "detector_forensic_log_event",
             "deauth_detector_process_events",
             "deauth_detector_channel_hop",
+            "deauth_detector_capture_packet",
+            "deauth_detector_v2_profile_validate",
+            "deauth_detector_v2_profile_wipe",
+            "deauth_detector_v2_profile_consume",
+            "deauth_detector_v2_profile_uncertainty",
+            "deauth_detector_v2_borrowed_receive",
+            "deauth_detector_v2_worker_poll",
             "cmd_deauth_detector_impl",
             "cmd_deauth_detector",
             "cmd_deauth_detector_v2",
@@ -1866,13 +2374,28 @@ class DeauthDetectorWatchTests(unittest.TestCase):
         target_core = ROOT / "main/deauth_target_core.c"
         if target_core.exists():
             files.append(target_core)
+        compiler = next((shutil.which(name) for name in
+                         (os.environ.get("CC", ""), "cc", "gcc", "clang")
+                         if name and shutil.which(name)), None)
+        flags = ["-std=gnu11", "-Wall", "-Wextra", "-Wno-unused-function",
+                 "-Wno-unused-variable"]
+        if os.environ.get("JANOS_TEST_SANITIZERS"):
+            flags += ["-fsanitize=address,undefined",
+                      "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
+        if compiler:
+            command = [compiler, *flags, "-I", str(ROOT / "main"),
+                       "-I", str(ROOT / "components/janos_wps/include"),
+                       *map(str, files), "-o", str(cls.binary)]
+            cls.run_prefix = [str(cls.binary)]
+        else:
+            if not shutil.which("wsl.exe"):
+                raise AssertionError("host C compiler required (native or WSL)")
+            command = ["wsl.exe", "cc", *flags, "-I", wsl_path(ROOT / "main"),
+                       "-I", wsl_path(ROOT / "components/janos_wps/include"),
+                       *map(wsl_path, files), "-o", wsl_path(cls.binary)]
+            cls.run_prefix = ["wsl.exe", wsl_path(cls.binary)]
         build = subprocess.run(
-            [
-                "cc", "-std=gnu11", "-Wall", "-Wextra", "-Wno-unused-function",
-                "-Wno-unused-variable", "-I", str(ROOT / "main"),
-                "-I", str(ROOT / "components/janos_wps/include"),
-                *map(str, files), "-o", str(cls.binary),
-            ],
+            command,
             capture_output=True,
             text=True,
         )
@@ -1881,7 +2404,7 @@ class DeauthDetectorWatchTests(unittest.TestCase):
 
     def check_scenario(self, name):
         result = subprocess.run(
-            [str(self.binary), name], capture_output=True, text=True
+            [*self.run_prefix, name], capture_output=True, text=True
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "watch PASS\n")
@@ -1925,6 +2448,12 @@ class DeauthDetectorWatchTests(unittest.TestCase):
     def test_details_selected_indices_do_not_filter_bssids(self):
         self.check_scenario("details-selected")
 
+    def test_v2_only_preserves_watch_cache_profile_and_event_metadata(self):
+        self.check_scenario("details-only-metadata")
+
+    def test_v2_failed_hop_retries_same_selected_channel(self):
+        self.check_scenario("details-retune-retry")
+
     def test_details_only_filters_both_deauth_and_csa(self):
         self.check_scenario("details-only")
 
@@ -1933,6 +2462,15 @@ class DeauthDetectorWatchTests(unittest.TestCase):
 
     def test_details_invalid_options_and_failed_start_emit_no_format_marker(self):
         self.check_scenario("details-invalid")
+
+    def test_retained_start_uncertainty_keeps_context_until_verified_cleanup(self):
+        self.check_scenario("details-retained-cleanup")
+
+    def test_retained_scan_prepare_blocks_retries_until_verified_cleanup(self):
+        self.check_scenario("details-retained-prepare")
+
+    def test_retained_reserve_internal_abort_failure_blocks_retries_until_stop(self):
+        self.check_scenario("details-retained-reserve")
 
     def test_details_stop_discards_queued_event_and_legacy_restart_resets_format(self):
         self.check_scenario("details-stop")

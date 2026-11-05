@@ -76,9 +76,12 @@ class PMKIDTest(unittest.TestCase):
         active = _function(main, "hs_run_active_pmkid_probes")
         self.assertIn("HS_PMKID_ACTIVE_ATTEMPTS", active)
         self.assertLess(active.index("pmkid_capture_attempt_begin"),
-                        active.index("esp_wifi_connect"))
-        self.assertLess(active.index("esp_wifi_connect"),
+                        active.index("analyzer_tracked_wifi_connect"))
+        self.assertLess(active.index("analyzer_tracked_wifi_connect"),
                         active.index("pmkid_capture_attempt_end"))
+        tracked_connect = _function(main, "analyzer_tracked_wifi_connect")
+        self.assertIn("analyzer_sta_connect_pending = true", tracked_connect)
+        self.assertIn("esp_wifi_connect", tracked_connect)
         self.assertIn("active_phase=%s", active)
         worker = _function(main, "handshake_attack_task_sniffer")
         self.assertIn("phase=before_clients", worker)

@@ -39,7 +39,11 @@ static void security(const uint8_t *p, size_t len, bool rsn, sx_security_t *s) {
     if (pos == len) goto valid;
     if (len-pos < 2) return;
     uint16_t caps = le16(p+pos); pos += 2;
-    if (rsn) { s->pmf_capable = (caps & 0x80) != 0; s->pmf_required = (caps & 0x40) != 0; }
+    if (rsn) {
+        s->capabilities_present = true;
+        s->pmf_capable = (caps & 0x80) != 0;
+        s->pmf_required = (caps & 0x40) != 0;
+    }
     if (pos == len) goto valid;
     if (!rsn || len-pos < 2) return;
     uint16_t count = le16(p+pos); pos += 2;
@@ -88,6 +92,29 @@ static void wps_parse(const uint8_t *p, size_t len, sx_wps_t *w) {
     }
     w->status = SX_VALID;
 }
+static void rsnxe_parse(const uint8_t *p, size_t len, sx_rsnxe_t *r) {
+    r->present = true;
+    r->len = len > SX_RSNXE_BYTES ? SX_RSNXE_BYTES : (uint8_t)len;
+    r->truncated = len > SX_RSNXE_BYTES;
+    if (r->len != 0U) memcpy(r->bytes,p,r->len);
+    r->status = len == 0U || r->truncated ? SX_INVALID : SX_VALID;
+}
+static void country_parse(const uint8_t *p, size_t len, sx_country_t *country) {
+    size_t stored = len < sizeof(country->code) ? len : sizeof(country->code);
+    if (stored != 0U) memcpy(country->code,p,stored);
+    country->status = SX_INVALID;
+    if (len < sizeof(country->code)) return;
+    if (country->code[0] < 'A' || country->code[0] > 'Z' ||
+        country->code[1] < 'A' || country->code[1] > 'Z') return;
+    if (country->code[2] != ' ' && country->code[2] != 'I' &&
+        country->code[2] != 'O') return;
+    country->status = SX_VALID;
+}
+static void incomplete_advertisement(sx_observation_t *o, bool advertisement) {
+    if (!advertisement) return;
+    o->rsnxe.status = SX_INVALID;
+    o->country.status = SX_INVALID;
+}
 bool sx_parse(const uint8_t *f, size_t len, sx_observation_t *o) {
     if (!f || !o || len < 24 || (f[0]&0x0f) || (f[1]&0xc7) || (f[22]&0x0f)) return false;
     sx_source_t source; size_t fixed;
@@ -112,9 +139,9 @@ bool sx_parse(const uint8_t *f, size_t len, sx_observation_t *o) {
     uint8_t wps_bytes[SX_WPS_IE_BYTES];
     bool wps_seen = false, wps_overflow = false;
     while (pos < len) {
-        if (len-pos < 2) return true;
+        if (len-pos < 2) { incomplete_advertisement(o,advertisement); return true; }
         uint8_t id = f[pos], n = f[pos+1]; pos += 2;
-        if (n > len-pos) return true;
+        if (n > len-pos) { incomplete_advertisement(o,advertisement); return true; }
         const uint8_t *p = f+pos;
         if (id == 0) {
             if (n > 32 || o->ssid_present) return true;
@@ -127,6 +154,18 @@ bool sx_parse(const uint8_t *f, size_t len, sx_observation_t *o) {
         } else if (advertisement && id == 48) {
             if (o->rsn.status != SX_UNKNOWN) return true;
             security(p,n,true,&o->rsn);
+        } else if (advertisement && id == 244) {
+            if (o->rsnxe.status != SX_UNKNOWN) {
+                o->rsnxe.status = SX_INVALID;
+                return true;
+            }
+            rsnxe_parse(p,n,&o->rsnxe);
+        } else if (advertisement && id == 7) {
+            if (o->country.status != SX_UNKNOWN) {
+                o->country.status = SX_INVALID;
+                return true;
+            }
+            country_parse(p,n,&o->country);
         } else if (advertisement && id == 221 && n >= 4 &&
                    p[0] == 0 && p[1] == 0x50 && p[2] == 0xf2) {
             if (p[3] == 1) {
@@ -145,6 +184,8 @@ bool sx_parse(const uint8_t *f, size_t len, sx_observation_t *o) {
     if (advertisement) {
         if (o->rsn.status == SX_UNKNOWN) o->rsn.status = SX_ABSENT;
         if (o->wpa.status == SX_UNKNOWN) o->wpa.status = SX_ABSENT;
+        if (o->rsnxe.status == SX_UNKNOWN) o->rsnxe.status = SX_ABSENT;
+        if (o->country.status == SX_UNKNOWN) o->country.status = SX_ABSENT;
         if (wps_seen) {
             o->wps.present = true;
             if (wps_overflow) { o->wps.status = SX_INVALID; o->wps.truncated = true; }
@@ -161,12 +202,19 @@ void sx_apply(sx_ap_t *ap, const sx_observation_t *o) {
     if (o->source != SX_BEACON && o->source != SX_PROBE_RESP) return;
     ap->profile_source = o->source; ap->frame_status = o->complete ? SX_VALID : SX_INVALID;
     if (!o->complete) {
-        memset(&ap->rsn,0,sizeof(ap->rsn)); memset(&ap->wpa,0,sizeof(ap->wpa)); wps_init(&ap->wps);
-        ap->rsn.status = ap->wpa.status = ap->wps.status = SX_INVALID; ap->privacy = -1; return;
+        memset(&ap->rsn,0,sizeof(ap->rsn)); memset(&ap->wpa,0,sizeof(ap->wpa));
+        wps_init(&ap->wps); memset(&ap->rsnxe,0,sizeof(ap->rsnxe));
+        memset(&ap->country,0,sizeof(ap->country));
+        ap->rsn.status = ap->wpa.status = ap->wps.status = SX_INVALID;
+        ap->rsnxe.status = ap->country.status = SX_INVALID;
+        ap->privacy = -1; return;
     }
     if (o->source == SX_BEACON) ap->hidden = o->hidden;
-    ap->privacy = o->privacy; ap->rsn = o->rsn; ap->wpa = o->wpa; ap->wps = o->wps;
-    if (o->rsn.status == SX_INVALID || o->wpa.status == SX_INVALID || o->wps.status == SX_INVALID)
+    ap->privacy = o->privacy; ap->rsn = o->rsn; ap->wpa = o->wpa;
+    ap->wps = o->wps; ap->rsnxe = o->rsnxe; ap->country = o->country;
+    if (o->rsn.status == SX_INVALID || o->wpa.status == SX_INVALID ||
+        o->wps.status == SX_INVALID || o->rsnxe.status == SX_INVALID ||
+        o->country.status == SX_INVALID)
         ap->frame_status = SX_INVALID;
 }
 

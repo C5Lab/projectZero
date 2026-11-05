@@ -6,12 +6,19 @@ No ESP-IDF firmware build or radio operation occurs.
 
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def wsl_path(path):
+    path = Path(path).resolve()
+    return (f"/mnt/{path.drive.rstrip(':').lower()}/"
+            f"{path.relative_to(path.anchor).as_posix()}")
 
 
 def extract_function(source, name):
@@ -104,12 +111,23 @@ int main(void) {
             source_file = Path(tmp) / "scan_records.c"
             executable = Path(tmp) / "scan_records"
             source_file.write_text(code, encoding="utf-8")
-            subprocess.run(
-                ["gcc", "-std=c11", "-Wall", "-Wextra", "-Werror", str(source_file), "-o", str(executable)],
-                check=True,
-            )
+            compiler = next((shutil.which(name) for name in ("cc", "gcc", "clang")
+                             if shutil.which(name)), None)
+            flags = ["-std=c11", "-Wall", "-Wextra", "-Werror",
+                     "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+                     "-fno-omit-frame-pointer"]
+            if compiler:
+                command = [compiler, *flags, str(source_file),
+                           "-o", str(executable)]
+                run = [str(executable)]
+            else:
+                self.assertTrue(shutil.which("wsl.exe"), "host C compiler required")
+                command = ["wsl.exe", "cc", *flags, wsl_path(source_file),
+                           "-o", wsl_path(executable)]
+                run = ["wsl.exe", wsl_path(executable)]
+            subprocess.run(command, check=True)
             self.assertEqual(
-                subprocess.check_output([str(executable)], text=True),
+                subprocess.check_output(run, text=True),
                 "scan records: PASS\n",
             )
 

@@ -5,12 +5,49 @@
 #include <stdint.h>
 #include <stdio.h>
 
-static void expect_rgb(led_status_rgb_t actual, uint8_t red, uint8_t green, uint8_t blue)
+_Static_assert(LED_STATUS_IDLE == 0, "legacy activity ABI changed");
+_Static_assert(LED_STATUS_SCAN == 1, "legacy activity ABI changed");
+_Static_assert(LED_STATUS_MONITOR == 2, "legacy activity ABI changed");
+_Static_assert(LED_STATUS_CAPTURE == 3, "legacy activity ABI changed");
+_Static_assert(LED_STATUS_TRANSMIT == 4, "legacy activity ABI changed");
+_Static_assert(LED_STATUS_PORTAL == 5, "legacy activity ABI changed");
+_Static_assert(LED_STATUS_WPS == 6, "legacy activity ABI changed");
+_Static_assert(LED_STATUS_TRANSFER == 7, "legacy activity ABI changed");
+_Static_assert(LED_STATUS_OTA == 8, "legacy activity ABI changed");
+_Static_assert(LED_STATUS_ACTIVITY_COUNT == 9, "legacy activity ABI changed");
+_Static_assert(LED_STATUS_EVENT_HANDSHAKE_SAVED == 0,
+               "legacy event ABI changed");
+_Static_assert(LED_STATUS_EVENT_WPS_VERIFIED == 1,
+               "legacy event ABI changed");
+_Static_assert(LED_STATUS_EVENT_NEW_TARGET == 2,
+               "legacy event ABI changed");
+_Static_assert(LED_STATUS_EVENT_THREAT == 3,
+               "legacy event ABI changed");
+_Static_assert(LED_STATUS_EVENT_SHIELD_INFO == 4,
+               "Shield event ABI must append");
+_Static_assert(LED_STATUS_EVENT_SHIELD_WARN == 5,
+               "Shield event ABI must append");
+_Static_assert(LED_STATUS_EVENT_SHIELD_ALERT == 6,
+               "Shield event ABI must append");
+_Static_assert(LED_STATUS_EVENT_SHIELD_DECOY_TX == 7,
+               "Shield event ABI must append");
+_Static_assert(LED_STATUS_EVENT_COUNT == 8, "event ABI changed");
+_Static_assert(LED_STATUS_EVENT_QUEUE_CAPACITY == 4,
+               "legacy event FIFO capacity changed");
+
+static void expect_rgb_at(led_status_rgb_t actual, uint8_t red, uint8_t green,
+                          uint8_t blue, int line)
 {
+    if (actual.r != red || actual.g != green || actual.b != blue)
+        fprintf(stderr, "line %d: got %u,%u,%u expected %u,%u,%u\n", line,
+                actual.r, actual.g, actual.b, red, green, blue);
     assert(actual.r == red);
     assert(actual.g == green);
     assert(actual.b == blue);
 }
+
+#define expect_rgb(actual, red, green, blue) \
+    expect_rgb_at((actual), (red), (green), (blue), __LINE__)
 
 static void idle_and_manual_off(void)
 {
@@ -142,6 +179,58 @@ static void ota_masks_transient_flash(void)
     expect_rgb(led_status_render(&status, 1000), 0, 255, 0);
 }
 
+static void shield_overlays_restore_cyan_monitor(void)
+{
+    led_status_t status;
+
+    led_status_init(&status);
+    assert(led_status_set_activity(&status, LED_STATUS_MONITOR, true, 100U));
+    assert(led_status_queue_event(&status, LED_STATUS_EVENT_SHIELD_INFO, 100U));
+    expect_rgb(led_status_render(&status, 100U), 255, 128, 0);
+    expect_rgb(led_status_render(&status, 199U), 255, 128, 0);
+    expect_rgb(led_status_render(&status, 200U), 0, 0, 0);
+    expect_rgb(led_status_render(&status, 299U), 0, 0, 0);
+    expect_rgb(led_status_render(&status, 300U), 0, 255, 255);
+
+    led_status_init(&status);
+    assert(led_status_queue_event(&status, LED_STATUS_EVENT_SHIELD_WARN, 100U));
+    expect_rgb(led_status_render(&status, 100U), 255, 128, 0);
+    expect_rgb(led_status_render(&status, 199U), 255, 128, 0);
+    expect_rgb(led_status_render(&status, 200U), 0, 0, 0);
+    expect_rgb(led_status_render(&status, 300U), 255, 128, 0);
+    assert(led_status_set_activity(&status, LED_STATUS_MONITOR, true, 300U));
+    expect_rgb(led_status_render(&status, 400U), 0, 0, 0);
+    expect_rgb(led_status_render(&status, 499U), 0, 0, 0);
+    expect_rgb(led_status_render(&status, 500U), 0, 255, 255);
+
+    led_status_init(&status);
+    assert(led_status_queue_event(&status, LED_STATUS_EVENT_SHIELD_ALERT, 100U));
+    expect_rgb(led_status_render(&status, 100U), 255, 0, 0);
+    expect_rgb(led_status_render(&status, 199U), 255, 0, 0);
+    expect_rgb(led_status_render(&status, 200U), 0, 0, 0);
+    expect_rgb(led_status_render(&status, 300U), 255, 0, 0);
+    expect_rgb(led_status_render(&status, 400U), 0, 0, 0);
+    assert(led_status_set_activity(&status, LED_STATUS_MONITOR, true, 500U));
+    expect_rgb(led_status_render(&status, 500U), 255, 0, 0);
+    expect_rgb(led_status_render(&status, 600U), 0, 0, 0);
+    expect_rgb(led_status_render(&status, 699U), 0, 0, 0);
+    expect_rgb(led_status_render(&status, 700U), 0, 255, 255);
+
+    led_status_init(&status);
+    assert(led_status_queue_event(&status,
+                                  LED_STATUS_EVENT_SHIELD_DECOY_TX, 100U));
+    expect_rgb(led_status_render(&status, 100U), 255, 0, 0);
+    expect_rgb(led_status_render(&status, 149U), 255, 0, 0);
+    expect_rgb(led_status_render(&status, 150U), 0, 0, 0);
+    assert(led_status_set_activity(&status, LED_STATUS_MONITOR, true, 200U));
+    expect_rgb(led_status_render(&status, 200U), 255, 0, 0);
+    expect_rgb(led_status_render(&status, 250U), 0, 0, 0);
+    expect_rgb(led_status_render(&status, 300U), 255, 0, 0);
+    expect_rgb(led_status_render(&status, 350U), 0, 0, 0);
+    expect_rgb(led_status_render(&status, 399U), 0, 0, 0);
+    expect_rgb(led_status_render(&status, 400U), 0, 255, 255);
+}
+
 int main(void)
 {
     idle_and_manual_off();
@@ -151,6 +240,7 @@ int main(void)
     events_queue_in_order();
     rate_limit_and_manual_override();
     ota_masks_transient_flash();
+    shield_overlays_restore_cyan_monitor();
     puts("LED_STATUS_CORE_PASS");
     return 0;
 }

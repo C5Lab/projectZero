@@ -129,15 +129,6 @@ static BaseType_t xTaskCreate(void (*task)(void *), const char *name,
     *handle = &task_calls;
     return pdPASS;
 }
-static esp_err_t led_set_color(int red, int green, int blue) {
-    assert(red == 255 && green == 165 && blue == 0);
-    return ESP_OK;
-}
-static const char *esp_err_to_name(esp_err_t error) {
-    (void)error;
-    return "ESP_OK";
-}
-
 FUNCTION
 
 static void reset_fixture(void) {

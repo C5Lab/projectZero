@@ -13,13 +13,62 @@ static bool equals(const char *value, const char *expected)
     return value != NULL && strcmp(value, expected) == 0;
 }
 
+static bool is_security_command(const char *command)
+{
+    return equals(command, "wps_guard") || equals(command, "sae_guard") ||
+           equals(command, "wifi_trust");
+}
+
+static bool is_security_status(const char *command, const char *subcommand)
+{
+    return is_security_command(command) && equals(subcommand, "status");
+}
+
+static bool is_security_stop(const char *command, const char *subcommand)
+{
+    return is_security_command(command) && equals(subcommand, "stop");
+}
+
+static bool is_shield_control(const char *command, const char *subcommand)
+{
+    return equals(command, "wifi_shield") &&
+           (equals(subcommand, "status") || equals(subcommand, "report") ||
+            equals(subcommand, "log") || equals(subcommand, "stop"));
+}
+
+static bool is_client_isolation_status(const char *command,
+                                       const char *subcommand)
+{
+    return equals(command, "client_isolation_audit") &&
+           equals(subcommand, "status");
+}
+
+static bool is_router_audit_status(const char *command,
+                                   const char *subcommand)
+{
+    return equals(command, "router_audit") &&
+           (equals(subcommand, "status") || equals(subcommand, "db_status"));
+}
+
+static bool is_router_audit_operation(const char *command,
+                                      const char *subcommand)
+{
+    return equals(command, "router_audit") &&
+           (equals(subcommand, "scan_passive") ||
+            equals(subcommand, "scan_standard") ||
+            equals(subcommand, "db_verify") ||
+            equals(subcommand, "db_install"));
+}
+
 static bool is_status_read(const char *command, const char *subcommand)
 {
     return (equals(command, "wifi_analyzer") &&
             (equals(subcommand, "caps") || equals(subcommand, "status"))) ||
            (equals(command, "wps") && equals(subcommand, "status")) ||
            (equals(command, "secret") && equals(subcommand, "status")) ||
-           (equals(command, "sta_mac") && equals(subcommand, "status"));
+           (equals(command, "sta_mac") && equals(subcommand, "status")) ||
+           is_client_isolation_status(command, subcommand) ||
+           is_router_audit_status(command, subcommand);
 }
 
 static bool is_always_safe(const char *command, const char *subcommand)
@@ -47,8 +96,23 @@ janos_console_admission_result_t janos_console_admission_decide(
     bool analyzer_busy)
 {
     if (command == NULL || command[0] == '\0' ||
-        owner < JANOS_RADIO_OWNER_NONE || owner > JANOS_RADIO_OWNER_DEFENCE) {
+        owner < JANOS_RADIO_OWNER_NONE || owner > JANOS_RADIO_OWNER_SHIELD) {
         return JANOS_CONSOLE_BUSY_RADIO_LEASE;
+    }
+    if (owner == JANOS_RADIO_OWNER_SHIELD) {
+        return is_shield_control(command, subcommand) ||
+               is_security_status(command, subcommand) ||
+               is_defence_safe(command, subcommand) ?
+            JANOS_CONSOLE_ADMIT : JANOS_CONSOLE_BUSY_RADIO_LEASE;
+    }
+    if (owner == JANOS_RADIO_OWNER_SECURITY_MONITOR) {
+        return is_security_status(command, subcommand) ||
+               is_security_stop(command, subcommand) ||
+               is_client_isolation_status(command, subcommand) ||
+               is_router_audit_status(command, subcommand) ||
+               equals(command, "stop") || equals(command, "help") ||
+               equals(command, "ping") || equals(command, "version") ?
+            JANOS_CONSOLE_ADMIT : JANOS_CONSOLE_BUSY_RADIO_LEASE;
     }
     if (owner == JANOS_RADIO_OWNER_DEFENCE) {
         return is_defence_safe(command, subcommand) ?
@@ -58,6 +122,8 @@ janos_console_admission_result_t janos_console_admission_decide(
 
     bool analyzer_command = equals(command, "wifi_analyzer");
     bool sta_mac_set = equals(command, "sta_mac") && equals(subcommand, "set");
+    bool client_isolation_start = equals(command, "client_isolation_audit") &&
+                                  equals(subcommand, "start");
     bool wps_command = janos_wps_command_family_name(command);
     bool wps_uses_radio = janos_wps_named_operation_requires_radio(
         command, subcommand);
@@ -70,14 +136,27 @@ janos_console_admission_result_t janos_console_admission_decide(
     }
 
     if (owner == JANOS_RADIO_OWNER_ANALYZER) {
-        return analyzer_command || (wps_command && !wps_uses_radio) ?
+        return analyzer_command || (wps_command && !wps_uses_radio) ||
+               is_client_isolation_status(command, subcommand) ||
+               is_router_audit_status(command, subcommand) ?
             JANOS_CONSOLE_ADMIT : JANOS_CONSOLE_BUSY_RADIO_LEASE;
     }
     if (owner == JANOS_RADIO_OWNER_WPS) {
-        return wps_command ? JANOS_CONSOLE_ADMIT :
+        return wps_command || is_client_isolation_status(command, subcommand) ||
+               is_router_audit_status(command, subcommand) ?
+            JANOS_CONSOLE_ADMIT :
                              JANOS_CONSOLE_BUSY_RADIO_LEASE;
     }
+    if (is_security_command(command) || equals(command, "wifi_shield")) {
+        if (is_security_status(command, subcommand) ||
+            is_security_stop(command, subcommand) ||
+            is_shield_control(command, subcommand))
+            return JANOS_CONSOLE_ADMIT;
+        if (commands_inflight != 0U)
+            return JANOS_CONSOLE_BUSY_COMMAND_IN_PROGRESS;
+    }
     if ((analyzer_command || wps_uses_radio || sta_mac_set ||
+         client_isolation_start || is_router_audit_operation(command, subcommand) ||
          equals(command, "test_radio_channel") ||
          equals(command, "test_radio_channels")) &&
         commands_inflight != 0U) {
@@ -98,13 +177,13 @@ janos_console_admission_result_t janos_console_admission_begin(
     if (!lease || !token) return JANOS_CONSOLE_BUSY_RADIO_LEASE;
     *token = (janos_console_admission_token_t){0};
     janos_radio_lease_snapshot_t snapshot = janos_radio_lease_snapshot(lease);
-    /* ROM reset is allowed after a failed WPS restore, but only for this
-     * retained owner. The handler must still wait for its worker epilogue. */
+    /* Bare download is an explicit terminal request. An existing owner stays
+     * intact so cmd_download can run the owner's normal Stop path before it
+     * arms ROM boot. The inflight gate prevents racing another handler. */
     if (equals(command, "download") && subcommand == NULL &&
-        snapshot.owner == JANOS_RADIO_OWNER_WPS &&
-        snapshot.state == JANOS_RADIO_LEASE_QUARANTINED &&
-        snapshot.generation != 0U && commands_inflight == 0U &&
-        !analyzer_busy)
+        snapshot.owner != JANOS_RADIO_OWNER_NONE &&
+        snapshot.state != JANOS_RADIO_LEASE_IDLE &&
+        snapshot.generation != 0U && commands_inflight == 0U)
         return JANOS_CONSOLE_ADMIT;
     /* A failed Defence radio restore retains ownership. Only a bare reboot
      * may bypass that quarantined owner; running Defence still blocks it. */
@@ -114,12 +193,21 @@ janos_console_admission_result_t janos_console_admission_begin(
         snapshot.generation != 0U && commands_inflight == 0U &&
         !analyzer_busy)
         return JANOS_CONSOLE_ADMIT;
+    /* A retained passive monitor permits only a bare reboot once cleanup
+     * has finished unsuccessfully and no command remains in flight. */
+    if (equals(command, "reboot") && subcommand == NULL &&
+        snapshot.owner == JANOS_RADIO_OWNER_SECURITY_MONITOR &&
+        snapshot.state == JANOS_RADIO_LEASE_QUARANTINED &&
+        snapshot.generation != 0U && commands_inflight == 0U &&
+        !analyzer_busy)
+        return JANOS_CONSOLE_ADMIT;
     janos_console_admission_result_t result = janos_console_admission_decide(
         snapshot.owner, command, subcommand, commands_inflight, analyzer_busy);
     if (result != JANOS_CONSOLE_ADMIT) return result;
     /* WPS and analyzer acquire their long-lived lease before validating the
      * host baseline. Their own reservation rechecks any racing legacy start. */
-    if (is_always_safe(command, subcommand) ||
+    if (is_security_command(command) || equals(command, "wifi_shield") ||
+        is_always_safe(command, subcommand) ||
         janos_wps_command_family_name(command) ||
         (equals(command, "deauth_detector_v2") &&
          equals(subcommand, "defence")) ||

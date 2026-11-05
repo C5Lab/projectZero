@@ -216,6 +216,39 @@ later in this manual define output, persistence, admission and error behavior.
 | `secret status` | Inspect the volatile credential-vault state without revealing data. | [JanOS WPS laboratory workflows](janos-wps.md#secret-lifecycle-and-memory) |
 | `secret reveal` | Reveal the recovered PIN/key once, then wipe the retained copy. | [JanOS WPS laboratory workflows](janos-wps.md#secret-lifecycle-and-memory) |
 | `secret erase` | Explicitly wipe the volatile WPS result. | [JanOS WPS laboratory workflows](janos-wps.md#secret-lifecycle-and-memory) |
+| `wps_guard start` | Start passive WPS fragmentation forensics for BSSIDs from one completed scan. | [WPS Guard](#wps_guard) |
+| `wps_guard start --only <scan-index> [scan-index ...]` | Start the same passive monitor for selected scan BSSIDs only. | [WPS Guard](#wps_guard) |
+| `wps_guard status` | Read bounded fragment, anomaly, loss and lifecycle counters. | [WPS Guard](#wps_guard) |
+| `wps_guard stop` | Stop WPS Guard and retry any retained cleanup. | [WPS Guard](#wps_guard) |
+| `sae_guard start` | Start passive SAE authentication forensics for BSSIDs from one completed scan. | [SAE Guard](#sae_guard) |
+| `sae_guard start --only <scan-index> [scan-index ...]` | Start SAE Guard for an immutable selected BSSID set. | [SAE Guard](#sae_guard) |
+| `sae_guard status` | Read bounded SAE observation, loss and lifecycle counters. | [SAE Guard](#sae_guard) |
+| `sae_guard stop` | Stop SAE Guard and retry any retained cleanup. | [SAE Guard](#sae_guard) |
+| `wifi_trust baseline capture [--seconds <5..120>] [--only <scan-index> [scan-index ...]]` | Capture a bounded advertisement baseline on the current channel or sampled selected channels. | [Wi-Fi Trust Baseline](#wifi_trust) |
+| `wifi_trust baseline list` | Validate and print the stored baseline. | [Wi-Fi Trust Baseline](#wifi_trust) |
+| `wifi_trust baseline clear` | Recover and remove the stored baseline transactionally. | [Wi-Fi Trust Baseline](#wifi_trust) |
+| `wifi_trust monitor [--only <scan-index> [scan-index ...]]` | Compare current-channel or sampled selected-channel advertisements with the stored baseline. | [Wi-Fi Trust Baseline](#wifi_trust) |
+| `wifi_trust status` | Print bounded capture, monitor, storage and loss telemetry. | [Wi-Fi Trust Baseline](#wifi_trust) |
+| `wifi_trust stop` | Stop Trust capture/monitor and retry retained cleanup. | [Wi-Fi Trust Baseline](#wifi_trust) |
+| `wifi_shield start` | Start the combined passive evidence monitor after one bounded Shield-owned scan. | [Wi-Fi Shield](#wifi_shield) |
+| `wifi_shield start --only <scan-index> [scan-index ...]` | Start passive Shield on an immutable selected BSSID/channel snapshot. | [Wi-Fi Shield](#wifi_shield) |
+| `wifi_shield start --only <scan-index> [scan-index ...] --defence decoy-4way` | Explicitly enable the bounded selected-target Defence bridge. | [Wi-Fi Shield](#wifi_shield) |
+| `wifi_shield start --only <scan-index> [scan-index ...] --defence decoy-4way --pmkid-decoy` | Also enable the explicit experimental PMKID decoy. | [Wi-Fi Shield](#wifi_shield) |
+| `wifi_shield start --only <scan-index> [scan-index ...] --defence decoy-4way --pmkid-decoy --multi-vector` | Opt in to at most one successful decoy response per enabled attack vector in one BSSID campaign. | [Wi-Fi Shield](#wifi_shield) |
+| `wifi_shield start --only <scan-index> [scan-index ...] --protect-all` | Start the autonomous preset: active bounded Deauth/PMKID deception plus passive WPS/SAE/Trust monitoring. | [Wi-Fi Shield](#wifi_shield) |
+| `wifi_shield status` | Read aggregate targets, coverage, source counters, drops and lifecycle state. | [Wi-Fi Shield](#wifi_shield) |
+| `wifi_shield report` | Read the bounded V2 campaign and AP-health snapshot without changing radio or session state. | [Wi-Fi Shield](#wifi_shield) |
+| `wifi_shield log status` | Read the bounded V2 journal state and counters without mounting storage or changing session state. | [Wi-Fi Shield](#wifi_shield) |
+| `wifi_shield stop` | Stop Shield or retry retained quarantined cleanup. | [Wi-Fi Shield](#wifi_shield) |
+| `client_isolation_audit start <peer-ipv4> <32-hex-token> [--port <1024..65535>] [--count <1..10>]` | Test an explicitly owned same-subnet peer with authenticated bounded UDP challenges. | [Client Isolation Audit](#client_isolation_audit) |
+| `client_isolation_audit status` | Read the last sanitized isolation-audit summary. | [Client Isolation Audit](#client_isolation_audit) |
+| `router_audit scan passive` | Inventory the connected gateway from cached/local evidence with zero network transmission. | [Router Audit and signed CVE catalog](#router_audit) |
+| `router_audit scan standard --owned` | Run bounded gateway-only discovery against an explicitly owned router. | [Router Audit and signed CVE catalog](#router_audit) |
+| `router_audit status` | Read the last bounded audit outcome plus a fresh trusted installed-catalog validation. | [Router Audit and signed CVE catalog](#router_audit) |
+| `router_audit db status` | Revalidate the trusted commit/journal/pair, signature, catalog structure and current time state. | [Router Audit and signed CVE catalog](#router_audit) |
+| `router_audit db verify` | Verify the staged pair, or recover and verify the installed pair when no stage exists. | [Router Audit and signed CVE catalog](#router_audit) |
+| `router_audit db install` | Verify and install the staged signed catalog using trusted time. | [Router Audit and signed CVE catalog](#router_audit) |
+| `router_audit db install --allow-time-unknown` | Explicitly permit install when trusted time is unavailable and persist that fact. | [Router Audit and signed CVE catalog](#router_audit) |
 | `wifi_country status` | Show configured and active Wi-Fi country information. | [Settings](#settings) |
 | `wifi_country list` | List accepted two-character country profiles. | [Settings](#settings) |
 | `wifi_country set <CC>` | Persist a country profile for application after reboot. | [Settings](#settings) |
@@ -293,6 +326,651 @@ are described under [STA MAC boot policy](#sta-mac-boot-policy).
 See the [protocol and admission rules](wifi-analyzer-protocol.md), [shared-radio
 contract](janos-radio-lease.md), [hardware smoke-test runbook](wifi-analyzer-smoke-test.md)
 and [device evidence](wifi-analyzer-device-validation.md).
+
+### `wps_guard`
+
+Built-in help is exactly:
+`Passive WPS fragment forensics: start [--only indexes...] | status | stop`.
+
+- **Commands**: `wps_guard start`,
+  `wps_guard start --only <scan-index> [scan-index ...]`, `wps_guard status`,
+  and `wps_guard stop`. No alias is provided. The existing active `wps`,
+  `jwps`, `selftest` and `secret` commands keep their syntax and behavior.
+- **Targets and channel scope**: Start resolves whole target records from one
+  completed scan before acquiring the security-monitor lease. Scan indexes are
+  one-based scan indexes. Bare `start` snapshots every result; `--only`
+  snapshots only the listed targets. The owned BSSID filter and channel plan
+  are immutable for the session, so a later scan-cache change cannot retarget
+  or retune the monitor. Missing, duplicate, nonnumeric or out-of-range indexes
+  and zero or group BSSIDs are rejected. Observations always describe the
+  currently received/tuned channel. When one effective selected channel remains
+  pinned, coverage is continuous for that channel; multiple unique selected
+  channels are sampled in scan order with a 250 ms per-channel dwell. Failed
+  retunes do not advance the plan and are retried later. This sampling does not
+  guarantee complete multi-channel coverage, and silence on a channel is not
+  evidence of absence.
+- **Bounds**: WPS Guard tracks at most eight live flows, accepts at most a
+  4096-byte declared WSC length and applies a 5000 ms inactivity timeout.
+  Expiry requires inactivity strictly greater than 5000 ms: the first expired
+  instant is 5000001 us, not at 5000000 us. A flow is keyed by BSSID, station
+  and direction. Identical retransmissions are counted as telemetry, not
+  anomalies.
+
+The monitor recognizes unprotected EAPOL/EAP Expanded WSC fragmentation and
+publishes bounded `[WPS_GUARD/1]` evidence records. Event fields are BSSID,
+station, direction, channel, RSSI, opcode, fragment count, declared and observed
+lengths, retransmission count, reason, severity, truncation and monotonic
+timestamp. `status` and terminal records add received, filtered, unrelated,
+completion, anomaly, timeout, capacity, RX-drop, output-failure, active-flow and
+lifecycle counters. `RX_DROPS` is the saturated sum of shared-runtime
+`dropped_pool` and `dropped_queue`; `CAPACITY_DROPS` remains the distinct WPS
+flow-table capacity counter. The public event reason tokens are:
+
+- `first_missing_length`;
+- `declared_not_larger_than_first`;
+- `declared_over_limit`;
+- `repeated_length_field`;
+- `opcode_changed`;
+- `eap_id_conflict`;
+- `observed_exceeds_declared`;
+- `final_length_mismatch`;
+- `empty_more_fragment`;
+- `session_timeout`;
+- `session_capacity`;
+- `frame_truncated`;
+- `invalid_envelope`.
+
+The status `REASONS` vector also reserves its first positions for internal
+`none`, `retransmission` and `complete` counters; these three do not produce
+event records. Timeout/capacity records express bounded uncertainty, not a
+claim that all RF traffic was received.
+
+WPS Guard is passive and evidence-only. It sends no Fragment ACK, EAP response,
+enrollment message, PIN verification, association request or raw TX. It neither
+reuses the active WPS reassembly path nor materializes a WSC message. Its
+flow/session state and telemetry retain and print no payload bytes, WSC
+attributes, nonces, keys, PINs, credentials or authentication tags. The shared
+runtime temporarily owns the bounded frame copy described in the runtime
+manual; the metadata-only core keeps only bounded lengths, counters and a
+non-cryptographic fragment fingerprint used to compare observed fragments.
+
+Current operator terminal outcomes are:
+
+| Outcome | Meaning |
+| --- | --- |
+| `stopped` | A requested cancellation/Stop completed verified cleanup. |
+| `busy` | Another session, radio owner or mutable legacy-radio baseline prevented Start. |
+| `invalid` | CLI, scan snapshot, target validation or startup setup failed; any acquired resources are rolled back first. |
+| `timeout` | Startup cancellation/lifecycle contention or worker join did not complete in the allowed time. |
+| `queue_overflow` | Verified cleanup completed, but shared-runtime pool/queue drops make the received observation set incomplete. |
+| `restore_failed` | Saved channel/filter state or the cleanup/release sequence could not be verified. |
+| `output_failed` | The bounded record sink failed; feature processing fail-closes until Stop. |
+
+When a cleanup produces a lifecycle result, deduplication permits one terminal
+per cleanup attempt. Concurrent Start rollback, Stop and uncertainty reporting
+share that attempt. If uncertainty retains the context, a later retry receives
+a new terminal. The session retains persistent output-failure evidence in its
+live/final status, so the retry result remains `output_failed` even when that
+retry finishes radio cleanup successfully.
+
+On successful session cleanup, any retained `RX_DROPS` evidence and no
+higher-priority output or cleanup failure means successful cleanup reports
+`queue_overflow`, not `stopped`. The scan mutex and output gate each wait at
+most 250 ms, and publisher-queue admission has the same bound. In full: the
+scan mutex, output gate and publisher-queue admission each wait at most 250 ms.
+Lifecycle callers never wait for the UART driver. A dedicated publisher writes
+each complete record in one UART transaction; a full queue or publisher failure
+marks output failure and fail-closes the live monitor without holding the
+feature state critical section across I/O. To keep asynchronous publication
+failure scoped to the session that produced it, a new Start remains busy until
+prior-session publications resolve.
+
+`wps_guard stop` and global `stop` close callback admission, drain accepted
+frames, join the worker, restore the saved promiscuous filter and channel,
+zeroize the module state and release the radio owner. No new timeout event is
+created after callback closure. A worker-join or filter/channel restore failure
+retains the context and target snapshot: failed cleanup keeps the radio owner
+quarantined. A later `wps_guard stop` or global `stop` retries cleanup, and no
+terminal success is emitted while cleanup is uncertain. Conflicting radio
+commands remain refused until verified cleanup succeeds.
+
+An alert describes a malformed or inconsistent sequence observed by JanOS. It
+does not attribute a sender, does not prove WPSplinter, and does not prove that
+a device is exploitable. Disabled WPS advertisement does not prove that legacy
+WPS code is unreachable. Conversely, observing a malformed sequence does not
+prove that a particular router accepts it or is vulnerable. Establishing that
+requires separately approved, controlled-device and RF evidence.
+
+### `sae_guard`
+
+Built-in help is exactly:
+`Passive SAE authentication forensics: start [--only indexes...] | status | stop`.
+
+- **Commands**: `sae_guard start`,
+  `sae_guard start --only <scan-index> [scan-index ...]`, `sae_guard status`,
+  and `sae_guard stop`. The existing active `sae_overflow` keeps its existing syntax, help and behavior; SAE Guard is a separate passive mode.
+- **Targets**: Start copies BSSID, sanitized SSID evidence, scan channel and
+  eligibility from one completed scan into a private immutable whole-target
+  snapshot in byte-addressable PSRAM. Indexes are one-based. Missing,
+  duplicate, nonnumeric, zero, overflowing or out-of-range indexes, zero or
+  group BSSIDs, and zero channels are rejected. A later scan-cache change
+  cannot retarget the monitor.
+- **Coverage**: one effective selected channel remains pinned for continuous
+  coverage; multiple unique selected channels are sampled in scan order with a
+  250 ms per-channel dwell. Failed retunes retry the same channel. Evidence is
+  accepted only on the currently tuned channel through the single shared
+  callback. Sampling does not claim complete RF reception, and silence on a
+  channel is not evidence of absence.
+
+SAE Guard accepts only selected, unprotected Authentication management frames
+whose authentication algorithm is SAE (3). Transaction 1 is classified as a
+Commit and transaction 2 as a Confirm. For groups 19, 20 and 21, the parser
+validates the bounded scalar/element minima; matching Confirm bodies have
+minimum total lengths of 40, 56 and 72 bytes. Transaction-1 status 126 (Hash-to-Element) and status 127 (SAE-PK) remain Commit-bearing modes and undergo the same known-group checks. Transaction-1 status 76 anti-clogging requires a complete group and keeps any token opaque; status 77 unsupported-group remains a distinct response without an inferred group. Unknown groups remain observable and are not malformed merely because the group is unknown. Protected Authentication bodies are hidden and cannot be classified as SAE evidence.
+
+The core has two independent fixed tables: 32 `(BSSID, station, direction)` pairs for Commit/Confirm correlation and 32 independent malformed-BSSID rows for aggregation across stations and directions. It emits evidence at these conservative thresholds:
+
+- three malformed SAE frames for one BSSID in a half-open ten-second window;
+- eight unconfirmed Commit observations for one pair in that window;
+- three distinct group identifiers for one uncompleted pair in that window.
+
+The window expires exactly at ten seconds. An identical sequence/group retry is
+retry telemetry; a first-seen or changed retry counts once as a Commit. A
+matching successful Confirm clears the attempt counts while the per-window
+alert cooldown remains until expiry. Simultaneous threshold crossings retain
+combined reasons in deterministic enum order.
+
+Every event, status and terminal line uses `[SAE_GUARD/1]` and CRLF. Event
+records include BSSID, station, direction, channel, RSSI, transaction, status,
+group or `unknown`, Commit/Confirm/malformed counts, window, reason, severity,
+interpretation and monotonic timestamp. Status and terminal records include
+aggregate `CAPACITY_DROPS` plus independent `PAIR_DROPS` and
+`MALFORMED_DROPS`. `RX_DROPS` is the saturated sum of shared-runtime pool and
+queue loss; it expresses incomplete reception rather than detector capacity.
+The public interpretations are `observation`, `malformed_observation` and
+`potential_dos`. Terminal precedence is exactly `output_failed > restore_failed > queue_overflow > stopped`; diagnostic `busy`, `invalid` and `timeout` outcomes remain available for their defined lifecycle failures.
+
+SAE Guard is passive and evidence-only. It sends no SAE Commit, SAE Confirm, anti-clogging token, status response, deauthentication, disassociation or channel-switch announcement. It retains and prints no scalar, element, token, password identifier, password, PMK or raw payload. `sae_guard stop` and global `stop` use the shared cleanup order and retry quarantined cleanup; output failure fail-closes the feature until Stop. When SAE Guard is inactive, existing scan, sniffer, deauth detector, help, `sae_overflow` and global Stop behavior remains compatible.
+
+Short or malformed SAE evidence may resemble parser-risk conditions such as
+CVE-2026-72003, but the observation cannot identify a vulnerable driver and
+cannot prove exploitation or code execution. It cannot prove attribution, password compromise or that WPA3 is broken. Commit bursts indicate possible resource pressure, not a broken password exchange. These are evidence labels, not a live CVE-catalog match or a statement that a target executes vulnerable code.
+
+### `wifi_trust`
+
+Built-in help is exactly:
+`Wi-Fi trust baseline: baseline capture/list/clear | monitor [--only indexes...] | status | stop`.
+
+The accepted command forms are:
+
+```text
+wifi_trust baseline capture [--seconds <5..120>] [--only <scan-index> [scan-index ...]]
+wifi_trust baseline list
+wifi_trust baseline clear
+wifi_trust monitor [--only <scan-index> [scan-index ...]]
+wifi_trust status
+wifi_trust stop
+```
+
+Capture duration must be 5 through 120 seconds; the default is 15 seconds.
+Scan indexes are one-based, unique decimal entries from the most recent
+completed scan. Bare capture and monitor remain current channel only: they use
+no scan snapshot, no initial tune and no channel hopping, and capture observes
+all received BSSIDs. `--only` freezes immutable complete selected target
+records, tunes to the first selected channel, and uses 250 ms sampled residence
+over the distinct selected channels. A failed retune is retried without moving
+the channel cursor. The existing `SCOPE=current_channel` wire value is
+unchanged; `CHANNEL` follows the actually resident selected channel. Sampled
+silence is not proof that a selected BSSID or event is absent. Trust remains
+passive: neither mode probes, associates nor transmits a raw frame.
+
+Bare capture and monitor remain current-channel only. `--only` uses sampled
+residence, while `SCOPE=current_channel` remains byte-for-byte unchanged. The
+runtime migration changes ownership only; it adds no Trust CLI token, wire
+field, Shield output or presentation path.
+
+An operator workflow is:
+
+1. Run `scan_networks` and inspect the current scan results.
+2. In a known-good network state, run `wifi_trust baseline capture`, optionally
+   with `--only` scan indexes and a bounded `--seconds` value.
+3. Run `wifi_trust baseline list` to validate and inspect the published rows.
+4. Run `wifi_trust monitor`, with the same optional target selection, then use
+   `wifi_trust status` and `wifi_trust stop` as needed.
+
+The primary identity is BSSID. An SSID change is evidence; a new BSSID is not
+automatically merged with an existing same-SSID row. BSSID changes can be
+legitimate in mesh and extender deployments, after hardware replacement, or
+after administrator reconfiguration. Every result is evidence, not attribution:
+drift does not identify an attacker, an evil twin, compromise or exploitability.
+
+The baseline contains at most 128 profiles and is stored at
+`/sdcard/lab/wifi-trust/baseline-v1.jsonl`. Its strict, LF-only schema is one
+version-1 header, zero to 128 canonical AP records sorted by BSSID, then one end
+record. The end record carries record count and CRC32 over the exact AP lines,
+including each LF. Binary SSID, selector, RSNXE, WPS text and Country values are
+bounded hex; they are not treated as UTF-8. A boot ID and optional trusted Unix
+creation time distinguish boot-relative observation timestamps. The `PRIVACY`
+value is only the advertised 802.11 Capability Information privacy bit; it is
+not a claim about user privacy, negotiated client security or confidentiality.
+
+The states `unknown`, `absent`, `valid`, and `invalid` remain distinct.
+`unknown` never overwrites confirmed evidence or becomes a downgrade. `absent`
+requires a complete advertisement. A malformed advertisement can emit
+`malformed_observation`, but it does not mutate the saved baseline. Capture
+publishes only complete, conflict-free profiles after verified radio cleanup;
+cancel, startup failure or cleanup uncertainty preserves the previous file.
+
+Publication uses stage, target and backup paths plus checked file and volume
+sync operations. Recovery runs before load, publish and clear. `ok_backup_pending`
+means the new target is readable but backup removal was not completed;
+`published_uncertain` means publication may have taken effect but final durable
+state was not proved; `recovered_retry` means recovery changed the filesystem
+and the operator must retry the requested operation. These map to terminal
+`storage_uncertain` or `storage_failed` rather than false success. The host model
+checks rollback preservation, but real SD durability and FAT power-loss behavior
+remain device acceptance work; the manual does not claim power-loss atomicity.
+
+Versioned UART records are `[WIFI_TRUST/1] EVENT`, `[WIFI_TRUST/1] BASELINE`,
+`[WIFI_TRUST/1] STATUS`, and `[WIFI_TRUST/1] TERMINAL`. Events own BSSID, bounded
+SSID evidence, channel, Beacon/Probe source, changed field, baseline/current
+value, reason, severity, `CONFIDENCE=observation` and monotonic timestamp. Public
+reason tokens are `new_bssid`, `ssid_changed`, `akm_changed`, `cipher_changed`,
+`pmf_downgrade`, `rsnxe_changed`, `wps_enabled`, `wps_lock_changed`,
+`country_changed`, `channel_changed`, `advertisement_conflict`, and
+`malformed_observation`.
+
+Status and terminal lines include `SCOPE=current_channel`, channel, baseline
+metadata, storage/recovery state, receive/filter/invalid/profile/conflict counts,
+severity counts, capacity/RX drops, output/storage failures, and running/stopping
+state. Terminal outcomes are `ok`, `stopped`, `busy`, `invalid`, `timeout`,
+`queue_overflow`, `restore_failed`, `storage_failed`, `storage_uncertain`, and
+`output_failed`. Output failure has highest precedence; verified cleanup cannot
+claim a complete observation set after capacity or shared-runtime loss.
+
+Trust is passive and evidence-only. It sends no probe, authentication,
+association, deauthentication, disassociation or raw frame and stores no packet
+payload or credential. When inactive, ordinary and extended sniffer rows,
+scanning, selection, help, and legacy global Stop bytes remain compatible.
+Current validation is host-only: it does not prove firmware compilation,
+FreeRTOS scheduling, driver callback fencing, RF reception, on-device channel
+restore, PSRAM behavior or real SD durability. Firmware build, flash, controlled
+RF work and real-SD/power-loss testing require separate approval.
+
+### `wifi_shield`
+
+Built-in help is exactly:
+`Wi-Fi Shield: start [--only indexes...] [--protect-all | --defence decoy-4way [--pmkid-decoy [--multi-vector]]] | status | report | log status | stop`.
+
+The accepted command forms are exactly:
+
+```text
+wifi_shield start
+wifi_shield start --only <scan-index> [scan-index ...]
+wifi_shield start --only <scan-index> [scan-index ...] --defence decoy-4way
+wifi_shield start --only <scan-index> [scan-index ...] --defence decoy-4way --pmkid-decoy
+wifi_shield start --only <scan-index> [scan-index ...] --defence decoy-4way --pmkid-decoy --multi-vector
+wifi_shield start --only <scan-index> [scan-index ...] --protect-all
+wifi_shield status
+wifi_shield report
+wifi_shield log status
+wifi_shield stop
+```
+
+Bare `start` performs one bounded scan while Shield owns its preparing lease,
+then monitors the immutable valid BSSID/channel results. `--only` resolves
+one-based indexes from a completed scan before radio mutation. Invalid,
+duplicate or stale indexes reject the entire command. `status`, `report` and
+`log status` are read-only. `report` emits bounded `[SHIELD/2] CAMPAIGN` and
+`[SHIELD/2] AP_HEALTH` records followed by zero or more
+`[SHIELD/2] RECOMMENDATION` records; `log status` emits one bounded
+`[SHIELD/2] LOG` record. Both commands remain usable while Shield owns the
+radio lease; the central admission gate treats them as read-only Shield
+control, while the Shield parser still rejects malformed subcommands. After
+cleanup they read a retained scalar snapshot
+from a separate permanent PSRAM block rather than the wiped per-session PSRAM
+state. That retained block is reset on the next accepted Shield start, and
+neither command mounts storage,
+writes the journal, tunes a channel, transmits, or admits radio work. Their
+behavior is covered by the executable CLI and lifecycle harnesses, not only by
+documentation string checks.
+
+After the unchanged `[SHIELD/1] ARMED` record, a successful start publishes one
+bounded target-identity record for every immutable selected target:
+
+```text
+[SHIELD/1] TARGET N=1/1 SSID="TP-Link_0E90" BSSID=b0:be:76:70:0e:90 CH=4
+```
+
+`N=<ordinal>/<total>` follows selection order. An empty SSID is printed as
+`SSID="<hidden>"`; quotes, backslashes and non-printable SSID bytes are escaped
+inside the quoted value, so scan evidence cannot inject another UART record.
+The formatter uses the existing bounded start buffer and does not allocate.
+
+Campaigns are keyed only by selected BSSID and retain normalized source
+evidence. Threat order is `quiet -> watch -> attack -> critical`. The
+correlation window is 30 seconds and the idle deadline is 60 seconds. An
+isolated informational observation produces `REASON=isolated_activity`; an
+isolated alert produces `REASON=isolated_alert`; correlated evidence from at
+least two sources produces `REASON=cross_vector`. Loss lowers confidence but
+never erases an observed event. `RX_DROPS`, `EVENT_DROPS`,
+`OUTPUT_FAILURES`, `JOURNAL_DROPS` and sampled channel coverage therefore make
+confidence limited without inventing or deleting source facts. Campaign IDs
+are local to one Shield session and do not identify a transmitter.
+`SESSION_PEAK` retains the highest threat reached by that BSSID during the
+current Shield session, while `COMPLETED` is the saturating number of campaigns
+closed by idle expiry or Stop. A later quiet campaign therefore cannot hide an
+earlier Critical result in the operator report.
+
+AP Health is a passive advisor for selected BSSIDs. It uses validated Beacon
+and Probe Response posture plus observed beacon timing, RSSI, channel/CSA,
+retry, Deauth/Disassoc and fresh neighbor evidence. It never changes router
+settings. Beacon sequence gaps and jitter are local observations, not AP-side
+packet-loss measurements; sampled coverage and local drops visibly limit their
+confidence. Each advice item is a separate bounded record:
+`[SHIELD/2] RECOMMENDATION BSSID=<mac> ACTION=<token> EVIDENCE=<token>
+CONFIDENCE=<observed|limited>`. A recommendation reports its evidence and
+uncertainty; it does not claim a vulnerability or a successful defence.
+`EPOCH_CHANGES`, `CHANNEL_CHANGES` and `CSA_EVENTS` are reported separately.
+CSA activity alone does not establish channel instability because the
+announcement is spoofable; `channel_unstable` requires at least two observed
+channel/band changes. `tsf_epoch_change_observed` likewise reports a spoofable
+TSF discontinuity and does not claim that the selected AP restarted. The
+JSONL recommendation state is a complete replacement set. A new
+revision/index/count envelope makes a partially lost set detectable, an
+unchanged periodic revision is only a reference, and count zero explicitly
+withdraws the previous set. If admission loses any member of a replacement
+set, the next selected Beacon opens a newer revision and retries the complete
+set; the original admission loss remains counted.
+
+Every accepted Shield start makes one automatic journal attempt at
+`/sdcard/lab/shield/shield-b<boot_id>-s<session_id>.jsonl.part`. The per-session
+ceiling is 8 MiB. A dedicated writer owns the file and drains a fixed PSRAM
+queue. The same transactional session bundle owns its journal coordinator and
+writer stack; partial allocation rolls back without an internal-RAM fallback.
+The journal queue depth is 32 PSRAM records. High-rate Deauth, Disassoc and CSA
+observations are coalesced per selected BSSID/type into one-second windows
+before queue admission. Their JSONL records add `count`, `first_boot_us`,
+`last_boot_us` and `window_us`; detector, campaign, AP-health and `[SHIELD/1]`
+counters still consume every observation. WPS, SAE, Trust and PMKID events stay
+individually journaled. This bounds an RF burst without hiding its total and
+still leaves room for AP health and a complete recommendation set. An aggregate
+rejected by the zero-wait queue is closed and its represented observation count
+is added once to `DROPS`/`ADMISSION_DROPS`; it is never merged into the next
+one-second window.
+The radio callback never formats JSON or calls the filesystem. Clean
+Stop appends the actual terminal result, flushes and synchronizes the file and
+SD metadata, closes it, and renames `.jsonl.part` to `.jsonl`. The same clean
+finalization then creates:
+
+```text
+/sdcard/lab/shield/shield-b<boot_id>-s<session_id>-summary.txt
+/sdcard/lab/shield/00-LATEST.txt
+```
+
+The summary is a human-readable scalar view with target/SSID, BSSID, channel,
+mode, outcome, monotonic duration, threat, event totals, Defence options,
+journal integrity and AP recommendations. For a multi-target session, the named
+primary target is the first selected target and recommendations are scoped only
+to that BSSID. It never contains WPS PINs, PSKs,
+nonces, MIC/key material or station identities. `00-LATEST.txt` names the most
+recent clean JSONL and summary. It is a convenience pointer updated from a
+synced temporary file; the uniquely named JSONL files remain authoritative if
+power is lost while that pointer is replaced.
+
+Missing SD,
+open/write/encode/sync failure, a full queue, or the quota is fail-open for
+monitoring and Defence. `wifi_shield log status` reports state, path, bytes,
+queue high-water, aggregate drops/failures, separate admission/encoding/write/
+sync/finalization domains, sidecar failures through the aggregate failure count,
+and available time sources. A summary/latest failure never rolls back a
+finalized JSONL. Storage has no
+in-session retry, and Shield never deletes older journals to make room; repair
+or replace storage before the next session.
+
+Radio cleanup uncertainty is different from a storage failure. A failed radio
+restore durably checkpoints `session_uncertain`, retains the `.part` session,
+PSRAM and writer, and reports `SHIELD/QUARANTINED`. A later
+`wifi_shield stop` may recover the same radio generation, append its one actual
+terminal, and finalize that same journal. A terminal admission or writer join
+timeout retains a storage-pending owner; its later retry is storage-only and
+does not repeat radio cleanup. A permanently unavailable/degraded journal is
+reported but cannot by itself quarantine a radio that restored cleanly.
+
+The authoritative journal ordering is `boot_id`, `session_id`, `sequence` and
+monotonic `boot_us`. AP TSF is AP-relative and spoofable, never UTC. Exact TSF
+comes from a Beacon/Probe Response; a fresh matching anchor may produce a
+bounded estimated TSF. JSONL names these quality fields `ap_tsf_quality` and
+`ap_tsf_uncertainty_us`. Calendar `epoch_ms` appears only with an already trusted
+GPS clock and is always emitted as the complete `epoch_ms`, `time_source=gps`
+and `time_uncertainty_ms` tuple. The current whole-second `time(NULL)` adapter
+uses a conservative 1000 ms uncertainty. Untrusted time clears both scalar
+fields and emits none of the tuple; Shield does not associate, start SNTP, or
+fabricate wall time. AP-health JSONL keeps every measurement while using the
+bounded schema keys `jitter_avg_us`, `same_neighbors`, `overlap_neighbors`,
+`continuity_conf` and `timing_conf`.
+Journal records contain normalized scalar evidence only: no raw frames, WPS
+PINs, PSKs, PMKs, nonces, MIC/key material, station identities, or complete
+decoy material.
+
+Use this hardware acceptance flow only for an owned or explicitly authorized
+AP; `--protect-all` enables bounded active Deauth/PMKID deception:
+
+```text
+scan_networks
+wifi_shield start --only <scan-index> --protect-all
+wifi_shield status
+wifi_shield report
+wifi_shield log status
+wifi_shield stop
+wifi_shield report
+wifi_shield log status
+list_dir lab/shield -s
+```
+
+Expected legacy indicators remain `[SHIELD/1] ARMED`, `[SHIELD/1] STATUS` and
+one `[SHIELD/1] TERMINAL`; their existing bytes are unchanged. Successful start
+adds one `[SHIELD/1] TARGET` record per selected target immediately after
+`ARMED`, so consumers must ignore additive versioned record types they do not
+use.
+Read-only V2 commands produce `[SHIELD/2] CAMPAIGN`, `[SHIELD/2] AP_HEALTH`,
+`[SHIELD/2] RECOMMENDATION` and `[SHIELD/2] LOG` as evidence becomes available.
+A healthy clean run ends with `STATE=finalized`, a `.jsonl`, a matching
+`-summary.txt`, and `00-LATEST.txt`. With no SD,
+`LOG STATE=unavailable` is expected while Shield continues. Verify an
+interrupted `.part`, full-card behavior, RF results and on-device task
+high-water separately; a successful firmware build or host harness does not
+prove them.
+
+`stop` is idempotent and can retry retained cleanup; global stop does the same
+before legacy Wi-Fi teardown. The internal `wifi_shield_start_*_profile`
+functions, module enums and roadmap items are not public CLI.
+
+Passive Shield makes exactly zero TX calls, including malformed input, queue
+pressure, hopping and Stop. Defence requires `--only` and the exact
+`--defence decoy-4way` value. It can act only for an immutable selected BSSID
+and snapshotted channel whose scan evidence is WPA2-PSK/CCMP. Unknown,
+unselected, multicast, malformed and unsupported-AKM observations stay
+observe-only. `--pmkid-decoy` is separately explicit and experimental in the
+granular form: `--defence decoy-4way` alone never implies it. The explicit
+`--protect-all` preset is the exception and enables it as part of the complete
+policy. In Shield, a selected Open Authentication plus Association sequence is
+first a bounded PMKID candidate, not immediate attack proof. Shield waits 30 ms
+for a matching standards-shaped EAPOL M2 from the same BSSID/station/channel.
+M2 cancels the candidate, produces
+`decision=observe reason=association_complete`, and causes no PMKID event,
+counter contribution or decoy TX. Only a candidate still incomplete at the
+deadline publishes `SOURCE=pmkid TYPE=sequence` and, when explicitly enabled,
+reaches the existing PMKID-decoy policy. This grace gate uses fixed session
+state in the Shield PSRAM arena and performs no heap allocation. It does not
+change the legacy `deauth_detector_v2` wire or response timing.
+`--multi-vector` is valid only after that complete granular active form.
+Without it, the first successful PMKID or four-way decoy retains the existing
+cross-action satisfied latch until 20 seconds of matching-BSSID inactivity.
+With it, one successful PMKID decoy and one successful four-way decoy may run,
+in either order, during the same BSSID campaign. Repeats of an already
+completed action remain suppressed, a failed TX does not complete that action,
+and the existing PMKID and four-way rate limits still bound retries. Another
+BSSID remains observe-only while the campaign lock is active. The opt-in mode
+announces `policy=multi_vector`; its release record keeps the compatible last
+`response=` token and adds `completed=decoy_pmkid+decoy_4way` when both
+responses completed. `--protect-all` is an explicit preset for the complete
+selected-target active form: it enables `decoy-4way`, `pmkid-decoy` and
+`multi-vector` while retaining the already combined passive WPS, SAE and Trust
+monitors. It cannot be combined with granular Defence options. Its records
+identify `MODE=protect-all`, `ACTIVE=deauth,pmkid` and
+`PASSIVE=wps,sae,trust`. WPS, SAE and Trust never trigger an active response.
+
+A one-channel plan reports `COVERAGE=continuous`, subject to driver and RX-drop
+uncertainty. A multi-channel plan reports `COVERAGE=sampled`; only the current
+resident channel is observed, so silence is not proof of absence. WPS activity
+does not prove Pixie Dust, exploitation or a vulnerable router. SAE evidence
+does not identify an attacker, and Trust drift does not prove an evil twin.
+A completed decoy TX does not prove prevention, client retention or that a real
+handshake was not captured. PMF/802.11w remains the protocol control for
+protected management frames.
+
+Large Shield state, frame slots, target snapshots, histories, queues and task
+stacks are allocated in PSRAM with
+`MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT` and `portBYTE_ALIGNMENT`. There is no
+fallback to internal SRAM. Allocation is transactional; a failure prevents
+`ARMED`. Successful cleanup closes callback and TX admission, joins workers,
+drains output, restores radio state, wipes PSRAM and verifies lease release
+before successful terminal publication. Uncertain callback close, join, TX
+quiescence, filter/channel restore or lease release retains
+`SHIELD/QUARANTINED`; `wifi_shield stop` or global stop retries it, and no
+successful terminal is emitted while uncertainty remains.
+
+Shield is an evidence and bounded-deception sensor, not a firewall. Host tests
+do not prove firmware compilation, device behavior, physical PSRAM/SD behavior
+or RF behavior. Firmware build, flash, physical storage, controlled passive RF
+and separately authorized active Defence remain distinct acceptance gates.
+
+### `client_isolation_audit`
+
+Built-in help is exactly:
+`Owned peer isolation audit: start <peer-ipv4> <32-hex-token> [--port 1024..65535] [--count 1..10] | status`.
+
+The accepted command forms are:
+
+```text
+client_isolation_audit start <peer-ipv4> <32-hex-token> [--port <1024..65535>] [--count <1..10>]
+client_isolation_audit status
+```
+
+`start` is a synchronous, owned-lab transaction. The default port is `48731`
+and the default probe count is `3`. Count is limited to 1 through 10. Each
+probe is limited to 32 datagrams per probe and 1000 ms per probe; setup and all
+probes share a 15000 ms total command deadline. The peer must be a numeric IPv4
+address in the connected STA subnet. JanOS accepts contiguous prefixes `/1`
+through `/30` and rejects the local address, gateway, network, broadcast,
+multicast, unspecified and limited-broadcast addresses. It snapshots BSSID,
+local address, netmask, gateway and interface twice before socket I/O; any
+connection change rejects the run.
+
+Use this copy-ready owned-lab workflow:
+
+1. On the second owned client, start the peer:
+   `python tools/client_isolation_peer.py --bind 0.0.0.0 --port 48731`.
+   Without `--token`, its generated secret is printed once to stderr as
+   `[ISO_PEER_TOKEN/1] <32-uppercase-hex>`. An explicit test secret may instead
+   be supplied with `--token <32-hex-token>` and is not echoed.
+2. Copy that token to JanOS without saving it in shell history or evidence.
+   The token is an authentication secret and never appears in `[ISO_PEER/1]`
+   JSONL or any `[ISO_AUDIT/1]` record. JanOS overwrites the CLI token, frees
+   console history and wipes its fixed 16-byte internal copies on every exit.
+3. Confirm both owned clients are on the same SSID/BSSID, or record the exact
+   intended multi-AP topology. Confirm the peer IPv4 is in the same subnet and
+   the host firewall permits the selected UDP port.
+4. Run `client_isolation_audit start <peer-ipv4> <token>`, adding matching
+   `--port` and an optional `--count`. Keep the peer awake; client sleep, a host
+   firewall, packet loss or an incorrect topology can all suppress replies.
+5. Retain the paired JanOS `RUN` value and peer JSONL `run` value, then stop the
+   peer with Ctrl+C. The peer binds to the first authenticated run and suppresses
+   replayed challenges in a bounded window; restart it before a different run.
+
+The peer emits secret-free `[ISO_PEER/1]` JSON objects with `monotonic_ms`,
+`valid`, `replied`, `run`, `sequence`, `source_ip`, `source_port` and `type`.
+JanOS emits complete CRLF records:
+
+- `[ISO_AUDIT/1] BEGIN` owns `BSSID`, `LOCAL`, `PEER`, `PORT`, `COUNT` and
+  `RUN`;
+- `[ISO_AUDIT/1] PROBE` owns `SEQ`, `SEND`, `VALID`, `INVALID`, `TIMEOUT` and
+  `RTT_MS`;
+- `[ISO_AUDIT/1] END` owns `SENT`, `VALID`, `INVALID`, `TIMEOUTS`,
+  `DURATION_MS` and `OUTCOME`;
+- `[ISO_AUDIT/1] STATUS` is either `AVAILABLE=0` or
+  `AVAILABLE=1 SENT=<n> VALID=<n> INVALID=<n> TIMEOUTS=<n> DURATION_MS=<n> OUTCOME=<token>`.
+
+One authenticated matching reply proves that the tested client-to-client path
+was reachable and produces `peer_reachable`; for an AP expected to isolate
+clients, that is a tested isolation failure. No authenticated replies is
+`inconclusive_no_reply` and never proves isolation. Invalid or unrelated
+datagrams are telemetry only. Final evidence precedence is
+`peer_reachable > local_error > cancelled > inconclusive_no_reply`: proof is
+retained even if a later local error or cancellation occurs, while
+`local_error` outranks cancellation without proof. `status` does not repeat a
+token, nonce or tag, and there is deliberately no feature-specific Stop command.
+
+Current evidence is host-only and does not prove firmware compilation, device
+socket behavior, AP isolation, RF delivery or a real network result. Separate
+device/network acceptance requires explicit approval and an owned AP tested
+with isolation both off and on, an owned peer kept awake, documented host
+firewall state, an independent capture, three repeated paired runs, and a
+second owned AP/SSID topology where supported. Silence remains inconclusive in
+every device run.
+
+### `router_audit`
+
+Built-in help is exactly:
+`Gateway inventory/CVE audit: scan passive | scan standard --owned | status | db status|verify|install [--allow-time-unknown]`.
+
+The accepted forms are exactly:
+
+```text
+router_audit scan passive
+router_audit scan standard --owned
+router_audit status
+router_audit db status
+router_audit db verify
+router_audit db install
+router_audit db install --allow-time-unknown
+```
+
+`scan passive` uses the connected STA/IP snapshot, cached gateway ARP entry and
+local OUI evidence only; passive mode performs zero network I/O. `scan standard
+--owned` is authorized only for a router you own or are permitted to test. It
+sends one unicast SSDP M-SEARCH to the literal gateway, accepts at most four
+gateway-source responses within one 2000 ms transaction budget, follows at
+most one strictly validated gateway HTTP location, and sends one bounded HEAD
+request. It never multicasts, resolves a host name, follows a redirect, tries
+credentials, changes configuration or contacts an off-gateway address.
+
+Identity is evidence, not attribution. Only a confirmed, nonconflicting,
+nontruncated exact vendor/model identity is eligible for catalog lookup.
+`EXACT_FIRMWARE` means that the exact normalized firmware string occurs in one
+reviewed rule; `MODEL_CANDIDATE` means only that the exact model matched and a
+person must review the advisory. The command never claims that a router is
+vulnerable or exploitable, safe, patched or compromised.
+
+The versioned `[ROUTER_AUDIT/1]` records, source-governance policy, signed
+`JCVE/1`/`JCSG/1` release process, pair-atomic install/recovery behavior and
+separate build/device acceptance gates are specified in
+[Router CVE catalog governance](router-cve-catalog.md). Untrusted text is
+percent-escaped and each complete record is published in one bounded write.
+The firmware performs no download of vulnerability data.
+
+`db install --allow-time-unknown` is an explicit exception, not a freshness
+claim. Its `TIME_UNKNOWN=1` state is bound into the trusted commit and remains
+visible after recovery. A release must provision an approved production trust
+anchor by key ID; this repository deliberately provisions none, so an
+unprovisioned build returns `UNKNOWN_KEY` rather than accepting a test key.
+
+Current validation is host-only. It includes no firmware build, no real
+router, no real SD/NVS and no physical power-cut. The host Mbed TLS development
+package was unavailable, so the production adapter has a source gate rather
+than an ESP-IDF compile result. Firmware build, trust-anchor provisioning and
+owned-router testing each require separate approval.
 
 ### `wps`, `jwps`, `selftest` and `secret`
 
@@ -383,11 +1061,12 @@ WFACTL1 busy line and nonzero console result documented in
   - Repeated BSSID/TX/RX/target/mode/class announcements are limited to once per two seconds regardless of countdown/RSSI/source subtype. First announcements for up to 16 distinct keys can be emitted per two-second window. Extra observations exceeding this capacity and event-queue overflow are reported separately. Stop/restart clears queued events and rate state.
   - Announcements can be legitimate AP channel changes, including DFS; they do not establish an attack. Hopping coverage depends on band mode, connection state, regulatory settings and dwell time. Initial tuning failures abort startup; later tuning failures are reported at most every two seconds. The detector does not force a band-mode change on an existing connection.
 - `deauth_detector_v2 [i1 i2 ... | --only i1 i2 ...] [trace] [defence [pmkid-decoy]]` — use the same no-argument startup scan, channel selection, `--only` BSSID filtering, CSA output, and `stop` behavior with detailed deauth records. Versioned deauth/disassoc forensic evidence is enabled by default in every V2 form and has no separate command token. Supported passive forms remain `deauth_detector_v2`, `deauth_detector_v2 1 3`, and `deauth_detector_v2 --only 1 3`. Active Defence is accepted only with a fresh, completed `--only` selection; otherwise startup fails with `Defence requires --only protected scan indices.`
+  - V2 now runs as a Deauth-only compatibility profile of the shared Wi-Fi Shield runtime. This ownership migration does not change legacy V2 record bytes, ordering, Forensics, Trace, Defence, LED or OLED behavior. The legacy `deauth_detector` remains on its direct established path.
   - Trace examples: `deauth_detector_v2 trace`, `deauth_detector_v2 1 3 trace`, and `deauth_detector_v2 --only 1 3 trace`. A successful trace start reports `[DETECTOR_TRACE] armed` immediately after `[DETECTOR_INFO] format=deauth_v2`. The first queued DEAUTH event accepted by the current selection starts a one-second confirmation and reports `[DETECTOR_TRACE] confirming_bssid=<bssid> first_channel=<ch> window_ms=1000`. Only observations claiming that first BSSID contribute to the choice; other accepted DEAUTH records are still emitted normally. Confirmation samples receive channels within ±2 on 2.4 GHz, or the previous/current/next entries in the detector's 5 GHz channel list. It selects the channel with the most frames, then the strongest average RSSI; the BSSID's startup scan-cache channel wins an exact tie, followed by the first receive channel. The final result is `[DETECTOR_TRACE] locked_channel=<ch>` and stops detector-initiated hopping. Locking can therefore occur after several `[DEAUTH_V2]` records rather than before the first one.
   - After passive Trace locks, an unknown BSSID gets a 750 ms SSID-resolution window on that channel. A matching beacon or probe response with a non-empty SSID fills a detector-only eight-entry cache without scanning. If the window expires unresolved, JanOS performs exactly one active scan limited to that BSSID and locked channel, with 20–60 ms active dwell, then drains its private result without replacing the main scan cache or changing `--only` indices. A miss is not retried during the same Trace lock. The first event can therefore remain `SSID: <Unknown>` while later records use the resolved name. Hidden/empty SSIDs and absent responses remain unknown. This resolver is disabled in Defence mode. The fallback active scan can transmit 802.11 probe requests; it is not a countermeasure and sends no deauthentication, disassociation, jamming, CSA, or decoy handshake frame.
   - During confirmation, selected-channel forms can temporarily sample nearby channels; `--only` still filters by the captured BSSIDs. CSA/ECSA announcements, short frames, and filtered DEAUTH frames do not start or score confirmation, and advertised CSA `TO` is never used as the lock channel. Queue-overflow losses are not scored and can bias the sample. A spoofed DEAUTH can start confirmation, including under `--only` if it claims a watched BSSID. A failed final tune reports `[DETECTOR_TRACE] lock_failed_channel=<ch> error=<name>` at a limited rate, returns to hopping, and lets a later accepted DEAUTH begin a new confirmation.
   - While locked, only an accepted DEAUTH claiming the confirmed BSSID refreshes the idle deadline. After 20 seconds without such an observation, Trace emits `[DETECTOR_TRACE] released_channel=<ch> reason=idle idle_ms=20000`, immediately emits `[DETECTOR_TRACE] armed`, and resumes detector-initiated hopping. CSA/ECSA and other BSSIDs do not keep the lock alive. Queue overflow can drop the matching observations that would have refreshed the deadline and can therefore cause an early release. A later eligible DEAUTH starts a new one-second confirmation. `stop` clears pending confirmation, the idle deadline, and an established lock; a new run starts armed but unlocked. A connected Wi-Fi mode can still let the driver control the physical radio channel, so continuous residency is not guaranteed. A DEAUTH observation alone does not establish an attack, prove that it ended, or prove a client disconnected. Trace provides no active defense and transmits no countermeasure frames; only the bounded SSID fallback above may actively probe. The legacy `deauth_detector` command is unchanged.
-  - Defence examples are `deauth_detector_v2 --only 1 3 trace` (passive Trace), `deauth_detector_v2 --only 1 3 trace defence` (bounded decoy four-way response), and `deauth_detector_v2 --only 1 3 trace defence pmkid-decoy` (also the experimental PMKID decoy). `defence` implies fast Trace even when the explicit `trace` token is omitted. JanOS copies the selected BSSIDs and channels from the completed scan, emits `[DETECTOR_WATCH]` proof lines, then acquires `JANOS_RADIO_OWNER_DEFENCE`. Unknown or unselected BSSIDs are observe-only and can never reach raw TX. Active response TX and its Trace lock stay pinned to the selected BSSID's startup scan channel; an overlapping receive observed while Trace samples an adjacent 2.4 GHz channel cannot steer a response away from the protected AP. Passive Trace channel scoring is unchanged.
+  - Defence examples are `deauth_detector_v2 --only 1 3 trace` (passive Trace), `deauth_detector_v2 --only 1 3 trace defence` (bounded decoy four-way response), and `deauth_detector_v2 --only 1 3 trace defence pmkid-decoy` (also the experimental PMKID decoy). `defence` implies fast Trace even when the explicit `trace` token is omitted. JanOS copies the selected BSSIDs and channels from the completed scan, emits `[DETECTOR_WATCH]` proof lines, then starts `WIFI_SECURITY_MODULE_DEAUTH_V2` under `JANOS_RADIO_OWNER_SECURITY_MONITOR`. Unknown or unselected BSSIDs are observe-only and can never reach raw TX. Active response TX and its Trace lock stay pinned to the selected BSSID's startup scan channel; an overlapping receive observed while Trace samples an adjacent 2.4 GHz channel cannot steer a response away from the protected AP. Passive Trace channel scoring is unchanged.
   - The default active response is limited to scan entries confirmed as WPA2-PSK/CCMP. It sends a coherent decoy EAPOL M1+M2 made from a fresh random 256-bit PMK; it does not send deauthentication, disassociation, jamming, or corrective/reverse CSA. WPA3-SAE-only, OWE, mixed/unsupported, open, WEP, and non-CCMP profiles report `observe_only_unsupported_akm`. The decoy does not prevent a real handshake from also being captured and must not be described as proof that an attack ended.
   - The first successful decoy PMKID or four-way response latches that BSSID as satisfied. Further eligible triggers refresh activity but remain observe-only until 20 seconds of inactivity releases and rearms the BSSID. This cross-action latch prevents a PMKID success from being followed by an unnecessary four-way decoy. The underlying failure limits remain one pair per 1000 ms and at most three attempts in a rolling 10 second window; they still bound retries when a response does not complete. `pmkid-decoy` additionally correlates one Open Authentication Request with Association/Reassociation from the same station within 2000 ms and retains its per-BSSID/station 5000 ms limit. A full PMKID station table fails closed instead of evicting a still-active cooldown. PMKID mode is experimental because a legitimate client join has the same observable sequence; it is never enabled by ordinary Defence.
   - Defence telemetry is emitted only by the worker as `[DETECTOR_DEFENCE] armed`, `trigger`, `provisional_bssid`, `tx`, `suppressed`, `released_bssid`, and `stopped` records. Repeated `rate_limited_cooldown`, `rate_limited_window`, and `pmkid_rate_limited` observations are aggregated per BSSID for one second as `[DETECTOR_DEFENCE] suppressed=<n> reason=<token> BSSID=<mac> window_ms=1000`. A satisfied latch stays silent while traffic continues: `response_satisfied` never produces a periodic serial line. Its observations are counted and reported once when that campaign becomes idle as `[DETECTOR_DEFENCE] released_bssid=<mac> channel=<ch> reason=idle idle_ms=20000 response=<decoy_4way|decoy_pmkid> suppressed=<n>`. Stop reports `[DETECTOR_DEFENCE] stopped observations=<n> tx_pairs=<n> pmkid_m1=<n> responses=<n> satisfied=<n> errors=<n> dropped=<n> outcome=<responded|observed|idle>`. `responded` means that at least one decoy TX completed, `observed` means selected-target traffic was processed without a successful response, and `idle` means no selected-target observation was processed. None of these values proves that an attack was prevented or that a real handshake was not captured. Duplicate active-mode `[DEAUTH_V2]` lines remain omitted, while default `[DEAUTH_FORENSIC/1]` evidence remains visible and OLED detection counters remain complete. Passive V2 and passive Trace output are unchanged. No PMK, PTK, KCK, nonce, or other raw secret is printed. `stop` first closes the RX generation, disables further response TX, disables promiscuous receive, joins the worker, restores the saved channel, zeroizes material, and releases the lease. Failed or uncertain restore remains fail-closed under the shared radio lease.
@@ -773,7 +1452,7 @@ Requires an nRF24L01+ wired to SPI2 (SCK=6, MOSI=7, MISO=2, CSN=3, CE=4).
 - `reboot` — reboot the device.
 - `ping` — connectivity test; replies `pong` even while another operation owns the radio.
 - `version` — print firmware version (`JanOS version: X.Y.Z`) even while another operation owns the radio.
-- `download` — reboot into ROM download (UART flashing) mode. Also admitted after a WPS cleanup failure retains a quarantined radio lease, once the WPS worker has finished; it resets directly to ROM without claiming in-place radio recovery.
+- `download` — force a transition into ROM download (UART flashing) mode. A bare command is admitted while a radio owner is active, runs the universal `stop` path, and arms ROM boot only after every affected worker reports a safe stop; a failed or uncertain Stop refuses the transition without setting the ROM flag. Extra arguments and a genuinely concurrent command remain blocked. The retained `WPS/QUARANTINED` recovery remains a separate terminal path: once callbacks are closed and the WPS worker has finished, it wipes retained buffers and resets directly to ROM without claiming in-place radio recovery.
 - `help [command]` — list all commands or show help for one.
 
 ---

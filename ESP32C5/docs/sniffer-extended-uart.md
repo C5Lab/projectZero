@@ -40,6 +40,14 @@ The original command bodies are frozen in
 `tests/fixtures/sniffer_legacy_commands.c` and executed against the modified
 bodies in host tests, including empty SSIDs, punctuation, vendors, filters and ties.
 
+The parser also retains bounded RSNXE and Country IE evidence internally for
+Wi-Fi Trust Baseline. RSNXE and Country IE evidence is not added to the legacy
+or `extended` UART suffix documented here, so all existing field order, limits
+and bytes remain unchanged. Trust records expose these fields only through the
+separate versioned `[WIFI_TRUST/1]` schema. A missing element in a complete
+advertisement is `absent`; a duplicate, truncated or malformed element is
+`invalid`; a field not established by a qualifying advertisement is `unknown`.
+
 ## Wire grammar and limits
 
 Every suffix starts with ` | ext_ver=1 | `; all further fields use exactly

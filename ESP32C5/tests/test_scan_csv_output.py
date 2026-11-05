@@ -60,6 +60,7 @@ static const char *TAG = "scan-test";
 static bool vendor_enabled;
 
 #define pdMS_TO_TICKS(ms) (ms)
+#define VENDOR_RECORD_NAME_BYTES 60
 #define MY_LOG_INFO(tag, ...) do { (void)(tag); printf(__VA_ARGS__); putchar('\n'); } while (0)
 static void vTaskDelay(int ticks) { (void)ticks; }
 static bool vendor_is_enabled(void) { return vendor_enabled; }
@@ -120,7 +121,7 @@ class ScanCsvOutputTest(unittest.TestCase):
         source = (ROOT / "main/main.c").read_text(encoding="utf-8")
         functions = "\n\n".join(
             production_function(source, name)
-            for name in ("escape_csv_field", "print_network_csv", "print_scan_results")
+            for name in ("escape_csv_quoted_content", "print_network_csv", "print_scan_results")
         )
         c_file = directory / "scan_csv_test.c"
         c_file.write_text(PRELUDE + functions + SETUP, encoding="utf-8")
@@ -149,7 +150,11 @@ class ScanCsvOutputTest(unittest.TestCase):
                 compiler, "-std=c11", "-Wall", "-Wextra", "-Werror", str(c_file),
                 "-o", cls.executable,
             ]
-        subprocess.run(compile_command, check=True, capture_output=True, text=True)
+        build = subprocess.run(compile_command, capture_output=True, text=True)
+        if build.returncode:
+            raise RuntimeError(
+                f"scan CSV host compilation failed:\n{build.stdout}\n{build.stderr}"
+            )
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -189,23 +194,18 @@ class ScanCsvOutputTest(unittest.TestCase):
         )
         self.assertEqual(self.parsed_rows("plain"), self.expected_rows("O'Brien"))
 
-    # Known printer defects: keep these assertions active without breaking CI
-    # before the planned production fix. Remove the decorators with that fix.
-    @unittest.expectedFailure
     def test_comma_in_oui_vendor_preserves_eight_fields_and_network_identity(self) -> None:
         self.assertEqual(
             self.parsed_rows("vendor"),
             self.expected_rows("O'Brien", "HUAWEI TECHNOLOGIES CO.,LTD"),
         )
 
-    @unittest.expectedFailure
     def test_comma_and_quote_in_ssid_preserve_eight_fields_and_network_identity(self) -> None:
         self.assertEqual(
             self.parsed_rows("ssid"),
             self.expected_rows('O\'Brien, "Lab"'),
         )
 
-    @unittest.expectedFailure
     def test_comma_without_quote_in_ssid_preserves_network_identity(self) -> None:
         self.assertEqual(
             self.parsed_rows("ssid_comma"),
@@ -218,7 +218,6 @@ class ScanCsvOutputTest(unittest.TestCase):
             self.expected_rows("ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"),
         )
 
-    @unittest.expectedFailure
     def test_32_quotes_in_ssid_are_escaped_without_truncation(self) -> None:
         self.assertEqual(
             self.parsed_rows("quotes32"),

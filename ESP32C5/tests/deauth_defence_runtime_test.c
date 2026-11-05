@@ -19,10 +19,14 @@ typedef struct {
     unsigned notify_calls;
     unsigned random_calls;
     unsigned tune_calls;
+    unsigned radio_enter_calls;
+    unsigned radio_leave_calls;
     unsigned tx_calls;
     unsigned fail_random_call;
     unsigned fail_tx_call;
     bool fail_tune;
+    bool fail_radio_enter;
+    bool fail_radio_leave;
     bool fail_builder;
     bool stop_after_first_tx;
     bool stop_before_first_tx;
@@ -56,6 +60,21 @@ static int fake_tune(void *opaque, uint8_t channel)
     ++fixture->tune_calls;
     fixture->tuned_channel = channel;
     return fixture->fail_tune ? -1 : 0;
+}
+
+static int fake_radio_enter(void *opaque, uint8_t channel)
+{
+    fixture_t *fixture = opaque;
+    ++fixture->radio_enter_calls;
+    fixture->tuned_channel = channel;
+    return fixture->fail_radio_enter ? -1 : 0;
+}
+
+static int fake_radio_leave(void *opaque)
+{
+    fixture_t *fixture = opaque;
+    ++fixture->radio_leave_calls;
+    return fixture->fail_radio_leave ? -1 : 0;
 }
 
 static int fake_tx(void *opaque, const uint8_t *frame, size_t length,
@@ -455,6 +474,10 @@ static void invalid_start_and_join_timeout(void)
     assert(!deauth_defence_runtime_start(&runtime, &config));
 
     config = config_for(&fixture, false);
+    config.multi_vector = true;
+    assert(!deauth_defence_runtime_start(&runtime, &config));
+
+    config = config_for(&fixture, false);
     assert(deauth_defence_runtime_start(&runtime, &config));
     assert(deauth_defence_runtime_arm(&runtime, 7U));
     runtime.processing = true;
@@ -619,6 +642,75 @@ static void telemetry_counters_saturate(void)
     assert(pmkid_runtime.stats.pmkid_m1 == UINT32_MAX);
 }
 
+static void radio_fence_spans_the_complete_response(void)
+{
+    fixture_t fixture = {.now_us = 9600100};
+    deauth_defence_runtime_t runtime = {0};
+    fixture.runtime = &runtime;
+    deauth_defence_config_t config = config_for(&fixture, false);
+    config.radio_enter = fake_radio_enter;
+    config.radio_leave = fake_radio_leave;
+    assert(deauth_defence_runtime_start(&runtime, &config));
+    assert(deauth_defence_runtime_arm(&runtime, 7U));
+
+    deauth_defence_runtime_observation_t event =
+        observation(DEF_TRIG_DEAUTH, 9600000);
+    assert(deauth_defence_runtime_process(&runtime, &event));
+    assert(fixture.radio_enter_calls == 1U);
+    assert(fixture.radio_leave_calls == 1U);
+    assert(fixture.tune_calls == 0U);
+    assert(fixture.tuned_channel == 6U);
+    assert(fixture.tx_calls == 2U);
+
+    fixture.now_us += DEAUTH_DEFENCE_PAIR_COOLDOWN_US + 1;
+    assert(deauth_defence_runtime_abort_confirmation(&runtime));
+    fixture.fail_radio_leave = true;
+    assert(!deauth_defence_runtime_process(&runtime, &event));
+    assert(fixture.radio_enter_calls == 2U);
+    assert(fixture.radio_leave_calls == 2U);
+    assert(runtime.stats.errors == 1U);
+    assert_contains(&fixture, "result=error frames=2 latency_us=1000101 error=fence");
+}
+
+static void multi_vector_runtime_completes_both_responses(void)
+{
+    fixture_t fixture = {.now_us = 9700100};
+    deauth_defence_runtime_t runtime = {0};
+    fixture.runtime = &runtime;
+    deauth_defence_config_t config = config_for(&fixture, true);
+    config.multi_vector = true;
+    assert(deauth_defence_runtime_start(&runtime, &config));
+    assert(deauth_defence_runtime_arm(&runtime, 7U));
+    assert_contains(&fixture,
+        "[DETECTOR_DEFENCE] armed targets=1 trace=fast pmkid=decoy policy=multi_vector\n");
+
+    deauth_defence_runtime_observation_t pmkid =
+        observation(DEF_TRIG_PMKID_PROBE, 9700000);
+    assert(deauth_defence_runtime_process(&runtime, &pmkid));
+    assert(fixture.tx_calls == 1U);
+    assert(deauth_defence_runtime_confirm(&runtime, AP, 6U));
+
+    fixture.now_us += 100;
+    deauth_defence_runtime_observation_t deauth =
+        observation(DEF_TRIG_DEAUTH, fixture.now_us);
+    assert(deauth_defence_runtime_process(&runtime, &deauth));
+    assert(fixture.tx_calls == 3U);
+    assert(runtime.stats.pmkid_m1 == 1U);
+    assert(runtime.stats.tx_pairs == 1U);
+
+    ++fixture.now_us;
+    assert(deauth_defence_runtime_process(&runtime, &deauth));
+    ++fixture.now_us;
+    assert(deauth_defence_runtime_process(&runtime, &pmkid));
+    assert(fixture.tx_calls == 3U);
+    assert(runtime.stats.satisfied == 2U);
+
+    fixture.now_us += DEAUTH_DEFENCE_IDLE_RELEASE_US;
+    assert(deauth_defence_runtime_poll_idle(&runtime));
+    assert_contains(&fixture,
+        "[DETECTOR_DEFENCE] released_bssid=02:00:00:00:00:01 channel=6 reason=idle idle_ms=20000 response=decoy_4way completed=decoy_pmkid+decoy_4way suppressed=2\n");
+}
+
 int main(void)
 {
     successful_fast_pair();
@@ -633,6 +725,8 @@ int main(void)
     concurrent_stop_counts_completed_pmkid_m1();
     suppression_capacity_covers_every_target_and_reason();
     telemetry_counters_saturate();
+    radio_fence_spans_the_complete_response();
+    multi_vector_runtime_completes_both_responses();
     puts("deauth defence runtime: PASS");
     return 0;
 }

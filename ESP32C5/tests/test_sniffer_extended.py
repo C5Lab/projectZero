@@ -28,6 +28,7 @@ def function(source, name):
     return source[begin:end]
 
 COMMON = r'''
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

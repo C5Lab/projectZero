@@ -52,6 +52,24 @@ class LegacyConsoleRegistryTest(unittest.TestCase):
         )
         self.assertEqual(missing, [], "legacy command is not registered exactly once")
 
+    def test_wifi_shield_is_registered_once_with_exact_help_and_stop_order(self):
+        source = MAIN.read_text(encoding="utf-8")
+        registration = re.search(
+            r"const\s+esp_console_cmd_t\s+wifi_shield_cmd\s*=\s*\{(.*?)\n\s*\};",
+            source, flags=re.S)
+        self.assertIsNotNone(registration, "wifi_shield command is not declared")
+        body = registration.group(1)
+        self.assertIn('.command = "wifi_shield"', body)
+        self.assertIn('.help = WIFI_SHIELD_HELP_TEXT', body)
+        self.assertIn('.func = &wifi_shield_command', body)
+        self.assertEqual(source.count("esp_console_cmd_register(&wifi_shield_cmd)"), 1)
+
+        stop = source.split("static int cmd_stop(int argc, char **argv) {", 1)[1].split(
+            'MY_LOG_INFO(TAG, "Stop command received', 1)[0]
+        self.assertIn("wifi_shield_stop(5000)", stop)
+        self.assertLess(stop.index("wifi_shield_stop(5000)"),
+                        stop.index("wifi_security_runtime_stop(5000)"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -150,22 +150,34 @@ int main(void)
     assert(pthread_join(startup_observer_thread, NULL) == 0);
     assert(!atomic_load_explicit(&invalid_startup_snapshot, memory_order_acquire));
 
+    const janos_radio_owner_t security_monitor_owner =
+        JANOS_RADIO_OWNER_SECURITY_MONITOR;
+    const janos_radio_owner_t owner_pairs[][2] = {
+        {JANOS_RADIO_OWNER_SHIELD, JANOS_RADIO_OWNER_WPS},
+        {security_monitor_owner, JANOS_RADIO_OWNER_ANALYZER},
+        {security_monitor_owner, JANOS_RADIO_OWNER_WPS},
+        {security_monitor_owner, JANOS_RADIO_OWNER_LEGACY},
+        {security_monitor_owner, JANOS_RADIO_OWNER_DEFENCE},
+        {JANOS_RADIO_OWNER_ANALYZER, JANOS_RADIO_OWNER_WPS},
+        {JANOS_RADIO_OWNER_LEGACY, JANOS_RADIO_OWNER_WPS},
+        {JANOS_RADIO_OWNER_DEFENCE, JANOS_RADIO_OWNER_WPS},
+    };
     for (unsigned iteration = 0; iteration < ITERATIONS; ++iteration) {
+        const unsigned pair = iteration %
+            (sizeof(owner_pairs) / sizeof(owner_pairs[0]));
         atomic_bool start = ATOMIC_VAR_INIT(false);
         atomic_bool stop_observer = ATOMIC_VAR_INIT(false);
         atomic_bool invalid_snapshot = ATOMIC_VAR_INIT(false);
         atomic_uint ready = ATOMIC_VAR_INIT(0U);
         contender_t analyzer = {
             .lease = &lease,
-            .owner = iteration % 3U == 0U ? JANOS_RADIO_OWNER_DEFENCE :
-                     iteration % 2U ? JANOS_RADIO_OWNER_ANALYZER :
-                                      JANOS_RADIO_OWNER_LEGACY,
+            .owner = owner_pairs[pair][0],
             .start = &start,
             .ready = &ready,
         };
         contender_t wps = {
             .lease = &lease,
-            .owner = JANOS_RADIO_OWNER_WPS,
+            .owner = owner_pairs[pair][1],
             .start = &start,
             .ready = &ready,
         };

@@ -18,6 +18,17 @@ static void clear_active(deauth_defence_core_t *core)
     core->active_channel = 0U;
     core->last_activity_us = 0;
     core->response_satisfied = false;
+    core->completed_actions = 0U;
+    core->pending_action = DEF_ACT_OBSERVE;
+}
+
+static uint8_t action_mask(deauth_defence_action_t action)
+{
+    switch (action) {
+        case DEF_ACT_DECOY_4WAY: return DEAUTH_DEFENCE_COMPLETED_4WAY;
+        case DEF_ACT_DECOY_PMKID: return DEAUTH_DEFENCE_COMPLETED_PMKID;
+        default: return 0U;
+    }
 }
 
 static void rollback_provisional(deauth_defence_core_t *core, bool provisional)
@@ -103,12 +114,15 @@ static deauth_defence_station_rate_t *station_rate(
 
 void deauth_defence_core_reset(deauth_defence_core_t *core,
                                bool pmkid_decoy_enabled,
+                               bool multi_vector_enabled,
                                uint32_t generation)
 {
     if (!core) return;
     memset(core, 0, sizeof(*core));
     core->state = DEF_ARMED_HOPPING;
     core->pmkid_decoy_enabled = pmkid_decoy_enabled;
+    core->multi_vector_enabled =
+        pmkid_decoy_enabled && multi_vector_enabled;
     core->generation = generation;
 }
 
@@ -159,7 +173,13 @@ deauth_defence_decision_t deauth_defence_consume(
         core->state = DEF_PROVISIONAL_LOCK;
     }
     core->last_activity_us = now_us;
-    if (core->response_satisfied) {
+    deauth_defence_action_t requested_action =
+        observation->trigger == DEF_TRIG_PMKID_PROBE
+            ? DEF_ACT_DECOY_PMKID : DEF_ACT_DECOY_4WAY;
+    bool requested_action_satisfied =
+        (core->completed_actions & action_mask(requested_action)) != 0U;
+    if (core->response_satisfied ||
+        (core->multi_vector_enabled && requested_action_satisfied)) {
         return decision(DEF_ACT_OBSERVE, "response_satisfied", false);
     }
 
@@ -181,6 +201,7 @@ deauth_defence_decision_t deauth_defence_consume(
         }
         slot->last_pmkid_us = now_us;
         slot->has_pmkid = true;
+        core->pending_action = DEF_ACT_DECOY_PMKID;
         return decision(DEF_ACT_DECOY_PMKID, "pmkid_decoy_opt_in",
                         provisional);
     }
@@ -207,6 +228,7 @@ deauth_defence_decision_t deauth_defence_consume(
     }
     slot->pair_times_us[slot->pair_count] = now_us;
     ++slot->pair_count;
+    core->pending_action = DEF_ACT_DECOY_4WAY;
     return decision(DEF_ACT_DECOY_4WAY, "selected_wpa2", provisional);
 }
 
@@ -230,7 +252,13 @@ bool deauth_defence_response_succeeded(deauth_defence_core_t *core)
         (core->state != DEF_FAST_RESPONSE &&
          core->state != DEF_CONFIRMING &&
          core->state != DEF_CONFIRMED_LOCK)) return false;
-    core->response_satisfied = true;
+    uint8_t completed = action_mask(core->pending_action);
+    if (completed == 0U) return false;
+    core->completed_actions |= completed;
+    core->pending_action = DEF_ACT_OBSERVE;
+    core->response_satisfied = !core->multi_vector_enabled ||
+        (core->completed_actions & DEAUTH_DEFENCE_COMPLETED_ALL) ==
+            DEAUTH_DEFENCE_COMPLETED_ALL;
     return true;
 }
 

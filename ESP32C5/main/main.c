@@ -23,6 +23,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 
 #include "esp_system.h"
 #include "esp_log.h"
@@ -59,6 +60,7 @@
 #include "mbedtls/ecp.h"
 #include "mbedtls/bignum.h"
 #include "mbedtls/base64.h"
+#include "mbedtls/md.h"
 #if defined(__has_include)
 #if __has_include("mbedtls/ctr_drbg.h")
 #include "mbedtls/ctr_drbg.h"
@@ -126,6 +128,19 @@
 #include "artifact_inventory_core.h"
 #include "ota_diag.h"
 #include "wifi_analyzer.h"
+#include "janos_psram_storage.h"
+#include "wifi_security_runtime.h"
+#include "wifi_shield.h"
+#include "wifi_shield_wire.h"
+#include "wifi_shield_output_platform.h"
+#include "wifi_shield_storage_bundle.h"
+#include "wifi_shield_journal_platform.h"
+#include "wps_guard.h"
+#include "sae_guard.h"
+#include "wifi_trust.h"
+#include "wifi_trust_deadline.h"
+#include "client_isolation_command.h"
+#include "router_audit.h"
 #include "led_status_core.h"
 #include "led_cli_activity.h"
 #include "led_target_cache.h"
@@ -666,11 +681,19 @@ typedef struct {
     int64_t rx_us;
 } detector_event_t;
 typedef struct { uint8_t bssid[6]; char ssid[33]; uint8_t channel; } detector_cache_entry_t;
-static detector_event_t detector_events[DETECTOR_EVENT_CAPACITY];
-static detector_cache_entry_t detector_cache[MAX_AP_CNT];
-static detector_cache_entry_t detector_resolved_ssids[DETECTOR_RESOLVED_SSID_CAPACITY];
+static detector_event_t detector_legacy_events[DETECTOR_EVENT_CAPACITY];
+static detector_cache_entry_t detector_legacy_cache[MAX_AP_CNT];
+static detector_cache_entry_t
+    detector_legacy_resolved_ssids[DETECTOR_RESOLVED_SSID_CAPACITY];
+static detector_event_t *detector_events = detector_legacy_events;
+static detector_cache_entry_t *detector_cache = detector_legacy_cache;
+static detector_cache_entry_t *detector_resolved_ssids =
+    detector_legacy_resolved_ssids;
 _Static_assert(DEAUTH_TARGET_MAX == MAX_AP_CNT, "detector target and scan capacities differ");
-static deauth_target_filter_t detector_watch_filter;
+static deauth_target_filter_t detector_legacy_watch_filter;
+static deauth_target_filter_t *detector_watch_filter_storage =
+    &detector_legacy_watch_filter;
+#define detector_watch_filter (*detector_watch_filter_storage)
 static bool detector_watch_enabled;
 static size_t detector_cache_count;
 static size_t detector_resolved_ssid_count, detector_resolved_ssid_replace;
@@ -694,7 +717,61 @@ typedef struct {
 } detector_trace_candidate_t;
 static bool detector_trace_confirming;
 static uint8_t detector_trace_bssid[6];
-static detector_trace_candidate_t detector_trace_candidates[DETECTOR_TRACE_MAX_CANDIDATES];
+static detector_trace_candidate_t
+    detector_legacy_trace_candidates[DETECTOR_TRACE_MAX_CANDIDATES];
+static detector_trace_candidate_t *detector_trace_candidates =
+    detector_legacy_trace_candidates;
+static portMUX_TYPE detector_event_lock = portMUX_INITIALIZER_UNLOCKED;
+typedef struct {
+    detector_event_t events[DETECTOR_EVENT_CAPACITY];
+    detector_cache_entry_t cache[MAX_AP_CNT];
+    detector_cache_entry_t resolved_ssids[DETECTOR_RESOLVED_SSID_CAPACITY];
+    deauth_target_filter_t watch_filter;
+    detector_trace_candidate_t trace_candidates[DETECTOR_TRACE_MAX_CANDIDATES];
+    wifi_shield_target_t profile_targets[DEAUTH_TARGET_MAX];
+    deauth_defence_runtime_target_t
+        defence_targets[DEAUTH_DEFENCE_RUNTIME_TARGETS];
+    size_t defence_target_count;
+    wifi_shield_deauth_scan_token_t scan_token;
+    wifi_shield_deauth_radio_token_t defence_radio_token;
+    uint32_t runtime_generation;
+    int64_t oled_last_us;
+    int64_t overflow_last_ms;
+} detector_v2_context_t;
+static detector_v2_context_t *detector_v2_context;
+
+static bool deauth_detector_v2_context_acquire(void) {
+    if (detector_v2_context != NULL) return false;
+    detector_v2_context_t *context = heap_caps_calloc(
+        1U, sizeof(*context), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (context == NULL) return false;
+    portENTER_CRITICAL(&detector_event_lock);
+    detector_v2_context = context;
+    detector_events = context->events;
+    detector_cache = context->cache;
+    detector_resolved_ssids = context->resolved_ssids;
+    detector_watch_filter_storage = &context->watch_filter;
+    detector_trace_candidates = context->trace_candidates;
+    portEXIT_CRITICAL(&detector_event_lock);
+    return true;
+}
+
+static void deauth_detector_v2_context_release(detector_v2_context_t *context) {
+    if (context == NULL) return;
+    portENTER_CRITICAL(&detector_event_lock);
+    if (detector_v2_context == context) {
+        detector_v2_context = NULL;
+        detector_events = detector_legacy_events;
+        detector_cache = detector_legacy_cache;
+        detector_resolved_ssids = detector_legacy_resolved_ssids;
+        detector_watch_filter_storage = &detector_legacy_watch_filter;
+        detector_trace_candidates = detector_legacy_trace_candidates;
+    }
+    portEXIT_CRITICAL(&detector_event_lock);
+    volatile uint8_t *bytes = (volatile uint8_t *)context;
+    for (size_t i = 0U; i < sizeof(*context); ++i) bytes[i] = 0U;
+    heap_caps_free(context);
+}
 static size_t detector_trace_candidate_count, detector_trace_hop_index;
 static int detector_trace_first_channel, detector_trace_cached_channel;
 static int detector_trace_locked_channel;
@@ -709,7 +786,6 @@ typedef struct {
 static detector_ssid_resolver_t detector_ssid_resolver;
 static uint8_t detector_targeted_scan_events_pending;
 static csa_rate_limit_t detector_csa_rate;
-static portMUX_TYPE detector_event_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static size_t detector_details_skip_csi(const char in[33], size_t i) {
     while (i < 32 && in[i]) {
@@ -1238,6 +1314,783 @@ static SemaphoreHandle_t sta_mac_state_mutex;
 static bool ota_check_started = false;
 static bool ota_check_in_progress = false;
 static janos_radio_lease_t janos_radio_lease;
+static esp_err_t analyzer_host_prepare_wifi(void);
+
+/* Security monitor platform state has static lifetime, including late rejected
+ * callbacks. Feature command parsers/consumers are supplied by later plans. */
+enum {
+    SECURITY_PHASE_IDLE, SECURITY_PHASE_STARTING, SECURITY_PHASE_CANCELLED,
+    SECURITY_PHASE_OPEN_COMMITTED, SECURITY_PHASE_STOPPING
+};
+typedef struct {
+    wifi_security_session_config_t config;
+    wifi_security_session_result_t result;
+    bool valid, owned;
+} security_report_t;
+static const char *analyzer_host_busy_reason(void);
+#define SECURITY_WORKER_STACK_BYTES 5120U
+#define SECURITY_WORKER_STACK_DEPTH \
+    (SECURITY_WORKER_STACK_BYTES / sizeof(StackType_t))
+static struct {
+    wifi_security_runtime_t *runtime;
+    wifi_security_session_t session;
+    portMUX_TYPE lock;
+    portMUX_TYPE phase_lock;
+    atomic_uint phase;
+    wifi_security_session_config_t report_config;
+    security_report_t deferred_report;
+    TaskHandle_t worker;
+    StaticTask_t worker_storage;
+    StackType_t *worker_stack;
+    StaticSemaphore_t done_storage;
+    SemaphoreHandle_t done;
+    StaticSemaphore_t lifecycle_storage;
+    SemaphoreHandle_t lifecycle;
+    uint32_t callback_generation;
+    janos_radio_owner_t owner;
+    uint32_t shield_scan_generation;
+    uint8_t shield_staged_channel;
+    wifi_security_module_t shield_scan_module;
+    wifi_security_module_t baseline_module;
+    bool shield_scan_reserved;
+    bool worker_stop, initialized;
+} security_platform = {
+    .lock = portMUX_INITIALIZER_UNLOCKED,
+    .phase_lock = portMUX_INITIALIZER_UNLOCKED,
+    .phase = ATOMIC_VAR_INIT(SECURITY_PHASE_IDLE)
+};
+
+static void security_enter(void *context)
+{
+    (void)context;
+    portENTER_CRITICAL(&security_platform.lock);
+}
+
+static void security_leave(void *context)
+{
+    (void)context;
+    portEXIT_CRITICAL(&security_platform.lock);
+}
+
+static void security_notify(void *context)
+{
+    (void)context;
+    /* Pair handle use with join's detach: a delayed notification must never
+     * target deleted/reused task storage. This hook never drains inline. */
+    security_enter(NULL);
+    if (security_platform.worker != NULL)
+        xTaskNotifyGive(security_platform.worker);
+    security_leave(NULL);
+}
+
+/* Explicit adapter conversion: the detector's private enum is not a public ABI. */
+static wifi_shield_compact_kind_t security_shield_kind(detector_event_kind_t kind)
+{
+    switch (kind) {
+    case DETECTOR_EVENT_DEAUTH: return WIFI_SHIELD_COMPACT_DEAUTH;
+    case DETECTOR_EVENT_DISASSOC: return WIFI_SHIELD_COMPACT_DISASSOC;
+    case DETECTOR_EVENT_CSA: return WIFI_SHIELD_COMPACT_CSA;
+    case DETECTOR_EVENT_AUTH: return WIFI_SHIELD_COMPACT_AUTH;
+    case DETECTOR_EVENT_ASSOC: return WIFI_SHIELD_COMPACT_ASSOC;
+    case DETECTOR_EVENT_REASSOC: return WIFI_SHIELD_COMPACT_REASSOC;
+    }
+    return WIFI_SHIELD_COMPACT_DEAUTH;
+}
+
+/* Callback-safe classifier for Shield's only DATA-plane input: an unprotected,
+ * unfragmented LLC/SNAP EAPOL frame. Ordinary channel traffic is rejected
+ * before it can consume one of the eight full-frame worker slots. Semantic WPS
+ * parsing and all mutable policy remain in the worker. */
+static bool security_shield_data_candidate(const uint8_t *bytes,
+                                           uint16_t length)
+{
+    static const uint8_t eapol_snap[] = {
+        0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e
+    };
+    if (bytes == NULL || length < 24U + sizeof(eapol_snap) ||
+        (bytes[0] & 0x0fU) != 0x08U ||
+        (bytes[0] & 0x40U) != 0U ||
+        (bytes[1] & 0x44U) != 0U ||
+        (bytes[1] & 0x03U) == 0x03U ||
+        (bytes[22] & 0x0fU) != 0U)
+        return false;
+
+    size_t header_length = 24U;
+    if ((bytes[0] & 0x80U) != 0U) {
+        if (length < 26U || (bytes[24] & 0x80U) != 0U) return false;
+        header_length += 2U;
+        if ((bytes[1] & 0x80U) != 0U) header_length += 4U;
+    }
+    return header_length <= length &&
+        length - header_length >= sizeof(eapol_snap) &&
+        memcmp(bytes + header_length, eapol_snap, sizeof(eapol_snap)) == 0;
+}
+
+static bool security_shield_submit(wifi_security_runtime_t *runtime,
+    uint32_t generation, const uint8_t *bytes, uint16_t length,
+    uint64_t timestamp_us, int8_t rssi, uint8_t channel)
+{
+    wifi_security_runtime_status_t status;
+    wifi_security_runtime_get_status(runtime, &status);
+    if (status.module != WIFI_SECURITY_MODULE_SHIELD)
+        return wifi_security_runtime_submit(runtime, generation, bytes, length,
+                                             timestamp_us, rssi, channel);
+    if (length < 24) return false;
+    uint8_t fc = bytes[0];
+    detector_event_kind_t kind;
+    size_t minimum;
+    if ((fc & 0x0cU) == 0x08U) {
+        if (!security_shield_data_candidate(bytes, length)) return true;
+        return wifi_security_runtime_submit(runtime, generation, bytes, length,
+                                             timestamp_us, rssi, channel);
+    }
+    /* SAE authentication is a full-frame protocol candidate, never duplicated
+     * in the compact Auth lane. All semantic protocol parsing stays in worker. */
+    if (fc == 0xb0) {
+        /* Match wifi_security_decode's management Order/HT-Control offset.
+         * Two algorithm bytes are enough; the worker reports short SAE bodies. */
+        size_t body_offset = (bytes[1] & 0x80U) != 0 ? 28U : 24U;
+        if (length >= body_offset + 2U &&
+            bytes[body_offset] == 3 && bytes[body_offset + 1U] == 0)
+            return wifi_security_runtime_submit(runtime, generation, bytes, length,
+                                                 timestamp_us, rssi, channel);
+    }
+    switch (fc) {
+    case 0xc0: kind = DETECTOR_EVENT_DEAUTH; minimum = 26; break;
+    case 0xa0: kind = DETECTOR_EVENT_DISASSOC; minimum = 26; break;
+    case 0xb0: kind = DETECTOR_EVENT_AUTH; minimum = 30; break;
+    case 0x00: kind = DETECTOR_EVENT_ASSOC; minimum = 28; break;
+    case 0x20: kind = DETECTOR_EVENT_REASSOC; minimum = 34; break;
+    case 0x80:
+    case 0x50:
+    case 0xd0: {
+        csa_event_t observation;
+        /* Only complete short announcements can be classified and preserved in
+         * 64 raw bytes. Longer candidates retain their original frame for the
+         * worker, including CSA IEs beyond the prefix and Trust/WPS evidence.
+         * No synthesized frames and no duplicate queue ownership. */
+        if (length <= WIFI_SHIELD_COMPACT_BYTES &&
+            csa_parse(bytes, length, channel, rssi, &observation)) {
+            kind = DETECTOR_EVENT_CSA;
+            minimum = 24;
+            break;
+        }
+        return wifi_security_runtime_submit(runtime, generation, bytes, length,
+                                             timestamp_us, rssi, channel);
+    }
+    default: return false;
+    }
+    if (length < minimum) return false;
+    wifi_shield_compact_event_t event = {0};
+    event.kind = security_shield_kind(kind);
+    event.generation = generation;
+    event.length = length < WIFI_SHIELD_COMPACT_BYTES ? length : WIFI_SHIELD_COMPACT_BYTES;
+    memcpy(event.bytes, bytes, event.length);
+    memcpy(event.bssid, bytes + 16, 6);
+    /* The worker validates direction/identity; preserve the observed peer. */
+    memcpy(event.station, memcmp(bytes + 10, bytes + 16, 6) == 0 ? bytes + 4 : bytes + 10, 6);
+    event.channel = channel;
+    event.rssi = rssi;
+    event.rx_us = (int64_t)timestamp_us;
+    return wifi_security_runtime_submit_compact(runtime, &event);
+}
+
+static void wifi_security_promiscuous_callback(void *buffer,
+                                              wifi_promiscuous_pkt_type_t type)
+{
+    if (buffer == NULL || (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA)) return;
+    const wifi_promiscuous_pkt_t *packet = buffer;
+    /* ESP-IDF sig_len includes the four-byte FCS; the decoder expects MAC bytes. */
+    if (packet->rx_ctrl.sig_len <= 4U) return;
+    if (security_platform.runtime == NULL) return;
+    wifi_security_session_config_t *config = &security_platform.session.config;
+    wifi_security_receive_policy_t packet_class = type == WIFI_PKT_MGMT ?
+        WIFI_SECURITY_RECEIVE_MGMT : WIFI_SECURITY_RECEIVE_DATA;
+    wifi_security_receive_policy_t policy = config->receive_policy ==
+        WIFI_SECURITY_RECEIVE_DEFAULT ?
+        (WIFI_SECURITY_RECEIVE_MGMT | WIFI_SECURITY_RECEIVE_DATA) :
+        config->receive_policy;
+    if ((policy & packet_class) == 0U) return;
+    if (config->borrowed_receive != NULL) {
+        const wifi_security_rx_view_t observation = {
+            .bytes = packet->payload,
+            .captured_length = (uint16_t)(packet->rx_ctrl.sig_len - 4U),
+            .signal_length = packet->rx_ctrl.sig_len,
+            .dump_length = packet->rx_ctrl.dump_len,
+            .rx_state = packet->rx_ctrl.rx_state,
+            .timestamp_us = packet->rx_ctrl.timestamp,
+            .rssi = packet->rx_ctrl.rssi,
+            .channel = packet->rx_ctrl.channel,
+            .packet_class = packet_class,
+        };
+        (void)config->borrowed_receive(
+            config->context, security_platform.callback_generation,
+            &observation);
+        return;
+    }
+    (void)security_shield_submit(security_platform.runtime,
+        security_platform.callback_generation, packet->payload,
+        (uint16_t)(packet->rx_ctrl.sig_len - 4U),
+        (uint64_t)esp_timer_get_time(),
+        packet->rx_ctrl.rssi, packet->rx_ctrl.channel);
+}
+
+static void security_worker(void *context)
+{
+    wifi_security_runtime_t *runtime = context;
+    for (;;) {
+        size_t drained = wifi_security_runtime_drain_bounded(
+            runtime, WIFI_SECURITY_POOL_SLOTS);
+        wifi_shield_worker_poll();
+        wifi_security_session_config_t *config = &security_platform.session.config;
+        if (config->worker_poll != NULL)
+            config->worker_poll(config->context);
+        security_enter(NULL);
+        bool stop = security_platform.worker_stop;
+        security_leave(NULL);
+        if (stop) {
+            /* Close has already fenced accepted submissions. Drain a frame
+             * queued between the previous drain and that close before join. */
+            (void)wifi_security_runtime_drain(runtime);
+            xSemaphoreGive(security_platform.done);
+            /* Join deletes this task; it must not reuse our static stack until
+             * vTaskDelete has completed. No runtime/module access after signal. */
+            for (;;) vTaskSuspend(NULL);
+        }
+        if (drained == WIFI_SECURITY_POOL_SLOTS) continue;
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50U));
+    }
+}
+
+static bool security_lease_acquire(void *context, uint32_t *generation)
+{
+    (void)context;
+    return janos_radio_lease_acquire(&janos_radio_lease,
+        security_platform.owner, generation) == JANOS_RADIO_LEASE_OK;
+}
+
+static bool security_baseline_idle(void *context)
+{
+    (void)context;
+    /* The probe covers published legacy tasks and uncertain driver activity;
+     * it does not reject the SECURITY_MONITOR reservation we just acquired. */
+    const char *reason = analyzer_host_busy_reason();
+    return reason == NULL ||
+        (security_platform.baseline_module == WIFI_SECURITY_MODULE_DEAUTH_V2 &&
+         strcmp(reason, "wifi_connected") == 0);
+}
+
+static bool security_lease_mark(void *context, uint32_t generation)
+{
+    (void)context;
+    return janos_radio_lease_mark_running(&janos_radio_lease,
+        security_platform.owner, generation);
+}
+
+static bool security_lease_cancelled(void *context, uint32_t generation)
+{
+    (void)context;
+    return atomic_load_explicit(&security_platform.phase, memory_order_acquire) ==
+        SECURITY_PHASE_CANCELLED || janos_radio_lease_cancel_requested(&janos_radio_lease,
+        security_platform.owner, generation);
+}
+
+static bool security_generation_open(void *context, wifi_security_runtime_t *runtime,
+                                     const wifi_security_runtime_config_t *config)
+{
+    (void)context;
+    /* Linearization point: a contending Stop either latches CANCELLED first,
+     * or observes this committed Start and waits for serialized cleanup. */
+    unsigned expected = SECURITY_PHASE_STARTING;
+    if (!atomic_compare_exchange_strong_explicit(&security_platform.phase,
+            &expected, SECURITY_PHASE_OPEN_COMMITTED,
+            memory_order_acq_rel, memory_order_acquire)) return false;
+    return wifi_security_runtime_start(runtime, config);
+}
+
+static void security_lease_cancel(void *context, uint32_t generation)
+{
+    (void)context;
+    (void)janos_radio_lease_request_cancel(&janos_radio_lease,
+        security_platform.owner, generation);
+}
+
+static bool security_lease_begin_cleanup(void *context, uint32_t generation)
+{
+    (void)context;
+    return janos_radio_lease_begin_cleanup(&janos_radio_lease,
+        security_platform.owner, generation);
+}
+
+static bool security_lease_finish_cleanup(void *context, uint32_t generation,
+                                          bool restored)
+{
+    (void)context;
+    return janos_radio_lease_finish_cleanup(&janos_radio_lease,
+        security_platform.owner, generation, restored);
+}
+
+static bool security_channel_read(void *context, uint8_t *primary, uint8_t *secondary)
+{
+    (void)context;
+    wifi_second_chan_t second;
+    if (esp_wifi_get_channel(primary, &second) != ESP_OK) return false;
+    *secondary = (uint8_t)second;
+    return true;
+}
+
+static bool security_channel_tune(void *context, uint8_t primary)
+{
+    (void)context;
+    return primary != 0U &&
+        esp_wifi_set_channel(primary, (wifi_second_chan_t)0) == ESP_OK;
+}
+
+static bool security_channel_restore(void *context, uint8_t primary, uint8_t secondary)
+{
+    (void)context;
+    return esp_wifi_set_channel(primary, (wifi_second_chan_t)secondary) == ESP_OK;
+}
+
+static bool security_filter_read(void *context, uint32_t *mask)
+{
+    (void)context;
+    wifi_promiscuous_filter_t filter;
+    if (esp_wifi_get_promiscuous_filter(&filter) != ESP_OK) return false;
+    *mask = filter.filter_mask;
+    return true;
+}
+
+static bool security_filter_apply(void *context,
+                                  wifi_security_receive_policy_t policy)
+{
+    (void)context;
+    uint32_t mask = 0U;
+    if ((policy & WIFI_SECURITY_RECEIVE_MGMT) != 0U)
+        mask |= WIFI_PROMIS_FILTER_MASK_MGMT;
+    if ((policy & WIFI_SECURITY_RECEIVE_DATA) != 0U)
+        mask |= WIFI_PROMIS_FILTER_MASK_DATA;
+    if (mask == 0U) return false;
+    const wifi_promiscuous_filter_t filter = {
+        .filter_mask = mask
+    };
+    return esp_wifi_set_promiscuous_filter(&filter) == ESP_OK;
+}
+
+static bool security_filter_restore(void *context, uint32_t mask)
+{
+    (void)context;
+    const wifi_promiscuous_filter_t filter = {.filter_mask = mask};
+    return esp_wifi_set_promiscuous_filter(&filter) == ESP_OK;
+}
+
+static bool security_prepare(void *context)
+{
+    (void)context;
+    if (security_platform.done == NULL)
+        security_platform.done = xSemaphoreCreateBinaryStatic(&security_platform.done_storage);
+    if (security_platform.done == NULL) return false;
+    (void)xSemaphoreTake(security_platform.done, 0);
+    security_platform.worker_stop = false;
+    return true;
+}
+
+static bool security_worker_create(void *context, wifi_security_runtime_t *runtime)
+{
+    (void)context;
+    security_platform.worker = xTaskCreateStatic(security_worker, "wifi_security",
+        SECURITY_WORKER_STACK_DEPTH, runtime, 5,
+        security_platform.worker_stack, &security_platform.worker_storage);
+    return security_platform.worker != NULL;
+}
+
+static bool security_callback_register(void *context, uint32_t generation)
+{
+    (void)context;
+    security_platform.callback_generation = generation;
+    return esp_wifi_set_promiscuous_rx_cb(wifi_security_promiscuous_callback) == ESP_OK;
+}
+
+static bool security_callback_unregister(void *context)
+{
+    (void)context;
+    return esp_wifi_set_promiscuous_rx_cb(NULL) == ESP_OK;
+}
+
+static bool security_promiscuous(void *context, bool enabled)
+{
+    (void)context;
+    return esp_wifi_set_promiscuous(enabled) == ESP_OK;
+}
+
+static void security_worker_stop(void *context)
+{
+    (void)context;
+    security_enter(NULL);
+    security_platform.worker_stop = true;
+    security_leave(NULL);
+    security_notify(NULL);
+}
+
+static bool security_worker_join(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    if (xSemaphoreTake(security_platform.done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE)
+        return false;
+    security_enter(NULL);
+    TaskHandle_t worker = security_platform.worker;
+    security_platform.worker = NULL;
+    security_leave(NULL);
+    vTaskDelete(worker);
+    return true;
+}
+
+static uint64_t security_monotonic_us(void *context)
+{
+    (void)context;
+    return (uint64_t)esp_timer_get_time();
+}
+
+static security_report_t security_make_report(const wifi_security_session_config_t *config,
+                                               wifi_security_session_result_t result)
+{
+    janos_radio_lease_snapshot_t lease = janos_radio_lease_snapshot(&janos_radio_lease);
+    security_report_t report = {
+        .config = *config, .result = result, .valid = config->uncertainty != NULL,
+        .owned = security_platform.owner != JANOS_RADIO_OWNER_NONE &&
+                 lease.owner == security_platform.owner
+    };
+    return report;
+}
+
+static void security_emit_report(const security_report_t *report)
+{
+    if (report->valid)
+        report->config.uncertainty(report->config.telemetry_context, report->result, report->owned);
+}
+
+static void security_uncertainty(void *context, const wifi_security_session_config_t *config,
+                                  wifi_security_session_result_t result)
+{
+    (void)context;
+    /* Portable cleanup runs under lifecycle ownership. Queue one result and
+     * invoke the feature only after this caller releases its locks. */
+    security_platform.deferred_report = security_make_report(config, result);
+}
+
+static bool security_lifecycle_take(bool starting, uint64_t deadline_us,
+                                    const wifi_security_session_config_t *config,
+                                    wifi_security_session_config_t *pending)
+{
+    for (;;) {
+        /* Only a zero-wait take is allowed here. Publish the operation phase in
+         * the same critical section as acquisition, so Stop cannot miss Start
+         * in the mutex-acquired/before-validation window. RX never takes this lock. */
+        portENTER_CRITICAL(&security_platform.phase_lock);
+        bool acquired = xSemaphoreTake(security_platform.lifecycle, 0) == pdTRUE;
+        if (acquired) {
+            security_platform.deferred_report.valid = false;
+            if (starting && !security_platform.session.active)
+                security_platform.report_config = *config;
+            if (!starting || !security_platform.session.active)
+                atomic_store_explicit(&security_platform.phase,
+                    starting ? SECURITY_PHASE_STARTING : SECURITY_PHASE_STOPPING,
+                    memory_order_release);
+        } else if (!starting) {
+            *pending = security_platform.report_config;
+            unsigned expected = SECURITY_PHASE_STARTING;
+            (void)atomic_compare_exchange_strong_explicit(&security_platform.phase,
+                &expected, SECURITY_PHASE_CANCELLED,
+                memory_order_acq_rel, memory_order_acquire);
+        }
+        portEXIT_CRITICAL(&security_platform.phase_lock);
+        if (acquired) return true;
+        if (!starting && security_monotonic_us(NULL) >= deadline_us) return false;
+        vTaskDelay(1); /* Wait outside the phase gate; callback submit stays independent. */
+    }
+}
+
+static void security_lifecycle_release(bool failed)
+{
+    portENTER_CRITICAL(&security_platform.phase_lock);
+    if (!security_platform.session.active) {
+        memset(&security_platform.report_config, 0, sizeof(security_platform.report_config));
+        atomic_store_explicit(&security_platform.phase,
+            security_platform.shield_scan_reserved ? SECURITY_PHASE_STOPPING :
+                                                     SECURITY_PHASE_IDLE,
+            memory_order_release);
+    } else if (failed)
+        atomic_store_explicit(&security_platform.phase, SECURITY_PHASE_STOPPING, memory_order_release);
+    xSemaphoreGive(security_platform.lifecycle);
+    portEXIT_CRITICAL(&security_platform.phase_lock);
+}
+
+static bool wifi_security_platform_init(void)
+{
+    if (security_platform.runtime == NULL ||
+        security_platform.worker_stack == NULL) return false;
+    security_platform.lifecycle = xSemaphoreCreateMutexStatic(&security_platform.lifecycle_storage);
+    if (security_platform.lifecycle == NULL) return false;
+    const wifi_security_runtime_hooks_t core = {
+        .enter = security_enter, .leave = security_leave, .notify = security_notify
+    };
+    const wifi_security_platform_hooks_t platform = {
+        .lease_acquire = security_lease_acquire, .lease_mark_running = security_lease_mark,
+        .baseline_idle = security_baseline_idle,
+        .lease_cancelled = security_lease_cancelled, .lease_cancel = security_lease_cancel,
+        .generation_open = security_generation_open,
+        .lease_begin_cleanup = security_lease_begin_cleanup,
+        .lease_finish_cleanup = security_lease_finish_cleanup,
+        .channel_read = security_channel_read, .channel_tune = security_channel_tune,
+        .channel_restore = security_channel_restore,
+        .filter_read = security_filter_read, .filter_apply = security_filter_apply,
+        .filter_restore = security_filter_restore,
+        .prepare = security_prepare, .worker_create = security_worker_create,
+        .callback_register = security_callback_register, .callback_unregister = security_callback_unregister,
+        .promiscuous = security_promiscuous, .worker_stop = security_worker_stop,
+        .worker_join = security_worker_join, .monotonic_us = security_monotonic_us,
+        .uncertainty = security_uncertainty
+    };
+    security_platform.initialized =
+        wifi_security_runtime_init(security_platform.runtime, &core, WIFI_SECURITY_POOL_SLOTS) &&
+        wifi_security_session_init(&security_platform.session, security_platform.runtime, &platform);
+    return security_platform.initialized;
+}
+
+static bool security_release_shield_reservation(uint32_t generation)
+{
+    janos_radio_owner_t reserved_owner =
+        security_platform.shield_scan_module == WIFI_SECURITY_MODULE_SHIELD ?
+            JANOS_RADIO_OWNER_SHIELD : JANOS_RADIO_OWNER_SECURITY_MONITOR;
+    janos_radio_lease_snapshot_t snapshot =
+        janos_radio_lease_snapshot(&janos_radio_lease);
+    if (snapshot.owner == JANOS_RADIO_OWNER_NONE)
+        return snapshot.state == JANOS_RADIO_LEASE_IDLE &&
+               snapshot.generation == 0U;
+    if (snapshot.owner != reserved_owner ||
+        snapshot.generation != generation) return false;
+    bool begun = janos_radio_lease_begin_cleanup(
+        &janos_radio_lease, reserved_owner, generation);
+    bool released = begun && janos_radio_lease_finish_cleanup(
+        &janos_radio_lease, reserved_owner, generation, true);
+    if (!released && begun)
+        (void)janos_radio_lease_finish_cleanup(
+            &janos_radio_lease, reserved_owner, generation, false);
+    return released;
+}
+
+static void security_clear_shield_reservation(void)
+{
+    security_platform.shield_scan_reserved = false;
+    security_platform.shield_scan_generation = 0U;
+    security_platform.shield_scan_module = WIFI_SECURITY_MODULE_NONE;
+}
+
+wifi_security_session_result_t wifi_security_runtime_platform_start(
+    const wifi_security_session_config_t *config)
+{
+    if (!security_platform.initialized || config == NULL || config->uncertainty == NULL)
+        return WIFI_SECURITY_SESSION_INVALID;
+    /* Console admission releases its mutex before invoking handlers. This gate
+     * serializes lifecycle operations without ever blocking callback submit. */
+    (void)security_lifecycle_take(true, 0, config, NULL);
+    if (security_platform.session.active ||
+        (security_platform.shield_scan_reserved &&
+         config->module != security_platform.shield_scan_module)) {
+        security_lifecycle_release(false);
+        return WIFI_SECURITY_SESSION_BUSY;
+    }
+    security_platform.owner = config->module == WIFI_SECURITY_MODULE_SHIELD ?
+        JANOS_RADIO_OWNER_SHIELD : JANOS_RADIO_OWNER_SECURITY_MONITOR;
+    wifi_security_session_config_t effective = *config;
+    if (config->module == WIFI_SECURITY_MODULE_SHIELD)
+        effective.initial_channel = security_platform.shield_staged_channel;
+    bool continuing_reservation = security_platform.shield_scan_reserved &&
+        config->module == security_platform.shield_scan_module;
+    uint32_t reserved_generation =
+        security_platform.shield_scan_generation;
+    security_platform.baseline_module = config->module;
+    wifi_security_session_result_t result =
+        continuing_reservation ?
+        wifi_security_session_start_reserved(
+            &security_platform.session, &effective,
+            reserved_generation, 5000) :
+        wifi_security_session_start(&security_platform.session, &effective, 5000);
+    security_platform.baseline_module = WIFI_SECURITY_MODULE_NONE;
+    if (continuing_reservation) {
+        bool adopted = security_platform.session.active &&
+            security_platform.session.generation == reserved_generation;
+        if (adopted ||
+            security_release_shield_reservation(reserved_generation)) {
+            security_clear_shield_reservation();
+        } else {
+            /* The exact PREPARING owner/generation remains retained and
+             * quarantined for a later abort retry. Never erase its identity. */
+            result = WIFI_SECURITY_SESSION_CLEANUP_FAILED;
+        }
+    }
+    security_report_t report = security_platform.deferred_report;
+    security_lifecycle_release(result != WIFI_SECURITY_SESSION_OK);
+    security_emit_report(&report);
+    if (!security_platform.session.active &&
+        !security_platform.shield_scan_reserved)
+        security_platform.owner = JANOS_RADIO_OWNER_NONE;
+    return result;
+}
+
+static bool security_lifecycle_try_take(unsigned phase)
+{
+    if (!security_platform.initialized || security_platform.lifecycle == NULL)
+        return false;
+    portENTER_CRITICAL(&security_platform.phase_lock);
+    bool acquired = xSemaphoreTake(security_platform.lifecycle, 0) == pdTRUE;
+    if (acquired)
+        atomic_store_explicit(&security_platform.phase, phase,
+                              memory_order_release);
+    portEXIT_CRITICAL(&security_platform.phase_lock);
+    return acquired;
+}
+
+static void security_lifecycle_give_reserved(bool retained)
+{
+    portENTER_CRITICAL(&security_platform.phase_lock);
+    unsigned phase = retained ? SECURITY_PHASE_STOPPING :
+        (security_platform.session.active ? SECURITY_PHASE_OPEN_COMMITTED :
+                                            SECURITY_PHASE_IDLE);
+    atomic_store_explicit(&security_platform.phase, phase, memory_order_release);
+    xSemaphoreGive(security_platform.lifecycle);
+    portEXIT_CRITICAL(&security_platform.phase_lock);
+}
+
+static bool wifi_security_platform_reserve_scan_module(
+    wifi_security_module_t module)
+{
+    if (module != WIFI_SECURITY_MODULE_SHIELD &&
+        module != WIFI_SECURITY_MODULE_DEAUTH_V2) return false;
+    if (!security_lifecycle_try_take(SECURITY_PHASE_STARTING)) return false;
+    bool reserved = false;
+    bool retained = false;
+    if (!security_platform.session.active &&
+        !security_platform.shield_scan_reserved) {
+        janos_radio_owner_t reserved_owner =
+            module == WIFI_SECURITY_MODULE_SHIELD ?
+                JANOS_RADIO_OWNER_SHIELD : JANOS_RADIO_OWNER_SECURITY_MONITOR;
+        security_platform.owner = reserved_owner;
+        uint32_t generation = 0U;
+        reserved = janos_radio_lease_acquire(
+            &janos_radio_lease, reserved_owner, &generation) ==
+            JANOS_RADIO_LEASE_OK;
+        security_platform.baseline_module = module;
+        if (reserved && !security_baseline_idle(NULL)) {
+            bool begun = janos_radio_lease_begin_cleanup(
+                &janos_radio_lease, reserved_owner, generation);
+            bool released = begun && janos_radio_lease_finish_cleanup(
+                &janos_radio_lease, reserved_owner, generation, true);
+            retained = !released;
+            if (retained && begun) {
+                (void)janos_radio_lease_finish_cleanup(
+                    &janos_radio_lease, reserved_owner, generation,
+                    false);
+            }
+            reserved = false;
+        }
+        security_platform.baseline_module = WIFI_SECURITY_MODULE_NONE;
+        if (reserved || retained) {
+            security_platform.shield_scan_reserved = true;
+            security_platform.shield_scan_generation = generation;
+            security_platform.shield_scan_module = module;
+        } else {
+            security_platform.owner = JANOS_RADIO_OWNER_NONE;
+        }
+    }
+    security_lifecycle_give_reserved(reserved || retained);
+    return reserved;
+}
+
+static bool wifi_security_platform_abort_scan_module(
+    wifi_security_module_t module, uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    if (!security_platform.shield_scan_reserved) return true;
+    if (security_platform.shield_scan_module != module) return false;
+    if (!security_lifecycle_try_take(SECURITY_PHASE_STOPPING)) return false;
+    uint32_t generation = security_platform.shield_scan_generation;
+    bool released = security_release_shield_reservation(generation);
+    if (released) {
+        security_clear_shield_reservation();
+        security_platform.owner = JANOS_RADIO_OWNER_NONE;
+    }
+    security_lifecycle_give_reserved(!released);
+    return released;
+}
+
+static bool wifi_security_platform_reserve_shield_scan(void)
+{
+    return wifi_security_platform_reserve_scan_module(
+        WIFI_SECURITY_MODULE_SHIELD);
+}
+
+static bool wifi_security_platform_abort_shield_scan(uint32_t timeout_ms)
+{
+    return wifi_security_platform_abort_scan_module(
+        WIFI_SECURITY_MODULE_SHIELD, timeout_ms);
+}
+
+static bool wifi_security_runtime_platform_quiesce(uint32_t timeout_ms)
+{
+    if (!security_platform.initialized) return true;
+    uint64_t started = security_monotonic_us(NULL);
+    wifi_security_session_config_t pending = {0};
+    if (!security_lifecycle_take(false,
+            started + (uint64_t)timeout_ms * 1000U, NULL, &pending))
+        return false;
+    uint64_t elapsed_ms = (security_monotonic_us(NULL) - started) / 1000U;
+    uint32_t remaining = elapsed_ms < timeout_ms ?
+        timeout_ms - (uint32_t)elapsed_ms : 0U;
+    bool quiet = wifi_security_session_quiesce(
+        &security_platform.session, remaining) == WIFI_SECURITY_SESSION_OK;
+    security_report_t report = security_platform.deferred_report;
+    security_lifecycle_release(!quiet);
+    security_emit_report(&report);
+    return quiet;
+}
+
+static bool wifi_security_runtime_platform_finish_cleanup(uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    if (!security_platform.initialized) return true;
+    wifi_security_session_config_t pending = {0};
+    if (!security_lifecycle_take(false, security_monotonic_us(NULL),
+                                 NULL, &pending)) return false;
+    bool finished = wifi_security_session_finish_cleanup(
+        &security_platform.session) == WIFI_SECURITY_SESSION_OK;
+    security_report_t report = security_platform.deferred_report;
+    security_lifecycle_release(!finished);
+    security_emit_report(&report);
+    if (finished) security_platform.owner = JANOS_RADIO_OWNER_NONE;
+    return finished;
+}
+
+bool wifi_security_runtime_stop(uint32_t timeout_ms)
+{
+    if (!security_platform.initialized) return true;
+    uint64_t started = security_monotonic_us(NULL);
+    wifi_security_session_config_t pending = {0};
+    if (!security_lifecycle_take(false, started + (uint64_t)timeout_ms * 1000U, NULL, &pending)) {
+        security_report_t report = security_make_report(&pending, WIFI_SECURITY_SESSION_BUSY);
+        security_emit_report(&report);
+        return false;
+    }
+    uint64_t elapsed_ms = (security_monotonic_us(NULL) - started) / 1000U;
+    uint32_t remaining = elapsed_ms < timeout_ms ? timeout_ms - (uint32_t)elapsed_ms : 0U;
+    bool stopped = wifi_security_session_stop(&security_platform.session, remaining) == WIFI_SECURITY_SESSION_OK;
+    security_report_t report = security_platform.deferred_report;
+    security_lifecycle_release(!stopped);
+    security_emit_report(&report);
+    if (!security_platform.session.active)
+        security_platform.owner = JANOS_RADIO_OWNER_NONE;
+    return stopped;
+}
 static atomic_bool ota_boot_ready = ATOMIC_VAR_INIT(false);
 static char ota_channel[OTA_CHANNEL_MAX_LEN] = "main";
 static bool ota_auto_on_ip = false;
@@ -2141,13 +2994,13 @@ static void beacon_spam_task(void *pvParameters) {
 
     MY_LOG_INFO(TAG, "Beacon spam task started with %d SSIDs on channels %u-%u",
                beacon_ssid_count, first_channel, last_channel);
-    
+
     // Static BSSID for all fake APs
     const uint8_t bssid[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
-    
+
     // Frame buffer
     uint8_t frame_buffer[256];
-    
+
     while (beacon_spam_active && !operation_stop_requested) {
         // Iterate through all channels
         for (uint8_t current_channel = first_channel;
@@ -2158,20 +3011,20 @@ static void beacon_spam_task(void *pvParameters) {
             if (err != ESP_OK) {
                 MY_LOG_INFO(TAG, "Failed to set channel %d: %s", current_channel, esp_err_to_name(err));
             }
-            
+
             // Small delay to allow channel switch
             vTaskDelay(pdMS_TO_TICKS(10));
-            
+
             // Send beacons for all SSIDs on this channel
             for (int i = 0; i < beacon_ssid_count && beacon_spam_active && !operation_stop_requested; i++) {
                 // Build beacon frame for this SSID on current channel
                 int frame_size = build_beacon_frame(frame_buffer, sizeof(frame_buffer), beacon_ssids[i], bssid, current_channel);
-                
+
                 if (frame_size > 0) {
                     // Send the beacon frame
                     send_beacon_frame(frame_buffer, frame_size);
                 }
-                
+
                 {
                     static int64_t bcn_oled_last_us = 0;
                     int64_t bcn_now_us = esp_timer_get_time();
@@ -2184,13 +3037,13 @@ static void beacon_spam_task(void *pvParameters) {
                         oled_display_update_full("> Beacon Spam", bcn_l2, bcn_l3, bcn_l4);
                     }
                 }
-                
+
                 // Fast delay between beacons (10ms for faster transmission)
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
         }
     }
-    
+
     MY_LOG_INFO(TAG, "Beacon spam task stopped");
     beacon_spam_active = false;
     beacon_spam_task_handle = NULL;
@@ -2217,6 +3070,925 @@ static volatile bool g_scan_done = false;
 static StaticSemaphore_t g_scan_results_mutex_storage;
 static SemaphoreHandle_t g_scan_results_mutex = NULL;
 static bool g_scan_records_valid = false;
+
+#define WIFI_SHIELD_JOURNAL_QUEUE_DEPTH 32U
+#define WIFI_SHIELD_JOURNAL_STACK_BYTES 8192U
+#define WIFI_SHIELD_OUTPUT_QUEUE_DEPTH 8U
+#define WIFI_SHIELD_OUTPUT_STACK_BYTES 4096U
+#define WIFI_SHIELD_OUTPUT_TASK_STACK_DEPTH \
+    (WIFI_SHIELD_OUTPUT_STACK_BYTES / sizeof(StackType_t))
+#define WIFI_SHIELD_PRESENTATION_STACK_BYTES 4096U
+#define WIFI_SHIELD_PRESENTATION_TASK_STACK_DEPTH \
+    (WIFI_SHIELD_PRESENTATION_STACK_BYTES / sizeof(StackType_t))
+typedef struct {
+    uint16_t length;
+    char bytes[WIFI_SHIELD_LINE_MAX];
+} wifi_shield_output_record_t;
+
+static wifi_shield_state_t *wifi_shield_state_storage;
+static wifi_shield_compact_event_t *wifi_shield_event_ring;
+static wifi_shield_output_record_t *wifi_shield_output_queue_buffer;
+static StackType_t *wifi_shield_output_task_stack;
+static wifi_shield_journal_record_t *wifi_shield_journal_queue_buffer;
+static StackType_t *wifi_shield_journal_task_stack;
+static StaticQueue_t wifi_shield_journal_queue_storage;
+static QueueHandle_t wifi_shield_journal_queue;
+static StaticTask_t wifi_shield_journal_task_storage;
+static TaskHandle_t wifi_shield_journal_task_handle;
+static StaticSemaphore_t wifi_shield_journal_done_storage;
+static SemaphoreHandle_t wifi_shield_journal_done;
+static portMUX_TYPE wifi_shield_journal_mux = portMUX_INITIALIZER_UNLOCKED;
+static wifi_shield_journal_platform_t *wifi_shield_journal_platform;
+static void *wifi_shield_retained_storage;
+static StaticQueue_t wifi_shield_output_queue_storage;
+static QueueHandle_t wifi_shield_output_queue;
+static StaticTask_t wifi_shield_output_task_storage;
+static TaskHandle_t wifi_shield_output_task_handle;
+static StaticSemaphore_t wifi_shield_output_mutex_storage;
+static SemaphoreHandle_t wifi_shield_output_mutex;
+static StaticSemaphore_t wifi_shield_state_mutex_storage;
+static SemaphoreHandle_t wifi_shield_state_mutex;
+static StaticSemaphore_t wifi_shield_radio_mutex_storage;
+static SemaphoreHandle_t wifi_shield_radio_mutex;
+static StaticSemaphore_t wifi_shield_profile_mutex_storage;
+static SemaphoreHandle_t wifi_shield_profile_mutex;
+static StaticSemaphore_t wifi_shield_output_done_storage;
+static SemaphoreHandle_t wifi_shield_output_done;
+static wifi_shield_output_platform_t wifi_shield_output_platform;
+static atomic_bool wifi_shield_output_stop = ATOMIC_VAR_INIT(false);
+static bool wifi_shield_output_failed_token;
+static StackType_t *wifi_shield_presentation_task_stack;
+static StaticTask_t wifi_shield_presentation_task_storage;
+static TaskHandle_t wifi_shield_presentation_task_handle;
+static atomic_bool wifi_shield_presentation_monitor = ATOMIC_VAR_INIT(false);
+static const wifi_trust_store_ops_t wifi_trust_readonly_storage_ops;
+
+static void *feature_psram_aligned_calloc(size_t alignment, size_t count,
+                                         size_t size, uint32_t capabilities);
+static void feature_psram_free(void *memory);
+
+/* Shield journal ESP-IDF adapters: only the dedicated writer enters store hooks. */
+static esp_err_t init_sd_card(void);
+static bool sd_mkdir_recursive(const char *path);
+static bool sd_sync_checked(void);
+static void (*wifi_shield_journal_writer_entry)(void *);
+static void *wifi_shield_journal_writer_argument;
+
+static void wifi_shield_journal_lock(void *context)
+{
+    (void)context;
+    portENTER_CRITICAL(&wifi_shield_journal_mux);
+}
+static void wifi_shield_journal_unlock(void *context)
+{
+    (void)context;
+    portEXIT_CRITICAL(&wifi_shield_journal_mux);
+}
+static bool wifi_shield_journal_queue_send(
+    void *context, const wifi_shield_journal_record_t *record)
+{
+    (void)context;
+    return xQueueSend(wifi_shield_journal_queue, record, 0U) == pdTRUE;
+}
+static bool wifi_shield_journal_queue_receive(
+    void *context, wifi_shield_journal_record_t *record)
+{
+    (void)context;
+    return xQueueReceive(wifi_shield_journal_queue, record, 0U) == pdTRUE;
+}
+static void wifi_shield_journal_task(void *context)
+{
+    (void)context;
+    wifi_shield_journal_writer_entry(wifi_shield_journal_writer_argument);
+    xSemaphoreGive(wifi_shield_journal_done);
+    /* The joining owner deletes this task before freeing its stack. */
+    for (;;) vTaskSuspend(NULL);
+}
+static bool wifi_shield_journal_task_start(void *context,
+    void (*entry)(void *), void *argument, void *stack, size_t stack_bytes)
+{
+    (void)context;
+    if (wifi_shield_journal_task_handle != NULL ||
+        stack != wifi_shield_journal_task_stack ||
+        stack_bytes != WIFI_SHIELD_JOURNAL_STACK_BYTES) return false;
+    if (wifi_shield_journal_done == NULL)
+        wifi_shield_journal_done = xSemaphoreCreateBinaryStatic(
+            &wifi_shield_journal_done_storage);
+    if (wifi_shield_journal_done == NULL) return false;
+    (void)xSemaphoreTake(wifi_shield_journal_done, 0U);
+    wifi_shield_journal_writer_entry = entry;
+    wifi_shield_journal_writer_argument = argument;
+    /* ESP-IDF's xTaskCreateStatic stack depth is in bytes. */
+    wifi_shield_journal_task_handle = xTaskCreateStatic(wifi_shield_journal_task,
+        "shield_journal", stack_bytes, NULL, 3,
+        wifi_shield_journal_task_stack, &wifi_shield_journal_task_storage);
+    return wifi_shield_journal_task_handle != NULL;
+}
+static void wifi_shield_journal_task_wake(void *context)
+{
+    /* Bounded polling avoids a notification racing task deletion at shutdown. */
+    (void)context;
+}
+static void wifi_shield_journal_task_wait(void *context)
+{
+    (void)context;
+    vTaskDelay(1U);
+}
+static bool wifi_shield_journal_task_join(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    if (wifi_shield_journal_task_handle == NULL) return true;
+    TickType_t ticks = timeout_ms == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+    if (xSemaphoreTake(wifi_shield_journal_done, ticks) != pdTRUE) return false;
+    vTaskDelete(wifi_shield_journal_task_handle);
+    wifi_shield_journal_task_handle = NULL;
+    wifi_shield_journal_writer_entry = NULL;
+    wifi_shield_journal_writer_argument = NULL;
+    return true;
+}
+static bool wifi_shield_journal_gps_time(void *context, uint64_t *epoch_ms,
+                                         uint32_t *uncertainty_ms)
+{
+    (void)context;
+    *epoch_ms = 0U;
+    *uncertainty_ms = 0U;
+    if (!g_gps_clock_synced) return false;
+    time_t now = time(NULL);
+    if (now <= 0 || (uint64_t)now > UINT64_MAX / 1000U) return false;
+    *epoch_ms = (uint64_t)now * 1000U;
+    /* time(NULL) exposes whole seconds, so the conservative sub-second bound
+     * is one full second even when the trusted GPS RMC clock is synchronized. */
+    *uncertainty_ms = 1000U;
+    return true;
+}
+static bool wifi_shield_journal_mount(void *context)
+{
+    (void)context;
+    return init_sd_card() == ESP_OK;
+}
+static bool wifi_shield_journal_mkdir(void *context, const char *path)
+{
+    (void)context;
+    return sd_mkdir_recursive(path);
+}
+static void *wifi_shield_journal_open(void *context, const char *path)
+{
+    (void)context;
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) return NULL;
+    FILE *file = fdopen(fd, "wb");
+    if (file == NULL) { close(fd); return NULL; }
+    /* Keep buffering bounded; the queue and encoder already batch whole lines. */
+    if (setvbuf(file, NULL, _IONBF, 0) != 0) { fclose(file); return NULL; }
+    return file;
+}
+static void *wifi_shield_journal_open_replace(void *context, const char *path)
+{
+    (void)context;
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return NULL;
+    if (setvbuf(file, NULL, _IONBF, 0) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    return file;
+}
+static size_t wifi_shield_journal_write(void *context, void *handle,
+                                        const char *line, size_t length)
+{
+    (void)context;
+    return fwrite(line, 1U, length, handle);
+}
+static bool wifi_shield_journal_flush(void *context, void *handle)
+{
+    (void)context;
+    return fflush(handle) == 0;
+}
+static bool wifi_shield_journal_file_sync(void *context, void *handle)
+{
+    (void)context;
+    return fsync(fileno(handle)) == 0;
+}
+static bool wifi_shield_journal_close(void *context, void *handle)
+{
+    (void)context;
+    return fclose(handle) == 0;
+}
+static bool wifi_shield_journal_sync(void *context)
+{
+    (void)context;
+    return sd_sync_checked();
+}
+static bool wifi_shield_journal_rename(void *context, const char *from, const char *to)
+{
+    (void)context;
+    struct stat existing;
+    if (stat(to, &existing) == 0 || errno != ENOENT) return false;
+    /* ESP-IDF 6.0.1 vfs_fat_rename directly calls f_rename under its VFS lock;
+     * FatFs refuses an existing destination. Never unlink an earlier journal. */
+    return rename(from, to) == 0;
+}
+static bool wifi_shield_journal_rename_replace(
+    void *context, const char *from, const char *to)
+{
+    (void)context;
+    struct stat existing;
+    if (stat(to, &existing) == 0) {
+        /* This hook is used only for the disposable latest-session pointer;
+         * evidence JSONL and unique summaries always use no-replace rename. */
+        if (remove(to) != 0) return false;
+    } else if (errno != ENOENT) {
+        return false;
+    }
+    return rename(from, to) == 0;
+}
+/* Task 7 invokes this once for each accepted session and uses platform
+ * submit/status/ack/drain/finish above. Starting the radio does not depend on SD. */
+static bool wifi_shield_journal_session_start(
+    uint32_t boot_id, uint32_t session_id, uint64_t quota_bytes,
+    const wifi_shield_summary_metadata_t *metadata)
+{
+    if (wifi_shield_journal_queue == NULL || wifi_shield_journal_queue_buffer == NULL ||
+        wifi_shield_journal_task_stack == NULL) return false;
+    const wifi_shield_journal_platform_hooks_t hooks = {
+        .lock = wifi_shield_journal_lock, .unlock = wifi_shield_journal_unlock,
+        .queue_send = wifi_shield_journal_queue_send,
+        .queue_receive = wifi_shield_journal_queue_receive,
+        .task_start = wifi_shield_journal_task_start, .task_wake = wifi_shield_journal_task_wake,
+        .task_wait = wifi_shield_journal_task_wait, .task_join = wifi_shield_journal_task_join,
+        .gps_epoch_ms = wifi_shield_journal_gps_time,
+    };
+    const wifi_shield_journal_store_hooks_t store_hooks = {
+        .mount = wifi_shield_journal_mount, .mkdir = wifi_shield_journal_mkdir,
+        .open_exclusive = wifi_shield_journal_open, .write = wifi_shield_journal_write,
+        .flush = wifi_shield_journal_flush, .fsync_file = wifi_shield_journal_file_sync,
+        .close = wifi_shield_journal_close, .sync_sd = wifi_shield_journal_sync,
+        .rename_no_replace = wifi_shield_journal_rename,
+        .open_replace = wifi_shield_journal_open_replace,
+        .rename_replace = wifi_shield_journal_rename_replace,
+    };
+    if (wifi_shield_journal_platform == NULL) return false;
+    return wifi_shield_journal_platform_start(wifi_shield_journal_platform,
+        &hooks, &store_hooks, metadata, boot_id, session_id, quota_bytes,
+        wifi_shield_journal_queue_buffer, WIFI_SHIELD_JOURNAL_QUEUE_DEPTH,
+        wifi_shield_journal_task_stack, WIFI_SHIELD_JOURNAL_STACK_BYTES);
+}
+static uint32_t wifi_shield_journal_boot_id(void *context)
+{
+    (void)context;
+    static uint32_t boot_id;
+    if (boot_id == 0U) {
+        boot_id = esp_random();
+        if (boot_id == 0U) boot_id = 1U;
+    }
+    return boot_id;
+}
+static bool wifi_shield_journal_start_adapter(
+    void *context, uint32_t boot_id, uint32_t session_id,
+    uint64_t quota_bytes, const wifi_shield_summary_metadata_t *metadata)
+{
+    (void)context;
+    return wifi_shield_journal_session_start(
+        boot_id, session_id, quota_bytes, metadata);
+}
+static bool wifi_shield_journal_submit_adapter(
+    void *context, const wifi_shield_journal_record_t *record)
+{
+    (void)context;
+    return wifi_shield_journal_platform_submit(
+        wifi_shield_journal_platform, record);
+}
+static wifi_shield_journal_status_t wifi_shield_journal_status_adapter(
+    void *context)
+{
+    (void)context;
+    return wifi_shield_journal_platform_status(
+        wifi_shield_journal_platform);
+}
+static void wifi_shield_journal_ack_adapter(void *context)
+{
+    (void)context;
+    wifi_shield_journal_platform_acknowledge_degraded(
+        wifi_shield_journal_platform);
+}
+static bool wifi_shield_journal_drain_adapter(
+    void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    int64_t started_us = esp_timer_get_time();
+    uint64_t budget_us = (uint64_t)timeout_ms * UINT64_C(1000);
+    for (;;) {
+        if (wifi_shield_journal_platform_drain(
+                wifi_shield_journal_platform)) return true;
+        int64_t now_us = esp_timer_get_time();
+        if (timeout_ms == 0U || now_us < started_us ||
+            (uint64_t)(now_us - started_us) >= budget_us) return false;
+        vTaskDelay(1U);
+    }
+}
+static bool wifi_shield_journal_finish_adapter(
+    void *context, bool clean, uint32_t timeout_ms)
+{
+    (void)context;
+    return wifi_shield_journal_platform_finish(
+        wifi_shield_journal_platform, clean, timeout_ms);
+}
+/* End Shield journal ESP-IDF adapters */
+
+static wifi_shield_storage_destinations_t wifi_shield_storage_destinations(void)
+{
+    wifi_shield_storage_destinations_t destinations = {
+        .state = &wifi_shield_state_storage,
+        .event_ring = &wifi_shield_event_ring,
+        .output_queue = &wifi_shield_output_queue_buffer,
+        .publisher_stack = &wifi_shield_output_task_stack,
+        .journal_queue = &wifi_shield_journal_queue_buffer,
+        .journal_stack = &wifi_shield_journal_task_stack,
+        .journal_platform = &wifi_shield_journal_platform,
+    };
+    return destinations;
+}
+
+static wifi_shield_storage_layout_t wifi_shield_storage_layout(void)
+{
+    wifi_shield_storage_layout_t layout = {
+        .state_bytes = wifi_shield_state_size(),
+        .event_capacity = WIFI_SHIELD_COMPACT_EVENT_CAPACITY,
+        .event_size = sizeof(*wifi_shield_event_ring),
+        .output_records = WIFI_SHIELD_OUTPUT_QUEUE_DEPTH,
+        .output_record_size = sizeof(*wifi_shield_output_queue_buffer),
+        .publisher_stack_bytes = WIFI_SHIELD_OUTPUT_STACK_BYTES,
+        .journal_records = WIFI_SHIELD_JOURNAL_QUEUE_DEPTH,
+        .journal_record_size = sizeof(*wifi_shield_journal_queue_buffer),
+        .journal_stack_bytes = WIFI_SHIELD_JOURNAL_STACK_BYTES,
+        .journal_platform_bytes = sizeof(*wifi_shield_journal_platform),
+        .alignment = portBYTE_ALIGNMENT,
+        .spiram_capability = MALLOC_CAP_SPIRAM,
+        .byte_capability = MALLOC_CAP_8BIT,
+    };
+    return layout;
+}
+
+static bool wifi_shield_storage_create_queue(
+    void *context, wifi_shield_storage_queue_role_t role,
+    void *buffer, size_t records, size_t record_size)
+{
+    (void)context;
+    if (role == WIFI_SHIELD_STORAGE_QUEUE_JOURNAL) {
+        if (buffer != NULL && records == WIFI_SHIELD_JOURNAL_QUEUE_DEPTH &&
+            record_size == sizeof(wifi_shield_journal_record_t))
+            wifi_shield_journal_queue = xQueueCreateStatic(records, record_size,
+                buffer, &wifi_shield_journal_queue_storage);
+        if (wifi_shield_journal_queue != NULL) return true;
+        /* The bundle will wipe/release both buffers after this return. */
+        if (wifi_shield_output_queue != NULL) vQueueDelete(wifi_shield_output_queue);
+        wifi_shield_output_queue = NULL;
+        return false;
+    }
+    if (role != WIFI_SHIELD_STORAGE_QUEUE_OUTPUT || buffer == NULL ||
+        records != WIFI_SHIELD_OUTPUT_QUEUE_DEPTH ||
+        record_size != sizeof(wifi_shield_output_record_t)) return false;
+    wifi_shield_output_queue = xQueueCreateStatic(
+        records, record_size, buffer, &wifi_shield_output_queue_storage);
+    return wifi_shield_output_queue != NULL;
+}
+
+static bool wifi_shield_storage_acquire(void *context, size_t state_bytes,
+                                        void **state_storage)
+{
+    (void)context;
+    if (state_storage == NULL || *state_storage != NULL ||
+        state_bytes != wifi_shield_state_size() ||
+        wifi_shield_state_storage != NULL || wifi_shield_event_ring != NULL ||
+        wifi_shield_output_queue_buffer != NULL ||
+        wifi_shield_output_task_stack != NULL ||
+        wifi_shield_journal_queue_buffer != NULL ||
+        wifi_shield_journal_task_stack != NULL ||
+        wifi_shield_journal_platform != NULL) return false;
+    wifi_shield_storage_destinations_t destinations =
+        wifi_shield_storage_destinations();
+    wifi_shield_storage_layout_t layout = wifi_shield_storage_layout();
+    if (!wifi_shield_storage_bundle_acquire(
+            &destinations, &layout, feature_psram_aligned_calloc,
+            feature_psram_free, wifi_shield_storage_create_queue, NULL))
+        return false;
+    *state_storage = wifi_shield_state_storage;
+    return true;
+}
+
+static void wifi_shield_storage_release(void *context, void **state_storage,
+                                        size_t state_bytes)
+{
+    (void)context;
+    if (state_storage == NULL || state_bytes != wifi_shield_state_size()) return;
+    /* A false detach means the shared runtime can still dereference the ring.
+     * Fail closed instead of freeing storage underneath it. */
+    if (!wifi_security_runtime_detach_compact(security_platform.runtime)) abort();
+    /* A void release cannot report a pending writer: join before releasing its
+     * PSRAM. Task 7 normally finishes earlier with a bounded timeout. SD status
+     * never changes the radio cleanup result. */
+    if (!wifi_shield_journal_platform_finish(wifi_shield_journal_platform,
+                                             false, UINT32_MAX)) abort();
+    if (wifi_shield_journal_queue != NULL) vQueueDelete(wifi_shield_journal_queue);
+    wifi_shield_journal_queue = NULL;
+    if (wifi_shield_output_queue != NULL) vQueueDelete(wifi_shield_output_queue);
+    wifi_shield_output_queue = NULL;
+    wifi_shield_storage_destinations_t destinations =
+        wifi_shield_storage_destinations();
+    wifi_shield_storage_layout_t layout = wifi_shield_storage_layout();
+    wifi_shield_storage_bundle_release(
+        &destinations, &layout, feature_psram_free);
+    *state_storage = NULL;
+}
+
+static void wifi_shield_copy_target(wifi_shield_target_t *target,
+                                    const wifi_ap_record_t *record)
+{
+    memset(target, 0, sizeof(*target));
+    memcpy(target->bssid, record->bssid, sizeof(target->bssid));
+    target->channel = record->primary;
+    target->wpa2_psk_ccmp =
+        record->authmode == WIFI_AUTH_WPA2_PSK &&
+        record->pairwise_cipher == WIFI_CIPHER_TYPE_CCMP;
+    for (size_t i = 0U; i < sizeof(target->ssid) - 1U && record->ssid[i] != 0U; ++i) {
+        unsigned char byte = record->ssid[i];
+        target->ssid[i] = byte >= 0x20U && byte <= 0x7eU ? (char)byte : '?';
+    }
+}
+
+static bool wifi_shield_scan_all(void *context, wifi_shield_target_t *targets,
+                                 size_t capacity, size_t *count)
+{
+    (void)context;
+    if (targets == NULL || count == NULL || capacity < MAX_AP_CNT ||
+        !security_platform.shield_scan_reserved ||
+        g_scan_results_mutex == NULL) return false;
+    wifi_scan_config_t scan = {0};
+    if (analyzer_host_prepare_wifi() != ESP_OK ||
+        esp_wifi_scan_start(&scan, true) != ESP_OK ||
+        xSemaphoreTake(g_scan_results_mutex, pdMS_TO_TICKS(5000U)) != pdTRUE)
+        return false;
+    uint16_t found = MAX_AP_CNT;
+    g_scan_records_valid = false;
+    esp_err_t result = esp_wifi_scan_get_ap_records(&found, g_scan_results);
+    if (result == ESP_OK) {
+        g_scan_count = found;
+        g_scan_done = true;
+        g_scan_records_valid = found != 0U;
+        for (size_t i = 0U; i < found; ++i)
+            wifi_shield_copy_target(&targets[i], &g_scan_results[i]);
+    } else {
+        g_scan_count = 0U;
+        g_scan_done = false;
+    }
+    xSemaphoreGive(g_scan_results_mutex);
+    *count = result == ESP_OK ? found : 0U;
+    return result == ESP_OK && found != 0U;
+}
+
+static bool wifi_shield_scan_snapshot(void *context, const size_t *indices,
+                                      size_t index_count,
+                                      wifi_shield_target_t *targets,
+                                      size_t capacity, size_t *count)
+{
+    (void)context;
+    if (indices == NULL || targets == NULL || count == NULL ||
+        index_count == 0U || index_count > capacity ||
+        g_scan_results_mutex == NULL ||
+        xSemaphoreTake(g_scan_results_mutex, pdMS_TO_TICKS(5000U)) != pdTRUE)
+        return false;
+    bool valid = g_scan_done && !g_scan_in_progress && g_scan_records_valid;
+    for (size_t i = 0U; valid && i < index_count; ++i)
+        valid = indices[i] != 0U && indices[i] <= g_scan_count;
+    if (valid)
+        for (size_t i = 0U; i < index_count; ++i)
+            wifi_shield_copy_target(&targets[i], &g_scan_results[indices[i] - 1U]);
+    xSemaphoreGive(g_scan_results_mutex);
+    *count = valid ? index_count : 0U;
+    return valid;
+}
+
+static bool wifi_shield_trust_snapshot(void *context,
+                                       wifi_trust_profile_t *profiles,
+                                       size_t capacity, size_t *count)
+{
+    (void)context;
+    if (profiles == NULL || count == NULL || capacity == 0U) return false;
+    wifi_trust_store_meta_t meta;
+    return wifi_trust_store_load_readonly(
+        WIFI_TRUST_STORE_PATH, profiles, capacity, count, &meta,
+        &wifi_trust_readonly_storage_ops) == WIFI_TRUST_STORE_OK;
+}
+
+static bool wifi_shield_reserve_scan(void *context)
+{
+    (void)context;
+    return wifi_security_platform_reserve_shield_scan();
+}
+
+static bool wifi_shield_abort_prepare(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    return wifi_security_platform_abort_shield_scan(timeout_ms);
+}
+
+static bool wifi_shield_profile_reserve_scan(
+    void *context, wifi_security_module_t module)
+{
+    (void)context;
+    return wifi_security_platform_reserve_scan_module(module);
+}
+
+static bool wifi_shield_profile_abort_prepare(
+    void *context, wifi_security_module_t module, uint32_t timeout_ms)
+{
+    (void)context;
+    return wifi_security_platform_abort_scan_module(module, timeout_ms);
+}
+
+static bool wifi_shield_stage_channel(void *context, uint8_t channel)
+{
+    (void)context;
+    if (channel == 0U) return false;
+    security_platform.shield_staged_channel = channel;
+    return true;
+}
+
+static bool wifi_shield_retune_channel(void *context, uint8_t channel)
+{
+    (void)context;
+    wifi_security_runtime_status_t status;
+    wifi_security_runtime_get_status(security_platform.runtime, &status);
+    return status.module == WIFI_SECURITY_MODULE_SHIELD && status.running &&
+        security_channel_tune(NULL, channel);
+}
+
+static bool wifi_shield_radio_enter(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    return wifi_shield_radio_mutex != NULL &&
+        xSemaphoreTake(wifi_shield_radio_mutex,
+                       pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+static void wifi_shield_radio_leave(void *context)
+{
+    (void)context;
+    if (wifi_shield_radio_mutex == NULL ||
+        xSemaphoreGive(wifi_shield_radio_mutex) != pdTRUE)
+        abort();
+}
+
+static void wifi_shield_state_enter(void *context)
+{
+    (void)context;
+    if (wifi_shield_state_mutex == NULL ||
+        xSemaphoreTake(wifi_shield_state_mutex,
+                       pdMS_TO_TICKS(WIFI_SHIELD_OUTPUT_TIMEOUT_MS)) != pdTRUE)
+        abort();
+}
+
+static void wifi_shield_state_leave(void *context)
+{
+    (void)context;
+    if (wifi_shield_state_mutex == NULL ||
+        xSemaphoreGive(wifi_shield_state_mutex) != pdTRUE)
+        abort();
+}
+
+static void wifi_shield_runtime_status(
+    void *context, wifi_security_runtime_status_t *status)
+{
+    (void)context;
+    wifi_security_runtime_get_status(security_platform.runtime, status);
+}
+
+static bool wifi_shield_compact_consume(void *context,
+                                        const wifi_shield_compact_event_t *event)
+{
+    return wifi_shield_consume_compact(context, event);
+}
+
+static void wifi_shield_output_publisher(void *context)
+{
+    (void)context;
+    wifi_shield_output_record_t record;
+    for (;;) {
+        if (xQueueReceive(wifi_shield_output_queue, &record,
+                          pdMS_TO_TICKS(10U)) == pdTRUE) {
+            int written = -1;
+            if (record.length != 0U && record.length < sizeof(record.bytes))
+                written = uart_write_bytes(
+                    UART_NUM_0, record.bytes, record.length);
+            (void)wifi_shield_output_platform_published(
+                &wifi_shield_output_platform, record.length, written);
+            memset(&record, 0, sizeof(record));
+        }
+        if (atomic_load_explicit(&wifi_shield_output_stop, memory_order_acquire) &&
+            wifi_shield_output_platform_pending(
+                &wifi_shield_output_platform) == 0U) {
+            xSemaphoreGive(wifi_shield_output_done);
+            for (;;) vTaskSuspend(NULL);
+        }
+    }
+}
+
+static bool wifi_shield_output_start(void)
+{
+    if (wifi_shield_output_queue == NULL || wifi_shield_output_task_stack == NULL ||
+        wifi_shield_output_task_handle != NULL || wifi_shield_output_done == NULL)
+        return false;
+    (void)xSemaphoreTake(wifi_shield_output_done, 0U);
+    wifi_shield_output_platform_open(&wifi_shield_output_platform);
+    atomic_store_explicit(&wifi_shield_output_stop, false, memory_order_release);
+    wifi_shield_output_failed_token = false;
+    wifi_shield_output_task_handle = xTaskCreateStatic(
+        wifi_shield_output_publisher, "wifi_shield_out",
+        WIFI_SHIELD_OUTPUT_TASK_STACK_DEPTH, NULL, 4,
+        wifi_shield_output_task_stack, &wifi_shield_output_task_storage);
+    if (wifi_shield_output_task_handle == NULL) {
+        uint32_t remaining_ms;
+        (void)wifi_shield_output_platform_close(
+            &wifi_shield_output_platform, 5000U, &remaining_ms);
+        atomic_store_explicit(&wifi_shield_output_stop, true,
+                              memory_order_release);
+        return false;
+    }
+    return true;
+}
+
+static wifi_security_session_result_t wifi_shield_start_radio(
+    void *context, const wifi_security_session_config_t *config)
+{
+    (void)context;
+    if (config == NULL || wifi_shield_event_ring == NULL) {
+        return wifi_security_platform_abort_shield_scan(5000U) ?
+            WIFI_SECURITY_SESSION_PREPARE_FAILED :
+            WIFI_SECURITY_SESSION_CLEANUP_FAILED;
+    }
+    if (!wifi_security_runtime_bind_compact(security_platform.runtime,
+            wifi_shield_event_ring, wifi_shield_compact_consume,
+            config->context)) {
+        return wifi_security_platform_abort_shield_scan(5000U) ?
+            WIFI_SECURITY_SESSION_PREPARE_FAILED :
+            WIFI_SECURITY_SESSION_CLEANUP_FAILED;
+    }
+    if (!wifi_shield_output_start()) {
+        bool detached = wifi_security_runtime_detach_compact(
+            security_platform.runtime);
+        bool aborted = wifi_security_platform_abort_shield_scan(5000U);
+        return detached && aborted ? WIFI_SECURITY_SESSION_PREPARE_FAILED :
+                                     WIFI_SECURITY_SESSION_CLEANUP_FAILED;
+    }
+    wifi_security_session_result_t result =
+        wifi_security_runtime_platform_start(config);
+    if (result != WIFI_SECURITY_SESSION_OK &&
+        !security_platform.session.active) {
+        uint32_t remaining_ms;
+        if (!wifi_shield_output_platform_close(
+                &wifi_shield_output_platform, 5000U, &remaining_ms))
+            return WIFI_SECURITY_SESSION_JOIN_TIMEOUT;
+        atomic_store_explicit(&wifi_shield_output_stop, true,
+                              memory_order_release);
+        if (wifi_shield_output_task_handle != NULL) {
+            if (xSemaphoreTake(wifi_shield_output_done,
+                               pdMS_TO_TICKS(remaining_ms)) != pdTRUE)
+                return WIFI_SECURITY_SESSION_JOIN_TIMEOUT;
+            vTaskDelete(wifi_shield_output_task_handle);
+            wifi_shield_output_task_handle = NULL;
+        }
+        if (!wifi_security_runtime_detach_compact(security_platform.runtime))
+            return WIFI_SECURITY_SESSION_JOIN_TIMEOUT;
+    }
+    return result;
+}
+
+static bool wifi_shield_quiesce_radio(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    return wifi_security_runtime_platform_quiesce(timeout_ms);
+}
+
+static bool wifi_shield_finish_radio_cleanup(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    if (!wifi_security_runtime_platform_finish_cleanup(timeout_ms)) return false;
+    return wifi_security_runtime_detach_compact(security_platform.runtime);
+}
+
+static uint64_t wifi_shield_monotonic_us(void *context)
+{
+    (void)context;
+    return (uint64_t)esp_timer_get_time();
+}
+
+static bool wifi_shield_defence_random(void *context, uint8_t *out,
+                                       size_t length)
+{
+    (void)context;
+    if (out == NULL || length == 0U) return false;
+    esp_fill_random(out, length);
+    return true;
+}
+
+static int wifi_shield_defence_tx(void *context, const uint8_t *frame,
+                                  size_t length, bool en_sys_seq)
+{
+    (void)context;
+    if (frame == NULL || length == 0U || length > INT_MAX) return -1;
+    return esp_wifi_80211_tx(WIFI_IF_STA, frame, (int)length, en_sys_seq) ==
+        ESP_OK ? 0 : -1;
+}
+
+static wifi_security_session_result_t wifi_shield_profile_start_radio(
+    void *context, const wifi_security_session_config_t *config)
+{
+    (void)context;
+    return wifi_security_runtime_platform_start(config);
+}
+
+static bool wifi_shield_profile_stop_radio(void *context,
+                                           uint32_t timeout_ms)
+{
+    (void)context;
+    return wifi_security_runtime_stop(timeout_ms);
+}
+
+static bool wifi_shield_profile_retune(void *context,
+                                       wifi_security_module_t module,
+                                       uint32_t generation, uint8_t channel)
+{
+    (void)context;
+    wifi_security_runtime_status_t status = {0};
+    wifi_security_runtime_get_status(security_platform.runtime, &status);
+    return channel != 0U && status.running && !status.stopping &&
+        status.module == module && status.generation == generation &&
+        security_channel_tune(NULL, channel);
+}
+
+static bool wifi_shield_profile_gate_enter(void *context,
+                                           uint32_t timeout_ms)
+{
+    (void)context;
+    return wifi_shield_profile_mutex != NULL &&
+        xSemaphoreTake(wifi_shield_profile_mutex,
+                       pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+static void wifi_shield_profile_gate_leave(void *context)
+{
+    (void)context;
+    if (wifi_shield_profile_mutex == NULL ||
+        xSemaphoreGive(wifi_shield_profile_mutex) != pdTRUE)
+        abort();
+}
+
+static bool wifi_shield_output_enter(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    return wifi_shield_output_mutex != NULL &&
+        xSemaphoreTake(wifi_shield_output_mutex,
+                       pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+static void wifi_shield_output_leave(void *context)
+{
+    (void)context;
+    if (wifi_shield_output_mutex == NULL ||
+        xSemaphoreGive(wifi_shield_output_mutex) != pdTRUE) abort();
+}
+
+static bool wifi_shield_output_write(void *context, const char *line,
+                                     size_t length)
+{
+    (void)context;
+    if (line == NULL || length == 0U || length >= WIFI_SHIELD_LINE_MAX)
+        return false;
+    bool queue_ready = wifi_shield_output_queue != NULL;
+    bool admitted = wifi_shield_output_platform_admitted(
+        &wifi_shield_output_platform);
+    if (wifi_shield_output_platform_should_sync_status(
+            line, length, queue_ready, admitted)) {
+        int written = uart_write_bytes(UART_NUM_0, line, length);
+        return written >= 0 && (size_t)written == length;
+    }
+    if (!queue_ready || !admitted) return false;
+    wifi_shield_output_record_t record = {.length = (uint16_t)length};
+    memcpy(record.bytes, line, length);
+    wifi_shield_output_platform_accepted(&wifi_shield_output_platform);
+    bool queued = xQueueSend(wifi_shield_output_queue, &record,
+        pdMS_TO_TICKS(WIFI_SHIELD_OUTPUT_TIMEOUT_MS)) == pdTRUE;
+    if (!queued) {
+        (void)wifi_shield_output_platform_rejected(
+            &wifi_shield_output_platform);
+        wifi_shield_output_failed_token = true;
+    }
+    return queued;
+}
+
+static bool wifi_shield_output_write_terminal(
+    void *context, const wifi_shield_status_t *status, const char *outcome)
+{
+    (void)context;
+    char line[WIFI_SHIELD_LINE_MAX];
+    int length = wifi_shield_format_terminal(
+        line, sizeof(line), status, outcome);
+    if (length <= 0) return false;
+    int written = uart_write_bytes(UART_NUM_0, line, (size_t)length);
+    return written >= 0 && (size_t)written == (size_t)length;
+}
+
+static void wifi_shield_output_complete(void *context, bool accepted)
+{
+    (void)context;
+    if (accepted) {
+        if (wifi_shield_output_failed_token) abort();
+        return;
+    }
+    if (wifi_shield_output_failed_token) {
+        wifi_shield_output_failed_token = false;
+    }
+}
+
+static bool wifi_shield_output_idle(void *context)
+{
+    (void)context;
+    return wifi_shield_output_platform_pending(
+        &wifi_shield_output_platform) == 0U;
+}
+
+static bool wifi_shield_output_drain(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    uint32_t remaining_ms;
+    if (!wifi_shield_output_platform_close(
+            &wifi_shield_output_platform, timeout_ms, &remaining_ms))
+        return false;
+    if (wifi_shield_output_task_handle == NULL)
+        return wifi_shield_output_idle(NULL);
+    atomic_store_explicit(&wifi_shield_output_stop, true, memory_order_release);
+    if (xSemaphoreTake(wifi_shield_output_done,
+                       pdMS_TO_TICKS(remaining_ms)) != pdTRUE) return false;
+    vTaskDelete(wifi_shield_output_task_handle);
+    wifi_shield_output_task_handle = NULL;
+    return true;
+}
+
+static uint32_t wifi_shield_output_take_failures(void *context)
+{
+    (void)context;
+    return wifi_shield_output_platform_take_failures(
+        &wifi_shield_output_platform);
+}
+
+static const wifi_shield_runtime_hooks_t wifi_shield_runtime_hooks = {
+    .storage_acquire = wifi_shield_storage_acquire,
+    .storage_release = wifi_shield_storage_release,
+    .scan_all = wifi_shield_scan_all,
+    .scan_snapshot = wifi_shield_scan_snapshot,
+    .trust_snapshot = wifi_shield_trust_snapshot,
+    .reserve_scan = wifi_shield_reserve_scan,
+    .abort_prepare = wifi_shield_abort_prepare,
+    .start_radio = wifi_shield_start_radio,
+    .tune = wifi_shield_stage_channel,
+    .retune = wifi_shield_retune_channel,
+    .radio_enter = wifi_shield_radio_enter,
+    .radio_leave = wifi_shield_radio_leave,
+    .state_enter = wifi_shield_state_enter,
+    .state_leave = wifi_shield_state_leave,
+    .runtime_status = wifi_shield_runtime_status,
+    .quiesce_radio = wifi_shield_quiesce_radio,
+    .finish_radio_cleanup = wifi_shield_finish_radio_cleanup,
+    .monotonic_us = wifi_shield_monotonic_us,
+    .defence_random = wifi_shield_defence_random,
+    .defence_tx = wifi_shield_defence_tx,
+    .profile_start_radio = wifi_shield_profile_start_radio,
+    .profile_stop_radio = wifi_shield_profile_stop_radio,
+    .profile_retune = wifi_shield_profile_retune,
+    .profile_gate_enter = wifi_shield_profile_gate_enter,
+    .profile_gate_leave = wifi_shield_profile_gate_leave,
+    .profile_reserve_scan = wifi_shield_profile_reserve_scan,
+    .profile_abort_prepare = wifi_shield_profile_abort_prepare,
+    .journal_boot_id = wifi_shield_journal_boot_id,
+    .journal_start = wifi_shield_journal_start_adapter,
+    .journal_submit = wifi_shield_journal_submit_adapter,
+    .journal_status = wifi_shield_journal_status_adapter,
+    .journal_acknowledge_degraded = wifi_shield_journal_ack_adapter,
+    .journal_drain = wifi_shield_journal_drain_adapter,
+    .journal_finish = wifi_shield_journal_finish_adapter,
+};
+
+static const wifi_shield_output_hooks_t wifi_shield_output_hooks = {
+    .enter = wifi_shield_output_enter,
+    .leave = wifi_shield_output_leave,
+    .write = wifi_shield_output_write,
+    .write_terminal = wifi_shield_output_write_terminal,
+    .complete = wifi_shield_output_complete,
+    .idle = wifi_shield_output_idle,
+    .drain = wifi_shield_output_drain,
+    .take_failures = wifi_shield_output_take_failures,
+};
+
 static volatile bool g_scan_teardown_in_progress = false; // set when cancelling a scan to switch radio mode (suppresses misleading failure log)
 /* Unlike g_scan_in_progress this counter is not cleared by timeout/stop paths.
  * Analyzer admission requires the entire legacy completion callback to drain. */
@@ -2224,6 +3996,2019 @@ static portMUX_TYPE analyzer_legacy_scan_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t analyzer_legacy_scan_pending;
 static bool analyzer_legacy_radio_uncertain;
 static bool analyzer_sta_connect_pending;
+
+static bool client_isolation_platform_snapshot(
+    void *context, client_isolation_sta_snapshot_t *snapshot)
+{
+    (void)context;
+    if (snapshot == NULL) return false;
+    wifi_ap_record_t access_point = {0};
+    if (esp_wifi_sta_get_ap_info(&access_point) != ESP_OK) return false;
+    esp_netif_t *station = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t info = {0};
+    if (station == NULL || esp_netif_get_ip_info(station, &info) != ESP_OK)
+        return false;
+    int interface_index = esp_netif_get_netif_impl_index(station);
+    if (interface_index < 0) return false;
+    *snapshot = (client_isolation_sta_snapshot_t){
+        .connected = true,
+        .local_ipv4 = ntohl(info.ip.addr),
+        .netmask = ntohl(info.netmask.addr),
+        .gateway_ipv4 = ntohl(info.gw.addr),
+        .interface_id = (uint32_t)interface_index + 1U,
+    };
+    memcpy(snapshot->bssid, access_point.bssid, sizeof(snapshot->bssid));
+    return true;
+}
+
+static bool client_isolation_hmac_sha256(
+    void *context, const uint8_t token[JISO_TOKEN_BYTES],
+    const uint8_t *data, size_t data_length,
+    uint8_t digest[JISO_SHA256_BYTES])
+{
+    (void)context;
+    const mbedtls_md_info_t *info =
+        mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    return info != NULL &&
+        mbedtls_md_hmac(info, token, JISO_TOKEN_BYTES, data, data_length,
+                        digest) == 0;
+}
+
+static bool client_isolation_socket_open(void *context, int *socket_handle)
+{
+    (void)context;
+    if (socket_handle == NULL) return false;
+    *socket_handle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    return *socket_handle >= 0;
+}
+
+static bool client_isolation_socket_bind(void *context, int socket_handle,
+                                         uint32_t local_ipv4)
+{
+    (void)context;
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(0U),
+        .sin_addr.s_addr = htonl(local_ipv4),
+    };
+    return bind(socket_handle, (const struct sockaddr *)&address,
+                sizeof(address)) == 0;
+}
+
+static bool client_isolation_random_fill(void *context, uint8_t *bytes,
+                                         size_t length)
+{
+    (void)context;
+    if (bytes == NULL || length == 0U) return false;
+    esp_fill_random(bytes, length);
+    return true;
+}
+
+static bool client_isolation_send_datagram(
+    void *context, int socket_handle, uint32_t peer_ipv4, uint16_t peer_port,
+    const uint8_t *packet, size_t length)
+{
+    (void)context;
+    struct sockaddr_in peer = {
+        .sin_family = AF_INET,
+        .sin_port = htons(peer_port),
+        .sin_addr.s_addr = htonl(peer_ipv4),
+    };
+    ssize_t sent = sendto(socket_handle, packet, length, 0,
+                          (const struct sockaddr *)&peer, sizeof(peer));
+    return sent >= 0 && (size_t)sent == length;
+}
+
+static void client_isolation_platform_zero(void *memory, size_t size)
+{
+    volatile uint8_t *bytes = memory;
+    while (size > 0U) {
+        *bytes++ = 0U;
+        --size;
+    }
+}
+
+static client_isolation_receive_t client_isolation_receive_datagram(
+    void *context, int socket_handle, uint32_t timeout_ms, uint8_t *packet,
+    size_t capacity, size_t *length, uint32_t *source_ipv4,
+    uint16_t *source_port)
+{
+    (void)context;
+    if (packet == NULL || capacity != JISO_PACKET_BYTES || length == NULL ||
+        source_ipv4 == NULL || source_port == NULL) {
+        return CLIENT_ISOLATION_RECEIVE_ERROR;
+    }
+    struct timeval timeout = {
+        .tv_sec = (time_t)(timeout_ms / 1000U),
+        .tv_usec = (suseconds_t)((timeout_ms % 1000U) * 1000U),
+    };
+    if (setsockopt(socket_handle, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                   sizeof(timeout)) != 0) {
+        return CLIENT_ISOLATION_RECEIVE_ERROR;
+    }
+    uint8_t bounded[JISO_PACKET_BYTES + 1U] = {0};
+    struct sockaddr_in source = {0};
+    socklen_t source_length = sizeof(source);
+    ssize_t received = recvfrom(socket_handle, bounded, sizeof(bounded), 0,
+        (struct sockaddr *)&source, &source_length);
+    if (received < 0) {
+        return errno == EAGAIN || errno == EWOULDBLOCK ?
+            CLIENT_ISOLATION_RECEIVE_TIMEOUT : CLIENT_ISOLATION_RECEIVE_ERROR;
+    }
+    size_t received_length = (size_t)received;
+    size_t copied = received_length < capacity ? received_length : capacity;
+    memcpy(packet, bounded, copied);
+    client_isolation_platform_zero(bounded, sizeof(bounded));
+    *length = received_length;
+    *source_ipv4 = ntohl(source.sin_addr.s_addr);
+    *source_port = ntohs(source.sin_port);
+    return CLIENT_ISOLATION_RECEIVE_DATAGRAM;
+}
+
+static bool client_isolation_socket_close(void *context, int socket_handle)
+{
+    (void)context;
+    return close(socket_handle) == 0;
+}
+
+static uint64_t client_isolation_monotonic_ms(void *context)
+{
+    (void)context;
+    int64_t now = esp_timer_get_time();
+    return now > 0 ? (uint64_t)now / 1000U : 0U;
+}
+
+static bool client_isolation_cancelled(void *context)
+{
+    (void)context;
+    return false;
+}
+
+static void client_isolation_telemetry(
+    void *context, client_isolation_telemetry_t event, uint32_t sequence)
+{
+    (void)context;
+    (void)event;
+    (void)sequence;
+}
+
+static const jiso_crypto_t client_isolation_crypto = {
+    .hmac_sha256 = client_isolation_hmac_sha256,
+};
+
+static const client_isolation_ops_t client_isolation_runtime_ops = {
+    .socket_open = client_isolation_socket_open,
+    .socket_bind = client_isolation_socket_bind,
+    .random_fill = client_isolation_random_fill,
+    .send_datagram = client_isolation_send_datagram,
+    .receive_datagram = client_isolation_receive_datagram,
+    .socket_close = client_isolation_socket_close,
+    .monotonic_ms = client_isolation_monotonic_ms,
+    .cancelled = client_isolation_cancelled,
+    .telemetry = client_isolation_telemetry,
+    .crypto = &client_isolation_crypto,
+};
+
+static client_isolation_conclusion_t client_isolation_platform_run(
+    void *context, const client_isolation_config_t *config,
+    client_isolation_result_t *result)
+{
+    (void)context;
+    return client_isolation_run(config, &client_isolation_runtime_ops, result);
+}
+
+static bool client_isolation_platform_write(void *context, const char *line,
+                                            size_t length)
+{
+    (void)context;
+    if (line == NULL || length == 0U || length >= CLIENT_ISOLATION_LINE_MAX)
+        return false;
+    int written = uart_write_bytes(UART_NUM_0, line, length);
+    return written == (int)length;
+}
+
+static void client_isolation_platform_history_free(void *context)
+{
+    (void)context;
+    linenoiseHistoryFree();
+}
+
+static const client_isolation_hooks_t client_isolation_hooks = {
+    .snapshot = client_isolation_platform_snapshot,
+    .run = client_isolation_platform_run,
+    .write = client_isolation_platform_write,
+    .history_free = client_isolation_platform_history_free,
+};
+
+static const char *lookup_vendor_name(const uint8_t *mac);
+static uint8_t *router_audit_scratch;
+static void *router_audit_command_workspace;
+static StaticSemaphore_t router_cve_storage_mutex_storage;
+static SemaphoreHandle_t router_cve_storage_mutex;
+static esp_err_t init_sd_card(void);
+static bool sd_sync_checked(void);
+static bool sd_mkdir_recursive(const char *path);
+
+#define ROUTER_CVE_DIR "/sdcard/lab/router-audit"
+#define ROUTER_CVE_STAGE_PATH ROUTER_CVE_DIR "/catalog-v1.stage"
+#define ROUTER_CVE_STAGE_SIG_PATH ROUTER_CVE_DIR "/catalog-v1.stage.sig"
+#define ROUTER_CVE_NVS_NAMESPACE "router_cve"
+#define ROUTER_CVE_NVS_COMMIT_KEY "commit_v1"
+#define ROUTER_CVE_NVS_COMMIT_BYTES 144U
+
+static bool router_audit_platform_snapshot(void *context,
+                                           router_network_context_t *network)
+{
+    (void)context;
+    if (network == NULL) return false;
+    wifi_ap_record_t access_point = {0};
+    if (esp_wifi_sta_get_ap_info(&access_point) != ESP_OK) return false;
+    esp_netif_t *station = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t info = {0};
+    if (station == NULL || esp_netif_get_ip_info(station, &info) != ESP_OK)
+        return false;
+    *network = (router_network_context_t){
+        .sta_connected = true,
+        .local_ipv4 = ntohl(info.ip.addr),
+        .netmask_ipv4 = ntohl(info.netmask.addr),
+        .gateway_ipv4 = ntohl(info.gw.addr),
+        .bssid_known = true,
+    };
+    memcpy(network->bssid, access_point.bssid, sizeof(network->bssid));
+    struct netif *lwip = (struct netif *)esp_netif_get_netif_impl(station);
+    if (lwip != NULL) {
+        ip4_addr_t gateway;
+        ip4_addr_set_u32(&gateway, info.gw.addr);
+        struct eth_addr *ethernet = NULL;
+        const ip4_addr_t *cached_ip = NULL;
+        if (etharp_find_addr(lwip, &gateway, &ethernet, &cached_ip) >= 0 &&
+            ethernet != NULL && cached_ip != NULL) {
+            network->gateway_mac_known = true;
+            memcpy(network->gateway_mac, ethernet->addr,
+                   sizeof(network->gateway_mac));
+        }
+    }
+    return true;
+}
+
+static int router_audit_socket_open(void *context, router_socket_kind_t kind)
+{
+    (void)context;
+    return socket(AF_INET, kind == ROUTER_SOCKET_UDP ? SOCK_DGRAM : SOCK_STREAM,
+                  kind == ROUTER_SOCKET_UDP ? IPPROTO_UDP : IPPROTO_TCP);
+}
+
+static bool router_audit_socket_set_timeout(void *context, int socket_fd,
+                                            uint32_t timeout_ms)
+{
+    (void)context;
+    struct timeval timeout = {
+        .tv_sec = (time_t)(timeout_ms / 1000U),
+        .tv_usec = (suseconds_t)((timeout_ms % 1000U) * 1000U),
+    };
+    return setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                      sizeof(timeout)) == 0 &&
+           setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                      sizeof(timeout)) == 0;
+}
+
+static int64_t router_audit_socket_send_to(
+    void *context, int socket_fd, const uint8_t *bytes, size_t length,
+    uint32_t peer_ipv4, uint16_t peer_port)
+{
+    (void)context;
+    struct sockaddr_in peer = {
+        .sin_family = AF_INET,
+        .sin_port = htons(peer_port),
+        .sin_addr.s_addr = htonl(peer_ipv4),
+    };
+    return (int64_t)sendto(socket_fd, bytes, length, 0,
+        (const struct sockaddr *)&peer, sizeof(peer));
+}
+
+static int64_t router_audit_socket_recv_from(
+    void *context, int socket_fd, uint8_t *bytes, size_t capacity,
+    uint32_t *peer_ipv4, uint16_t *peer_port)
+{
+    (void)context;
+    struct sockaddr_in peer = {0};
+    socklen_t peer_size = sizeof(peer);
+    ssize_t received = recvfrom(socket_fd, bytes, capacity, 0,
+        (struct sockaddr *)&peer, &peer_size);
+    if (received < 0) return errno == EAGAIN || errno == EWOULDBLOCK ?
+        ROUTER_IO_TIMEOUT : ROUTER_IO_ERROR;
+    if (peer_ipv4 == NULL || peer_port == NULL || peer_size != sizeof(peer))
+        return ROUTER_IO_ERROR;
+    *peer_ipv4 = ntohl(peer.sin_addr.s_addr);
+    *peer_port = ntohs(peer.sin_port);
+    return (int64_t)received;
+}
+
+static bool router_audit_socket_connect(void *context, int socket_fd,
+                                        uint32_t peer_ipv4,
+                                        uint16_t peer_port,
+                                        uint32_t timeout_ms)
+{
+    if (timeout_ms == 0U ||
+        !router_audit_socket_set_timeout(context, socket_fd, timeout_ms))
+        return false;
+    struct sockaddr_in peer = {
+        .sin_family = AF_INET,
+        .sin_port = htons(peer_port),
+        .sin_addr.s_addr = htonl(peer_ipv4),
+    };
+    int flags = fcntl(socket_fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) != 0)
+        return false;
+    bool connected = false;
+    if (connect(socket_fd, (const struct sockaddr *)&peer, sizeof(peer)) == 0) {
+        connected = true;
+    } else {
+        int connect_error = errno;
+        if (connect_error == EINPROGRESS || connect_error == EALREADY ||
+            connect_error == EWOULDBLOCK) {
+            fd_set write_set;
+            FD_ZERO(&write_set);
+            FD_SET(socket_fd, &write_set);
+            struct timeval timeout = {
+                .tv_sec = (time_t)(timeout_ms / 1000U),
+                .tv_usec = (suseconds_t)((timeout_ms % 1000U) * 1000U),
+            };
+            int ready = select(socket_fd + 1, NULL, &write_set, NULL, &timeout);
+            if (ready > 0 && FD_ISSET(socket_fd, &write_set)) {
+                int socket_error = 0;
+                socklen_t error_size = sizeof(socket_error);
+                connected = getsockopt(socket_fd, SOL_SOCKET, SO_ERROR,
+                    &socket_error, &error_size) == 0 && socket_error == 0;
+            }
+        }
+    }
+    bool restored = fcntl(socket_fd, F_SETFL, flags) == 0;
+    return connected && restored;
+}
+
+static int64_t router_audit_socket_send(void *context, int socket_fd,
+                                        const uint8_t *bytes, size_t length)
+{
+    (void)context;
+    ssize_t sent = send(socket_fd, bytes, length, 0);
+    return sent < 0 ? ROUTER_IO_ERROR : (int64_t)sent;
+}
+
+static int64_t router_audit_socket_recv(void *context, int socket_fd,
+                                        uint8_t *bytes, size_t capacity)
+{
+    (void)context;
+    ssize_t received = recv(socket_fd, bytes, capacity, 0);
+    if (received < 0) return errno == EAGAIN || errno == EWOULDBLOCK ?
+        ROUTER_IO_TIMEOUT : ROUTER_IO_ERROR;
+    return (int64_t)received;
+}
+
+static void router_audit_socket_close(void *context, int socket_fd)
+{
+    (void)context;
+    (void)close(socket_fd);
+}
+
+static uint64_t router_audit_monotonic_ms(void *context)
+{
+    (void)context;
+    int64_t now = esp_timer_get_time();
+    return now > 0 ? (uint64_t)now / 1000U : 0U;
+}
+
+static bool router_audit_cancelled(void *context)
+{
+    (void)context;
+    return operation_stop_requested;
+}
+
+static bool router_audit_oui_lookup(
+    void *context, const uint8_t mac[6],
+    char vendor[ROUTER_EVIDENCE_TEXT_MAX + 1U])
+{
+    (void)context;
+    if (mac == NULL || vendor == NULL || (mac[0] & 0x02U) != 0U) return false;
+    const char *name = lookup_vendor_name(mac);
+    if (name == NULL) return false;
+    size_t length = strnlen(name, ROUTER_EVIDENCE_TEXT_MAX + 1U);
+    if (length == 0U || length > ROUTER_EVIDENCE_TEXT_MAX) return false;
+    memcpy(vendor, name, length + 1U);
+    return true;
+}
+
+static router_audit_result_t router_audit_platform_collect(
+    void *context, router_audit_mode_t mode,
+    const router_network_context_t *network, router_evidence_set_t *evidence)
+{
+    (void)context;
+    if (router_audit_scratch == NULL) return ROUTER_AUDIT_RESULT_INVALID;
+    const router_audit_ops_t ops = {
+        .socket_open = router_audit_socket_open,
+        .socket_set_timeout = router_audit_socket_set_timeout,
+        .socket_send_to = router_audit_socket_send_to,
+        .socket_recv_from = router_audit_socket_recv_from,
+        .socket_connect = router_audit_socket_connect,
+        .socket_send = router_audit_socket_send,
+        .socket_recv = router_audit_socket_recv,
+        .socket_close = router_audit_socket_close,
+        .monotonic_ms = router_audit_monotonic_ms,
+        .cancelled = router_audit_cancelled,
+        .oui_lookup = router_audit_oui_lookup,
+        .scratch = router_audit_scratch,
+        .scratch_capacity = ROUTER_AUDIT_SCRATCH_MIN,
+    };
+    return router_audit_collect(mode, network, &ops, evidence);
+}
+
+static const char *router_cve_object_path(router_cve_install_object_t object)
+{
+    static const char * const paths[ROUTER_CVE_OBJECT_COUNT] = {
+        ROUTER_CVE_DIR "/catalog-v1.slot0",
+        ROUTER_CVE_DIR "/catalog-v1.slot0.sig",
+        ROUTER_CVE_DIR "/catalog-v1.slot1",
+        ROUTER_CVE_DIR "/catalog-v1.slot1.sig",
+        ROUTER_CVE_DIR "/pointer-v1.0",
+        ROUTER_CVE_DIR "/pointer-v1.1",
+    };
+    return object < ROUTER_CVE_OBJECT_COUNT ? paths[object] : NULL;
+}
+
+static uint32_t router_cve_crc32(const uint8_t *bytes, size_t size)
+{
+    uint32_t crc = UINT32_MAX;
+    for (size_t index = 0U; index < size; ++index) {
+        crc ^= bytes[index];
+        for (unsigned bit = 0U; bit < 8U; ++bit)
+            crc = (crc >> 1U) ^ (UINT32_C(0xEDB88320) &
+                  (uint32_t)-(int32_t)(crc & 1U));
+    }
+    return ~crc;
+}
+
+static uint16_t router_cve_get_le16(const uint8_t *bytes)
+{
+    return (uint16_t)bytes[0] | (uint16_t)((uint16_t)bytes[1] << 8U);
+}
+
+static uint32_t router_cve_get_le32(const uint8_t *bytes)
+{
+    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8U) |
+           ((uint32_t)bytes[2] << 16U) | ((uint32_t)bytes[3] << 24U);
+}
+
+static uint64_t router_cve_get_le64(const uint8_t *bytes)
+{
+    return (uint64_t)router_cve_get_le32(bytes) |
+           ((uint64_t)router_cve_get_le32(bytes + 4U) << 32U);
+}
+
+static void router_cve_put_le16(uint8_t *bytes, uint16_t value)
+{
+    bytes[0] = (uint8_t)value;
+    bytes[1] = (uint8_t)(value >> 8U);
+}
+
+static void router_cve_put_le32(uint8_t *bytes, uint32_t value)
+{
+    bytes[0] = (uint8_t)value;
+    bytes[1] = (uint8_t)(value >> 8U);
+    bytes[2] = (uint8_t)(value >> 16U);
+    bytes[3] = (uint8_t)(value >> 24U);
+}
+
+static void router_cve_put_le64(uint8_t *bytes, uint64_t value)
+{
+    router_cve_put_le32(bytes, (uint32_t)value);
+    router_cve_put_le32(bytes + 4U, (uint32_t)(value >> 32U));
+}
+
+static bool router_cve_commit_equal(const router_cve_commit_record_t *left,
+                                    const router_cve_commit_record_t *right)
+{
+    return left != NULL && right != NULL && left->slot == right->slot &&
+           left->generation == right->generation && left->serial == right->serial &&
+           left->catalog_time_unknown == right->catalog_time_unknown &&
+           memcmp(left->catalog_sha256, right->catalog_sha256, 32U) == 0 &&
+           memcmp(left->signature_sha256, right->signature_sha256, 32U) == 0 &&
+           memcmp(left->key_id, right->key_id, 16U) == 0;
+}
+
+static void router_cve_commit_encode(
+    const router_cve_commit_record_t *commit,
+    uint8_t bytes[ROUTER_CVE_NVS_COMMIT_BYTES])
+{
+    memset(bytes, 0, ROUTER_CVE_NVS_COMMIT_BYTES);
+    memcpy(bytes, "JCCM", 4U);
+    router_cve_put_le16(bytes + 4U, 1U);
+    router_cve_put_le16(bytes + 6U, ROUTER_CVE_NVS_COMMIT_BYTES);
+    bytes[8U] = commit->slot;
+    bytes[9U] = commit->catalog_time_unknown ? 1U : 0U;
+    router_cve_put_le64(bytes + 16U, commit->generation);
+    router_cve_put_le64(bytes + 24U, commit->serial);
+    memcpy(bytes + 32U, commit->catalog_sha256, 32U);
+    memcpy(bytes + 64U, commit->signature_sha256, 32U);
+    memcpy(bytes + 96U, commit->key_id, 16U);
+    router_cve_put_le32(bytes + 140U, router_cve_crc32(bytes, 140U));
+}
+
+static bool router_cve_commit_decode(
+    const uint8_t bytes[ROUTER_CVE_NVS_COMMIT_BYTES],
+    router_cve_commit_record_t *commit)
+{
+    if (bytes == NULL || commit == NULL || memcmp(bytes, "JCCM", 4U) != 0 ||
+        router_cve_get_le16(bytes + 4U) != 1U ||
+        router_cve_get_le16(bytes + 6U) != ROUTER_CVE_NVS_COMMIT_BYTES ||
+        bytes[8U] >= ROUTER_CVE_INSTALL_SLOT_COUNT || bytes[9U] > 1U ||
+        router_cve_get_le32(bytes + 140U) != router_cve_crc32(bytes, 140U))
+        return false;
+    for (size_t index = 10U; index < 16U; ++index)
+        if (bytes[index] != 0U) return false;
+    for (size_t index = 112U; index < 140U; ++index)
+        if (bytes[index] != 0U) return false;
+    *commit = (router_cve_commit_record_t){
+        .slot = bytes[8U],
+        .generation = router_cve_get_le64(bytes + 16U),
+        .serial = router_cve_get_le64(bytes + 24U),
+        .catalog_time_unknown = bytes[9U] != 0U,
+    };
+    memcpy(commit->catalog_sha256, bytes + 32U, 32U);
+    memcpy(commit->signature_sha256, bytes + 64U, 32U);
+    memcpy(commit->key_id, bytes + 96U, 16U);
+    return commit->generation != 0U && commit->serial != 0U;
+}
+
+static bool router_cve_storage_enter(void *context)
+{
+    (void)context;
+    if (router_cve_storage_mutex == NULL ||
+        xSemaphoreTake(router_cve_storage_mutex, pdMS_TO_TICKS(5000U)) != pdTRUE)
+        return false;
+    if (init_sd_card() != ESP_OK || !sd_mkdir_recursive(ROUTER_CVE_DIR)) {
+        xSemaphoreGive(router_cve_storage_mutex);
+        return false;
+    }
+    return true;
+}
+
+static void router_cve_storage_leave(void *context)
+{
+    (void)context;
+    if (router_cve_storage_mutex != NULL)
+        xSemaphoreGive(router_cve_storage_mutex);
+}
+
+static router_cve_storage_result_t router_cve_storage_read(
+    void *context, router_cve_install_object_t object, void *buffer,
+    size_t capacity, size_t *size)
+{
+    (void)context;
+    const char *path = router_cve_object_path(object);
+    if (path == NULL || buffer == NULL || size == NULL) return ROUTER_CVE_STORAGE_ERROR;
+    struct stat file_status;
+    if (stat(path, &file_status) != 0)
+        return errno == ENOENT ? ROUTER_CVE_STORAGE_MISSING : ROUTER_CVE_STORAGE_ERROR;
+    if (!S_ISREG(file_status.st_mode) || file_status.st_size < 0 ||
+        (uint64_t)file_status.st_size > capacity) return ROUTER_CVE_STORAGE_ERROR;
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return ROUTER_CVE_STORAGE_ERROR;
+    size_t expected = (size_t)file_status.st_size;
+    bool ok = fread(buffer, 1U, expected, file) == expected;
+    if (ok) ok = fgetc(file) == EOF && !ferror(file);
+    if (fclose(file) != 0) ok = false;
+    if (!ok) return ROUTER_CVE_STORAGE_ERROR;
+    *size = expected;
+    return ROUTER_CVE_STORAGE_OK;
+}
+
+static bool router_cve_write_path(const char *path, const void *data,
+                                  size_t size)
+{
+    if (path == NULL || data == NULL || size == 0U) return false;
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    bool ok = fwrite(data, 1U, size, file) == size && fflush(file) == 0;
+    int descriptor = fileno(file);
+    if (ok && (descriptor < 0 || fsync(descriptor) != 0)) ok = false;
+    if (fclose(file) != 0) ok = false;
+    return ok;
+}
+
+static bool router_cve_storage_write(void *context,
+    router_cve_install_object_t object, const void *data, size_t size)
+{
+    (void)context;
+    const char *path = router_cve_object_path(object);
+    return path != NULL && router_cve_write_path(path, data, size);
+}
+
+static bool router_cve_storage_write_atomic(void *context,
+    router_cve_install_object_t object, const void *data, size_t size)
+{
+    (void)context;
+    const char *path = router_cve_object_path(object);
+    char temporary[192] = {0};
+    if (path == NULL || snprintf(temporary, sizeof(temporary), "%s.tmp", path) <= 0 ||
+        !router_cve_write_path(temporary, data, size) || !sd_sync_checked()) {
+        if (temporary[0] != '\0') (void)unlink(temporary);
+        return false;
+    }
+    if (unlink(path) != 0 && errno != ENOENT) {
+        (void)unlink(temporary);
+        return false;
+    }
+    if (rename(temporary, path) != 0) {
+        (void)unlink(temporary);
+        return false;
+    }
+    return sd_sync_checked();
+}
+
+static bool router_cve_storage_get_commit(
+    void *context, router_cve_commit_record_t *commit, bool *present)
+{
+    (void)context;
+    if (commit == NULL || present == NULL) return false;
+    *present = false;
+    memset(commit, 0, sizeof(*commit));
+    nvs_handle_t handle;
+    esp_err_t error = nvs_open(ROUTER_CVE_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (error == ESP_ERR_NVS_NOT_FOUND) return true;
+    if (error != ESP_OK) return false;
+    uint8_t bytes[ROUTER_CVE_NVS_COMMIT_BYTES];
+    size_t size = sizeof(bytes);
+    error = nvs_get_blob(handle, ROUTER_CVE_NVS_COMMIT_KEY, bytes, &size);
+    nvs_close(handle);
+    if (error == ESP_ERR_NVS_NOT_FOUND) return true;
+    if (error != ESP_OK || size != sizeof(bytes) ||
+        !router_cve_commit_decode(bytes, commit)) return false;
+    *present = true;
+    return true;
+}
+
+static bool router_cve_storage_advance_commit(
+    void *context, const router_cve_commit_record_t *expected,
+    bool expected_present, const router_cve_commit_record_t *desired)
+{
+    (void)context;
+    if (desired == NULL || desired->slot >= ROUTER_CVE_INSTALL_SLOT_COUNT ||
+        desired->serial == 0U || desired->generation == 0U) return false;
+    router_cve_commit_record_t current;
+    bool current_present = false;
+    if (!router_cve_storage_get_commit(NULL, &current, &current_present) ||
+        current_present != expected_present ||
+        (current_present && !router_cve_commit_equal(&current, expected)) ||
+        (current_present && (desired->serial <= current.serial ||
+                             desired->generation <= current.generation))) return false;
+    uint8_t bytes[ROUTER_CVE_NVS_COMMIT_BYTES];
+    router_cve_commit_encode(desired, bytes);
+    nvs_handle_t handle;
+    if (nvs_open(ROUTER_CVE_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK)
+        return false;
+    esp_err_t error = nvs_set_blob(handle, ROUTER_CVE_NVS_COMMIT_KEY,
+                                   bytes, sizeof(bytes));
+    if (error == ESP_OK) error = nvs_commit(handle);
+    nvs_close(handle);
+    if (error != ESP_OK) return false;
+    router_cve_commit_record_t readback;
+    bool readback_present = false;
+    return router_cve_storage_get_commit(NULL, &readback, &readback_present) &&
+           readback_present && router_cve_commit_equal(&readback, desired);
+}
+
+static const router_cve_install_ops_t router_cve_install_ops = {
+    .enter = router_cve_storage_enter,
+    .leave = router_cve_storage_leave,
+    .read = router_cve_storage_read,
+    .write = router_cve_storage_write,
+    .write_atomic = router_cve_storage_write_atomic,
+    .sync = (bool (*)(void *))NULL,
+    .get_commit = router_cve_storage_get_commit,
+    .advance_commit = router_cve_storage_advance_commit,
+};
+
+static bool router_cve_storage_sync(void *context)
+{
+    (void)context;
+    return sd_sync_checked();
+}
+
+static void router_cve_owned_release(void *context, void *data, size_t size)
+{
+    (void)context;
+    if (data != NULL) {
+        volatile uint8_t *bytes = data;
+        for (size_t index = 0U; index < size; ++index) bytes[index] = 0U;
+        heap_caps_free(data);
+    }
+}
+
+static router_cve_verify_result_t router_cve_load_owned(
+    const char *path, size_t minimum, size_t maximum,
+    router_cve_owned_bytes_t *owned)
+{
+    if (path == NULL || owned == NULL) return ROUTER_CVE_VERIFY_IO;
+    *owned = (router_cve_owned_bytes_t){0};
+    struct stat file_status;
+    if (stat(path, &file_status) != 0) return errno == ENOENT ?
+        ROUTER_CVE_VERIFY_NOT_FOUND : ROUTER_CVE_VERIFY_IO;
+    if (!S_ISREG(file_status.st_mode) || file_status.st_size < 0 ||
+        (uint64_t)file_status.st_size < minimum ||
+        (uint64_t)file_status.st_size > maximum) return ROUTER_CVE_VERIFY_BAD_FORMAT;
+    size_t size = (size_t)file_status.st_size;
+    uint8_t *bytes = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (bytes == NULL) return ROUTER_CVE_VERIFY_CAPACITY;
+    FILE *file = fopen(path, "rb");
+    bool ok = file != NULL && fread(bytes, 1U, size, file) == size &&
+              fgetc(file) == EOF && !ferror(file);
+    if (file != NULL && fclose(file) != 0) ok = false;
+    if (!ok) {
+        router_cve_owned_release(NULL, bytes, size);
+        return ROUTER_CVE_VERIFY_IO;
+    }
+    *owned = (router_cve_owned_bytes_t){
+        .data = bytes, .size = size,
+        .release = router_cve_owned_release,
+    };
+    return ROUTER_CVE_VERIFY_OK;
+}
+
+static router_cve_verify_result_t router_cve_allocate_owned(
+    size_t capacity, router_cve_owned_bytes_t *owned)
+{
+    if (owned == NULL || capacity == 0U) return ROUTER_CVE_VERIFY_BAD_FORMAT;
+    *owned = (router_cve_owned_bytes_t){0};
+    uint8_t *bytes = heap_caps_malloc(
+        capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (bytes == NULL) return ROUTER_CVE_VERIFY_CAPACITY;
+    *owned = (router_cve_owned_bytes_t){
+        .data = bytes,
+        .size = capacity,
+        .release = router_cve_owned_release,
+    };
+    return ROUTER_CVE_VERIFY_OK;
+}
+
+static bool router_cve_stage_presence(bool *catalog_present,
+                                      bool *signature_present)
+{
+    if (catalog_present == NULL || signature_present == NULL ||
+        init_sd_card() != ESP_OK || !sd_mkdir_recursive(ROUTER_CVE_DIR)) return false;
+    const char *paths[2] = {ROUTER_CVE_STAGE_PATH, ROUTER_CVE_STAGE_SIG_PATH};
+    bool *present[2] = {catalog_present, signature_present};
+    for (size_t index = 0U; index < 2U; ++index) {
+        struct stat status;
+        if (stat(paths[index], &status) == 0) {
+            if (!S_ISREG(status.st_mode)) return false;
+            *present[index] = true;
+        } else if (errno == ENOENT) {
+            *present[index] = false;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool router_cve_crypto(router_cve_crypto_t *crypto)
+{
+    if (crypto == NULL) return false;
+    const router_cve_trusted_key_t *keys = NULL;
+    size_t count = router_audit_provisioned_trusted_keys(&keys);
+    *crypto = (router_cve_crypto_t){
+        .keys = keys,
+        .key_count = count,
+        .verify = router_cve_mbedtls_p256_verify,
+    };
+    return keys != NULL && count > 0U && count <= ROUTER_CVE_MAX_TRUSTED_KEYS;
+}
+
+static router_cve_time_policy_t router_cve_time_policy(bool allow_unknown)
+{
+    time_t current = time(NULL);
+    bool reliable = g_gps_clock_synced && current > 0;
+    return (router_cve_time_policy_t){
+        .reliable = reliable,
+        .now_epoch = reliable ? (uint64_t)current : 0U,
+        .allow_unknown = allow_unknown,
+    };
+}
+
+static router_cve_verify_result_t router_cve_apply_catalog_time(
+    uint64_t serial, uint64_t created_epoch, uint64_t expires_epoch,
+    bool installed_time_unknown, router_audit_catalog_state_t *catalog)
+{
+    if (catalog == NULL || serial == 0U || created_epoch >= expires_epoch)
+        return ROUTER_CVE_VERIFY_BAD_FORMAT;
+    router_cve_time_policy_t time_policy = router_cve_time_policy(false);
+    *catalog = (router_audit_catalog_state_t){
+        .available = true,
+        .serial = serial,
+        .time_unknown = installed_time_unknown || !time_policy.reliable,
+    };
+    catalog->age_seconds = time_policy.now_epoch >= created_epoch ?
+        time_policy.now_epoch - created_epoch : 0U;
+    router_cve_verify_result_t result = router_cve_validate_catalog_time(
+        created_epoch, expires_epoch, &time_policy);
+    if (result == ROUTER_CVE_VERIFY_STALE)
+        catalog->stale = true;
+    return result;
+}
+
+static router_cve_db_result_t router_audit_platform_lookup(
+    void *context, const router_fingerprint_t *fingerprint,
+    router_cve_result_t *results, size_t capacity, size_t *required,
+    router_audit_catalog_state_t *catalog)
+{
+    (void)context;
+    if (fingerprint == NULL || results == NULL || required == NULL || catalog == NULL)
+        return ROUTER_CVE_DB_FORMAT;
+    *required = 0U;
+    *catalog = (router_audit_catalog_state_t){0};
+    if (!router_cve_storage_enter(NULL)) return ROUTER_CVE_DB_IO;
+    router_cve_commit_record_t commit;
+    bool present = false;
+    if (!router_cve_storage_get_commit(NULL, &commit, &present) || !present) {
+        router_cve_storage_leave(NULL);
+        return ROUTER_CVE_DB_NOT_FOUND;
+    }
+    router_cve_install_object_t object = commit.slot == 0U ?
+        ROUTER_CVE_OBJECT_SLOT0_CATALOG : ROUTER_CVE_OBJECT_SLOT1_CATALOG;
+    router_cve_owned_bytes_t owned;
+    router_cve_verify_result_t loaded = router_cve_load_owned(
+        router_cve_object_path(object), 192U, ROUTER_CVE_DB_MAX_BYTES, &owned);
+    if (loaded != ROUTER_CVE_VERIFY_OK) {
+        router_cve_storage_leave(NULL);
+        return loaded == ROUTER_CVE_VERIFY_CAPACITY ? ROUTER_CVE_DB_CAPACITY :
+               loaded == ROUTER_CVE_VERIFY_NOT_FOUND ? ROUTER_CVE_DB_NOT_FOUND :
+                                                       ROUTER_CVE_DB_IO;
+    }
+    const mbedtls_md_info_t *sha = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    uint8_t digest[32U];
+    bool hash_ok = sha != NULL && mbedtls_md(sha, owned.data, owned.size, digest) == 0 &&
+                   memcmp(digest, commit.catalog_sha256, sizeof(digest)) == 0;
+    if (!hash_ok) {
+        router_cve_owned_release(NULL, owned.data, owned.size);
+        router_cve_storage_leave(NULL);
+        return ROUTER_CVE_DB_HASH;
+    }
+    router_cve_db_result_t open_result;
+    router_cve_db_t *db = router_cve_db_open_owned_snapshot_with_release(
+        owned.data, (uint32_t)owned.size, router_cve_owned_release, NULL,
+        &open_result);
+    owned = (router_cve_owned_bytes_t){0};
+    if (db == NULL) {
+        router_cve_storage_leave(NULL);
+        return open_result;
+    }
+    router_cve_db_metadata_t metadata = {0};
+    router_cve_db_result_t result = router_cve_db_metadata(db, &metadata);
+    if (result == ROUTER_CVE_DB_OK)
+        result = router_cve_db_lookup(db, fingerprint, results, capacity, required);
+    router_cve_db_close(db);
+    router_cve_storage_leave(NULL);
+    router_cve_time_policy_t current_time = router_cve_time_policy(false);
+    *catalog = (router_audit_catalog_state_t){
+        .available = result == ROUTER_CVE_DB_OK || result == ROUTER_CVE_DB_NOT_FOUND,
+        .serial = metadata.serial,
+        .age_seconds = current_time.reliable &&
+                       current_time.now_epoch >= metadata.created_epoch ?
+                       current_time.now_epoch - metadata.created_epoch : 0U,
+        .stale = current_time.reliable &&
+                 current_time.now_epoch >= metadata.expires_epoch,
+        .time_unknown = !current_time.reliable || commit.catalog_time_unknown,
+    };
+    return result;
+}
+
+static router_cve_verify_result_t router_audit_platform_db_status(
+    void *context, router_audit_catalog_state_t *catalog)
+{
+    (void)context;
+    if (catalog == NULL) return ROUTER_CVE_VERIFY_BAD_FORMAT;
+    *catalog = (router_audit_catalog_state_t){0};
+    router_cve_crypto_t crypto;
+    (void)router_cve_crypto(&crypto);
+    router_cve_owned_bytes_t catalog_buffer, signature_buffer;
+    router_cve_verify_result_t result = router_cve_allocate_owned(
+        ROUTER_CVE_DB_MAX_BYTES, &catalog_buffer);
+    if (result != ROUTER_CVE_VERIFY_OK) return result;
+    result = router_cve_allocate_owned(
+        ROUTER_CVE_SIG_MAX_BYTES, &signature_buffer);
+    if (result != ROUTER_CVE_VERIFY_OK) {
+        router_cve_owned_release(NULL, catalog_buffer.data,
+                                 catalog_buffer.size);
+        return result;
+    }
+    router_cve_install_status_t recovered;
+    router_cve_install_ops_t ops = router_cve_install_ops;
+    ops.sync = router_cve_storage_sync;
+    const router_cve_time_policy_t structural_time = {
+        .reliable = false,
+        .now_epoch = 0U,
+        .allow_unknown = true,
+    };
+    result = router_cve_install_recover_owned(
+        &catalog_buffer, &signature_buffer, &ops, &crypto,
+        &structural_time, &recovered);
+    if (result != ROUTER_CVE_VERIFY_OK) return result;
+    return router_cve_apply_catalog_time(
+        recovered.serial, recovered.created_epoch, recovered.expires_epoch,
+        recovered.installed_time_unknown, catalog);
+}
+
+static router_cve_verify_result_t router_audit_platform_db_verify(
+    void *context, router_audit_catalog_state_t *catalog)
+{
+    (void)context;
+    if (catalog == NULL) return ROUTER_CVE_VERIFY_BAD_FORMAT;
+    *catalog = (router_audit_catalog_state_t){0};
+    bool catalog_present = false, signature_present = false;
+    if (!router_cve_stage_presence(&catalog_present, &signature_present))
+        return ROUTER_CVE_VERIFY_IO;
+    if (catalog_present != signature_present) {
+        catalog->incomplete_stage = true;
+        return ROUTER_CVE_VERIFY_NOT_FOUND;
+    }
+    if (!catalog_present)
+        return router_audit_platform_db_status(NULL, catalog);
+    router_cve_crypto_t crypto;
+    if (!router_cve_crypto(&crypto)) return ROUTER_CVE_VERIFY_UNKNOWN_KEY;
+    router_cve_owned_bytes_t owned_catalog, owned_signature;
+    router_cve_verify_result_t result = router_cve_load_owned(
+        ROUTER_CVE_STAGE_PATH, 192U, ROUTER_CVE_DB_MAX_BYTES, &owned_catalog);
+    if (result != ROUTER_CVE_VERIFY_OK) return result;
+    result = router_cve_load_owned(ROUTER_CVE_STAGE_SIG_PATH,
+        ROUTER_CVE_SIG_HEADER_BYTES + 8U, ROUTER_CVE_SIG_MAX_BYTES,
+        &owned_signature);
+    if (result != ROUTER_CVE_VERIFY_OK) {
+        router_cve_owned_release(NULL, owned_catalog.data, owned_catalog.size);
+        return result;
+    }
+    router_cve_verified_t verified;
+    const router_cve_time_policy_t time_policy = {
+        .reliable = false,
+        .now_epoch = 0U,
+        .allow_unknown = true,
+    };
+    result = router_cve_verify_owned(&owned_catalog, &owned_signature,
+                                     &crypto, &time_policy, &verified);
+    if (result != ROUTER_CVE_VERIFY_OK) return result;
+    return router_cve_apply_catalog_time(
+        verified.catalog.serial, verified.catalog.created_epoch,
+        verified.catalog.expires_epoch, false, catalog);
+}
+
+static router_cve_verify_result_t router_audit_platform_db_install(
+    void *context, bool allow_time_unknown,
+    router_audit_catalog_state_t *catalog)
+{
+    (void)context;
+    if (catalog == NULL) return ROUTER_CVE_VERIFY_BAD_FORMAT;
+    *catalog = (router_audit_catalog_state_t){0};
+    bool catalog_present = false, signature_present = false;
+    if (!router_cve_stage_presence(&catalog_present, &signature_present))
+        return ROUTER_CVE_VERIFY_IO;
+    if (!catalog_present || !signature_present) {
+        catalog->incomplete_stage = catalog_present != signature_present;
+        return ROUTER_CVE_VERIFY_NOT_FOUND;
+    }
+    router_cve_crypto_t crypto;
+    if (!router_cve_crypto(&crypto)) return ROUTER_CVE_VERIFY_UNKNOWN_KEY;
+    router_cve_owned_bytes_t owned_catalog, owned_signature;
+    router_cve_verify_result_t result = router_cve_load_owned(
+        ROUTER_CVE_STAGE_PATH, 192U, ROUTER_CVE_DB_MAX_BYTES, &owned_catalog);
+    if (result != ROUTER_CVE_VERIFY_OK) return result;
+    result = router_cve_load_owned(ROUTER_CVE_STAGE_SIG_PATH,
+        ROUTER_CVE_SIG_HEADER_BYTES + 8U, ROUTER_CVE_SIG_MAX_BYTES,
+        &owned_signature);
+    if (result != ROUTER_CVE_VERIFY_OK) {
+        router_cve_owned_release(NULL, owned_catalog.data, owned_catalog.size);
+        return result;
+    }
+    router_cve_time_policy_t time_policy = router_cve_time_policy(allow_time_unknown);
+    router_cve_install_status_t installed;
+    router_cve_install_ops_t ops = router_cve_install_ops;
+    ops.sync = router_cve_storage_sync;
+    result = router_cve_install_catalog_owned(&owned_catalog, &owned_signature,
+        &ops, &crypto, &time_policy, &installed);
+    if (result == ROUTER_CVE_VERIFY_OK ||
+        result == ROUTER_CVE_VERIFY_PUBLISHED_UNCERTAIN) {
+        *catalog = (router_audit_catalog_state_t){
+            .available = installed.available,
+            .serial = installed.serial,
+            .time_unknown = installed.catalog_time_unknown,
+        };
+    }
+    return result;
+}
+
+static bool router_audit_platform_write(void *context, const char *line,
+                                        size_t length)
+{
+    (void)context;
+    if (line == NULL || length == 0U || length >= ROUTER_AUDIT_LINE_MAX)
+        return false;
+    return uart_write_bytes(UART_NUM_0, line, length) == (int)length;
+}
+
+static router_audit_hooks_t router_audit_hooks = {
+    .snapshot = router_audit_platform_snapshot,
+    .collect = router_audit_platform_collect,
+    .lookup = router_audit_platform_lookup,
+    .db_status = router_audit_platform_db_status,
+    .db_verify = router_audit_platform_db_verify,
+    .db_install = router_audit_platform_db_install,
+    .write = router_audit_platform_write,
+};
+
+static portMUX_TYPE wps_guard_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static StaticSemaphore_t wps_guard_output_mutex_storage;
+static SemaphoreHandle_t wps_guard_output_mutex = NULL;
+#define WPS_GUARD_OUTPUT_QUEUE_DEPTH 8U
+#define WPS_GUARD_OUTPUT_TASK_STACK_DEPTH (4096U / sizeof(StackType_t))
+typedef struct {
+    bool terminal;
+    uint16_t length;
+    char bytes[WPS_GUARD_LINE_MAX];
+    wps_guard_status_t status;
+    char outcome[16];
+} wps_guard_output_record_t;
+static StaticQueue_t wps_guard_output_queue_storage;
+static uint8_t *wps_guard_output_queue_buffer;
+static QueueHandle_t wps_guard_output_queue;
+static StaticTask_t wps_guard_output_task_storage;
+static StackType_t *wps_guard_output_task_stack;
+static TaskHandle_t wps_guard_output_task_handle;
+static atomic_uint wps_guard_output_pending = ATOMIC_VAR_INIT(0U);
+/* Protected by wps_guard_output_mutex. A failed queue admission retains its
+ * pending token until the feature has synchronously recorded output failure. */
+static bool wps_guard_output_failed_admission_token;
+
+static void wps_guard_hook_enter(void *context)
+{
+    (void)context;
+    portENTER_CRITICAL(&wps_guard_state_lock);
+}
+
+static void wps_guard_hook_leave(void *context)
+{
+    (void)context;
+    portEXIT_CRITICAL(&wps_guard_state_lock);
+}
+
+static bool wps_guard_scan_snapshot(void *context,
+                                    wifi_shield_target_t (**targets),
+                                    size_t *count)
+{
+    (void)context;
+    if (targets == NULL || count == NULL || g_scan_results_mutex == NULL ||
+        xSemaphoreTake(g_scan_results_mutex,
+                       pdMS_TO_TICKS(WPS_GUARD_SCAN_TIMEOUT_MS)) != pdTRUE)
+        return false;
+    bool valid = g_scan_done && g_scan_records_valid && g_scan_count != 0U &&
+                 g_scan_count <= MAX_AP_CNT;
+    wifi_shield_target_t *snapshot = NULL;
+    size_t snapshot_count = valid ? g_scan_count : 0U;
+    if (valid) {
+        snapshot = heap_caps_calloc(
+            snapshot_count, sizeof(*snapshot),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (snapshot != NULL) {
+            for (size_t i = 0; i < snapshot_count; ++i)
+                wifi_shield_copy_target(&snapshot[i], &g_scan_results[i]);
+        }
+    }
+    xSemaphoreGive(g_scan_results_mutex);
+    if (snapshot == NULL) return false;
+    *targets = snapshot;
+    *count = snapshot_count;
+    return true;
+}
+
+static void wps_guard_scan_release(void *context,
+                                   wifi_shield_target_t *targets,
+                                   size_t count)
+{
+    (void)context;
+    volatile uint8_t *bytes = (volatile uint8_t *)targets;
+    for (size_t i = 0; bytes != NULL && i < count * sizeof(*targets); ++i)
+        bytes[i] = 0U;
+    heap_caps_free(targets);
+}
+
+static uint64_t wps_guard_monotonic_us(void *context)
+{
+    (void)context;
+    return (uint64_t)esp_timer_get_time();
+}
+
+static void wps_guard_runtime_status_snapshot(
+    void *context, wifi_security_runtime_status_t *status)
+{
+    (void)context;
+    wifi_security_runtime_get_status(security_platform.runtime, status);
+}
+
+static wifi_security_session_result_t wps_guard_runtime_start(
+    void *context, const wifi_shield_target_t *targets, size_t target_count,
+    const wifi_security_session_config_t *config)
+{
+    (void)context;
+    return wifi_shield_start_wps_profile(targets, target_count, config);
+}
+
+static bool wps_guard_runtime_stop(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    return wifi_shield_stop_wps_profile(timeout_ms);
+}
+
+static bool wps_guard_output_write(void *context, const char *line, size_t length)
+{
+    (void)context;
+    if (line == NULL || length == 0U || length >= WPS_GUARD_LINE_MAX ||
+        wps_guard_output_queue == NULL) return false;
+    wps_guard_output_record_t record = {.length = (uint16_t)length};
+    memcpy(record.bytes, line, length);
+    atomic_fetch_add_explicit(&wps_guard_output_pending, 1U,
+                              memory_order_acq_rel);
+    bool queued = xQueueSend(wps_guard_output_queue, &record,
+        pdMS_TO_TICKS(WPS_GUARD_OUTPUT_TIMEOUT_MS)) == pdTRUE;
+    if (!queued) wps_guard_output_failed_admission_token = true;
+    return queued;
+}
+
+static bool wps_guard_output_write_terminal(
+    void *context, const wps_guard_status_t *status, const char *outcome)
+{
+    (void)context;
+    if (status == NULL || outcome == NULL || wps_guard_output_queue == NULL)
+        return false;
+    size_t outcome_length = strlen(outcome);
+    if (outcome_length == 0U || outcome_length >= 16U) return false;
+    wps_guard_output_record_t record = {.terminal = true, .status = *status};
+    memcpy(record.outcome, outcome, outcome_length + 1U);
+    atomic_fetch_add_explicit(&wps_guard_output_pending, 1U,
+                              memory_order_acq_rel);
+    bool queued = xQueueSend(wps_guard_output_queue, &record,
+        pdMS_TO_TICKS(WPS_GUARD_OUTPUT_TIMEOUT_MS)) == pdTRUE;
+    if (!queued) wps_guard_output_failed_admission_token = true;
+    return queued;
+}
+
+static void wps_guard_output_complete(void *context, bool accepted)
+{
+    (void)context;
+    if (accepted) {
+        if (wps_guard_output_failed_admission_token) abort();
+        return;
+    }
+    if (wps_guard_output_failed_admission_token) {
+        wps_guard_output_failed_admission_token = false;
+        atomic_fetch_sub_explicit(&wps_guard_output_pending, 1U,
+                                  memory_order_acq_rel);
+    }
+}
+
+static bool wps_guard_output_idle(void *context)
+{
+    (void)context;
+    return atomic_load_explicit(&wps_guard_output_pending,
+                                memory_order_acquire) == 0U;
+}
+
+static bool wps_guard_output_publish_record(
+    const wps_guard_output_record_t *record)
+{
+    if (record == NULL || record->length == 0U ||
+        record->length >= WPS_GUARD_LINE_MAX) return false;
+    int written = uart_write_bytes(UART_NUM_0, record->bytes, record->length);
+    return written == (int)record->length;
+}
+
+static void wps_guard_output_publisher(void *context)
+{
+    (void)context;
+    wps_guard_output_record_t record;
+    for (;;) {
+        if (xQueueReceive(wps_guard_output_queue, &record,
+                          pdMS_TO_TICKS(1000U)) != pdTRUE)
+            continue;
+        if (record.terminal) {
+            int length = wps_guard_format_terminal_for_output(
+                record.bytes, sizeof(record.bytes), &record.status,
+                record.outcome);
+            record.length = length > 0 ? (uint16_t)length : 0U;
+        }
+        bool published = wps_guard_output_publish_record(&record);
+        memset(&record, 0, sizeof(record));
+        if (!published) wps_guard_report_output_failure();
+        atomic_fetch_sub_explicit(&wps_guard_output_pending, 1U,
+                                  memory_order_acq_rel);
+    }
+}
+
+static bool wps_guard_output_enter(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    if (wps_guard_output_mutex == NULL) return false;
+    BaseType_t result = xSemaphoreTake(wps_guard_output_mutex,
+                                       pdMS_TO_TICKS(timeout_ms));
+    return result == pdTRUE;
+}
+
+static void wps_guard_output_leave(void *context)
+{
+    (void)context;
+    if (wps_guard_output_mutex == NULL) abort();
+    BaseType_t result = xSemaphoreGive(wps_guard_output_mutex);
+    if (result != pdTRUE) abort();
+}
+
+static const wps_guard_runtime_hooks_t wps_guard_runtime_hooks = {
+    .enter = wps_guard_hook_enter,
+    .leave = wps_guard_hook_leave,
+    .scan_snapshot = wps_guard_scan_snapshot,
+    .scan_release = wps_guard_scan_release,
+    .monotonic_us = wps_guard_monotonic_us,
+    .status_snapshot = wps_guard_runtime_status_snapshot,
+    .start = wps_guard_runtime_start,
+    .stop = wps_guard_runtime_stop,
+};
+
+static const wps_guard_output_hooks_t wps_guard_output_hooks = {
+    .enter = wps_guard_output_enter,
+    .leave = wps_guard_output_leave,
+    .write = wps_guard_output_write,
+    .write_terminal = wps_guard_output_write_terminal,
+    .complete = wps_guard_output_complete,
+    .idle = wps_guard_output_idle,
+};
+
+static portMUX_TYPE sae_guard_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static StaticSemaphore_t sae_guard_output_mutex_storage;
+static SemaphoreHandle_t sae_guard_output_mutex = NULL;
+#define SAE_GUARD_OUTPUT_QUEUE_DEPTH 8U
+#define SAE_GUARD_OUTPUT_TASK_STACK_DEPTH (4096U / sizeof(StackType_t))
+typedef struct {
+    bool terminal;
+    uint16_t length;
+    char bytes[SAE_GUARD_LINE_MAX];
+    sae_guard_status_t status;
+    char outcome[16];
+} sae_guard_output_record_t;
+static StaticQueue_t sae_guard_output_queue_storage;
+static uint8_t *sae_guard_output_queue_buffer;
+static QueueHandle_t sae_guard_output_queue;
+static StaticTask_t sae_guard_output_task_storage;
+static StackType_t *sae_guard_output_task_stack;
+static TaskHandle_t sae_guard_output_task_handle;
+static atomic_uint sae_guard_output_pending = ATOMIC_VAR_INIT(0U);
+/* Protected by sae_guard_output_mutex. Failed admission keeps its pending
+ * token until SAE Guard has synchronously recorded the output failure. */
+static bool sae_guard_output_failed_admission_token;
+
+static void sae_guard_hook_enter(void *context)
+{
+    (void)context;
+    portENTER_CRITICAL(&sae_guard_state_lock);
+}
+
+static void sae_guard_hook_leave(void *context)
+{
+    (void)context;
+    portEXIT_CRITICAL(&sae_guard_state_lock);
+}
+
+static bool sae_guard_scan_snapshot(void *context,
+                                    wifi_shield_target_t (**targets),
+                                    size_t *count)
+{
+    (void)context;
+    if (targets == NULL || count == NULL || g_scan_results_mutex == NULL ||
+        xSemaphoreTake(g_scan_results_mutex,
+                       pdMS_TO_TICKS(SAE_GUARD_SCAN_TIMEOUT_MS)) != pdTRUE)
+        return false;
+    bool valid = g_scan_done && g_scan_records_valid && g_scan_count != 0U &&
+                 g_scan_count <= MAX_AP_CNT;
+    wifi_shield_target_t *snapshot = NULL;
+    size_t snapshot_count = valid ? g_scan_count : 0U;
+    if (valid) {
+        snapshot = heap_caps_calloc(
+            snapshot_count, sizeof(*snapshot),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (snapshot != NULL) {
+            for (size_t i = 0; i < snapshot_count; ++i)
+                wifi_shield_copy_target(&snapshot[i], &g_scan_results[i]);
+        }
+    }
+    xSemaphoreGive(g_scan_results_mutex);
+    if (snapshot == NULL) return false;
+    *targets = snapshot;
+    *count = snapshot_count;
+    return true;
+}
+
+static void sae_guard_scan_release(void *context,
+                                   wifi_shield_target_t *targets,
+                                   size_t count)
+{
+    (void)context;
+    volatile uint8_t *bytes = (volatile uint8_t *)targets;
+    for (size_t i = 0; bytes != NULL && i < count * sizeof(*targets); ++i)
+        bytes[i] = 0U;
+    heap_caps_free(targets);
+}
+
+static uint64_t sae_guard_monotonic_us(void *context)
+{
+    (void)context;
+    return (uint64_t)esp_timer_get_time();
+}
+
+static void sae_guard_runtime_status_snapshot(
+    void *context, wifi_security_runtime_status_t *status)
+{
+    (void)context;
+    wifi_security_runtime_get_status(security_platform.runtime, status);
+}
+
+static wifi_security_session_result_t sae_guard_runtime_start(
+    void *context, const wifi_shield_target_t *targets, size_t target_count,
+    const wifi_security_session_config_t *config)
+{
+    (void)context;
+    return wifi_shield_start_sae_profile(targets, target_count, config);
+}
+
+static bool sae_guard_runtime_stop(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    return wifi_shield_stop_sae_profile(timeout_ms);
+}
+
+static bool sae_guard_output_write(void *context, const char *line,
+                                   size_t length)
+{
+    (void)context;
+    if (line == NULL || length == 0U || length >= SAE_GUARD_LINE_MAX ||
+        sae_guard_output_queue == NULL) return false;
+    sae_guard_output_record_t record = {.length = (uint16_t)length};
+    memcpy(record.bytes, line, length);
+    atomic_fetch_add_explicit(&sae_guard_output_pending, 1U,
+                              memory_order_acq_rel);
+    bool queued = xQueueSend(sae_guard_output_queue, &record,
+        pdMS_TO_TICKS(SAE_GUARD_OUTPUT_TIMEOUT_MS)) == pdTRUE;
+    if (!queued) sae_guard_output_failed_admission_token = true;
+    return queued;
+}
+
+static bool sae_guard_output_write_terminal(
+    void *context, const sae_guard_status_t *status, const char *outcome)
+{
+    (void)context;
+    if (status == NULL || outcome == NULL || sae_guard_output_queue == NULL)
+        return false;
+    size_t outcome_length = strlen(outcome);
+    if (outcome_length == 0U || outcome_length >= 16U) return false;
+    sae_guard_output_record_t record = {.terminal = true, .status = *status};
+    memcpy(record.outcome, outcome, outcome_length + 1U);
+    atomic_fetch_add_explicit(&sae_guard_output_pending, 1U,
+                              memory_order_acq_rel);
+    bool queued = xQueueSend(sae_guard_output_queue, &record,
+        pdMS_TO_TICKS(SAE_GUARD_OUTPUT_TIMEOUT_MS)) == pdTRUE;
+    if (!queued) sae_guard_output_failed_admission_token = true;
+    return queued;
+}
+
+static void sae_guard_output_complete(void *context, bool accepted)
+{
+    (void)context;
+    if (accepted) {
+        if (sae_guard_output_failed_admission_token) abort();
+        return;
+    }
+    if (sae_guard_output_failed_admission_token) {
+        sae_guard_output_failed_admission_token = false;
+        atomic_fetch_sub_explicit(&sae_guard_output_pending, 1U,
+                                  memory_order_acq_rel);
+    }
+}
+
+static bool sae_guard_output_idle(void *context)
+{
+    (void)context;
+    return atomic_load_explicit(&sae_guard_output_pending,
+                                memory_order_acquire) == 0U;
+}
+
+static bool sae_guard_output_publish_record(
+    const sae_guard_output_record_t *record)
+{
+    if (record == NULL || record->length == 0U ||
+        record->length >= SAE_GUARD_LINE_MAX) return false;
+    int written = uart_write_bytes(UART_NUM_0, record->bytes, record->length);
+    return written == (int)record->length;
+}
+
+static void sae_guard_output_publisher(void *context)
+{
+    (void)context;
+    sae_guard_output_record_t record;
+    for (;;) {
+        if (xQueueReceive(sae_guard_output_queue, &record,
+                          pdMS_TO_TICKS(1000U)) != pdTRUE)
+            continue;
+        if (record.terminal) {
+            int length = sae_guard_format_terminal_for_output(
+                record.bytes, sizeof(record.bytes), &record.status,
+                record.outcome);
+            record.length = length > 0 ? (uint16_t)length : 0U;
+        }
+        bool published = sae_guard_output_publish_record(&record);
+        memset(&record, 0, sizeof(record));
+        if (!published) sae_guard_report_output_failure();
+        atomic_fetch_sub_explicit(&sae_guard_output_pending, 1U,
+                                  memory_order_acq_rel);
+    }
+}
+
+static bool sae_guard_output_enter(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    if (sae_guard_output_mutex == NULL) return false;
+    BaseType_t result = xSemaphoreTake(sae_guard_output_mutex,
+                                       pdMS_TO_TICKS(timeout_ms));
+    return result == pdTRUE;
+}
+
+static void sae_guard_output_leave(void *context)
+{
+    (void)context;
+    if (sae_guard_output_mutex == NULL) abort();
+    BaseType_t result = xSemaphoreGive(sae_guard_output_mutex);
+    if (result != pdTRUE) abort();
+}
+
+static const sae_guard_runtime_hooks_t sae_guard_runtime_hooks = {
+    .enter = sae_guard_hook_enter,
+    .leave = sae_guard_hook_leave,
+    .scan_snapshot = sae_guard_scan_snapshot,
+    .scan_release = sae_guard_scan_release,
+    .monotonic_us = sae_guard_monotonic_us,
+    .status_snapshot = sae_guard_runtime_status_snapshot,
+    .start = sae_guard_runtime_start,
+    .stop = sae_guard_runtime_stop,
+};
+
+static const sae_guard_output_hooks_t sae_guard_output_hooks = {
+    .enter = sae_guard_output_enter,
+    .leave = sae_guard_output_leave,
+    .write = sae_guard_output_write,
+    .write_terminal = sae_guard_output_write_terminal,
+    .complete = sae_guard_output_complete,
+    .idle = sae_guard_output_idle,
+};
+
+static esp_err_t init_sd_card(void);
+static bool sd_mkdir_recursive(const char *path);
+static bool sd_sync_checked(void);
+
+static portMUX_TYPE wifi_trust_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static StaticSemaphore_t wifi_trust_output_mutex_storage;
+static SemaphoreHandle_t wifi_trust_output_mutex;
+static StaticSemaphore_t wifi_trust_storage_mutex_storage;
+static SemaphoreHandle_t wifi_trust_storage_mutex;
+static StaticSemaphore_t wifi_trust_deadline_operation_mutex_storage;
+static SemaphoreHandle_t wifi_trust_deadline_operation_mutex;
+
+#define WIFI_TRUST_OUTPUT_QUEUE_DEPTH 8U
+#define WIFI_TRUST_OUTPUT_TASK_STACK_DEPTH (4096U / sizeof(StackType_t))
+typedef struct {
+    bool terminal;
+    uint16_t length;
+    char bytes[WIFI_TRUST_LINE_MAX];
+    wifi_trust_status_t status;
+    char outcome[20];
+} wifi_trust_output_record_t;
+static StaticQueue_t wifi_trust_output_queue_storage;
+static uint8_t *wifi_trust_output_queue_buffer;
+static QueueHandle_t wifi_trust_output_queue;
+static StaticTask_t wifi_trust_output_task_storage;
+static StackType_t *wifi_trust_output_task_stack;
+static TaskHandle_t wifi_trust_output_task_handle;
+static atomic_uint wifi_trust_output_pending = ATOMIC_VAR_INIT(0U);
+static bool wifi_trust_output_failed_admission_token;
+
+typedef struct {
+    uint64_t epoch;
+} wifi_trust_control_message_t;
+#define WIFI_TRUST_CONTROL_QUEUE_DEPTH 4U
+#define WIFI_TRUST_CONTROL_TASK_STACK_DEPTH (3072U / sizeof(StackType_t))
+static StaticQueue_t wifi_trust_control_queue_storage;
+static uint8_t *wifi_trust_control_queue_buffer;
+static QueueHandle_t wifi_trust_control_queue;
+static StaticTask_t wifi_trust_control_task_storage;
+static StackType_t *wifi_trust_control_task_stack;
+static TaskHandle_t wifi_trust_control_task_handle;
+static esp_timer_handle_t wifi_trust_deadline_timer;
+static wifi_trust_deadline_state_t wifi_trust_deadline_state;
+static wifi_trust_deadline_fn wifi_trust_deadline_callback;
+static void *wifi_trust_deadline_callback_context;
+static uint8_t wifi_trust_boot_id[8];
+
+static void wifi_trust_hook_enter(void *context)
+{
+    (void)context;
+    portENTER_CRITICAL(&wifi_trust_state_lock);
+}
+
+static void wifi_trust_hook_leave(void *context)
+{
+    (void)context;
+    portEXIT_CRITICAL(&wifi_trust_state_lock);
+}
+
+static bool wifi_trust_current_channel(void *context, uint8_t *channel)
+{
+    (void)context;
+    wifi_second_chan_t secondary;
+    return channel != NULL &&
+           esp_wifi_get_channel(channel, &secondary) == ESP_OK;
+}
+
+static bool wifi_trust_scan_snapshot(void *context,
+                                     wifi_shield_target_t *entries,
+                                     size_t capacity, size_t *count)
+{
+    (void)context;
+    if (entries == NULL || count == NULL || g_scan_results_mutex == NULL ||
+        xSemaphoreTake(g_scan_results_mutex,
+                       pdMS_TO_TICKS(WIFI_TRUST_SCAN_TIMEOUT_MS)) != pdTRUE)
+        return false;
+    bool valid = g_scan_done && g_scan_records_valid && g_scan_count != 0U &&
+                 g_scan_count <= MAX_AP_CNT && g_scan_count <= capacity;
+    size_t snapshot_count = valid ? g_scan_count : 0U;
+    if (valid) {
+        for (size_t i = 0; i < snapshot_count; ++i)
+            wifi_shield_copy_target(&entries[i], &g_scan_results[i]);
+    }
+    xSemaphoreGive(g_scan_results_mutex);
+    if (!valid) return false;
+    *count = snapshot_count;
+    return true;
+}
+
+static uint64_t wifi_trust_monotonic_us(void *context)
+{
+    (void)context;
+    return (uint64_t)esp_timer_get_time();
+}
+
+static void wifi_trust_runtime_status_snapshot(
+    void *context, wifi_security_runtime_status_t *status)
+{
+    (void)context;
+    wifi_security_runtime_get_status(security_platform.runtime, status);
+}
+
+static wifi_security_session_result_t wifi_trust_runtime_start(
+    void *context, const wifi_shield_target_t *targets, size_t target_count,
+    const wifi_security_session_config_t *config)
+{
+    (void)context;
+    return wifi_shield_start_trust_profile(targets, target_count, config);
+}
+
+static bool wifi_trust_runtime_stop(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    return wifi_shield_stop_trust_profile(timeout_ms);
+}
+
+static void wifi_trust_deadline_timer_callback(void *context)
+{
+    (void)context;
+    wifi_trust_control_message_t message = {0};
+    uint64_t now_us = (uint64_t)esp_timer_get_time();
+    portENTER_CRITICAL(&wifi_trust_state_lock);
+    bool due = wifi_trust_deadline_state_timer_fired(
+        &wifi_trust_deadline_state, now_us, &message.epoch);
+    portEXIT_CRITICAL(&wifi_trust_state_lock);
+    if (due && wifi_trust_control_queue != NULL)
+        (void)xQueueSend(wifi_trust_control_queue, &message, 0);
+}
+
+static void wifi_trust_control_task(void *context)
+{
+    (void)context;
+    wifi_trust_control_message_t message;
+    for (;;) {
+        (void)xQueueReceive(wifi_trust_control_queue, &message,
+                            pdMS_TO_TICKS(1000U));
+        wifi_trust_deadline_fn callback = NULL;
+        void *callback_context = NULL;
+        portENTER_CRITICAL(&wifi_trust_state_lock);
+        bool pending = wifi_trust_deadline_state_take_pending(
+            &wifi_trust_deadline_state, &message.epoch);
+        if (pending) {
+            callback = wifi_trust_deadline_callback;
+            callback_context = wifi_trust_deadline_callback_context;
+            wifi_trust_deadline_callback = NULL;
+            wifi_trust_deadline_callback_context = NULL;
+        }
+        portEXIT_CRITICAL(&wifi_trust_state_lock);
+        if (callback != NULL)
+            callback(callback_context, message.epoch);
+    }
+}
+
+static bool wifi_trust_deadline_arm(
+    void *context, uint64_t epoch, uint32_t seconds,
+    wifi_trust_deadline_fn callback, void *callback_context)
+{
+    (void)context;
+    if (epoch == 0U || seconds == 0U || callback == NULL ||
+        wifi_trust_deadline_timer == NULL ||
+        wifi_trust_deadline_operation_mutex == NULL ||
+        xSemaphoreTake(wifi_trust_deadline_operation_mutex,
+                       pdMS_TO_TICKS(WIFI_TRUST_SCAN_TIMEOUT_MS)) != pdTRUE)
+        return false;
+    (void)esp_timer_stop(wifi_trust_deadline_timer);
+    uint64_t delay_us = (uint64_t)seconds * UINT64_C(1000000);
+    uint64_t now_us = (uint64_t)esp_timer_get_time();
+    portENTER_CRITICAL(&wifi_trust_state_lock);
+    bool owned = wifi_trust_deadline_state_arm(
+        &wifi_trust_deadline_state, epoch, now_us, delay_us);
+    if (owned) {
+        wifi_trust_deadline_callback = callback;
+        wifi_trust_deadline_callback_context = callback_context;
+    }
+    portEXIT_CRITICAL(&wifi_trust_state_lock);
+    if (owned && esp_timer_start_once(wifi_trust_deadline_timer,
+                                      delay_us) == ESP_OK) {
+        xSemaphoreGive(wifi_trust_deadline_operation_mutex);
+        return true;
+    }
+    portENTER_CRITICAL(&wifi_trust_state_lock);
+    if (wifi_trust_deadline_state_cancel(&wifi_trust_deadline_state, epoch)) {
+        wifi_trust_deadline_callback = NULL;
+        wifi_trust_deadline_callback_context = NULL;
+    }
+    portEXIT_CRITICAL(&wifi_trust_state_lock);
+    xSemaphoreGive(wifi_trust_deadline_operation_mutex);
+    return false;
+}
+
+static void wifi_trust_deadline_cancel(void *context, uint64_t epoch)
+{
+    (void)context;
+    if (epoch == 0U || wifi_trust_deadline_timer == NULL ||
+        wifi_trust_deadline_operation_mutex == NULL ||
+        xSemaphoreTake(wifi_trust_deadline_operation_mutex,
+                       pdMS_TO_TICKS(WIFI_TRUST_SCAN_TIMEOUT_MS)) != pdTRUE)
+        return;
+    portENTER_CRITICAL(&wifi_trust_state_lock);
+    bool owned = wifi_trust_deadline_state_cancel(
+        &wifi_trust_deadline_state, epoch);
+    if (owned) {
+        wifi_trust_deadline_callback = NULL;
+        wifi_trust_deadline_callback_context = NULL;
+    }
+    portEXIT_CRITICAL(&wifi_trust_state_lock);
+    if (owned) (void)esp_timer_stop(wifi_trust_deadline_timer);
+    xSemaphoreGive(wifi_trust_deadline_operation_mutex);
+}
+
+static bool wifi_trust_output_write(void *context, const char *line,
+                                    size_t length)
+{
+    (void)context;
+    if (line == NULL || length == 0U || length >= WIFI_TRUST_LINE_MAX ||
+        wifi_trust_output_queue == NULL) return false;
+    wifi_trust_output_record_t record = {.length = (uint16_t)length};
+    memcpy(record.bytes, line, length);
+    atomic_fetch_add_explicit(&wifi_trust_output_pending, 1U,
+                              memory_order_acq_rel);
+    bool queued = xQueueSend(wifi_trust_output_queue, &record,
+        pdMS_TO_TICKS(WIFI_TRUST_OUTPUT_TIMEOUT_MS)) == pdTRUE;
+    if (!queued) wifi_trust_output_failed_admission_token = true;
+    return queued;
+}
+
+static bool wifi_trust_output_write_terminal(
+    void *context, const wifi_trust_status_t *status, const char *outcome)
+{
+    (void)context;
+    if (status == NULL || outcome == NULL || wifi_trust_output_queue == NULL)
+        return false;
+    size_t outcome_length = strlen(outcome);
+    if (outcome_length == 0U ||
+        outcome_length >= sizeof(((wifi_trust_output_record_t *)0)->outcome))
+        return false;
+    wifi_trust_output_record_t record = {.terminal = true, .status = *status};
+    memcpy(record.outcome, outcome, outcome_length + 1U);
+    atomic_fetch_add_explicit(&wifi_trust_output_pending, 1U,
+                              memory_order_acq_rel);
+    bool queued = xQueueSend(wifi_trust_output_queue, &record,
+        pdMS_TO_TICKS(WIFI_TRUST_OUTPUT_TIMEOUT_MS)) == pdTRUE;
+    if (!queued) wifi_trust_output_failed_admission_token = true;
+    return queued;
+}
+
+static void wifi_trust_output_complete(void *context, bool accepted)
+{
+    (void)context;
+    if (accepted) {
+        if (wifi_trust_output_failed_admission_token) abort();
+        return;
+    }
+    if (wifi_trust_output_failed_admission_token) {
+        wifi_trust_output_failed_admission_token = false;
+        atomic_fetch_sub_explicit(&wifi_trust_output_pending, 1U,
+                                  memory_order_acq_rel);
+    }
+}
+
+static bool wifi_trust_output_idle(void *context)
+{
+    (void)context;
+    return atomic_load_explicit(&wifi_trust_output_pending,
+                                memory_order_acquire) == 0U;
+}
+
+static bool wifi_trust_output_publish_record(
+    const wifi_trust_output_record_t *record)
+{
+    if (record == NULL || record->length == 0U ||
+        record->length >= WIFI_TRUST_LINE_MAX) return false;
+    int written = uart_write_bytes(UART_NUM_0, record->bytes, record->length);
+    return written == (int)record->length;
+}
+
+static void wifi_trust_output_publisher(void *context)
+{
+    (void)context;
+    wifi_trust_output_record_t record;
+    for (;;) {
+        if (xQueueReceive(wifi_trust_output_queue, &record,
+                          pdMS_TO_TICKS(1000U)) != pdTRUE)
+            continue;
+        if (record.terminal) {
+            int length = wifi_trust_format_terminal_for_output(
+                record.bytes, sizeof(record.bytes), &record.status,
+                record.outcome);
+            record.length = length > 0 ? (uint16_t)length : 0U;
+        }
+        bool published = wifi_trust_output_publish_record(&record);
+        memset(&record, 0, sizeof(record));
+        if (!published) wifi_trust_report_output_failure();
+        atomic_fetch_sub_explicit(&wifi_trust_output_pending, 1U,
+                                  memory_order_acq_rel);
+    }
+}
+
+static bool wifi_trust_output_enter(void *context, uint32_t timeout_ms)
+{
+    (void)context;
+    return wifi_trust_output_mutex != NULL &&
+           xSemaphoreTake(wifi_trust_output_mutex,
+                          pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+static void wifi_trust_output_leave(void *context)
+{
+    (void)context;
+    if (wifi_trust_output_mutex == NULL ||
+        xSemaphoreGive(wifi_trust_output_mutex) != pdTRUE)
+        abort();
+}
+
+static bool wifi_trust_arena_acquire(void *context, size_t size, void **arena)
+{
+    (void)context;
+    if (arena == NULL || size == 0U || size > WIFI_TRUST_ARENA_MAX_BYTES)
+        return false;
+    void *memory = heap_caps_calloc(
+        1U, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (memory == NULL) return false;
+    *arena = memory;
+    return true;
+}
+
+static void wifi_trust_arena_release(void *context, void *arena, size_t size)
+{
+    (void)context;
+    volatile uint8_t *bytes = arena;
+    for (size_t i = 0; bytes != NULL && i < size; ++i) bytes[i] = 0U;
+    heap_caps_free(arena);
+}
+
+static bool wifi_trust_store_enter(void *context)
+{
+    (void)context;
+    if (wifi_trust_storage_mutex == NULL ||
+        xSemaphoreTake(wifi_trust_storage_mutex,
+                       pdMS_TO_TICKS(WIFI_TRUST_SCAN_TIMEOUT_MS)) != pdTRUE)
+        return false;
+    if (init_sd_card() != ESP_OK ||
+        !sd_mkdir_recursive("/sdcard/lab/wifi-trust")) {
+        xSemaphoreGive(wifi_trust_storage_mutex);
+        return false;
+    }
+    return true;
+}
+
+static bool wifi_trust_store_enter_readonly(void *context)
+{
+    (void)context;
+    if (wifi_trust_storage_mutex == NULL ||
+        xSemaphoreTake(wifi_trust_storage_mutex,
+                       pdMS_TO_TICKS(WIFI_TRUST_SCAN_TIMEOUT_MS)) != pdTRUE)
+        return false;
+    if (init_sd_card() != ESP_OK) {
+        xSemaphoreGive(wifi_trust_storage_mutex);
+        return false;
+    }
+    return true;
+}
+
+static void wifi_trust_store_leave(void *context)
+{
+    (void)context;
+    if (wifi_trust_storage_mutex == NULL ||
+        xSemaphoreGive(wifi_trust_storage_mutex) != pdTRUE)
+        abort();
+}
+
+static wifi_trust_io_result_t wifi_trust_store_open(
+    void *context, const char *path, bool truncate, void **handle)
+{
+    (void)context;
+    if (path == NULL || handle == NULL) return WIFI_TRUST_IO_ERROR;
+    errno = 0;
+    FILE *file = fopen(path, truncate ? "wb+" : "rb");
+    if (file == NULL)
+        return errno == ENOENT ? WIFI_TRUST_IO_MISSING : WIFI_TRUST_IO_ERROR;
+    *handle = file;
+    return WIFI_TRUST_IO_OK;
+}
+
+static wifi_trust_io_result_t wifi_trust_store_read(
+    void *handle, uint8_t *out, size_t capacity, size_t *actual)
+{
+    if (handle == NULL || out == NULL || actual == NULL)
+        return WIFI_TRUST_IO_ERROR;
+    *actual = fread(out, 1U, capacity, handle);
+    if (*actual != 0U) return WIFI_TRUST_IO_OK;
+    return feof(handle) ? WIFI_TRUST_IO_EOF : WIFI_TRUST_IO_ERROR;
+}
+
+static wifi_trust_io_result_t wifi_trust_store_write(
+    void *handle, const uint8_t *data, size_t length, size_t *actual)
+{
+    if (handle == NULL || data == NULL || actual == NULL)
+        return WIFI_TRUST_IO_ERROR;
+    *actual = fwrite(data, 1U, length, handle);
+    return *actual == length ? WIFI_TRUST_IO_OK : WIFI_TRUST_IO_ERROR;
+}
+
+static wifi_trust_io_result_t wifi_trust_store_flush(void *handle)
+{
+    return handle != NULL && fflush(handle) == 0 ?
+           WIFI_TRUST_IO_OK : WIFI_TRUST_IO_ERROR;
+}
+
+static wifi_trust_io_result_t wifi_trust_store_sync(void *handle)
+{
+    if (handle == NULL) return WIFI_TRUST_IO_ERROR;
+    int descriptor = fileno(handle);
+    return descriptor >= 0 && fsync(descriptor) == 0 ?
+           WIFI_TRUST_IO_OK : WIFI_TRUST_IO_ERROR;
+}
+
+static wifi_trust_io_result_t wifi_trust_store_close(void *handle)
+{
+    return handle != NULL && fclose(handle) == 0 ?
+           WIFI_TRUST_IO_OK : WIFI_TRUST_IO_ERROR;
+}
+
+static wifi_trust_path_state_t wifi_trust_store_path_state(
+    void *context, const char *path)
+{
+    (void)context;
+    struct stat st;
+    if (path == NULL) return WIFI_TRUST_PATH_ERROR;
+    if (stat(path, &st) == 0)
+        return S_ISREG(st.st_mode) ? WIFI_TRUST_PATH_FILE :
+                                    WIFI_TRUST_PATH_OTHER;
+    return errno == ENOENT ? WIFI_TRUST_PATH_MISSING : WIFI_TRUST_PATH_ERROR;
+}
+
+static bool wifi_trust_store_rename(void *context, const char *from,
+                                    const char *to)
+{
+    (void)context;
+    return from != NULL && to != NULL && rename(from, to) == 0;
+}
+
+static bool wifi_trust_store_remove(void *context, const char *path)
+{
+    (void)context;
+    if (path == NULL) return false;
+    return unlink(path) == 0 || errno == ENOENT;
+}
+
+static bool wifi_trust_sd_sync_checked(void *context)
+{
+    (void)context;
+    return sd_sync_checked();
+}
+
+static fs_publish_result_t wifi_trust_store_publish_staged(
+    void *context, const char *stage, const char *target,
+    const char *backup, bool replace)
+{
+    (void)context;
+    return fs_publish_staged(stage, target, backup, replace, NULL);
+}
+
+static fs_recovery_result_t wifi_trust_store_recover_staged(
+    void *context, const char *stage, const char *target, const char *backup)
+{
+    (void)context;
+    return fs_recover_staged(stage, target, backup, NULL);
+}
+
+static bool wifi_trust_meta_snapshot(void *context,
+                                     wifi_trust_store_meta_t *meta)
+{
+    (void)context;
+    if (meta == NULL) return false;
+    memset(meta, 0, sizeof(*meta));
+    memcpy(meta->boot_id, wifi_trust_boot_id, sizeof(meta->boot_id));
+    meta->created_monotonic_us = (uint64_t)esp_timer_get_time();
+    return true;
+}
+
+static const wifi_trust_runtime_hooks_t wifi_trust_runtime_hooks = {
+    .enter = wifi_trust_hook_enter,
+    .leave = wifi_trust_hook_leave,
+    .current_channel = wifi_trust_current_channel,
+    .scan_snapshot = wifi_trust_scan_snapshot,
+    .monotonic_us = wifi_trust_monotonic_us,
+    .status_snapshot = wifi_trust_runtime_status_snapshot,
+    .start = wifi_trust_runtime_start,
+    .stop = wifi_trust_runtime_stop,
+    .deadline_arm = wifi_trust_deadline_arm,
+    .deadline_cancel = wifi_trust_deadline_cancel,
+};
+
+static const wifi_trust_storage_hooks_t wifi_trust_storage_hooks = {
+    .arena_acquire = wifi_trust_arena_acquire,
+    .arena_release = wifi_trust_arena_release,
+    .meta_snapshot = wifi_trust_meta_snapshot,
+    .store = {
+        .enter = wifi_trust_store_enter,
+        .leave = wifi_trust_store_leave,
+        .open = wifi_trust_store_open,
+        .read = wifi_trust_store_read,
+        .write = wifi_trust_store_write,
+        .flush = wifi_trust_store_flush,
+        .sync = wifi_trust_store_sync,
+        .close = wifi_trust_store_close,
+        .path_state = wifi_trust_store_path_state,
+        .rename_path = wifi_trust_store_rename,
+        .remove_path = wifi_trust_store_remove,
+        .sync_volume = wifi_trust_sd_sync_checked,
+        .publish_staged = wifi_trust_store_publish_staged,
+        .recover_staged = wifi_trust_store_recover_staged,
+    },
+};
+
+static const wifi_trust_store_ops_t wifi_trust_readonly_storage_ops = {
+    .enter = wifi_trust_store_enter_readonly,
+    .leave = wifi_trust_store_leave,
+    .open = wifi_trust_store_open,
+    .read = wifi_trust_store_read,
+    .close = wifi_trust_store_close,
+};
+
+static const wifi_trust_output_hooks_t wifi_trust_output_hooks = {
+    .enter = wifi_trust_output_enter,
+    .leave = wifi_trust_output_leave,
+    .write = wifi_trust_output_write,
+    .write_terminal = wifi_trust_output_write_terminal,
+    .complete = wifi_trust_output_complete,
+    .idle = wifi_trust_output_idle,
+};
+
+static const esp_timer_create_args_t wifi_trust_deadline_timer_args = {
+    .callback = wifi_trust_deadline_timer_callback,
+    .name = "wifi_trust_deadline",
+};
 
 static void analyzer_legacy_scan_finished(void)
 {
@@ -2244,6 +6029,35 @@ static esp_err_t analyzer_tracked_wifi_connect(void)
         portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
     }
     return err;
+}
+
+static bool analyzer_confirm_clean_wifi_reinit(esp_err_t stop_result,
+                                               esp_err_t deinit_result,
+                                               bool reinitialized)
+{
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    wifi_ap_record_t ap_info = {0};
+    bool promiscuous = true;
+    bool clean = true;
+    if (stop_result != ESP_OK || deinit_result != ESP_OK || !reinitialized)
+        clean = false;
+    if (clean && (esp_wifi_get_mode(&mode) != ESP_OK || mode != WIFI_MODE_STA))
+        clean = false;
+    if (clean &&
+        esp_wifi_sta_get_ap_info(&ap_info) != ESP_ERR_WIFI_NOT_CONNECT)
+        clean = false;
+    if (clean &&
+        (esp_wifi_get_promiscuous(&promiscuous) != ESP_OK || promiscuous))
+        clean = false;
+    portENTER_CRITICAL(&analyzer_legacy_scan_lock);
+    if (clean) {
+        analyzer_sta_connect_pending = false;
+        analyzer_legacy_radio_uncertain = false;
+    } else {
+        analyzer_legacy_radio_uncertain = true;
+    }
+    portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
+    return clean;
 }
 static volatile uint32_t g_last_scan_status = 1; // 0 => success, non-zero => failure/unknown
 static int64_t g_scan_start_time_us = 0;
@@ -2293,6 +6107,92 @@ static void led_status_wps_verified(void) {
 
 static void led_status_handshake_saved(void) {
     led_status_notify_event(LED_STATUS_EVENT_HANDSHAKE_SAVED);
+}
+
+static led_status_event_t wifi_shield_presentation_led_event(
+    wifi_shield_presentation_indicator_t indicator)
+{
+    static const led_status_event_t events[] = {
+        [WIFI_SHIELD_PRESENTATION_INFO] = LED_STATUS_EVENT_SHIELD_INFO,
+        [WIFI_SHIELD_PRESENTATION_WARN] = LED_STATUS_EVENT_SHIELD_WARN,
+        [WIFI_SHIELD_PRESENTATION_ALERT] = LED_STATUS_EVENT_SHIELD_ALERT,
+        [WIFI_SHIELD_PRESENTATION_DECOY_TX] =
+            LED_STATUS_EVENT_SHIELD_DECOY_TX,
+    };
+    return indicator < WIFI_SHIELD_PRESENTATION_INDICATOR_COUNT ?
+        events[indicator] : LED_STATUS_EVENT_COUNT;
+}
+
+static void wifi_shield_presentation_task(void *context)
+{
+    (void)context;
+    uint32_t observed[WIFI_SHIELD_PRESENTATION_INDICATOR_COUNT] = {0};
+    uint32_t last_session_id = 0U;
+    uint32_t last_revision = 0U;
+    bool was_active = false;
+    for (;;) {
+        wifi_shield_presentation_snapshot_t snapshot;
+        wifi_shield_presentation_get(&snapshot);
+        if (snapshot.session_id != last_session_id ||
+            snapshot.revision != last_revision) {
+            if (snapshot.session_id != last_session_id)
+                memset(observed, 0, sizeof(observed));
+            bool active = snapshot.armed &&
+                (snapshot.running || snapshot.stopping);
+            atomic_store_explicit(
+                &wifi_shield_presentation_monitor,
+                snapshot.armed && snapshot.running, memory_order_release);
+            for (wifi_shield_presentation_indicator_t indicator =
+                     WIFI_SHIELD_PRESENTATION_INFO;
+                 indicator < WIFI_SHIELD_PRESENTATION_INDICATOR_COUNT;
+                 ++indicator) {
+                uint32_t current = snapshot.indicator_counts[indicator];
+                if (active && current > observed[indicator]) {
+                    led_status_event_t event =
+                        wifi_shield_presentation_led_event(indicator);
+                    if (event < LED_STATUS_EVENT_COUNT)
+                        led_status_notify_event(event);
+                }
+                if (active) observed[indicator] = current;
+            }
+            if (active) {
+                wifi_shield_oled_lines_t lines;
+                if (wifi_shield_presentation_format_oled(&snapshot, &lines)) {
+                    oled_display_update_full(lines.line[0], lines.line[1],
+                                             lines.line[2], lines.line[3]);
+                }
+            } else if (was_active) {
+                oled_display_update_full("> STOPPED", "  All ops halted",
+                                         "", "  > Idle");
+            }
+            was_active = active;
+            last_session_id = snapshot.session_id;
+            last_revision = snapshot.revision;
+        }
+        vTaskDelay(pdMS_TO_TICKS(25U));
+    }
+}
+
+static bool wifi_shield_presentation_start(void)
+{
+    if (wifi_shield_presentation_task_handle != NULL) return true;
+    if (oled_display_get_type() == DISPLAY_NONE) return false;
+    wifi_shield_presentation_task_stack = feature_psram_aligned_calloc(
+        portBYTE_ALIGNMENT, WIFI_SHIELD_PRESENTATION_TASK_STACK_DEPTH,
+        sizeof(*wifi_shield_presentation_task_stack),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (wifi_shield_presentation_task_stack == NULL) return false;
+    wifi_shield_presentation_task_handle = xTaskCreateStatic(
+        wifi_shield_presentation_task, "wifi_shield_ui",
+        WIFI_SHIELD_PRESENTATION_TASK_STACK_DEPTH, NULL, 3,
+        wifi_shield_presentation_task_stack,
+        &wifi_shield_presentation_task_storage);
+    if (wifi_shield_presentation_task_handle == NULL) {
+        feature_psram_free(wifi_shield_presentation_task_stack);
+        wifi_shield_presentation_task_stack = NULL;
+        return false;
+    }
+    return true;
 }
 
 #define LED_NVS_NAMESPACE "ledcfg"
@@ -2490,6 +6390,36 @@ static int whitelistedBssidsCount = 0;
 // PSRAM buffer initialization (must be after all pointer declarations)
 // ============================================================================
 
+static void deinit_psram_buffers(void)
+{
+#define RELEASE_PSRAM_BUFFER(pointer) do { \
+        heap_caps_free(pointer);            \
+        (pointer) = NULL;                   \
+    } while (0)
+    RELEASE_PSRAM_BUFFER(wdp_seen_networks);
+    RELEASE_PSRAM_BUFFER(ducb_channels);
+    RELEASE_PSRAM_BUFFER(hs_clients);
+    RELEASE_PSRAM_BUFFER(hs_ap_targets);
+    RELEASE_PSRAM_BUFFER(selected_stations);
+    RELEASE_PSRAM_BUFFER(whiteListedBssids);
+    RELEASE_PSRAM_BUFFER(target_bssids);
+    RELEASE_PSRAM_BUFFER(sd_html_files);
+    RELEASE_PSRAM_BUFFER(handshake_targets);
+    RELEASE_PSRAM_BUFFER(wardrive_scan_results);
+    RELEASE_PSRAM_BUFFER(bt_devices);
+    RELEASE_PSRAM_BUFFER(bt_found_devices);
+    RELEASE_PSRAM_BUFFER(probe_requests);
+    RELEASE_PSRAM_BUFFER(sniffer_aps);
+#undef RELEASE_PSRAM_BUFFER
+    if (sniffer_data_mutex != NULL) {
+        vSemaphoreDelete(sniffer_data_mutex);
+        sniffer_data_mutex = NULL;
+    }
+    wdp_seen_capacity = 0;
+    bt_found_device_capacity = 0;
+    bt_device_capacity = 0;
+}
+
 static bool init_psram_buffers(void)
 {
     sniffer_data_mutex = xSemaphoreCreateMutex();
@@ -2513,6 +6443,7 @@ static bool init_psram_buffers(void)
         !handshake_targets || !sd_html_files || !target_bssids || !whiteListedBssids || !selected_stations ||
         !hs_ap_targets || !hs_clients || !ducb_channels || !wdp_seen_networks) {
         MY_LOG_INFO(TAG, "PSRAM allocation failed!");
+        deinit_psram_buffers();
         return false;
     }
     bt_found_device_capacity = BT_INITIAL_CAPACITY;
@@ -2814,6 +6745,18 @@ static void deauth_detector_channel_hop(void);
 static void deauth_detector_reset_events(void);
 static void deauth_detector_close_events(void);
 static void deauth_detector_process_events(void);
+static bool deauth_detector_v2_profile_validate(void *opaque);
+static void deauth_detector_v2_profile_wipe(void *opaque);
+static bool deauth_detector_v2_profile_consume(
+    void *opaque, const wifi_security_frame_slot_t *slot,
+    const wifi_security_decoded_t *decoded);
+static void deauth_detector_v2_profile_uncertainty(
+    void *opaque, wifi_security_session_result_t result, bool owned);
+static bool deauth_detector_v2_borrowed_receive(
+    void *opaque, uint32_t runtime_generation,
+    const wifi_security_rx_view_t *observation);
+static void deauth_detector_v2_worker_poll(void *opaque);
+static bool deauth_detector_stop_v2_profile(uint32_t timeout_ms);
 static bool zig_recon_radio_busy(char *reason, size_t reason_len);
 // BLE scanner functions (NimBLE)
 static int cmd_scan_bt(int argc, char **argv);
@@ -4518,6 +8461,9 @@ static esp_err_t wifi_init_with_configured_country(const wifi_init_config_t *con
         if (deinit_err != ESP_OK) {
             MY_LOG_INFO(TAG, "Failed to deinitialize WiFi after country error: %s",
                         esp_err_to_name(deinit_err));
+            portENTER_CRITICAL(&analyzer_legacy_scan_lock);
+            analyzer_legacy_radio_uncertain = true;
+            portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
         }
     }
     return err;
@@ -4563,52 +8509,69 @@ static esp_err_t wifi_start_with_boot_sta_mac(void)
     return esp_wifi_start();
 }
 
-static esp_err_t wifi_init_ap_sta(void) {
-    // Initialize netif only once (shared between WiFi and BLE modes)
+static esp_err_t wifi_prepare_sta_driver(void) {
+    esp_err_t err;
     if (!netif_initialized) {
-        ESP_ERROR_CHECK(esp_netif_init());
+        err = esp_netif_init();
+        if (err != ESP_OK) return err;
         netif_initialized = true;
     }
-    
-    // Create event loop only once (shared between WiFi and BLE modes)
     if (!event_loop_initialized) {
-        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        err = esp_event_loop_create_default();
+        if (err != ESP_OK) return err;
         event_loop_initialized = true;
     }
-
-    // Only create STA interface once (reused on WiFi re-init)
     if (sta_netif_handle == NULL) {
-        sta_netif_handle = esp_netif_create_default_wifi_sta();
+        esp_netif_config_t netif_config = ESP_NETIF_DEFAULT_WIFI_STA();
+        esp_netif_t *netif = esp_netif_new(&netif_config);
+        if (netif == NULL) return ESP_ERR_NO_MEM;
+        err = esp_netif_attach_wifi_station(netif);
+        if (err == ESP_OK) err = esp_wifi_set_default_wifi_sta_handlers();
+        if (err != ESP_OK) {
+            esp_netif_destroy_default_wifi(netif);
+            return err;
+        }
+        sta_netif_handle = netif;
     }
-
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(wifi_init_with_configured_country(&cfg));
-
-    // Register event handler only once (survives WiFi reinit after mode switch)
+    err = wifi_init_with_configured_country(&cfg);
+    if (err != ESP_OK) return err;
     if (!wifi_event_handler_registered) {
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                            ESP_EVENT_ANY_ID,
-                                                            &wifi_event_handler,
-                                                            NULL,
-                                                            NULL));
+        err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                  &wifi_event_handler, NULL, NULL);
+        if (err != ESP_OK) goto failed;
         wifi_event_handler_registered = true;
     }
     if (!ip_event_handler_registered) {
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                            IP_EVENT_STA_GOT_IP,
-                                                            &ip_event_handler,
-                                                            NULL,
-                                                            NULL));
+        err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                  &ip_event_handler, NULL, NULL);
+        if (err != ESP_OK) goto failed;
         ip_event_handler_registered = true;
     }
-
     wifi_config_t wifi_config = { 0 };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    esp_err_t start_err = wifi_start_with_boot_sta_mac();
-    if (start_err != ESP_OK) {
-        (void)esp_wifi_deinit();
-        return start_err;
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) goto failed;
+    err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK) goto failed;
+    err = wifi_start_with_boot_sta_mac();
+    if (err != ESP_OK) goto failed;
+    return ESP_OK;
+
+failed:
+    (void)esp_wifi_stop();
+    if (esp_wifi_deinit() != ESP_OK) {
+        portENTER_CRITICAL(&analyzer_legacy_scan_lock);
+        analyzer_legacy_radio_uncertain = true;
+        portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
+    }
+    return err;
+}
+
+static esp_err_t wifi_init_ap_sta(void) {
+    esp_err_t err = wifi_prepare_sta_driver();
+    if (err != ESP_OK) {
+        MY_LOG_INFO(TAG, "WiFi initialization failed: %s", esp_err_to_name(err));
+        return err;
     }
 
     uint8_t mac[6];
@@ -9573,7 +13536,7 @@ static void hs_run_active_pmkid_probes(const wifi_ap_record_t *ap)
         printf("[HS-PMKID] active_try=%u/2 action=sta_auth_assoc ssid='%s' channel=%u\n",
                ordinal, (const char *)ap->ssid, ap->primary);
         esp_err_t connect_err = config_err;
-        if (connect_err == ESP_OK) connect_err = esp_wifi_connect();
+        if (connect_err == ESP_OK) connect_err = analyzer_tracked_wifi_connect();
         if (connect_err == ESP_OK) {
             for (unsigned elapsed = 0;
                  elapsed < HS_PMKID_ACTIVE_LISTEN_MS && handshake_attack_active &&
@@ -14949,6 +18912,7 @@ static bool deauth_detector_stop_defence_session(uint32_t dropped,
 
 static int cmd_stop(int argc, char **argv) {
     (void)argc; (void)argv;
+    if (!wifi_shield_stop(5000)) return 1;
     if (!janos_wps_runtime_stop(5000)) {
         printf("{\"schema_version\":1,\"record_type\":\"terminal\","
                "\"operation\":\"stop\",\"operation_result\":\"wps_not_quiescent\"}\n");
@@ -14961,6 +18925,18 @@ static int cmd_stop(int argc, char **argv) {
         fflush(stdout);
         return 1;
     }
+    /* Feature-local cancellation covers pre-runtime Start; the generic gate
+     * remains for future security modules and already-borrowed contexts. */
+    if (!wps_guard_stop(5000)) return 1;
+    if (!sae_guard_stop(5000)) return 1;
+    if (!wifi_trust_stop(5000)) return 1;
+    bool deauth_v2_was_active = wifi_shield_deauth_profile_pending();
+    portENTER_CRITICAL(&detector_event_lock);
+    deauth_v2_was_active = deauth_v2_was_active ||
+        detector_v2_context != NULL;
+    portEXIT_CRITICAL(&detector_event_lock);
+    if (!deauth_detector_stop_v2_profile(5000)) return 1;
+    if (!wifi_security_runtime_stop(5000)) return 1;
     MY_LOG_INFO(TAG, "Stop command received - stopping all operations...");
     crack_worker_cancel_all();
 
@@ -15339,46 +19315,51 @@ static int cmd_stop(int argc, char **argv) {
         }
         deauth_detector_active = false;
         deauth_detector_close_events();
-        if (defence_session) {
-            (void)janos_radio_lease_request_cancel(
-                &janos_radio_lease, JANOS_RADIO_OWNER_DEFENCE,
-                detector_defence_lease_generation);
-            deauth_defence_runtime_request_stop(&detector_defence_runtime);
-        }
-        if (deauth_detector_task_handle != NULL) {
-            xTaskNotifyGive(deauth_detector_task_handle);
-        }
-        esp_wifi_set_promiscuous(false);
-        esp_wifi_set_promiscuous_rx_cb(NULL);
-        
-        // Wait a bit for task to finish
-        for (int i = 0; i < 20 && deauth_detector_task_handle != NULL; i++) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
-        
-        // Force delete if still running
-        if (deauth_detector_task_handle != NULL && defence_session) {
-            MY_LOG_INFO(TAG,
-                        "[DETECTOR_DEFENCE] stop_pending reason=worker_not_quiescent");
-            return 1;
-        }
-        if (deauth_detector_task_handle != NULL) {
-            vTaskDelete(deauth_detector_task_handle);
-            deauth_detector_task_handle = NULL;
-            MY_LOG_INFO(TAG, "Deauth Detector task forcefully stopped.");
-        }
-        
-        // Disable promiscuous mode
-        esp_wifi_set_promiscuous(false);
-        if (defence_session) {
-            bool restored = detector_defence_restore_valid &&
-                esp_wifi_set_channel(detector_defence_restore_channel,
-                                     detector_defence_restore_secondary) == ESP_OK;
-            if (!deauth_detector_stop_defence_session(defence_dropped,
-                                                       restored)) {
-                MY_LOG_INFO(TAG,
-                            "[DETECTOR_DEFENCE] stop_pending reason=radio_restore");
+        if (!deauth_v2_was_active) {
+            if (defence_session) {
+                (void)janos_radio_lease_request_cancel(
+                    &janos_radio_lease, JANOS_RADIO_OWNER_DEFENCE,
+                    detector_defence_lease_generation);
+                deauth_defence_runtime_request_stop(&detector_defence_runtime);
+            }
+            if (deauth_detector_task_handle != NULL) {
+                xTaskNotifyGive(deauth_detector_task_handle);
+            }
+            esp_wifi_set_promiscuous(false);
+            esp_wifi_set_promiscuous_rx_cb(NULL);
+
+            // Wait a bit for the legacy detector task to finish.
+            for (int i = 0;
+                 i < 20 && deauth_detector_task_handle != NULL; i++) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+
+            // Force delete if the legacy task is still running.
+            if (deauth_detector_task_handle != NULL && defence_session) {
+                MY_LOG_INFO(
+                    TAG,
+                    "[DETECTOR_DEFENCE] stop_pending reason=worker_not_quiescent");
                 return 1;
+            }
+            if (deauth_detector_task_handle != NULL) {
+                vTaskDelete(deauth_detector_task_handle);
+                deauth_detector_task_handle = NULL;
+                MY_LOG_INFO(TAG,
+                            "Deauth Detector task forcefully stopped.");
+            }
+
+            esp_wifi_set_promiscuous(false);
+            if (defence_session) {
+                bool restored = detector_defence_restore_valid &&
+                    esp_wifi_set_channel(detector_defence_restore_channel,
+                                         detector_defence_restore_secondary) == ESP_OK;
+                if (!deauth_detector_stop_defence_session(defence_dropped,
+                                                           restored)) {
+                    MY_LOG_INFO(
+                        TAG,
+                        "[DETECTOR_DEFENCE] stop_pending reason=radio_restore");
+                    return 1;
+                }
             }
         }
         
@@ -15602,8 +19583,8 @@ static int cmd_stop(int argc, char **argv) {
         
         // Reset WiFi to clean state
         MY_LOG_INFO(TAG, "Resetting WiFi...");
-        esp_wifi_stop();
-        esp_wifi_deinit();
+        esp_err_t stop_result = esp_wifi_stop();
+        esp_err_t deinit_result = esp_wifi_deinit();
         
         // Destroy AP netif if exists
         esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
@@ -15616,8 +19597,13 @@ static int cmd_stop(int argc, char **argv) {
         current_radio_mode = RADIO_MODE_NONE;
         
         // Reinitialize WiFi fresh (STA mode)
-        if (!ensure_wifi_mode()) {
+        bool reinitialized = ensure_wifi_mode();
+        if (!reinitialized) {
             MY_LOG_INFO(TAG, "Warning: Failed to reinitialize WiFi after stop");
+        }
+        if (!analyzer_confirm_clean_wifi_reinit(stop_result, deinit_result,
+                                                reinitialized)) {
+            MY_LOG_INFO(TAG, "Warning: WiFi reset not verified; independent radio features remain blocked");
         }
     }
     
@@ -16599,10 +20585,13 @@ static int cmd_wifi_connect(int argc, char **argv) {
         return 0;
     }
     
-    // Reset WiFi (same as mode switching)
-    esp_wifi_disconnect();
-    esp_wifi_stop();
-    esp_wifi_deinit();
+    // Reset only a driver that this host actually initialized. A first
+    // wifi_connect after boot must not emit ESP_ERR_WIFI_NOT_INIT noise.
+    if (wifi_initialized) {
+        (void)esp_wifi_disconnect();
+        (void)esp_wifi_stop();
+        (void)esp_wifi_deinit();
+    }
     
     // Destroy AP netif if exists
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
@@ -20086,9 +24075,33 @@ static bool detector_defence_random_adapter(void *opaque, uint8_t *out,
 
 static int detector_defence_tune_adapter(void *opaque, uint8_t channel) {
     (void)opaque;
-    esp_err_t result = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-    if (result == ESP_OK) deauth_detector_current_channel = channel;
-    return result == ESP_OK ? 0 : -1;
+    bool tuned = wifi_shield_deauth_profile_retune(channel);
+    if (tuned) deauth_detector_current_channel = channel;
+    return tuned ? 0 : -1;
+}
+
+static int detector_defence_radio_enter_adapter(void *opaque,
+                                                uint8_t channel) {
+    detector_v2_context_t *context = opaque;
+    bool immutable_target_channel = false;
+    if (context != NULL && context == detector_v2_context)
+        for (size_t i = 0U; i < context->defence_target_count; ++i)
+            immutable_target_channel = immutable_target_channel ||
+                context->defence_targets[i].channel == channel;
+    if (!immutable_target_channel ||
+        !wifi_shield_deauth_profile_radio_enter(
+            channel, &context->defence_radio_token)) {
+        return -1;
+    }
+    deauth_detector_current_channel = channel;
+    return 0;
+}
+
+static int detector_defence_radio_leave_adapter(void *opaque) {
+    detector_v2_context_t *context = opaque;
+    if (context == NULL || context != detector_v2_context) return -1;
+    return wifi_shield_deauth_profile_radio_leave(
+               &context->defence_radio_token) ? 0 : -1;
 }
 
 static int detector_defence_tx_adapter(void *opaque, const uint8_t *frame,
@@ -20115,6 +24128,33 @@ static void detector_defence_telemetry_adapter(void *opaque,
                                                const char *line) {
     (void)opaque;
     if (line) MY_LOG_INFO(TAG, "%s", line);
+}
+
+static bool deauth_detector_retained_profile_blocks_start(void) {
+    portENTER_CRITICAL(&detector_event_lock);
+    bool blocked = !deauth_detector_active &&
+        (detector_v2_context != NULL ||
+         wifi_shield_deauth_profile_pending());
+    portEXIT_CRITICAL(&detector_event_lock);
+    return blocked;
+}
+
+static bool deauth_detector_stop_v2_profile(uint32_t timeout_ms) {
+    portENTER_CRITICAL(&detector_event_lock);
+    detector_v2_context_t *context = detector_v2_context;
+    bool owns_profile = detector_v2_context != NULL;
+    if (owns_profile) detector_accepting = false;
+    portEXIT_CRITICAL(&detector_event_lock);
+    if (context != NULL && context->scan_token.held) {
+        bool aborted = wifi_shield_abort_deauth_scan(&context->scan_token,
+                                                     timeout_ms);
+        if (aborted && context == detector_v2_context)
+            deauth_detector_v2_context_release(context);
+        return aborted;
+    }
+    if (owns_profile && detector_defence_runtime.started)
+        deauth_defence_runtime_request_stop(&detector_defence_runtime);
+    return wifi_shield_stop_deauth_profile(timeout_ms);
 }
 
 static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
@@ -20144,6 +24184,11 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
         } else {
             MY_LOG_INFO(TAG, "Usage: deauth_detector --only <scan-index> [scan-index ...]");
         }
+        return 1;
+    }
+    if (deauth_detector_retained_profile_blocks_start()) {
+        MY_LOG_INFO(TAG,
+                    "Deauth detector cleanup pending. Use 'stop' and retry.");
         return 1;
     }
     oled_display_update_full("> Deauth Detect", "  Monitoring...", "  All channels", "  Passive scan");
@@ -20181,6 +24226,7 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
     size_t defence_target_count = 0U;
     uint16_t selected_scan_count = 0;
     bool watch_scan_locked = false;
+    wifi_shield_deauth_scan_token_t *deauth_scan_token = NULL;
     if (watch_only) {
         deauth_detector_reset_events();
         if (!g_scan_results_mutex ||
@@ -20274,6 +24320,12 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
         
         deauth_detector_selected_mode = true;
         if (watch_only) {
+            if (details && detector_v2_context == NULL &&
+                !deauth_detector_v2_context_acquire()) {
+                MY_LOG_INFO(TAG,
+                            "Detector V2 PSRAM context allocation failed.");
+                goto watch_prepare_failed;
+            }
             // One scan mutex hold covers index resolution and all displayed target data.
             portENTER_CRITICAL(&detector_event_lock);
             detector_cache_count = selected_scan_count;
@@ -20304,6 +24356,21 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
         // MODE A: No arguments - scan first, then monitor all channels
         MY_LOG_INFO(TAG, "Starting Deauth Detector in SCAN mode...");
         MY_LOG_INFO(TAG, "Scanning networks first...");
+
+        if (details) {
+            if (detector_v2_context == NULL &&
+                !deauth_detector_v2_context_acquire()) {
+                MY_LOG_INFO(TAG,
+                            "Detector V2 PSRAM context allocation failed.");
+                goto watch_prepare_failed;
+            }
+            deauth_scan_token = &detector_v2_context->scan_token;
+            if (!wifi_shield_reserve_deauth_scan(deauth_scan_token)) {
+                MY_LOG_INFO(TAG, "Detector receiver setup failed: profile_%d",
+                            (int)WIFI_SECURITY_SESSION_BUSY);
+                goto watch_prepare_failed;
+            }
+        }
         
         // Start WiFi scan with configurable timings
         esp_err_t err = start_background_scan(g_scan_min_channel_time, g_scan_max_channel_time);
@@ -20313,6 +24380,7 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
             } else {
                 MY_LOG_INFO(TAG, "Failed to start scan: %s", esp_err_to_name(err));
             }
+            if (details) goto watch_prepare_failed;
             return 1;
         }
         
@@ -20325,6 +24393,7 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
             // Check for stop request
             if (operation_stop_requested) {
                 MY_LOG_INFO(TAG, "Scan cancelled by user.");
+                if (details) goto watch_prepare_failed;
                 return 1;
             }
         }
@@ -20332,17 +24401,25 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
         if (g_scan_in_progress) {
             MY_LOG_INFO(TAG, "Scan timed out. Try again later.");
             esp_wifi_scan_stop(); // Force stop the scan
+            if (details) goto watch_prepare_failed;
             return 1;
         }
         
         // Verify scan actually completed with results
         if (!g_scan_done || g_scan_count == 0) {
             MY_LOG_INFO(TAG, "No scan results available. Try 'scan_networks' first.");
+            if (details) goto watch_prepare_failed;
             return 1;
         }
         
         MY_LOG_INFO(TAG, "Found %d networks.", g_scan_count);
         deauth_detector_selected_mode = false;
+    }
+
+    if (details && detector_v2_context == NULL &&
+        !deauth_detector_v2_context_acquire()) {
+        MY_LOG_INFO(TAG, "Detector V2 PSRAM context allocation failed.");
+        goto watch_prepare_failed;
     }
     
     if (defence) {
@@ -20372,27 +24449,15 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
             MY_LOG_INFO(TAG, "Defence radio busy: %s.", busy_reason);
             goto watch_prepare_failed;
         }
-        janos_radio_lease_result_t lease_result = janos_radio_lease_acquire(
-            &janos_radio_lease, JANOS_RADIO_OWNER_DEFENCE,
-            &detector_defence_lease_generation);
-        if (lease_result != JANOS_RADIO_LEASE_OK) {
-            MY_LOG_INFO(TAG, "Defence radio lease unavailable (code=%d).",
-                        (int)lease_result);
-            detector_defence_lease_generation = 0U;
-            goto watch_prepare_failed;
-        }
         if (!ensure_wifi_mode()) {
             MY_LOG_INFO(TAG, "Defence WiFi initialization failed.");
-            (void)deauth_detector_stop_defence_session(0U, false);
             goto watch_prepare_failed;
         }
-        if (esp_wifi_get_channel(&detector_defence_restore_channel,
-                                 &detector_defence_restore_secondary) != ESP_OK) {
-            MY_LOG_INFO(TAG, "Defence could not snapshot the current channel.");
-            (void)deauth_detector_stop_defence_session(0U, false);
-            goto watch_prepare_failed;
-        }
-        detector_defence_restore_valid = true;
+        /* The Deauth compatibility profile owns the sole radio lease and
+         * snapshots/restores the channel transactionally. Defence must not
+         * acquire a second owner or callback. */
+        detector_defence_lease_generation = 0U;
+        detector_defence_restore_valid = false;
     }
 
     // The watch cache was captured with the selected BSSIDs under the scan mutex.
@@ -20418,13 +24483,26 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
     if (defence) detector_accepting = false;
     portEXIT_CRITICAL(&detector_event_lock);
     if (defence) {
+        detector_v2_context_t *context = detector_v2_context;
+        deauth_scan_token = context == NULL ? NULL : &context->scan_token;
+        if (context == NULL ||
+            defence_target_count > DEAUTH_DEFENCE_RUNTIME_TARGETS) {
+            MY_LOG_INFO(TAG, "Defence target snapshot unavailable.");
+            goto watch_prepare_failed;
+        }
+        memcpy(context->defence_targets, defence_targets,
+               defence_target_count * sizeof(context->defence_targets[0]));
+        context->defence_target_count = defence_target_count;
         deauth_defence_config_t config = {
-            .targets = defence_targets,
+            .targets = context->defence_targets,
             .target_count = defence_target_count,
             .pmkid_decoy = cli.pmkid_decoy,
             .generation = detector_generation,
+            .opaque = context,
             .random = detector_defence_random_adapter,
             .tune = detector_defence_tune_adapter,
+            .radio_enter = detector_defence_radio_enter_adapter,
+            .radio_leave = detector_defence_radio_leave_adapter,
             .tx = detector_defence_tx_adapter,
             .now = detector_defence_now_adapter,
             .notify = detector_defence_notify_adapter,
@@ -20441,6 +24519,121 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
     }
     // Activate deauth_detector
     deauth_detector_active = true;
+
+    if (details) {
+        uint8_t profile_channels[WIFI_SHIELD_TARGET_MAX] = {0};
+        size_t profile_channel_count = 0U;
+        const int *source_channels = deauth_detector_selected_mode ?
+            deauth_detector_selected_channels : dual_band_channels;
+        int source_channel_count = deauth_detector_selected_mode ?
+            deauth_detector_selected_channels_count : dual_band_channels_count;
+        for (int i = 0; i < source_channel_count; ++i) {
+            int channel = source_channels[i];
+            if (channel <= 0 || channel > UINT8_MAX ||
+                profile_channel_count >= WIFI_SHIELD_TARGET_MAX)
+                continue;
+            profile_channels[profile_channel_count++] = (uint8_t)channel;
+        }
+        /* Selected-mode hopping remains exact, but Trace confirmation samples
+         * adjacent supported channels through the same fenced profile. Keep
+         * the released initial/selected order and append only fence admission. */
+        if (trace) {
+            for (int channel = 1; channel <= 14 &&
+                                  profile_channel_count <
+                                      WIFI_SHIELD_TARGET_MAX;
+                 ++channel) {
+                bool present = false;
+                for (size_t j = 0U; j < profile_channel_count; ++j)
+                    present = present ||
+                        profile_channels[j] == (uint8_t)channel;
+                if (!present)
+                    profile_channels[profile_channel_count++] =
+                        (uint8_t)channel;
+            }
+            for (int i = 0; i < dual_band_channels_count &&
+                            profile_channel_count < WIFI_SHIELD_TARGET_MAX;
+                 ++i) {
+                int channel = dual_band_channels[i];
+                if (channel <= 0 || channel > UINT8_MAX) continue;
+                bool present = false;
+                for (size_t j = 0U; j < profile_channel_count; ++j)
+                    present = present ||
+                        profile_channels[j] == (uint8_t)channel;
+                if (!present)
+                    profile_channels[profile_channel_count++] =
+                        (uint8_t)channel;
+            }
+        }
+        detector_v2_context_t *context = detector_v2_context;
+        wifi_shield_target_t *profile_targets = context == NULL ? NULL :
+            context->profile_targets;
+        size_t profile_target_count = 0U;
+        for (size_t i = 0U; i < requested_watch.count; ++i) {
+            if (profile_targets == NULL) break;
+            memcpy(profile_targets[i].bssid, requested_watch.bssid[i], 6U);
+            for (size_t j = 0U; j < detector_cache_count; ++j)
+                if (memcmp(detector_cache[j].bssid,
+                           requested_watch.bssid[i], 6U) == 0) {
+                    profile_targets[i].channel = detector_cache[j].channel;
+                    break;
+                }
+            ++profile_target_count;
+        }
+        wifi_security_session_config_t profile_config = {
+            .module = WIFI_SECURITY_MODULE_DEAUTH_V2,
+            .receive_policy = WIFI_SECURITY_RECEIVE_MGMT,
+            .borrowed_receive = deauth_detector_v2_borrowed_receive,
+            .worker_poll = deauth_detector_v2_worker_poll,
+            .context = context,
+            .consume = deauth_detector_v2_profile_consume,
+            .validate = deauth_detector_v2_profile_validate,
+            .wipe = deauth_detector_v2_profile_wipe,
+            .telemetry_context = context,
+            .uncertainty = deauth_detector_v2_profile_uncertainty,
+        };
+        deauth_detector_channel_index = 0;
+        deauth_detector_current_channel = profile_channels[0];
+        wifi_security_session_result_t profile_result =
+            wifi_shield_start_deauth_profile(
+                profile_target_count == 0U ? NULL : profile_targets,
+                profile_target_count, profile_channels,
+                profile_channel_count, &profile_config,
+                deauth_scan_token != NULL && deauth_scan_token->held ?
+                    deauth_scan_token : NULL);
+        if (profile_result != WIFI_SECURITY_SESSION_OK) {
+            if (defence && profile_result == WIFI_SECURITY_SESSION_BUSY)
+                MY_LOG_INFO(TAG,
+                            "Defence radio lease unavailable (code=%d).",
+                            (int)JANOS_RADIO_LEASE_BUSY);
+            else
+                MY_LOG_INFO(TAG, "Detector receiver setup failed: profile_%d",
+                            (int)profile_result);
+            bool profile_stopped =
+                deauth_detector_stop_v2_profile(5000U);
+            deauth_detector_active = false;
+            deauth_detector_close_events();
+            if (profile_stopped && context == detector_v2_context)
+                deauth_detector_v2_context_release(context);
+            if (defence)
+                (void)deauth_detector_stop_defence_session(
+                    detector_dropped_total, true);
+            return 1;
+        }
+        uint32_t runtime_generation = 0U;
+        if (context == NULL || context != detector_v2_context ||
+            !wifi_shield_deauth_profile_generation(&runtime_generation) ||
+            (context->runtime_generation != 0U &&
+             context->runtime_generation != runtime_generation)) {
+            (void)deauth_detector_stop_v2_profile(5000U);
+            deauth_detector_active = false;
+            deauth_detector_close_events();
+            return 1;
+        }
+        context->runtime_generation = runtime_generation;
+        deauth_detector_last_channel_hop = esp_timer_get_time() / 1000;
+        MY_LOG_INFO(TAG, "Detector channel coverage depends on current band/connection state; CSA RX is the received channel.");
+        goto detector_receiver_running;
+    }
     
     // Configure reception only. The legacy startup scan above retains its existing behavior.
     wifi_promiscuous_filter_t mgmt_filter = {
@@ -20516,10 +24709,14 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
         }
         return 1;
     }
+detector_receiver_running:
     if (defence) {
-        bool ready = janos_radio_lease_mark_running(
-            &janos_radio_lease, JANOS_RADIO_OWNER_DEFENCE,
-            detector_defence_lease_generation);
+        uint32_t defence_generation = 0U;
+        bool ready = details &&
+            wifi_shield_deauth_profile_generation(&defence_generation) &&
+            detector_v2_context != NULL &&
+            detector_v2_context->runtime_generation ==
+                defence_generation;
         uint32_t armed_generation = 0U;
         if (ready) {
             portENTER_CRITICAL(&detector_event_lock);
@@ -20537,30 +24734,14 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
                         "Defence radio lease/worker could not enter armed state.");
             deauth_detector_active = false;
             deauth_detector_close_events();
-            (void)janos_radio_lease_request_cancel(
-                &janos_radio_lease, JANOS_RADIO_OWNER_DEFENCE,
-                detector_defence_lease_generation);
             deauth_defence_runtime_request_stop(&detector_defence_runtime);
-            if (deauth_detector_task_handle) {
-                xTaskNotifyGive(deauth_detector_task_handle);
-            }
-            esp_wifi_set_promiscuous(false);
-            esp_wifi_set_promiscuous_rx_cb(NULL);
-            for (int i = 0; i < 20 && deauth_detector_task_handle;
-                 ++i) {
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-            if (deauth_detector_task_handle) {
+            bool profile_stopped = deauth_detector_stop_v2_profile(5000U);
+            bool defence_stopped = deauth_detector_stop_defence_session(
+                detector_dropped_total, profile_stopped);
+            if (!profile_stopped || !defence_stopped)
                 MY_LOG_INFO(
                     TAG,
                     "[DETECTOR_DEFENCE] startup_cleanup_pending reason=worker_not_quiescent");
-                return 1;
-            }
-            bool restored = !detector_defence_restore_valid ||
-                esp_wifi_set_channel(detector_defence_restore_channel,
-                                     detector_defence_restore_secondary) == ESP_OK;
-            (void)deauth_detector_stop_defence_session(detector_dropped_total,
-                                                       restored);
             return 1;
         }
         portENTER_CRITICAL(&detector_event_lock);
@@ -20619,9 +24800,14 @@ static int cmd_deauth_detector_impl(int argc, char **argv, bool details) {
     
     return 0;
 
-watch_prepare_failed:
+watch_prepare_failed: ;
+    bool prepare_retained = deauth_scan_token != NULL &&
+        deauth_scan_token->held &&
+        !wifi_shield_abort_deauth_scan(deauth_scan_token, 5000U);
     if (watch_scan_locked) xSemaphoreGive(g_scan_results_mutex);
     deauth_detector_close_events();
+    if (details && detector_v2_context != NULL && !prepare_retained)
+        deauth_detector_v2_context_release(detector_v2_context);
     deauth_detector_selected_mode = false;
     deauth_detector_selected_channels_count = 0;
     return 1;
@@ -22139,7 +26325,10 @@ static void led_status_render_task(void *argument)
                                 zig_recon_is_active(),
             [LED_STATUS_MONITOR] = sniffer_active || packet_monitor_active ||
                                    ap_locator_active || channel_view_active ||
-                                   deauth_detector_active || antisurv_active,
+                                   deauth_detector_active || antisurv_active ||
+                                   atomic_load_explicit(
+                                       &wifi_shield_presentation_monitor,
+                                       memory_order_acquire),
             [LED_STATUS_CAPTURE] = handshake_attack_active || pcap_capture_active ||
                                    capture_gateway_is_active() || wardrive_active ||
                                    wardrive_promisc_active || gps_raw_active,
@@ -22359,12 +26548,30 @@ static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
     }
     const char *admission_subcommand = defence_command ? "defence" :
         (argc > 1 ? argv[1] : NULL);
+    if (strcmp(cmd_context->command, "router_audit") == 0 && argc > 1) {
+        if (strcmp(argv[1], "status") == 0) {
+            admission_subcommand = "status";
+        } else if (strcmp(argv[1], "scan") == 0 && argc > 2) {
+            admission_subcommand = strcmp(argv[2], "passive") == 0 ?
+                "scan_passive" : "scan_standard";
+        } else if (strcmp(argv[1], "db") == 0 && argc > 2) {
+            admission_subcommand = strcmp(argv[2], "status") == 0 ? "db_status" :
+                strcmp(argv[2], "verify") == 0 ? "db_verify" : "db_install";
+        }
+    }
+    bool client_isolation_secret =
+        strcmp(cmd_context->command, "client_isolation_audit") == 0 &&
+        argc > 3 && argv[1] != NULL && strcmp(argv[1], "start") == 0;
     janos_console_admission_token_t token = {0};
     janos_console_admission_result_t admission = janos_console_admission_begin(
         &janos_radio_lease, cmd_context->command, admission_subcommand,
         janos_commands_inflight, wifi_analyzer_busy(), &token);
     if (admission != JANOS_CONSOLE_ADMIT) {
         xSemaphoreGiveRecursive(janos_command_mutex);
+        if (client_isolation_secret) {
+            client_isolation_scrub_cli_token(argv[3]);
+            linenoiseHistoryFree();
+        }
         char response[160] = {0};
         if (janos_console_admission_format(response, sizeof(response),
                                            admission)) puts(response);
@@ -22389,6 +26596,10 @@ static int janos_console_cmd_dispatch(void *context, int argc, char **argv)
     if (wps_command && argc >= 2 && strcmp(argv[1], "verify") == 0) {
         /* The runtime wipes argv[3]; also discard the REPL's retained copy of
          * the secret-bearing command instead of leaving it in RAM history. */
+        linenoiseHistoryFree();
+    }
+    if (client_isolation_secret) {
+        client_isolation_scrub_cli_token(argv[3]);
         linenoiseHistoryFree();
     }
     xSemaphoreTakeRecursive(janos_command_mutex, portMAX_DELAY);
@@ -27990,69 +32201,13 @@ static esp_err_t analyzer_host_prepare_wifi(void)
 {
     if (current_radio_mode == RADIO_MODE_WIFI) return ESP_OK;
     if (current_radio_mode != RADIO_MODE_NONE) return ESP_ERR_INVALID_STATE;
-    /* The legacy initializer aborts on allocation/driver errors. This opt-in
-     * path returns them to the protocol instead. Shared infrastructure that was
-     * successfully created remains available for a later retry. */
-    esp_err_t err;
-    if (!netif_initialized) {
-        err = esp_netif_init();
-        if (err != ESP_OK) return err;
-        netif_initialized = true;
-    }
-    if (!event_loop_initialized) {
-        err = esp_event_loop_create_default();
-        if (err != ESP_OK) return err;
-        event_loop_initialized = true;
-    }
-    if (sta_netif_handle == NULL) {
-        /* The convenience create_default helper asserts on OOM internally. */
-        esp_netif_config_t netif_config = ESP_NETIF_DEFAULT_WIFI_STA();
-        esp_netif_t *netif = esp_netif_new(&netif_config);
-        if (netif == NULL) return ESP_ERR_NO_MEM;
-        err = esp_netif_attach_wifi_station(netif);
-        if (err == ESP_OK) err = esp_wifi_set_default_wifi_sta_handlers();
-        if (err != ESP_OK) {
-            esp_netif_destroy_default_wifi(netif);
-            return err;
-        }
-        sta_netif_handle = netif;
-    }
-    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
-    err = wifi_init_with_configured_country(&init);
+    esp_err_t err = wifi_prepare_sta_driver();
     if (err != ESP_OK) return err;
-    if (!wifi_event_handler_registered) {
-        err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                  &wifi_event_handler, NULL, NULL);
-        if (err != ESP_OK) goto failed;
-        wifi_event_handler_registered = true;
-    }
-    if (!ip_event_handler_registered) {
-        err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                  &ip_event_handler, NULL, NULL);
-        if (err != ESP_OK) goto failed;
-        ip_event_handler_registered = true;
-    }
-    wifi_config_t config = {0};
-    err = esp_wifi_set_mode(WIFI_MODE_STA);
-    if (err != ESP_OK) goto failed;
-    err = esp_wifi_set_config(WIFI_IF_STA, &config);
-    if (err != ESP_OK) goto failed;
-    err = wifi_start_with_boot_sta_mac();
-    if (err != ESP_OK) goto failed;
     current_radio_mode = RADIO_MODE_WIFI;
     wifi_initialized = true;
     /* Country policy is installed centrally by wifi_init_with_configured_country().
      * Analyzer only consumes that host-owned radio configuration. */
     return ESP_OK;
-
-failed:
-    (void)esp_wifi_stop();
-    if (esp_wifi_deinit() != ESP_OK) {
-        portENTER_CRITICAL(&analyzer_legacy_scan_lock);
-        analyzer_legacy_radio_uncertain = true;
-        portEXIT_CRITICAL(&analyzer_legacy_scan_lock);
-    }
-    return err;
 }
 
 // --- Command registration in esp_console ---
@@ -28121,6 +32276,48 @@ static void register_commands(void)
         .func = &janos_wps_secret_command,
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&secret_cmd));
+
+    const esp_console_cmd_t wps_guard_cmd = {
+        .command = "wps_guard",
+        .help = "Passive WPS fragment forensics: start [--only indexes...] | status | stop",
+        .func = &wps_guard_command,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wps_guard_cmd));
+
+    const esp_console_cmd_t sae_guard_cmd = {
+        .command = "sae_guard",
+        .help = "Passive SAE authentication forensics: start [--only indexes...] | status | stop",
+        .func = &sae_guard_command,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&sae_guard_cmd));
+
+    const esp_console_cmd_t wifi_trust_cmd = {
+        .command = "wifi_trust",
+        .help = "Wi-Fi trust baseline: baseline capture/list/clear | monitor [--only indexes...] | status | stop",
+        .func = &wifi_trust_command,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_trust_cmd));
+
+    const esp_console_cmd_t wifi_shield_cmd = {
+        .command = "wifi_shield",
+        .help = WIFI_SHIELD_HELP_TEXT,
+        .func = &wifi_shield_command,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_shield_cmd));
+
+    const esp_console_cmd_t client_isolation_cmd = {
+        .command = "client_isolation_audit",
+        .help = "Owned peer isolation audit: start <peer-ipv4> <32-hex-token> [--port 1024..65535] [--count 1..10] | status",
+        .func = &client_isolation_command,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&client_isolation_cmd));
+
+    const esp_console_cmd_t router_audit_cmd = {
+        .command = "router_audit",
+        .help = "Gateway inventory/CVE audit: scan passive | scan standard --owned | status | db status|verify|install [--allow-time-unknown]",
+        .func = &router_audit_command,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&router_audit_cmd));
 
     const esp_console_cmd_t analyzer_cmd = {
         .command = "wifi_analyzer",
@@ -29215,6 +33412,64 @@ static void register_commands(void)
 }
 #undef esp_console_cmd_register
 
+static void *feature_psram_aligned_calloc(size_t alignment, size_t count,
+                                          size_t size, uint32_t capabilities)
+{
+    return heap_caps_aligned_calloc(alignment, count, size, capabilities);
+}
+
+static void feature_psram_free(void *memory)
+{
+    heap_caps_free(memory);
+}
+
+static bool init_feature_psram_storage(void)
+{
+    janos_psram_request_t requests[] = {
+        {.destination = &security_platform.runtime,
+         .size = sizeof(*security_platform.runtime), .alignment = portBYTE_ALIGNMENT},
+        {.destination = &security_platform.worker_stack,
+         .size = SECURITY_WORKER_STACK_DEPTH * sizeof(*security_platform.worker_stack),
+         .alignment = portBYTE_ALIGNMENT},
+        {.destination = &wps_guard_output_queue_buffer,
+         .size = WPS_GUARD_OUTPUT_QUEUE_DEPTH * sizeof(wps_guard_output_record_t),
+         .alignment = portBYTE_ALIGNMENT},
+        {.destination = &wps_guard_output_task_stack,
+         .size = WPS_GUARD_OUTPUT_TASK_STACK_DEPTH * sizeof(*wps_guard_output_task_stack),
+         .alignment = portBYTE_ALIGNMENT},
+        {.destination = &sae_guard_output_queue_buffer,
+         .size = SAE_GUARD_OUTPUT_QUEUE_DEPTH * sizeof(sae_guard_output_record_t),
+         .alignment = portBYTE_ALIGNMENT},
+        {.destination = &sae_guard_output_task_stack,
+         .size = SAE_GUARD_OUTPUT_TASK_STACK_DEPTH * sizeof(*sae_guard_output_task_stack),
+         .alignment = portBYTE_ALIGNMENT},
+        {.destination = &wifi_trust_output_queue_buffer,
+         .size = WIFI_TRUST_OUTPUT_QUEUE_DEPTH * sizeof(wifi_trust_output_record_t),
+         .alignment = portBYTE_ALIGNMENT},
+        {.destination = &wifi_trust_output_task_stack,
+         .size = WIFI_TRUST_OUTPUT_TASK_STACK_DEPTH * sizeof(*wifi_trust_output_task_stack),
+         .alignment = portBYTE_ALIGNMENT},
+        {.destination = &wifi_trust_control_queue_buffer,
+         .size = WIFI_TRUST_CONTROL_QUEUE_DEPTH * sizeof(wifi_trust_control_message_t),
+         .alignment = portBYTE_ALIGNMENT},
+        {.destination = &wifi_trust_control_task_stack,
+         .size = WIFI_TRUST_CONTROL_TASK_STACK_DEPTH * sizeof(*wifi_trust_control_task_stack),
+         .alignment = portBYTE_ALIGNMENT},
+        {.destination = &router_audit_scratch,
+         .size = ROUTER_AUDIT_SCRATCH_MIN, .alignment = portBYTE_ALIGNMENT},
+        {.destination = &router_audit_command_workspace,
+         .size = ROUTER_AUDIT_COMMAND_WORKSPACE_MIN,
+         .alignment = portBYTE_ALIGNMENT},
+        {.destination = &wifi_shield_retained_storage,
+         .size = wifi_shield_retained_size(),
+         .alignment = portBYTE_ALIGNMENT},
+    };
+    return janos_psram_allocate_all(
+        requests, sizeof(requests) / sizeof(requests[0]),
+        feature_psram_aligned_calloc, feature_psram_free,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
 void app_main(void) {
 
 
@@ -29224,8 +33479,106 @@ void app_main(void) {
     // heap_caps_print_heap_info(MALLOC_CAP_DEFAULT);
 
     printf("\n\n=== APP_MAIN START (v" JANOS_VERSION ") ===\n");
+#ifdef CONFIG_SPIRAM
+    esp_err_t psram_init_result = ESP_OK;
+    if (!esp_psram_is_initialized()) psram_init_result = esp_psram_init();
+    if (psram_init_result != ESP_OK || !esp_psram_is_initialized()) {
+        printf("FATAL: PSRAM initialization failed: %s\n",
+               esp_err_to_name(psram_init_result));
+        return;
+    }
+    if (!init_psram_buffers()) {
+        printf("FATAL: PSRAM buffer allocation failed!\n");
+        return;
+    }
+    if (!init_feature_psram_storage()) {
+        deinit_psram_buffers();
+        printf("FATAL: PSRAM buffer allocation failed!\n");
+        return;
+    }
+#else
+    printf("FATAL: PSRAM support disabled in config\n");
+    return;
+#endif
     g_scan_results_mutex = xSemaphoreCreateMutexStatic(&g_scan_results_mutex_storage);
     assert(g_scan_results_mutex != NULL);
+    wifi_shield_output_mutex =
+        xSemaphoreCreateMutexStatic(&wifi_shield_output_mutex_storage);
+    assert(wifi_shield_output_mutex != NULL);
+    wifi_shield_state_mutex =
+        xSemaphoreCreateMutexStatic(&wifi_shield_state_mutex_storage);
+    assert(wifi_shield_state_mutex != NULL);
+    wifi_shield_radio_mutex =
+        xSemaphoreCreateMutexStatic(&wifi_shield_radio_mutex_storage);
+    assert(wifi_shield_radio_mutex != NULL);
+    wifi_shield_profile_mutex =
+        xSemaphoreCreateMutexStatic(&wifi_shield_profile_mutex_storage);
+    assert(wifi_shield_profile_mutex != NULL);
+    wifi_shield_output_done =
+        xSemaphoreCreateBinaryStatic(&wifi_shield_output_done_storage);
+    assert(wifi_shield_output_done != NULL);
+    const wifi_shield_output_platform_hooks_t shield_output_platform_hooks = {
+        .lock = wifi_shield_output_enter,
+        .unlock = wifi_shield_output_leave,
+        .monotonic_us = wifi_shield_monotonic_us,
+    };
+    assert(wifi_shield_output_platform_init(
+        &wifi_shield_output_platform, &shield_output_platform_hooks));
+    wps_guard_output_mutex =
+        xSemaphoreCreateMutexStatic(&wps_guard_output_mutex_storage);
+    assert(wps_guard_output_mutex != NULL);
+    wps_guard_output_queue = xQueueCreateStatic(
+        WPS_GUARD_OUTPUT_QUEUE_DEPTH, sizeof(wps_guard_output_record_t),
+        wps_guard_output_queue_buffer, &wps_guard_output_queue_storage);
+    assert(wps_guard_output_queue != NULL);
+    wps_guard_output_task_handle = xTaskCreateStatic(wps_guard_output_publisher,
+        "wps_guard_out",
+        WPS_GUARD_OUTPUT_TASK_STACK_DEPTH,
+        NULL, 4, wps_guard_output_task_stack, &wps_guard_output_task_storage);
+    assert(wps_guard_output_task_handle != NULL);
+    sae_guard_output_mutex =
+        xSemaphoreCreateMutexStatic(&sae_guard_output_mutex_storage);
+    assert(sae_guard_output_mutex != NULL);
+    sae_guard_output_queue = xQueueCreateStatic(
+        SAE_GUARD_OUTPUT_QUEUE_DEPTH, sizeof(sae_guard_output_record_t),
+        sae_guard_output_queue_buffer, &sae_guard_output_queue_storage);
+    assert(sae_guard_output_queue != NULL);
+    sae_guard_output_task_handle = xTaskCreateStatic(sae_guard_output_publisher,
+        "sae_guard_out",
+        SAE_GUARD_OUTPUT_TASK_STACK_DEPTH,
+        NULL, 4, sae_guard_output_task_stack, &sae_guard_output_task_storage);
+    assert(sae_guard_output_task_handle != NULL);
+    wifi_trust_output_mutex =
+        xSemaphoreCreateMutexStatic(&wifi_trust_output_mutex_storage);
+    assert(wifi_trust_output_mutex != NULL);
+    wifi_trust_storage_mutex =
+        xSemaphoreCreateMutexStatic(&wifi_trust_storage_mutex_storage);
+    assert(wifi_trust_storage_mutex != NULL);
+    wifi_trust_output_queue = xQueueCreateStatic(
+        WIFI_TRUST_OUTPUT_QUEUE_DEPTH, sizeof(wifi_trust_output_record_t),
+        wifi_trust_output_queue_buffer, &wifi_trust_output_queue_storage);
+    assert(wifi_trust_output_queue != NULL);
+    wifi_trust_output_task_handle = xTaskCreateStatic(wifi_trust_output_publisher,
+        "wifi_trust_out",
+        WIFI_TRUST_OUTPUT_TASK_STACK_DEPTH,
+        NULL, 4, wifi_trust_output_task_stack, &wifi_trust_output_task_storage);
+    assert(wifi_trust_output_task_handle != NULL);
+    wifi_trust_control_queue = xQueueCreateStatic(
+        WIFI_TRUST_CONTROL_QUEUE_DEPTH, sizeof(wifi_trust_control_message_t),
+        wifi_trust_control_queue_buffer, &wifi_trust_control_queue_storage);
+    assert(wifi_trust_control_queue != NULL);
+    wifi_trust_deadline_operation_mutex = xSemaphoreCreateMutexStatic(
+        &wifi_trust_deadline_operation_mutex_storage);
+    assert(wifi_trust_deadline_operation_mutex != NULL);
+    wifi_trust_deadline_state_init(&wifi_trust_deadline_state);
+    wifi_trust_control_task_handle = xTaskCreateStatic(wifi_trust_control_task,
+        "wifi_trust_ctl",
+        WIFI_TRUST_CONTROL_TASK_STACK_DEPTH,
+        NULL, 4, wifi_trust_control_task_stack, &wifi_trust_control_task_storage);
+    assert(wifi_trust_control_task_handle != NULL);
+    ESP_ERROR_CHECK(esp_timer_create(&wifi_trust_deadline_timer_args,
+                                     &wifi_trust_deadline_timer));
+    esp_fill_random(wifi_trust_boot_id, sizeof(wifi_trust_boot_id));
     
     // Suppress WiFi internal WARNING logs (phy rate, etc.) - show only errors
     esp_log_level_set("wifi", ESP_LOG_ERROR);
@@ -29234,38 +33587,6 @@ void app_main(void) {
     esp_log_level_set("sdmmc_sd", ESP_LOG_NONE);
     esp_log_level_set("vfs_fat_sdmmc", ESP_LOG_NONE);
     esp_log_level_set("spi_common", ESP_LOG_NONE);
-
- #ifdef CONFIG_SPIRAM
-//     printf("Step 1: Manual PSRAM init\n");
-    
-    // Manual PSRAM initialization (CONFIG_SPIRAM_BOOT_INIT=n)
-    esp_err_t ret1 = esp_psram_init();
-    if (ret1 == ESP_OK) {
-        size_t psram_size = esp_psram_get_size();
-        (void)psram_size;
-        //printf("PSRAM initialized successfully, size: %zu bytes\n", psram_size);
-        
-        //printf("Step 2: Test PSRAM malloc\n");
-        void* ptr = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
-        if (ptr != NULL) {
-            //printf("Malloc from PSRAM succeeded\n");
-            heap_caps_free(ptr);
-        } else {
-            printf("Malloc from PSRAM failed\n");
-        }
-        
-        //printf("Step 2b: Allocate buffers in PSRAM\n");
-        if (!init_psram_buffers()) {
-            printf("FATAL: PSRAM buffer allocation failed!\n");
-            return;
-        }
-        //printf("PSRAM buffers allocated (~110 KB)\n");
-    } else {
-        printf("PSRAM init failed: %s (continuing without PSRAM)\n", esp_err_to_name(ret1));
-    }
-#else
-    printf("PSRAM support disabled in config\n");
-#endif
 
     // NVS must be ready before loading persisted display mode.
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -29407,6 +33728,26 @@ void app_main(void) {
     sta_mac_state_mutex = xSemaphoreCreateMutexStatic(&sta_mac_state_mutex_storage);
     assert(sta_mac_state_mutex != NULL);
     janos_radio_lease_init(&janos_radio_lease);
+    ESP_ERROR_CHECK(wifi_security_platform_init() ? ESP_OK : ESP_FAIL);
+    ESP_ERROR_CHECK(wifi_shield_init(&wifi_shield_runtime_hooks,
+                                     &wifi_shield_output_hooks,
+                                     wifi_shield_retained_storage,
+                                     wifi_shield_retained_size()) ?
+                    ESP_OK : ESP_FAIL);
+    ESP_ERROR_CHECK(wps_guard_init(&wps_guard_runtime_hooks, &wps_guard_output_hooks) ?
+                    ESP_OK : ESP_FAIL);
+    ESP_ERROR_CHECK(sae_guard_init(&sae_guard_runtime_hooks, &sae_guard_output_hooks) ?
+                    ESP_OK : ESP_FAIL);
+    ESP_ERROR_CHECK(wifi_trust_init(&wifi_trust_runtime_hooks, &wifi_trust_storage_hooks, &wifi_trust_output_hooks) ?
+                    ESP_OK : ESP_FAIL);
+    client_isolation_command_init(&client_isolation_hooks);
+    router_cve_storage_mutex = xSemaphoreCreateMutexStatic(
+        &router_cve_storage_mutex_storage);
+    assert(router_cve_storage_mutex != NULL);
+    router_audit_hooks.command_workspace = router_audit_command_workspace;
+    router_audit_hooks.command_workspace_size =
+        ROUTER_AUDIT_COMMAND_WORKSPACE_MIN;
+    ESP_ERROR_CHECK(router_audit_init(&router_audit_hooks) ? ESP_OK : ESP_FAIL);
     const wifi_analyzer_hooks_t analyzer_hooks = {
         .busy_reason = analyzer_host_busy_reason,
         .prepare_wifi = analyzer_host_prepare_wifi,
@@ -29439,6 +33780,8 @@ void app_main(void) {
     };
     fs_command_init(&fs_hooks);
     led_status_start_renderer();
+    if (!wifi_shield_presentation_start())
+        ESP_LOGW(TAG, "Wi-Fi Shield presentation disabled");
     attack_handshake_set_saved_hook(led_status_handshake_saved);
     esp_console_register_help_command();
     register_commands();
@@ -31729,7 +36072,21 @@ static void detector_ssid_resolver_poll(void) {
         .scan_time.active.max = DETECTOR_SSID_ACTIVE_MAX_MS,
         .home_chan_dwell_time = 0,
     };
+    wifi_shield_deauth_radio_token_t scan_token = {0};
+    if (!wifi_shield_deauth_profile_radio_enter((uint8_t)channel,
+                                                 &scan_token)) {
+        portENTER_CRITICAL(&detector_event_lock);
+        if (detector_targeted_scan_events_pending)
+            --detector_targeted_scan_events_pending;
+        portEXIT_CRITICAL(&detector_event_lock);
+        return;
+    }
     esp_err_t started = esp_wifi_scan_start(&scan, true);
+    wifi_ap_record_t record = {0};
+    uint16_t count = 1;
+    bool complete = started == ESP_OK &&
+        esp_wifi_scan_get_ap_records(&count, &record) == ESP_OK;
+    bool fence_current = wifi_shield_deauth_profile_radio_leave(&scan_token);
     if (started != ESP_OK) {
         portENTER_CRITICAL(&detector_event_lock);
         if (detector_targeted_scan_events_pending)
@@ -31737,10 +36094,7 @@ static void detector_ssid_resolver_poll(void) {
         portEXIT_CRITICAL(&detector_event_lock);
         return;
     }
-
-    wifi_ap_record_t record = {0};
-    uint16_t count = 1;
-    if (esp_wifi_scan_get_ap_records(&count, &record) != ESP_OK || count != 1 ||
+    if (!fence_current || !complete || count != 1 ||
         memcmp(record.bssid, bssid, 6) || record.primary != channel ||
         !record.ssid[0]) return;
     size_t ssid_length = 0;
@@ -31762,7 +36116,8 @@ static void detector_trace_reset_locked(void) {
     memset(&detector_ssid_resolver, 0, sizeof(detector_ssid_resolver));
     detector_trace_confirming = false;
     memset(detector_trace_bssid, 0, sizeof(detector_trace_bssid));
-    memset(detector_trace_candidates, 0, sizeof(detector_trace_candidates));
+    memset(detector_trace_candidates, 0,
+           DETECTOR_TRACE_MAX_CANDIDATES * sizeof(*detector_trace_candidates));
     detector_trace_candidate_count = 0;
     detector_trace_hop_index = 0;
     detector_trace_first_channel = 0;
@@ -31908,7 +36263,10 @@ static void detector_trace_finish_if_due(void) {
     portEXIT_CRITICAL(&detector_event_lock);
     if (!channel) return;
 
-    esp_err_t tune = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    esp_err_t tune = detector_details_mode ?
+        (wifi_shield_deauth_profile_retune((uint8_t)channel) ? ESP_OK :
+                                                               ESP_ERR_INVALID_STATE) :
+        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
     bool locked = false;
     bool report_failure = false;
     bool abort_defence_confirmation = false;
@@ -31978,7 +36336,8 @@ static void deauth_detector_reset_events(void) {
     detector_event_head = detector_event_count = detector_cache_count = 0;
     detector_resolved_ssid_count = detector_resolved_ssid_replace = 0;
     detector_targeted_scan_events_pending = 0;
-    memset(detector_resolved_ssids, 0, sizeof(detector_resolved_ssids));
+    memset(detector_resolved_ssids, 0,
+           DETECTOR_RESOLVED_SSID_CAPACITY * sizeof(*detector_resolved_ssids));
     detector_dropped = 0;
     detector_dropped_total = 0;
     detector_details_mode = false;
@@ -32004,7 +36363,8 @@ static void deauth_detector_close_events(void) {
     ++detector_generation;
     detector_event_head = detector_event_count = 0;
     detector_resolved_ssid_count = detector_resolved_ssid_replace = 0;
-    memset(detector_resolved_ssids, 0, sizeof(detector_resolved_ssids));
+    memset(detector_resolved_ssids, 0,
+           DETECTOR_RESOLVED_SSID_CAPACITY * sizeof(*detector_resolved_ssids));
     detector_details_mode = false;
     detector_details_announced = false;
     detector_trace_requested = false;
@@ -32224,6 +36584,7 @@ static void deauth_detector_channel_hop(void) {
     if (!deauth_detector_active) {
         return;
     }
+    int previous_channel_index = deauth_detector_channel_index;
     int trace_channel = 0;
     portENTER_CRITICAL(&detector_event_lock);
     bool trace_locked = detector_trace_locked;
@@ -32255,8 +36616,15 @@ static void deauth_detector_channel_hop(void) {
         }
     }
     
-    esp_err_t result = esp_wifi_set_channel(deauth_detector_current_channel, WIFI_SECOND_CHAN_NONE);
+    esp_err_t result = detector_details_mode ?
+        (wifi_shield_deauth_profile_retune(
+             (uint8_t)deauth_detector_current_channel) ? ESP_OK :
+                                                        ESP_ERR_INVALID_STATE) :
+        esp_wifi_set_channel(deauth_detector_current_channel,
+                             WIFI_SECOND_CHAN_NONE);
     if (result != ESP_OK) {
+        if (detector_details_mode)
+            deauth_detector_channel_index = previous_channel_index;
         // At most one notice per two seconds; failed tuning never changes reported CSA RX.
         static int64_t last_notice_ms = -2000;
         int64_t now_ms = esp_timer_get_time() / 1000;
@@ -32333,37 +36701,37 @@ static void deauth_detector_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-// Promiscuous callback: bounded parse/copy only; task owns output and display.
-static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
-    if (!buf || !deauth_detector_active || type != WIFI_PKT_MGMT) return;
+// Bounded parse/copy only; the selected legacy/shared worker owns output.
+static bool deauth_detector_capture_packet(
+    const uint8_t *frame, size_t sig_len, size_t dump_len,
+    unsigned rx_state, int8_t rssi, uint8_t channel) {
+    if (!frame || !deauth_detector_active) return false;
     portENTER_CRITICAL(&detector_event_lock);
     bool accepting = detector_accepting;
     bool details = detector_details_mode;
     bool defence = detector_defence_requested;
     uint32_t generation = detector_generation;
     portEXIT_CRITICAL(&detector_event_lock);
-    if (!accepting) return;
-    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    if (!accepting) return false;
     size_t length;
-    if (!csa_capture_length(pkt->rx_ctrl.sig_len, pkt->rx_ctrl.dump_len, pkt->rx_ctrl.rx_state, &length)) return;
-    if (!length) return;
-    const uint8_t *frame = pkt->payload;
+    if (!csa_capture_length(sig_len, dump_len, rx_state, &length)) return false;
+    if (!length) return false;
     detector_event_t event = {0};
     uint8_t subtype = frame[0] & 0xfcU;
     if (!defence && (subtype == 0x80U || subtype == 0x50U)) {
-        detector_ssid_resolver_observe(frame, length, pkt->rx_ctrl.channel,
+        detector_ssid_resolver_observe(frame, length, channel,
                                        generation);
     }
     if (subtype == 0xc0U) {
-        if (length < DETECTOR_DEAUTH_PREFIX_SIZE) return;
+        if (length < DETECTOR_DEAUTH_PREFIX_SIZE) return false;
         memcpy(event.deauth_prefix, frame, DETECTOR_DEAUTH_PREFIX_SIZE);
         memcpy(event.observation.bssid, frame + 16, 6);
-        event.observation.rssi = pkt->rx_ctrl.rssi;
-        event.legacy_channel = pkt->rx_ctrl.channel;
+        event.observation.rssi = rssi;
+        event.legacy_channel = channel;
         strcpy(event.legacy_ssid, "<Unknown>");
         event.kind = DETECTOR_EVENT_DEAUTH;
     } else if ((details || defence) && subtype == 0xa0U) {
-        if (length < DETECTOR_DEAUTH_PREFIX_SIZE) return;
+        if (length < DETECTOR_DEAUTH_PREFIX_SIZE) return false;
         memcpy(event.deauth_prefix, frame, DETECTOR_DEAUTH_PREFIX_SIZE);
         size_t captured = length < DETECTOR_MGMT_PREFIX_SIZE
                               ? length : DETECTOR_MGMT_PREFIX_SIZE;
@@ -32371,28 +36739,28 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
         event.management_length = (uint8_t)captured;
         event.rx_us = esp_timer_get_time();
         memcpy(event.observation.bssid, frame + 16, 6);
-        event.observation.rssi = pkt->rx_ctrl.rssi;
-        event.legacy_channel = pkt->rx_ctrl.channel;
+        event.observation.rssi = rssi;
+        event.legacy_channel = channel;
         event.kind = DETECTOR_EVENT_DISASSOC;
     } else if (defence &&
                (subtype == 0xb0U || subtype == 0x00U ||
                 subtype == 0x20U)) {
         size_t minimum = subtype == 0xb0U ? 30U :
                          subtype == 0x00U ? 28U : 34U;
-        if (length < minimum) return;
+        if (length < minimum) return false;
         size_t captured = length < DETECTOR_MGMT_PREFIX_SIZE
                               ? length : DETECTOR_MGMT_PREFIX_SIZE;
         memcpy(event.management_prefix, frame, captured);
         event.management_length = (uint8_t)captured;
         event.rx_us = esp_timer_get_time();
         memcpy(event.observation.bssid, frame + 16, 6);
-        event.observation.rssi = pkt->rx_ctrl.rssi;
-        event.legacy_channel = pkt->rx_ctrl.channel;
+        event.observation.rssi = rssi;
+        event.legacy_channel = channel;
         event.kind = subtype == 0xb0U ? DETECTOR_EVENT_AUTH :
                      subtype == 0x00U ? DETECTOR_EVENT_ASSOC :
                                         DETECTOR_EVENT_REASSOC;
     } else {
-        if (!csa_parse(frame, length, pkt->rx_ctrl.channel, pkt->rx_ctrl.rssi, &event.observation)) return;
+        if (!csa_parse(frame, length, channel, rssi, &event.observation)) return false;
         event.is_csa = true;
         event.kind = DETECTOR_EVENT_CSA;
     }
@@ -32402,12 +36770,12 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
     portENTER_CRITICAL(&detector_event_lock);
     if (!detector_accepting || detector_generation != generation) {
         portEXIT_CRITICAL(&detector_event_lock);
-        return;
+        return false;
     }
     if (detector_watch_enabled &&
         !deauth_target_contains(&detector_watch_filter, event.observation.bssid)) {
         portEXIT_CRITICAL(&detector_event_lock);
-        return;
+        return false;
     }
     // Reserve eight entries so a deauth burst cannot starve CSA/Defence control events.
     const bool bounded_forensic = event.kind == DETECTOR_EVENT_DEAUTH ||
@@ -32418,11 +36786,11 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
         if (detector_dropped != UINT32_MAX) ++detector_dropped;
         if (detector_dropped_total != UINT32_MAX) ++detector_dropped_total;
         portEXIT_CRITICAL(&detector_event_lock);
-        return;
+        return false;
     }
     if (event.is_csa && !csa_rate_allow(&detector_csa_rate, &event.observation, now_ms)) {
         portEXIT_CRITICAL(&detector_event_lock);
-        return;
+        return false;
     }
     char resolved_ssid[33];
     if (detector_ssid_lookup_locked(event.observation.bssid, resolved_ssid)) {
@@ -32440,6 +36808,130 @@ static void deauth_detector_promiscuous_callback(void *buf, wifi_promiscuous_pkt
     ++detector_event_count;
     portEXIT_CRITICAL(&detector_event_lock);
     if (defence) deauth_defence_runtime_notify(&detector_defence_runtime);
+    return true;
+}
+
+static void deauth_detector_promiscuous_callback(
+    void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!buf || type != WIFI_PKT_MGMT) return;
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    (void)deauth_detector_capture_packet(
+        pkt->payload, pkt->rx_ctrl.sig_len, pkt->rx_ctrl.dump_len,
+        pkt->rx_ctrl.rx_state, pkt->rx_ctrl.rssi, pkt->rx_ctrl.channel);
+}
+
+static bool deauth_detector_v2_profile_validate(void *opaque) {
+    detector_v2_context_t *context = opaque;
+    return context != NULL && context == detector_v2_context &&
+           detector_events == context->events &&
+           detector_cache == context->cache &&
+           detector_resolved_ssids == context->resolved_ssids &&
+           detector_trace_candidates == context->trace_candidates &&
+           detector_watch_filter_storage == &context->watch_filter;
+}
+
+static void deauth_detector_v2_profile_wipe(void *opaque) {
+    detector_v2_context_t *context = opaque;
+    uint32_t dropped = detector_dropped_total;
+    deauth_detector_close_events();
+    if (detector_defence_runtime.started) {
+        deauth_defence_runtime_request_stop(&detector_defence_runtime);
+        if (deauth_defence_runtime_join(&detector_defence_runtime, 0U)) {
+            deauth_defence_runtime_quiesce(&detector_defence_runtime);
+            deauth_defence_runtime_finish_stop(&detector_defence_runtime,
+                                               dropped);
+        }
+    }
+    deauth_detector_v2_context_release(context);
+}
+
+static bool deauth_detector_v2_profile_consume(
+    void *opaque, const wifi_security_frame_slot_t *slot,
+    const wifi_security_decoded_t *decoded) {
+    (void)opaque;
+    (void)slot;
+    (void)decoded;
+    return false;
+}
+
+static void deauth_detector_v2_profile_uncertainty(
+    void *opaque, wifi_security_session_result_t result, bool owned) {
+    (void)opaque;
+    (void)result;
+    (void)owned;
+}
+
+static bool deauth_detector_v2_borrowed_receive(
+    void *opaque, uint32_t runtime_generation,
+    const wifi_security_rx_view_t *observation) {
+    detector_v2_context_t *context = opaque;
+    if (context == NULL || observation == NULL ||
+        observation->packet_class != WIFI_SECURITY_RECEIVE_MGMT ||
+        observation->bytes == NULL || runtime_generation == 0U)
+        return false;
+    portENTER_CRITICAL(&detector_event_lock);
+    bool current = context == detector_v2_context;
+    if (current && context->runtime_generation == 0U)
+        context->runtime_generation = runtime_generation;
+    current = current && context->runtime_generation == runtime_generation;
+    portEXIT_CRITICAL(&detector_event_lock);
+    if (!current) return false;
+    bool accepted = deauth_detector_capture_packet(
+        observation->bytes, observation->signal_length,
+        observation->dump_length, observation->rx_state,
+        observation->rssi, observation->channel);
+    if (accepted) security_notify(NULL);
+    return accepted;
+}
+
+static void deauth_detector_v2_worker_poll(void *opaque) {
+    detector_v2_context_t *context = opaque;
+    if (context == NULL || context != detector_v2_context ||
+        !deauth_detector_active)
+        return;
+    deauth_detector_process_events();
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (now_ms - context->overflow_last_ms >= 2000) {
+        portENTER_CRITICAL(&detector_event_lock);
+        uint32_t dropped = detector_dropped;
+        detector_dropped = 0;
+        uint32_t limited = detector_csa_rate.capacity_dropped;
+        detector_csa_rate.capacity_dropped = 0;
+        portEXIT_CRITICAL(&detector_event_lock);
+        if (dropped)
+            MY_LOG_INFO(TAG,
+                "Detector event queue overflow: %lu observations dropped",
+                (unsigned long)dropped);
+        if (limited)
+            MY_LOG_INFO(TAG,
+                "Detector CSA rate capacity: %lu observations suppressed",
+                (unsigned long)limited);
+        context->overflow_last_ms = now_ms;
+    }
+    portENTER_CRITICAL(&detector_event_lock);
+    int hop_delay_ms = detector_trace_hop_delay_locked();
+    portEXIT_CRITICAL(&detector_event_lock);
+    if (now_ms - deauth_detector_last_channel_hop >= hop_delay_ms)
+        deauth_detector_channel_hop();
+    int64_t now_us = esp_timer_get_time();
+    if (now_us - context->oled_last_us > 500000) {
+        context->oled_last_us = now_us;
+        if (dd_oled_dirty) {
+            dd_oled_dirty = false;
+            char l2[64], l3[64], l4[64];
+            snprintf(l2, sizeof(l2), ">> %s", (const char *)dd_oled_ssid);
+            snprintf(l3, sizeof(l3), "  %s", (const char *)dd_oled_bssid);
+            snprintf(l4, sizeof(l4), "Ch%d %ddB #%lu", dd_oled_ch,
+                     dd_oled_rssi, (unsigned long)dd_oled_count);
+            oled_display_update_full("> Deauth Detect", l2, l3, l4);
+        } else {
+            char l3[64];
+            snprintf(l3, sizeof(l3), "  Ch %d scanning",
+                     deauth_detector_current_channel);
+            oled_display_update_full("> Deauth Detect", "  Monitoring...",
+                                     l3, "  No attacks yet");
+        }
+    }
 }
 
 // === WARDRIVE HELPER FUNCTIONS ===
@@ -32577,13 +37069,17 @@ static void gps_load_state_from_nvs(void) {
 // ESP-IDF newlib does not implement POSIX sync(), so we force a flush by
 // opening a temporary file, calling fsync() on its descriptor (which
 // triggers FatFs f_sync and flushes the FAT table), then removing it.
-static void sd_sync(void) {
+static bool sd_sync_checked(void) {
     int fd = open("/sdcard/.sync", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) {
-        fsync(fd);
-        close(fd);
-        unlink("/sdcard/.sync");
-    }
+    if (fd < 0) return false;
+    bool ok = fsync(fd) == 0;
+    if (close(fd) != 0) ok = false;
+    if (unlink("/sdcard/.sync") != 0 && errno != ENOENT) ok = false;
+    return ok;
+}
+
+static void sd_sync(void) {
+    (void)sd_sync_checked();
 }
 
 // Safely unmount SD card and restart to prevent FAT filesystem corruption
@@ -32748,6 +37244,8 @@ static esp_err_t create_sd_directories(void) {
         "/sdcard/lab/wardrives",
         "/sdcard/lab/wardrives/uploaded",
         "/sdcard/lab/pcaps",
+        "/sdcard/lab/wifi-trust",
+        "/sdcard/lab/router-audit",
     };
     for (int i = 0; i < (int)(sizeof(dirs) / sizeof(dirs[0])); i++) {
         if (!sd_mkdir_recursive(dirs[i])) {
@@ -33352,12 +37850,9 @@ static void load_whitelist_from_sd(void) {
     MY_LOG_INFO(TAG, "Found white.txt, loading whitelisted BSSIDs...");
     
     char line[128];
-    int line_number = 0;
-    int loaded_count = 0;
+    int invalid_count = 0;
     
     while (fgets(line, sizeof(line), file) != NULL && whitelistedBssidsCount < MAX_WHITELISTED_BSSIDS) {
-        line_number++;
-        
         // Remove trailing newline/whitespace
         line[strcspn(line, "\r\n")] = '\0';
         
@@ -33371,21 +37866,19 @@ static void load_whitelist_from_sd(void) {
             // Valid BSSID found, add to whitelist
             memcpy(whiteListedBssids[whitelistedBssidsCount].bssid, bssid, 6);
             whitelistedBssidsCount++;
-            loaded_count++;
-            
-            MY_LOG_INFO(TAG, "  [%d] Loaded: %02X:%02X:%02X:%02X:%02X:%02X",
-                       loaded_count,
-                       bssid[0], bssid[1], bssid[2],
-                       bssid[3], bssid[4], bssid[5]);
         } else {
-            MY_LOG_INFO(TAG, "  Line %d: Invalid BSSID format, ignoring: %s", line_number, line);
+            invalid_count++;
         }
     }
     
     fclose(file);
     
     if (whitelistedBssidsCount > 0) {
-        MY_LOG_INFO(TAG, "Successfully loaded %d whitelisted BSSID(s)", whitelistedBssidsCount);
+        if (invalid_count > 0) {
+            MY_LOG_INFO(TAG, "Successfully loaded %d whitelisted BSSID(s), %d invalid line(s) ignored", whitelistedBssidsCount, invalid_count);
+        } else {
+            MY_LOG_INFO(TAG, "Successfully loaded %d whitelisted BSSID(s)", whitelistedBssidsCount);
+        }
     } else {
         MY_LOG_INFO(TAG, "No valid BSSIDs found in white.txt");
     }

@@ -48,6 +48,20 @@ static const char *action_name(deauth_defence_action_t action)
     }
 }
 
+static const char *completed_name(uint8_t completed)
+{
+    switch (completed & DEAUTH_DEFENCE_COMPLETED_ALL) {
+        case DEAUTH_DEFENCE_COMPLETED_4WAY:
+            return "decoy_4way";
+        case DEAUTH_DEFENCE_COMPLETED_PMKID:
+            return "decoy_pmkid";
+        case DEAUTH_DEFENCE_COMPLETED_ALL:
+            return "decoy_pmkid+decoy_4way";
+        default:
+            return "none";
+    }
+}
+
 static const deauth_defence_runtime_target_t *find_target(
     const deauth_defence_runtime_t *runtime, const uint8_t bssid[6])
 {
@@ -197,6 +211,26 @@ static bool finish_error(
     return false;
 }
 
+static bool release_radio_fence(deauth_defence_runtime_t *runtime,
+                                bool *held)
+{
+    if (!held || !*held) return true;
+    *held = false;
+    return runtime->config.radio_leave != NULL &&
+        runtime->config.radio_leave(runtime->config.opaque) == 0;
+}
+
+static bool finish_fenced_error(
+    deauth_defence_runtime_t *runtime,
+    const deauth_defence_runtime_observation_t *observation,
+    deauth_defence_action_t action, unsigned frames, const char *error,
+    bool provisional, bool *radio_held)
+{
+    if (!release_radio_fence(runtime, radio_held)) error = "fence";
+    return finish_error(runtime, observation, action, frames, error,
+                        provisional);
+}
+
 static bool tx_claim(deauth_defence_runtime_t *runtime)
 {
     unsigned gate = atomic_load_explicit(&runtime->tx_gate,
@@ -231,7 +265,10 @@ bool deauth_defence_runtime_start(deauth_defence_runtime_t *runtime,
 {
     if (!runtime || !config || !config->targets || config->target_count == 0U ||
         config->target_count > DEAUTH_DEFENCE_RUNTIME_TARGETS ||
-        !config->random || !config->tune || !config->tx || !config->now) {
+        (config->multi_vector && !config->pmkid_decoy) ||
+        !config->random || !config->tx || !config->now ||
+        ((config->radio_enter == NULL) != (config->radio_leave == NULL)) ||
+        (config->radio_enter == NULL && config->tune == NULL)) {
         return false;
     }
     for (size_t i = 0; i < config->target_count; ++i) {
@@ -248,7 +285,7 @@ bool deauth_defence_runtime_start(deauth_defence_runtime_t *runtime,
     atomic_init(&runtime->processing, false);
     atomic_init(&runtime->tx_gate, 0U);
     deauth_defence_core_reset(&runtime->core, config->pmkid_decoy,
-                              config->generation);
+                              config->multi_vector, config->generation);
     return true;
 }
 
@@ -261,12 +298,19 @@ bool deauth_defence_runtime_arm(deauth_defence_runtime_t *runtime,
     }
     runtime->config.generation = generation;
     deauth_defence_core_reset(&runtime->core,
-                              runtime->config.pmkid_decoy, generation);
-    char line[128];
-    snprintf(line, sizeof(line),
-             "[DETECTOR_DEFENCE] armed targets=%u trace=fast pmkid=%s",
-             (unsigned)runtime->config.target_count,
-             runtime->config.pmkid_decoy ? "decoy" : "monitor");
+                              runtime->config.pmkid_decoy,
+                              runtime->config.multi_vector, generation);
+    char line[160];
+    if (runtime->config.multi_vector) {
+        snprintf(line, sizeof(line),
+                 "[DETECTOR_DEFENCE] armed targets=%u trace=fast pmkid=decoy policy=multi_vector",
+                 (unsigned)runtime->config.target_count);
+    } else {
+        snprintf(line, sizeof(line),
+                 "[DETECTOR_DEFENCE] armed targets=%u trace=fast pmkid=%s",
+                 (unsigned)runtime->config.target_count,
+                 runtime->config.pmkid_decoy ? "decoy" : "monitor");
+    }
     runtime->announced = true;
     atomic_store_explicit(&runtime->armed, true, memory_order_release);
     emit(runtime, line);
@@ -366,14 +410,18 @@ bool deauth_defence_runtime_process(
                  (unsigned)response_channel);
         emit(runtime, line);
     }
-    if (runtime->config.tune(runtime->config.opaque,
-                             response_channel) != 0) {
+    bool radio_held = false;
+    int tune_result = runtime->config.radio_enter != NULL
+        ? runtime->config.radio_enter(runtime->config.opaque, response_channel)
+        : runtime->config.tune(runtime->config.opaque, response_channel);
+    if (tune_result != 0) {
         return finish_error(runtime, observation, decision.action, 0U,
                             "tune", provisional);
     }
+    radio_held = runtime->config.radio_enter != NULL;
     if (provisional && !deauth_defence_response_started(&runtime->core)) {
-        return finish_error(runtime, observation, decision.action, 0U,
-                            "state", provisional);
+        return finish_fenced_error(runtime, observation, decision.action, 0U,
+                                   "state", provisional, &radio_held);
     }
 
     wpa_decoy_material_t material = {0};
@@ -400,8 +448,8 @@ bool deauth_defence_runtime_process(
         sizeof(material.replay_counter));
     if (!random_ok) {
         secure_zero(&material, sizeof(material));
-        return finish_error(runtime, observation, decision.action, 0U,
-                            "random", provisional);
+        return finish_fenced_error(runtime, observation, decision.action, 0U,
+                                   "random", provisional, &radio_held);
     }
 
     bool built;
@@ -418,8 +466,8 @@ bool deauth_defence_runtime_process(
         secure_zero(&material, sizeof(material));
         secure_zero(&pair, sizeof(pair));
         secure_zero(pmkid_frame, sizeof(pmkid_frame));
-        return finish_error(runtime, observation, decision.action, 0U,
-                            "builder", provisional);
+        return finish_fenced_error(runtime, observation, decision.action, 0U,
+                                   "builder", provisional, &radio_held);
     }
 
     const uint8_t *first = decision.action == DEF_ACT_DECOY_PMKID
@@ -430,8 +478,8 @@ bool deauth_defence_runtime_process(
         secure_zero(&material, sizeof(material));
         secure_zero(&pair, sizeof(pair));
         secure_zero(pmkid_frame, sizeof(pmkid_frame));
-        return finish_error(runtime, observation, decision.action, 0U,
-                            "stopped", provisional);
+        return finish_fenced_error(runtime, observation, decision.action, 0U,
+                                   "stopped", provisional, &radio_held);
     }
     int first_result = runtime->config.tx(runtime->config.opaque, first,
                                           first_length, true);
@@ -441,23 +489,25 @@ bool deauth_defence_runtime_process(
         secure_zero(&material, sizeof(material));
         secure_zero(&pair, sizeof(pair));
         secure_zero(pmkid_frame, sizeof(pmkid_frame));
-        return finish_error(runtime, observation, decision.action, sent,
-                            "m1_tx", provisional);
+        return finish_fenced_error(runtime, observation, decision.action, sent,
+                                   "m1_tx", provisional, &radio_held);
     }
     if (decision.action == DEF_ACT_DECOY_4WAY) {
         if (stop_is_requested(runtime)) {
             secure_zero(&material, sizeof(material));
             secure_zero(&pair, sizeof(pair));
             secure_zero(pmkid_frame, sizeof(pmkid_frame));
-            return finish_error(runtime, observation, decision.action, sent,
-                                "stopped", provisional);
+            return finish_fenced_error(runtime, observation, decision.action,
+                                       sent, "stopped", provisional,
+                                       &radio_held);
         }
         if (!tx_claim(runtime)) {
             secure_zero(&material, sizeof(material));
             secure_zero(&pair, sizeof(pair));
             secure_zero(pmkid_frame, sizeof(pmkid_frame));
-            return finish_error(runtime, observation, decision.action, sent,
-                                "stopped", provisional);
+            return finish_fenced_error(runtime, observation, decision.action,
+                                       sent, "stopped", provisional,
+                                       &radio_held);
         }
         int second_result = runtime->config.tx(runtime->config.opaque, pair.m2,
                                                pair.m2_len, true);
@@ -465,8 +515,9 @@ bool deauth_defence_runtime_process(
         if (second_result != 0) {
             secure_zero(&material, sizeof(material));
             secure_zero(&pair, sizeof(pair));
-            return finish_error(runtime, observation, decision.action, sent,
-                                "m2_tx", provisional);
+            return finish_fenced_error(runtime, observation, decision.action,
+                                       sent, "m2_tx", provisional,
+                                       &radio_held);
         }
         ++sent;
         increment_saturating(&runtime->stats.tx_pairs);
@@ -476,6 +527,10 @@ bool deauth_defence_runtime_process(
     secure_zero(&material, sizeof(material));
     secure_zero(&pair, sizeof(pair));
     secure_zero(pmkid_frame, sizeof(pmkid_frame));
+    if (!release_radio_fence(runtime, &radio_held)) {
+        return finish_error(runtime, observation, decision.action, sent,
+                            "fence", provisional);
+    }
     emit_tx(runtime, observation, decision.action, true, sent, "none");
     if (provisional) deauth_defence_confirmation_started(&runtime->core);
     (void)deauth_defence_response_succeeded(&runtime->core);
@@ -495,6 +550,11 @@ bool deauth_defence_runtime_confirm(deauth_defence_runtime_t *runtime,
     const deauth_defence_runtime_target_t *target =
         find_target(runtime, bssid);
     uint8_t response_channel = target ? target->channel : channel;
+    if (runtime->core.state == DEF_CONFIRMED_LOCK &&
+        memcmp(runtime->core.active_bssid, bssid, 6U) == 0 &&
+        runtime->core.active_channel == response_channel) {
+        return true;
+    }
     return deauth_defence_confirm_lock(
         &runtime->core, bssid, response_channel,
         runtime->config.now(runtime->config.opaque));
@@ -524,15 +584,24 @@ bool deauth_defence_runtime_poll_idle(deauth_defence_runtime_t *runtime)
     uint8_t channel = runtime->core.active_channel;
     uint32_t satisfied = runtime->active_satisfied;
     deauth_defence_action_t response = runtime->active_response;
+    uint8_t completed = runtime->core.completed_actions;
     if (!deauth_defence_release_if_idle(&runtime->core, now_us)) {
         return false;
     }
     char line[224];
-    snprintf(line, sizeof(line),
-             "[DETECTOR_DEFENCE] released_bssid=%02X:%02X:%02X:%02X:%02X:%02X channel=%u reason=idle idle_ms=20000 response=%s suppressed=%lu",
-             bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
-             (unsigned)channel, action_name(response),
-             (unsigned long)satisfied);
+    if (runtime->config.multi_vector) {
+        snprintf(line, sizeof(line),
+                 "[DETECTOR_DEFENCE] released_bssid=%02X:%02X:%02X:%02X:%02X:%02X channel=%u reason=idle idle_ms=20000 response=%s completed=%s suppressed=%lu",
+                 bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+                 (unsigned)channel, action_name(response),
+                 completed_name(completed), (unsigned long)satisfied);
+    } else {
+        snprintf(line, sizeof(line),
+                 "[DETECTOR_DEFENCE] released_bssid=%02X:%02X:%02X:%02X:%02X:%02X channel=%u reason=idle idle_ms=20000 response=%s suppressed=%lu",
+                 bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+                 (unsigned)channel, action_name(response),
+                 (unsigned long)satisfied);
+    }
     emit(runtime, line);
     runtime->active_satisfied = 0U;
     runtime->active_response = DEF_ACT_OBSERVE;

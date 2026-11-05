@@ -16,10 +16,15 @@ janos_download_result_t janos_download_flow_run(
     bool quarantined_wps = lease.owner == JANOS_RADIO_OWNER_WPS &&
                            lease.state == JANOS_RADIO_LEASE_QUARANTINED &&
                            lease.generation != 0U && !lease.callbacks_open;
-    bool normal_startup = lease.owner == JANOS_RADIO_OWNER_LEGACY &&
-                          lease.state == JANOS_RADIO_LEASE_PREPARING &&
-                          lease.generation != 0U;
-    if (!quarantined_wps && !normal_startup)
+    bool active_owner = lease.owner > JANOS_RADIO_OWNER_NONE &&
+                        lease.owner <= JANOS_RADIO_OWNER_SHIELD &&
+                        lease.state >= JANOS_RADIO_LEASE_PREPARING &&
+                        lease.state <= JANOS_RADIO_LEASE_QUARANTINED &&
+                        lease.generation != 0U;
+    bool unsafe_wps_quarantine = lease.owner == JANOS_RADIO_OWNER_WPS &&
+                                 lease.state == JANOS_RADIO_LEASE_QUARANTINED &&
+                                 !quarantined_wps;
+    if (!active_owner || unsafe_wps_quarantine)
         return JANOS_DOWNLOAD_REFUSED_OWNER;
     if (quarantined_wps && !ops->terminal_wipe)
         return JANOS_DOWNLOAD_INVALID_HOOKS;

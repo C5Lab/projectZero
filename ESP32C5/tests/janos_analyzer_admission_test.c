@@ -129,6 +129,7 @@ static int xTaskCreate(void (*fn)(void *), const char *name, int stack,
 }
 static void xTaskNotifyGive(TaskHandle_t worker) { assert(worker == (void *)1); }
 /* ANALYZER_FUNCTIONS */
+static bool wifi_shield_stop(unsigned timeout) { (void)timeout; return true; }
 static bool janos_wps_runtime_stop(unsigned timeout) { (void)timeout; return true; }
 /* GLOBAL_STOP_PREFIX */
 
@@ -160,6 +161,13 @@ static void xSemaphoreGiveRecursive(pthread_mutex_t *mutex)
 }
 static void uart_baud_note_activity(void) {}
 static void linenoiseHistoryFree(void) {}
+static void client_isolation_scrub_cli_token(char *token) { (void)token; }
+typedef int led_status_activity_t;
+static led_status_activity_t led_cli_activity(const char *command,
+                                              const char *subcommand)
+{ (void)command; (void)subcommand; return 0; }
+static void led_cli_activity_change(led_status_activity_t activity, bool active)
+{ (void)activity; (void)active; }
 static int capture_puts(const char *line)
 { snprintf(emitted, sizeof(emitted), "%s\n", line); return 0; }
 #define puts capture_puts

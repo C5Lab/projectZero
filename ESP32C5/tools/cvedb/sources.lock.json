@@ -1,0 +1,14 @@
+{
+  "schema": "janos-router-cve-sources-lock-v1",
+  "status": "test-fixture-only",
+  "sources": [
+    {
+      "id": "test-advisory-source",
+      "url": "https://security.example.invalid/advisories",
+      "retrieved_utc": "2099-01-03T00:00:00Z",
+      "license": "CC0-1.0-test-fixture",
+      "revision": "fixture-rev-1",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+  ]
+}

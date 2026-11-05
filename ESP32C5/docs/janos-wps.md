@@ -141,6 +141,52 @@ authenticated M7 publishes the vault/result. The terminal operation result is
 to the generic `success` value. A bounded campaign reports
 `pin_and_m7_verified` after the same authenticated-M7 gate.
 
+Capture uses the control PIN `12345670`. If the AP answers M4 with an M5 whose
+first half verifies, capture continues through M6. An authenticated M7 with a
+credential then ends the run as `control_pin_and_m7_verified`, and the offline
+search and verification session are skipped. Any rejection after M6 still keeps
+the M3 bundle, and the run continues with the offline search as before.
+
+### Recovery modes and the RTL epoch
+
+The offline search tries each recovery mode in a fixed order and stops at the
+first full match. For each mode it derives candidate E-S1/E-S2 secrets and
+checks them against E-Hash1/E-Hash2 for every PIN half (`0000`–`9999` plus
+the empty half).
+
+| Mode | Candidate secrets | When it runs |
+| --- | --- | --- |
+| Null secret | E-S1 and E-S2 are all zero | Always |
+| Static secret | E-S1 and E-S2 equal the enrollee E-Nonce | Always |
+| Ralink | E-S1 and E-S2 are read backwards from the LFSR state recovered from E-Nonce | Always |
+| RTL819x | E-S1 and E-S2 come from glibc `random()` seeded with the router's clock | Only when `epoch` is supplied |
+
+Without `epoch`, Realtek RTL819x-style routers are never tested and finish
+with `no_match`. The firmware does not fall back to the ESP32 system clock,
+even when GPS has set it. This differs from Wifit3, which by default searches
+one day on either side of the host clock.
+
+`epoch` is the router's own clock at capture time, as Unix seconds. It is not
+the ESP32 clock. The search starts from `epoch + 86400` and goes down to
+`epoch - 86400`, looking for the seed that reproduces E-Nonce. RTL mode is
+skipped when the top bit of any 32-bit E-Nonce word is set, because glibc
+`random()` never produces such words. After a nonce seed is found, E-S1 is
+searched within 600 seeds on either side of it, and E-S2 within the 10 seeds
+starting at the E-S1 seed.
+
+`partial_match` means the first PIN half was recovered but the second was not.
+Only RTL mode can produce it.
+
+Choosing `epoch`:
+
+- **Router with NTP.** Pass the current Unix time, for example from
+  `date +%s` on the host. The window is centred, so a few minutes of skew do
+  not matter.
+- **Router clock before 2020.** Values outside `1577836800..4102444800` are
+  rejected with `invalid_rtl_epoch`, so such seeds cannot be searched.
+
+The duration of a full RTL window search on ESP32-C5 has not been measured.
+
 ## JWPS plan and bounded campaign
 
 `jwps plan` mounts the laboratory database, creates a deterministic candidate
