@@ -599,6 +599,10 @@ RF work and real-SD/power-loss testing require separate approval.
 
 ### `wifi_shield`
 
+See the dedicated [Wi-Fi Shield operator guide](wifi-shield.md) for mode and
+evidence interpretation, and [Wi-Fi Shield validation](wifi-shield-validation.md)
+for the TDD methodology, controlled-session ledger and remaining RF test matrix.
+
 Built-in help is exactly:
 `Wi-Fi Shield: start [--only indexes...] [--protect-all | --defence decoy-4way [--pmkid-decoy [--multi-vector]]] | status | report | log status | stop`.
 

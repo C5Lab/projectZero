@@ -1,5 +1,10 @@
 # Passive Wi-Fi security runtime
 
+Operator-facing Shield behavior is documented in
+[JanOS Wi-Fi Shield](wifi-shield.md). The separation between host, firmware,
+device, RF and storage evidence is recorded in
+[Wi-Fi Shield validation](wifi-shield-validation.md).
+
 This foundation supplies bounded receive storage, decoding, a single consumer
 worker and a shared radio lifecycle. Combined Wi-Fi Shield, WPS Guard, SAE
 Guard, Wi-Fi Trust Baseline and Detector V2 use one shared callback and worker

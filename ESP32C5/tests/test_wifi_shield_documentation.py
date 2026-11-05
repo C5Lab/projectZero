@@ -15,6 +15,8 @@ SHIELD_SOURCE = ROOT / "main" / "wifi_shield.c"
 COMMAND_MANUAL = ROOT / "docs" / "command-manual.md"
 LEASE_MANUAL = ROOT / "docs" / "janos-radio-lease.md"
 RUNTIME_MANUAL = ROOT / "docs" / "wifi-security-runtime.md"
+OPERATOR_GUIDE = ROOT / "docs" / "wifi-shield.md"
+VALIDATION_GUIDE = ROOT / "docs" / "wifi-shield-validation.md"
 
 EXACT_HELP = (
     "Wi-Fi Shield: start [--only indexes...] "
@@ -81,6 +83,63 @@ def normalized(text):
 
 
 class WifiShieldDocumentationTest(unittest.TestCase):
+    def test_shield_guides_separate_operation_from_validation_evidence(self):
+        """Catch loss of the operator guide, evidence ledger or proof limits."""
+        operator = OPERATOR_GUIDE.read_text(encoding="utf-8")
+        validation = VALIDATION_GUIDE.read_text(encoding="utf-8")
+        manual = COMMAND_MANUAL.read_text(encoding="utf-8")
+        runtime = RUNTIME_MANUAL.read_text(encoding="utf-8")
+
+        operator_contract = (
+            "# JanOS Wi-Fi Shield",
+            "## Operator workflow",
+            "## Trust and Evil Twin indicators",
+            "## Beacon sequence continuity",
+            "## CSA interpretation",
+            "## Evidence boundaries",
+            "does not prove an evil twin",
+            "not AP-side packet loss",
+            "cannot authenticate a CSA transmitter",
+            "wifi_shield start --only <scan-index> --protect-all",
+            "wifi_shield report",
+            "wifi_shield log status",
+        )
+        validation_contract = (
+            "# JanOS Wi-Fi Shield Validation",
+            "## Evidence levels",
+            "## Methodology",
+            "## Controlled session evidence",
+            "## Recommended next tests",
+            "verified",
+            "observed",
+            "inconclusive",
+            "not run",
+            "LAB-AP-A",
+            "independent monitor",
+            "firmware SHA-256",
+            "UART",
+            "PCAP",
+            "JSONL",
+            "4095 -> 0",
+            "spoofed CSA",
+            "negative control",
+        )
+        for phrase in operator_contract:
+            with self.subTest(guide="operator", phrase=phrase):
+                self.assertIn(normalized(phrase), normalized(operator))
+        for phrase in validation_contract:
+            with self.subTest(guide="validation", phrase=phrase):
+                self.assertIn(normalized(phrase), normalized(validation))
+
+        for source in (manual, runtime):
+            self.assertIn("wifi-shield.md", source)
+            self.assertIn("wifi-shield-validation.md", source)
+
+        for sensitive in ("CZARNA", "TP-Link_0E90", "68:ff:7b:cd:fc:40",
+                          "b0:be:76:70:0e:90"):
+            self.assertNotIn(sensitive, operator)
+            self.assertNotIn(sensitive, validation)
+
     def test_v2_operator_contract_runs_real_cli_and_lifecycle_harnesses(self):
         """The operator prose is accepted only with executable CLI evidence."""
         environment = os.environ.copy()
