@@ -103,6 +103,10 @@ class WifiShieldDocumentationTest(unittest.TestCase):
             "wifi_shield start --only <scan-index> --protect-all",
             "wifi_shield report",
             "wifi_shield log status",
+            "[SHIELD/2] EVENT SOURCE=deauth TYPE=csa_announcement",
+            "a lone CSA announcement never authorizes Defence TX",
+            "Shield Trust currently compares only an observed selected BSSID with its matching baseline",
+            "same-SSID candidates on other BSSIDs are Stage 1 work",
         )
         validation_contract = (
             "# JanOS Wi-Fi Shield Validation",
@@ -123,6 +127,11 @@ class WifiShieldDocumentationTest(unittest.TestCase):
             "4095 -> 0",
             "spoofed CSA",
             "negative control",
+            "CSA Stage 0",
+            "one legitimate AP-controlled CSA",
+            "one authorized spoofed CSA",
+            "one Deauth control",
+            "zero CSA-triggered Defence telemetry",
         )
         for phrase in operator_contract:
             with self.subTest(guide="operator", phrase=phrase):
@@ -134,6 +143,16 @@ class WifiShieldDocumentationTest(unittest.TestCase):
         for source in (manual, runtime):
             self.assertIn("wifi-shield.md", source)
             self.assertIn("wifi-shield-validation.md", source)
+
+        stage_zero_contract = (
+            "[SHIELD/2] EVENT SOURCE=deauth TYPE=csa_announcement",
+            "a lone CSA announcement never authorizes Defence TX",
+        )
+        for phrase in stage_zero_contract:
+            with self.subTest(guide="stage-zero", phrase=phrase):
+                self.assertIn(normalized(phrase), normalized(manual))
+
+        self.assertNotIn("a new BSSID relative to the baseline", operator)
 
         for sensitive in ("CZARNA", "TP-Link_0E90", "68:ff:7b:cd:fc:40",
                           "b0:be:76:70:0e:90"):

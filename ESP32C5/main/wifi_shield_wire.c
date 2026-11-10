@@ -13,7 +13,7 @@ typedef struct {
 static const event_kind_t kinds[] = {
     {WIFI_SHIELD_SOURCE_DEAUTH, WIFI_SHIELD_SEVERITY_ALERT, "deauth"},
     {WIFI_SHIELD_SOURCE_DEAUTH, WIFI_SHIELD_SEVERITY_ALERT, "disassoc"},
-    {WIFI_SHIELD_SOURCE_DEAUTH, WIFI_SHIELD_SEVERITY_ALERT, "csa"},
+    {WIFI_SHIELD_SOURCE_DEAUTH, WIFI_SHIELD_SEVERITY_INFO, "csa_announcement"},
     {WIFI_SHIELD_SOURCE_WPS, WIFI_SHIELD_SEVERITY_INFO, "enrollment_activity"},
     {WIFI_SHIELD_SOURCE_WPS, WIFI_SHIELD_SEVERITY_WARN, "retry_burst"},
     {WIFI_SHIELD_SOURCE_WPS, WIFI_SHIELD_SEVERITY_ALERT, "protocol_anomaly"},
@@ -170,9 +170,11 @@ int wifi_shield_format_event(char *out, size_t capacity, const wifi_shield_event
          e->source == WIFI_SHIELD_SOURCE_PMKID) &&
         (!unicast(e->station) || memcmp(e->station, e->bssid, 6) == 0)) return -1;
     char line[WIFI_SHIELD_LINE_MAX];
+    const char *prefix = e->type == WIFI_SHIELD_EVENT_CSA ?
+        "[SHIELD/2]" : "[SHIELD/1]";
     int n = snprintf(line, sizeof(line),
-        "[SHIELD/1] %.5s SOURCE=%.6s TYPE=%.24s BSSID=%02x:%02x:%02x:%02x:%02x:%02x CH=%u SEVERITY=%.5s COUNT=%" PRIu32 " WINDOW_MS=%" PRIu32,
-        e->severity == WIFI_SHIELD_SEVERITY_INFO ? "EVENT" : "ALERT",
+        "%s %.5s SOURCE=%.6s TYPE=%.24s BSSID=%02x:%02x:%02x:%02x:%02x:%02x CH=%u SEVERITY=%.5s COUNT=%" PRIu32 " WINDOW_MS=%" PRIu32,
+        prefix, e->severity == WIFI_SHIELD_SEVERITY_INFO ? "EVENT" : "ALERT",
         sources[e->source], kind->name,
         (unsigned)e->bssid[0], (unsigned)e->bssid[1], (unsigned)e->bssid[2],
         (unsigned)e->bssid[3], (unsigned)e->bssid[4], (unsigned)e->bssid[5],

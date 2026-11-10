@@ -687,6 +687,14 @@ withdraws the previous set. If admission loses any member of a replacement
 set, the next selected Beacon opens a newer revision and retries the complete
 set; the original admission loss remains counted.
 
+Shield publishes an accepted standalone CSA observation as
+`[SHIELD/2] EVENT SOURCE=deauth TYPE=csa_announcement BSSID=<mac> CH=<channel>
+SEVERITY=info COUNT=1 WINDOW_MS=10000`. In the Stage 0 policy, a lone CSA
+announcement never authorizes Defence TX, never increments `ALERTS`, and does
+not by itself raise a campaign above informational activity. This Shield-only
+policy does not change legacy `deauth_detector`, `deauth_detector_v2`, raw
+`[CSA]` evidence, or the standalone Defence trigger API.
+
 Every accepted Shield start makes one automatic journal attempt at
 `/sdcard/lab/shield/shield-b<boot_id>-s<session_id>.jsonl.part`. The per-session
 ceiling is 8 MiB. A dedicated writer owns the file and drains a fixed PSRAM

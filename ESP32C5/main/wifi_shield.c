@@ -422,6 +422,7 @@ bool wifi_shield_presentation_indicator(
     case WIFI_SHIELD_EVENT_WPS_ACTIVITY:
     case WIFI_SHIELD_EVENT_SAE_ACTIVITY:
     case WIFI_SHIELD_EVENT_PMKID_SEQUENCE:
+    case WIFI_SHIELD_EVENT_CSA:
         *indicator = WIFI_SHIELD_PRESENTATION_INFO;
         return true;
     case WIFI_SHIELD_EVENT_WPS_RETRY_BURST:
@@ -429,7 +430,6 @@ bool wifi_shield_presentation_indicator(
         return true;
     case WIFI_SHIELD_EVENT_DEAUTH:
     case WIFI_SHIELD_EVENT_DISASSOC:
-    case WIFI_SHIELD_EVENT_CSA:
     case WIFI_SHIELD_EVENT_WPS_ANOMALY:
     case WIFI_SHIELD_EVENT_SAE_ANOMALY:
     case WIFI_SHIELD_EVENT_TRUST_DRIFT:
@@ -473,7 +473,6 @@ static const char *presentation_alert_label(
     case WIFI_SHIELD_EVENT_SAE_ANOMALY: return "SAE anomaly";
     case WIFI_SHIELD_EVENT_DEAUTH: return "Deauth";
     case WIFI_SHIELD_EVENT_DISASSOC: return "Disassoc";
-    case WIFI_SHIELD_EVENT_CSA: return "Channel switch";
     case WIFI_SHIELD_EVENT_TRUST_DRIFT: return "Trust drift";
     default: return "none";
     }
@@ -1496,7 +1495,6 @@ typedef struct {
     uint8_t station[6];
     uint8_t channel;
     int64_t rx_us;
-    bool csa;
     bool pmkid_association_complete;
 } shield_active_full_result_t;
 
@@ -2051,18 +2049,13 @@ static bool shield_feature_consume_modules(
         wifi_shield_event_t event = {
             .source = WIFI_SHIELD_SOURCE_DEAUTH,
             .type = WIFI_SHIELD_EVENT_CSA,
-            .severity = WIFI_SHIELD_SEVERITY_ALERT,
+            .severity = WIFI_SHIELD_SEVERITY_INFO,
             .channel = slot->channel,
             .count = 1U,
             .window_ms = WIFI_SHIELD_RATE_WINDOW_MS,
             .timestamp_us = now_us,
         };
         memcpy(event.bssid, csa.bssid, 6U);
-        active->csa = true;
-        active->channel = slot->channel;
-        active->rx_us = slot->timestamp_us > (uint64_t)INT64_MAX ? INT64_MAX :
-            (int64_t)slot->timestamp_us;
-        memcpy(active->bssid, csa.bssid, sizeof(active->bssid));
         if (shield_qualify_event_locked(state, &event))
             pending[pending_count++] = event;
     }
@@ -2103,9 +2096,6 @@ static bool shield_feature_consume(void *context,
     bool accepted = shield_feature_consume_modules(
         context, slot, decoded, &active);
     defence_emit_association_complete(context, &active);
-    if (active.csa)
-        defence_process_observation(context, DEF_TRIG_CSA, active.bssid, NULL,
-                                    active.channel, active.rx_us);
     return accepted;
 }
 
@@ -4077,11 +4067,8 @@ bool wifi_shield_consume_compact(void *token,
                                                        identity.bssid)) {
             event.source = WIFI_SHIELD_SOURCE_DEAUTH;
             event.type = WIFI_SHIELD_EVENT_CSA;
-            event.severity = WIFI_SHIELD_SEVERITY_ALERT;
+            event.severity = WIFI_SHIELD_SEVERITY_INFO;
             ready = shield_qualify_event_locked(state, &event);
-            active_observation = active_generation_valid &&
-                (input->bytes[1] & 0x40U) == 0U;
-            active_trigger = DEF_TRIG_CSA;
         }
     } else if ((input->kind == WIFI_SHIELD_COMPACT_AUTH ||
                 input->kind == WIFI_SHIELD_COMPACT_ASSOC ||

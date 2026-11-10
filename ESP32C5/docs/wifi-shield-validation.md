@@ -99,6 +99,22 @@ Normalized evidence should include:
 - AP/traffic-generator ground-truth log;
 - observed loss and coverage counters.
 
+### 7. CSA Stage 0 hardware gate
+
+Stage 0 changes only Shield classification and authorization. The physical gate
+must use one owned selected AP, one independent monitor and the exact firmware
+SHA-256. Run an idle baseline, one legitimate AP-controlled CSA, one authorized
+spoofed CSA and one Deauth control. Retain synchronized UART, PCAP, JSONL and AP
+or generator ground truth.
+
+Both CSA cases must emit
+`[SHIELD/2] EVENT SOURCE=deauth TYPE=csa_announcement`, retain the appropriate
+`CSA_EVENTS` evidence and produce zero CSA-triggered Defence telemetry or TX.
+In other words, a lone CSA announcement never authorizes Defence TX. The
+Deauth control must still produce its existing bounded response when the
+selected target and active policy authorize it. This gate is `not run` until
+those artifacts are returned; host GREEN alone is not RF proof.
+
 ## Host test coverage
 
 The current test families include:
@@ -178,7 +194,7 @@ independent monitor PCAP and the AP configuration for every case.
 | ID | Stimulus | Expected Shield result | Ground-truth purpose |
 |---|---|---|---|
 | ET-01 | Idle baseline AP | No unexplained Trust drift. | Negative control and false-positive rate. |
-| ET-02 | Same SSID, different BSSID and same security posture | New-BSSID evidence, never an attacker verdict. | Common clone indicator. |
+| ET-02 | Same SSID, different BSSID and same security posture | Current Shield Trust may remain silent; record the false-negative boundary. | Establish the input for Stage 1 same-SSID candidate work. |
 | ET-03 | Claimed same BSSID with AKM/cipher/PMF downgrade | Exact posture drift fields. | Same-identity security downgrade. |
 | ET-04 | Claimed same BSSID with WPS or RSNXE drift | Exact WPS/RSNXE evidence. | Optional-security-field coverage. |
 | ET-05 | Conflicting Beacon and Probe Response posture | Conflict evidence for the same claimed BSSID. | Cross-frame consistency. |
@@ -227,6 +243,12 @@ and a separate authorized frame generator.
 | CSA-07 | Spoofed CSA followed by spoofed follow-up Beacons | Demonstrate the remaining passive-authentication limit. |
 | CSA-08 | PMF optional and required configurations | Record which applicable robust action traffic is protected; do not generalize that result to Beacon/Probe CSA. |
 | CSA-09 | Legitimate automatic channel selection | Negative control for operational AP behavior. |
+
+For the Stage 0 gate, `CSA-01` and `CSA-02` must both produce informational
+`csa_announcement` evidence with zero CSA-triggered Defence telemetry and zero
+Shield-originated CSA response frames. Run `CSA-02` only with an authorized
+generator. Add one Deauth control in the same firmware build to prove that the
+bounded active response path was not disabled globally.
 
 A real AP management log and independent monitor establish the test's ground
 truth. Shield itself must continue to describe evidence, not declare a CSA

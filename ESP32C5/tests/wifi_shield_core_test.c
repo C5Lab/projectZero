@@ -52,8 +52,9 @@ static wifi_shield_event_t event(wifi_shield_event_type_t type)
     switch (type) {
     case WIFI_SHIELD_EVENT_DEAUTH:
     case WIFI_SHIELD_EVENT_DISASSOC:
-    case WIFI_SHIELD_EVENT_CSA:
         e.source = WIFI_SHIELD_SOURCE_DEAUTH; e.severity = WIFI_SHIELD_SEVERITY_ALERT; break;
+    case WIFI_SHIELD_EVENT_CSA:
+        e.source = WIFI_SHIELD_SOURCE_DEAUTH; e.severity = WIFI_SHIELD_SEVERITY_INFO; break;
     case WIFI_SHIELD_EVENT_WPS_ACTIVITY:
         e.source = WIFI_SHIELD_SOURCE_WPS; e.severity = WIFI_SHIELD_SEVERITY_INFO; break;
     case WIFI_SHIELD_EVENT_WPS_RETRY_BURST:
@@ -123,7 +124,7 @@ static void test_severity_source_mapping_and_passive_tx(void)
     assert(f.core.source_events[2] == 2);
     assert(f.core.source_events[3] == 1);
     assert(f.core.source_events[4] == 1);
-    assert(f.core.alerts == 6);
+    assert(f.core.alerts == 5);
 }
 
 static void test_wps_activity_identity_and_exact_window(void)
@@ -161,9 +162,14 @@ static void test_deauth_alert_is_published_once_per_window(void)
     assert(f.core.source_events[0] == 102 && f.core.alerts == 2);
 
     e.type = WIFI_SHIELD_EVENT_CSA;
+    e.severity = WIFI_SHIELD_SEVERITY_INFO;
     assert(submit(&f, &e));
     assert(!submit(&f, &e));
-    assert(f.core.source_events[0] == 104 && f.core.alerts == 3);
+    assert(f.core.source_events[0] == 104 && f.core.alerts == 2);
+    e.timestamp_us += 10000000U;
+    e.severity = WIFI_SHIELD_SEVERITY_ALERT;
+    assert(!submit(&f, &e));
+    assert(f.core.source_events[0] == 104 && f.core.alerts == 2);
 }
 
 static void test_retry_threshold_contributions_and_window(void)

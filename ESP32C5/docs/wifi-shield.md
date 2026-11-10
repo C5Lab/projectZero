@@ -157,14 +157,20 @@ Loss can lower confidence but never erase an event that was already observed.
 
 ## Trust and Evil Twin indicators
 
-Trust compares observed AP posture with its accepted baseline. It can report:
+Shield Trust currently compares only an observed selected BSSID with its
+matching baseline. It can report:
 
-- a new BSSID relative to the baseline;
 - SSID, AKM, privacy, pairwise/group cipher or PMF drift;
 - RSNXE changes;
 - WPS appearing or its lock state changing;
 - country or channel drift;
 - conflicting Beacon and Probe Response posture for the same claimed BSSID.
+
+The same-SSID candidates on other BSSIDs are Stage 1 work and are not
+implemented by the current Shield routing. Therefore a common same-SSID,
+different-BSSID clone may remain silent in the current build. A claimed
+same-BSSID clone can still be reported only when one of the compared posture
+fields drifts.
 
 These checks detect many configurations consistent with an Evil Twin, but
 Trust does not prove an evil twin. A legitimate multi-AP ESS, router upgrade,
@@ -204,6 +210,19 @@ and mode evidence.
 Shield cannot authenticate a CSA transmitter. Address 2 and the BSSID are
 claims carried by the received management frame. A spoofed announcement can
 therefore create CSA evidence.
+
+An accepted standalone announcement is emitted as informational evidence:
+
+```text
+[SHIELD/2] EVENT SOURCE=deauth TYPE=csa_announcement BSSID=<mac> CH=<channel> SEVERITY=info COUNT=1 WINDOW_MS=10000
+```
+
+In the Stage 0 policy, a lone CSA announcement never authorizes Defence TX,
+does not increment `ALERTS`, and can create only isolated informational
+campaign activity. Deauth and Disassociation retain their existing bounded
+active Defence behavior. A later campaign stage may correlate independently
+observed channel movement or other sources, but the announcement alone is not
+an attack verdict.
 
 For this reason Shield keeps these facts separate:
 

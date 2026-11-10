@@ -2643,7 +2643,8 @@ static void scenario_compact_mixed_deauth_csa_and_pmkid(void)
     memcpy(event.bytes + 16U, f.scan[0].bssid, 6U);
     memcpy(event.bytes + 36U, "\x00\x04Test\x25\x03\x01\x24\x03", 11U);
     assert(wifi_shield_consume_compact(f.config.context, &event));
-    assert(strstr(f.all_lines, "SOURCE=deauth TYPE=csa") != NULL);
+    assert(strstr(f.all_lines,
+                  "[SHIELD/2] EVENT SOURCE=deauth TYPE=csa_announcement") != NULL);
     assert(strstr(f.all_lines, "[DEAUTH_V2]") == NULL);
     assert(wifi_shield_stop(100U));
 }
@@ -2874,7 +2875,7 @@ static void scenario_compact_validates_raw_identity_before_module_state(void)
     assert(f.terminal_status.filtered == 9U);
     assert(f.terminal_status.source_events[WIFI_SHIELD_SOURCE_DEAUTH] == 3U);
     assert(f.terminal_status.source_events[WIFI_SHIELD_SOURCE_PMKID] == 1U);
-    assert(f.terminal_status.alerts == 3U);
+    assert(f.terminal_status.alerts == 2U);
 }
 
 static size_t line_occurrences(const char *haystack, const char *needle)
@@ -4131,9 +4132,10 @@ static void scenario_terminal_output_failure_updates_retained_campaign(void)
 
 static void start_active_fixture(void);
 
-static void scenario_defence_disassoc_and_csa_use_pair_builder(void)
+static void scenario_defence_disassoc_uses_pair_builder_and_csa_is_observe_only(void)
 {
     wifi_shield_compact_event_t event;
+    wifi_shield_presentation_snapshot_t presentation;
     reset_fixture(1U);
     f.scan[0].channel = 6U;
     start_active_fixture();
@@ -4153,8 +4155,13 @@ static void scenario_defence_disassoc_and_csa_use_pair_builder(void)
     event.channel = 11U;
     event.rx_us = (int64_t)f.now_us;
     assert(wifi_shield_consume_compact(f.config.context, &event));
-    assert(f.defence_tx_calls == 2U && f.retuned_channel == 6U);
-    assert(strstr(f.all_lines, "trigger=csa") != NULL);
+    assert(f.defence_tx_calls == 0U);
+    assert(strstr(f.all_lines, "trigger=csa") == NULL);
+    assert(strstr(f.all_lines,
+                  "[SHIELD/2] EVENT SOURCE=deauth TYPE=csa_announcement") != NULL);
+    wifi_shield_presentation_get(&presentation);
+    assert(presentation.indicator_counts[WIFI_SHIELD_PRESENTATION_INFO] == 1U);
+    assert(!presentation.latest_alert_valid);
     assert(wifi_shield_stop(100U));
 
     reset_fixture(1U);
@@ -4173,8 +4180,13 @@ static void scenario_defence_disassoc_and_csa_use_pair_builder(void)
     frame[length++] = 3U;
     assert(length > WIFI_SHIELD_COMPACT_BYTES);
     assert(deliver_full(frame, length, 11U, false));
-    assert(f.defence_tx_calls == 2U && f.retuned_channel == 6U);
-    assert(strstr(f.all_lines, "trigger=csa") != NULL);
+    assert(f.defence_tx_calls == 0U);
+    assert(strstr(f.all_lines, "trigger=csa") == NULL);
+    assert(strstr(f.all_lines,
+                  "[SHIELD/2] EVENT SOURCE=deauth TYPE=csa_announcement") != NULL);
+    wifi_shield_presentation_get(&presentation);
+    assert(presentation.indicator_counts[WIFI_SHIELD_PRESENTATION_INFO] == 1U);
+    assert(!presentation.latest_alert_valid);
     assert(wifi_shield_stop(100U));
 }
 
@@ -4633,7 +4645,7 @@ static void scenario_presentation_mapping_and_bounded_oled(void)
     } cases[] = {
         {WIFI_SHIELD_EVENT_DEAUTH, WIFI_SHIELD_PRESENTATION_ALERT},
         {WIFI_SHIELD_EVENT_DISASSOC, WIFI_SHIELD_PRESENTATION_ALERT},
-        {WIFI_SHIELD_EVENT_CSA, WIFI_SHIELD_PRESENTATION_ALERT},
+        {WIFI_SHIELD_EVENT_CSA, WIFI_SHIELD_PRESENTATION_INFO},
         {WIFI_SHIELD_EVENT_WPS_ACTIVITY, WIFI_SHIELD_PRESENTATION_INFO},
         {WIFI_SHIELD_EVENT_WPS_RETRY_BURST, WIFI_SHIELD_PRESENTATION_WARN},
         {WIFI_SHIELD_EVENT_WPS_ANOMALY, WIFI_SHIELD_PRESENTATION_ALERT},
@@ -4682,7 +4694,7 @@ static void scenario_presentation_mapping_and_bounded_oled(void)
     assert(wifi_shield_presentation_format_oled(&snapshot, &lines));
     assert(strcmp(lines.line[1], "Targets: 255  Ch: 255") == 0);
     assert(strcmp(lines.line[2], "D:99W:99+S:99+T:7") == 0);
-    assert(strcmp(lines.line[3], "Alert: Channel switch") == 0);
+    assert(strcmp(lines.line[3], "Alert: none") == 0);
     assert_oled_widths(&lines);
 
     static const struct {
@@ -4694,7 +4706,7 @@ static void scenario_presentation_mapping_and_bounded_oled(void)
         {WIFI_SHIELD_EVENT_SAE_ANOMALY, "Alert: SAE anomaly"},
         {WIFI_SHIELD_EVENT_DEAUTH, "Alert: Deauth"},
         {WIFI_SHIELD_EVENT_DISASSOC, "Alert: Disassoc"},
-        {WIFI_SHIELD_EVENT_CSA, "Alert: Channel switch"},
+        {WIFI_SHIELD_EVENT_CSA, "Alert: none"},
         {WIFI_SHIELD_EVENT_TRUST_DRIFT, "Alert: Trust drift"},
     };
     snapshot.target_count = 0U;
@@ -6208,7 +6220,7 @@ int main(void)
     scenario_terminal_queue_full_before_writer_status_drains_first();
     scenario_failed_start_terminal_pressure_retains_storage();
     scenario_terminal_output_failure_updates_retained_campaign();
-    scenario_defence_disassoc_and_csa_use_pair_builder();
+    scenario_defence_disassoc_uses_pair_builder_and_csa_is_observe_only();
     scenario_defence_failures_and_rejected_hint();
     scenario_defence_stop_join_retry_and_single_finish();
     scenario_scheduler_hop_lock_release_and_drop_merge();

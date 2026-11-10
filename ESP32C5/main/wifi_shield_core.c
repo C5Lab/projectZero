@@ -27,9 +27,12 @@ static bool valid_event(const wifi_shield_event_t *event)
     switch (event->type) {
     case WIFI_SHIELD_EVENT_DEAUTH:
     case WIFI_SHIELD_EVENT_DISASSOC:
-    case WIFI_SHIELD_EVENT_CSA:
         source = WIFI_SHIELD_SOURCE_DEAUTH;
         severity = WIFI_SHIELD_SEVERITY_ALERT;
+        break;
+    case WIFI_SHIELD_EVENT_CSA:
+        source = WIFI_SHIELD_SOURCE_DEAUTH;
+        severity = WIFI_SHIELD_SEVERITY_INFO;
         break;
     case WIFI_SHIELD_EVENT_WPS_ACTIVITY:
         source = WIFI_SHIELD_SOURCE_WPS;
