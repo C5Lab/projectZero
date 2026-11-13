@@ -1,5 +1,5 @@
 file(TO_CMAKE_PATH "$ENV{IDF_PATH}" CRACK_WORKER_IDF_PATH)
-idf_component_register(SRCS "oled_display.c" "main.c" "janos_psram_storage.c" "ota_diag.c" "attack_handshake.c"
+idf_component_register(SRCS "oled_display.c" "main.c" "gps_config.c" "janos_psram_storage.c" "ota_diag.c" "attack_handshake.c"
                             "led_status_core.c" "led_cli_activity.c" "led_target_cache.c"
                             "handshake_tx_telemetry.c"
                             "handshake_ducb_guard.c"

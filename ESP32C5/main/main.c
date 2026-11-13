@@ -105,6 +105,7 @@
 #include "esp_netif_net_stack.h"
 
 #include "attack_handshake.h"
+#include "gps_config.h"
 #include "handshake_tx_telemetry.h"
 #include "handshake_ducb_guard.h"
 #include "bssid_protection.h"
@@ -259,11 +260,7 @@
 
 // GPS UART pins (Marauder compatible)
 #define GPS_UART_NUM       UART_NUM_1
-#define GPS_TX_PIN         13
-#define GPS_RX_PIN         14
 #define GPS_BUF_SIZE       1024
-#define GPS_BAUD_ATGM336H  9600
-#define GPS_BAUD_M5STACK   115200
 
 // SD Card SPI pins (Marauder compatible)
 #define SD_MISO_PIN        2
@@ -354,16 +351,6 @@ typedef struct {
     int satellites;
     bool valid;
 } gps_data_t;
-
-typedef enum {
-    GPS_MODULE_ATGM336H = 0,
-    GPS_MODULE_M5STACK_GPS_V11 = 1,
-    GPS_MODULE_EXTERNAL = 2,
-    GPS_MODULE_EXTERNAL_CAP = 3,
-    // Backward compatibility alias for previously exposed name.
-    GPS_MODULE_USB_TAB = GPS_MODULE_EXTERNAL,
-    GPS_MODULE_CAP = GPS_MODULE_EXTERNAL_CAP,
-} gps_module_t;
 
 // Wardrive state
 static bool wardrive_active = false;
@@ -6772,11 +6759,6 @@ static bool is_own_device_mac(const uint8_t *mac);
 static void add_client_to_ap(int ap_index, const uint8_t *client_mac, int rssi);
 // Wardrive functions
 static esp_err_t init_gps_uart(int baud_rate);
-static int gps_get_baud_for_module(gps_module_t module);
-static const char *gps_get_module_name(gps_module_t module);
-static bool gps_module_uses_external_feed(gps_module_t module);
-static bool gps_module_uses_external_cap_feed(gps_module_t module);
-static const char *gps_external_position_command_name(gps_module_t module);
 static void gps_sync_from_selected_external_source(void);
 static void gps_load_state_from_nvs(void);
 static void gps_save_state_to_nvs(void);
@@ -12193,7 +12175,8 @@ static int cmd_start_wardrive_promisc_impl(int argc, char **argv, bool trace_ena
             return 1;
         }
         MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
-                    GPS_TX_PIN, GPS_RX_PIN, baud);
+                    gps_get_uart_tx_pin(current_gps_module),
+                    gps_get_uart_rx_pin(current_gps_module), baud);
     } else {
         MY_LOG_INFO(TAG, "Using external GPS feed. Provide fixes via '%s'.",
                     gps_external_position_command_name(current_gps_module));
@@ -12403,7 +12386,8 @@ static int cmd_start_antisurveillance(int argc, char **argv) {
             return 1;
         }
         MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
-                    GPS_TX_PIN, GPS_RX_PIN, baud);
+                    gps_get_uart_tx_pin(current_gps_module),
+                    gps_get_uart_rx_pin(current_gps_module), baud);
     } else {
         MY_LOG_INFO(TAG, "Using external GPS feed for anti-surveillance.");
     }
@@ -20074,7 +20058,7 @@ static const cli_hint_t k_cli_hints[] = {
     { "select_stations", " <MAC1> [MAC2] ..." },
     { "sniffer_debug", " <0|1>" },
     { "start_gps_raw", " [baud]" },
-    { "gps_set", " <m5|atgm|external|cap>" },
+    { "gps_set", " <m5|atgm|external|cap|rf_cap>" },
     { "set_gps_position", " <lat> <lon> [alt] [acc]" },
     { "set_gps_position_cap", " <lat> <lon> [alt] [acc]" },
     { "start_portal", " <SSID>" },
@@ -27379,19 +27363,8 @@ static int cmd_gps_set(int argc, char **argv) {
     }
 
     gps_module_t selected = current_gps_module;
-    if (strcasecmp(argv[1], "m5") == 0 || strcasecmp(argv[1], "m5stack") == 0 || strcasecmp(argv[1], "m5stackgps1.1") == 0 || strcasecmp(argv[1], "m5stackgpsv11") == 0) {
-        selected = GPS_MODULE_M5STACK_GPS_V11;
-    } else if (strcasecmp(argv[1], "atgm") == 0 || strcasecmp(argv[1], "atgm336h") == 0) {
-        selected = GPS_MODULE_ATGM336H;
-    } else if (strcasecmp(argv[1], "external") == 0 || strcasecmp(argv[1], "ext") == 0 ||
-               strcasecmp(argv[1], "usb") == 0 || strcasecmp(argv[1], "tab") == 0 ||
-               strcasecmp(argv[1], "tab5") == 0) {
-        selected = GPS_MODULE_EXTERNAL;
-    } else if (strcasecmp(argv[1], "cap") == 0 || strcasecmp(argv[1], "external_cap") == 0 ||
-               strcasecmp(argv[1], "lora_cap") == 0 || strcasecmp(argv[1], "adv_cap") == 0) {
-        selected = GPS_MODULE_EXTERNAL_CAP;
-    } else {
-        MY_LOG_INFO(TAG, "Unknown module '%s'. Use 'm5', 'atgm', 'external' (usb alias) or 'cap'.", argv[1]);
+    if (!gps_module_parse(argv[1], &selected)) {
+        MY_LOG_INFO(TAG, "Unknown module '%s'. Use 'm5', 'atgm', 'external' (usb alias), 'cap' or 'rf_cap'.", argv[1]);
         return 1;
     }
 
@@ -27947,7 +27920,8 @@ static int cmd_start_wardrive(int argc, char **argv) {
             return 1;
         }
         MY_LOG_INFO(TAG, "GPS UART initialized on pins %d (TX) and %d (RX) at %d baud",
-                    GPS_TX_PIN, GPS_RX_PIN, wardrive_baud);
+                    gps_get_uart_tx_pin(current_gps_module),
+                    gps_get_uart_rx_pin(current_gps_module), wardrive_baud);
     } else {
         MY_LOG_INFO(TAG, "Using external GPS feed. Provide fixes via '%s'.",
                     gps_external_position_command_name(current_gps_module));
@@ -32718,8 +32692,8 @@ static void register_commands(void)
 
     const esp_console_cmd_t gps_set_cmd = {
         .command = "gps_set",
-        .help = "Select GPS module: gps_set <m5|atgm|external|cap> (usb alias for external)",
-        .hint = "<m5|atgm|external|cap>",
+        .help = "Select GPS module: gps_set <m5|atgm|external|cap|rf_cap> (usb alias for external)",
+        .hint = "<m5|atgm|external|cap|rf_cap>",
         .func = &cmd_gps_set,
         .argtable = NULL
     };
@@ -36936,32 +36910,6 @@ static void deauth_detector_v2_worker_poll(void *opaque) {
 
 // === WARDRIVE HELPER FUNCTIONS ===
 
-static const char *gps_get_module_name(gps_module_t module) {
-    switch (module) {
-        case GPS_MODULE_M5STACK_GPS_V11:
-            return "M5StackGPS1.1";
-        case GPS_MODULE_EXTERNAL:
-            return "External";
-        case GPS_MODULE_EXTERNAL_CAP:
-            return "ExternalCap";
-        case GPS_MODULE_ATGM336H:
-        default:
-            return "ATGM336H";
-    }
-}
-
-static bool gps_module_uses_external_feed(gps_module_t module) {
-    return (module == GPS_MODULE_EXTERNAL || module == GPS_MODULE_EXTERNAL_CAP);
-}
-
-static bool gps_module_uses_external_cap_feed(gps_module_t module) {
-    return module == GPS_MODULE_EXTERNAL_CAP;
-}
-
-static const char *gps_external_position_command_name(gps_module_t module) {
-    return gps_module_uses_external_cap_feed(module) ? "set_gps_position_cap" : "set_gps_position";
-}
-
 static void gps_sync_from_selected_external_source(void) {
     if (!gps_module_uses_external_feed(current_gps_module)) {
         return;
@@ -36971,20 +36919,6 @@ static void gps_sync_from_selected_external_source(void) {
         current_gps = external_cap_gps_position;
     } else {
         current_gps = external_gps_position;
-    }
-}
-
-static int gps_get_baud_for_module(gps_module_t module) {
-    switch (module) {
-        case GPS_MODULE_M5STACK_GPS_V11:
-            return GPS_BAUD_M5STACK;
-        case GPS_MODULE_EXTERNAL:
-        case GPS_MODULE_EXTERNAL_CAP:
-            // In external mode wardrive does not read GPS UART. Keep safe fallback.
-            return GPS_BAUD_ATGM336H;
-        case GPS_MODULE_ATGM336H:
-        default:
-            return GPS_BAUD_ATGM336H;
     }
 }
 
@@ -37016,7 +36950,9 @@ static esp_err_t init_gps_uart(int baud_rate) {
         return err;
     }
 
-    err = uart_set_pin(GPS_UART_NUM, GPS_TX_PIN, GPS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    err = uart_set_pin(GPS_UART_NUM, gps_get_uart_tx_pin(current_gps_module),
+                       gps_get_uart_rx_pin(current_gps_module),
+                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err != ESP_OK) {
         return err;
     }
@@ -37060,7 +36996,7 @@ static void gps_load_state_from_nvs(void) {
     uint8_t module_val = (uint8_t)current_gps_module;
     err = nvs_get_u8(handle, GPS_NVS_KEY_MODULE, &module_val);
     nvs_close(handle);
-    if (err == ESP_OK && module_val <= GPS_MODULE_EXTERNAL_CAP) {
+    if (err == ESP_OK && gps_module_is_valid_persisted(module_val)) {
         current_gps_module = (gps_module_t)module_val;
     }
 }

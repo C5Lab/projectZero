@@ -1172,7 +1172,7 @@ Recon PAN/node tables and CLI snapshots are allocated in PSRAM. The RX queue rem
 
 ## GPS
 
-- `gps_set [module]` — set/read GPS module: `m5`, `atgm`, `external`/`ext`/`usb`/`tab`/`tab5`, `cap`/`external_cap`. No arg = read. Machine-readable output is terminated by `[GPSCFG] END`.
+- `gps_set [module]` — set/read GPS module: `m5`, `atgm`, `external`/`ext`/`usb`/`tab`/`tab5`, `cap`/`external_cap`, or `rf_cap`. `rf_cap` selects the directly connected Monster RF Cap GPS on UART1 at 115200 baud: module `GPS_TX` is received on GPIO4 through the Monster RF `GDO0` net, and module `GPS_RX` is driven from GPIO5 through `CC1101_RF_SW0`. Other direct UART modes use GPIO13 TX and GPIO14 RX. No arg = read. Machine-readable output is terminated by `[GPSCFG] END`.
 - `set_gps_position <lat> <lon> [alt] [acc]` — provide an external GPS fix (no arg = clear). Used when GPS module is an external feed.
 - `set_gps_position_cap <lat> <lon> [alt] [acc]` — same for the CAP feed.
 - `start_gps_raw [baud]` — print raw NMEA sentences. Stop with `stop`.
